@@ -164,10 +164,12 @@ fn visuals(palette: &Palette, theme: Theme) -> Visuals {
     widgets.hovered.fg_stroke = Stroke::new(1.0, palette.text);
     widgets.hovered.corner_radius = corner_radius;
 
-    widgets.active.bg_fill = palette.accent;
-    widgets.active.weak_bg_fill = palette.accent;
-    widgets.active.bg_stroke = Stroke::new(1.0, palette.accent_hover);
-    widgets.active.fg_stroke = Stroke::new(1.0, palette.accent_text);
+    // egui also uses this text colour for all strong text, so it has to stay readable
+    // on panels. That rules out filling pressed controls with the accent.
+    widgets.active.bg_fill = palette.raised;
+    widgets.active.weak_bg_fill = palette.raised;
+    widgets.active.bg_stroke = Stroke::new(2.0, palette.accent);
+    widgets.active.fg_stroke = Stroke::new(1.0, palette.text);
     widgets.active.corner_radius = corner_radius;
 
     visuals
@@ -350,6 +352,20 @@ mod tests {
                     ratio >= SHAPE_MINIMUM,
                     "{name} playhead on {label} is {ratio:.2}:1"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn strong_text_is_readable_in_both_themes() {
+        for (name, palette, theme) in [
+            ("dark", &DARK, Theme::Dark),
+            ("light", &LIGHT, Theme::Light),
+        ] {
+            let strong = visuals(palette, theme).strong_text_color();
+            for background in [palette.surface, palette.raised, palette.bg_app] {
+                let ratio = contrast(strong, background);
+                assert!(ratio >= TEXT_MINIMUM, "{name} strong text is {ratio:.2}:1");
             }
         }
     }

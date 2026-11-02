@@ -1,4 +1,4 @@
-//! The trimming screen: everything between opening a video and exporting it.
+//! The editing screen: a media panel, the preview, and the timeline below them.
 
 use std::{
     path::{Path, PathBuf},
@@ -12,12 +12,14 @@ use std::{
 };
 
 use bareclip_core::{
-    cut::CutList,
+    history::History,
     splice::{CutMode, FrameIndex},
-    time::{Ticks, TimeBase, format_timecode},
+    time::{Ticks, format_timecode},
+    timeline::{ClipEdge, ClipId, MediaId, TimeRange, Timeline},
 };
 use bareclip_media::{
-    ExportReport, ExportRequest, MediaError, MediaInfo, export, plan_export, probe, scan_frames,
+    DecodeStep, ExportPart, ExportReport, ExportRequest, MediaError, MediaInfo, PreviewFrame,
+    VideoPreview, can_write_gaps, export, join_problem, plan_export, probe, scan_frames,
 };
 use eframe::egui::{
     self, Align, Button, Color32, CornerRadius, FontFamily, FontId, Frame, Key, Layout, Margin,
@@ -26,29 +28,73 @@ use eframe::egui::{
 
 use crate::{
     fonts,
-    player::Player,
+    preview::Preview,
     text,
     theme::{self, Palette},
-    timeline::{self, TimelineDrag},
+    timeline::{self, ClipView, MediaDrag, TimelineState, TimelineView},
 };
 
 const VIDEO_EXTENSIONS: [&str; 6] = ["mp4", "mkv", "mov", "webm", "avi", "ts"];
 const LOGO_DARK: &[u8] = include_bytes!("../../../assets/brand/png/mark-dark-256.png");
-const LOGO_LIGHT: &[u8] = include_bytes!("../../../assets/brand/png/mark-light-256.png");
 const SHIFT_STEP_SECONDS: f64 = 1.0;
 const BACKGROUND_TICK: Duration = Duration::from_millis(50);
+const MIN_CLIP_SECONDS: f64 = 0.05;
+/// Moving to a trimmed clip's end shows its last frame rather than what follows it.
+const JUST_BEFORE_END_SECONDS: f64 = 0.001;
+const THUMBNAIL_WIDTH: u32 = 160;
+const THUMBNAIL_HEIGHT: u32 = 90;
+const RAIL_WIDTH: f32 = 78.0;
+const MEDIA_PANEL_WIDTH: f32 = 290.0;
+const MEDIA_PANEL_MIN_WIDTH: f32 = 210.0;
+const MEDIA_PANEL_MAX_WIDTH: f32 = 720.0;
+/// Each card is at least this wide, so a wider panel fits more of them across.
+const MEDIA_CARD_MIN_WIDTH: f32 = 220.0;
+const MEDIA_CARD_SPACING: f32 = 10.0;
+const CARD_BUTTON_SIZE: f32 = 30.0;
+const TIMELINE_HEIGHT: f32 = 200.0;
+const TIMELINE_MIN_HEIGHT: f32 = 160.0;
+/// Whatever the timeline's height, the preview keeps this share of the room.
+const TIMELINE_MAX_SHARE: f32 = 0.65;
+/// How far the arrow keys step in dead space, which has no frames of its own.
+const GAP_STEP_SECONDS: f64 = 1.0 / 30.0;
 
-/// The frame table being read in the background.
-struct ScanTask {
-    result: Receiver<Result<FrameIndex, MediaError>>,
-    progress: Arc<AtomicU32>,
-    cancel: Arc<AtomicBool>,
+/// What a video's background reading sends back.
+enum ScanMessage {
+    Thumbnail(PreviewFrame),
+    Frames(Result<FrameIndex, MediaError>),
 }
 
-impl Drop for ScanTask {
+/// A video in the project.
+struct MediaEntry {
+    id: MediaId,
+    info: MediaInfo,
+    name: String,
+    index: Option<Arc<FrameIndex>>,
+    scan: Option<Receiver<ScanMessage>>,
+    cancel_scan: Arc<AtomicBool>,
+    progress: Arc<AtomicU32>,
+    thumbnail: Option<TextureHandle>,
+}
+
+impl Drop for MediaEntry {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        self.cancel_scan.store(true, Ordering::Relaxed);
     }
+}
+
+/// The parts of the project that undo and redo bring back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Snapshot {
+    timeline: Timeline,
+    /// Videos removed from the panel. They stay loaded so undo can restore them.
+    hidden: Vec<MediaId>,
+}
+
+/// A trim in progress: where the clip's edge was when the drag started.
+#[derive(Clone, Copy, Debug)]
+struct TrimOrigin {
+    source: Ticks,
+    pointer: Ticks,
 }
 
 struct ExportTask {
@@ -69,196 +115,416 @@ enum ExportState {
     Failed(String),
 }
 
-struct Loaded {
-    info: MediaInfo,
-    player: Player,
-    cuts: CutList,
-    index: Option<Arc<FrameIndex>>,
-    clean_points: Vec<Ticks>,
-    scan: Option<ScanTask>,
-    picture: Option<TextureHandle>,
-    drag: TimelineDrag,
-}
-
-impl Loaded {
-    fn time_base(&self) -> TimeBase {
-        self.info.video.time_base
-    }
-
-    /// The position a mark should use: the start of the frame on screen.
-    fn frame_position(&self) -> Ticks {
-        let position = self.player.position();
-        let Some(index) = &self.index else {
-            return position;
-        };
-        let time_base = self.time_base();
-        index
-            .frame_at(position.to_pts(time_base))
-            .map_or(position, |pts| Ticks::from_pts(pts, time_base))
-    }
-
-    fn step_frame(&mut self, forward: bool) {
-        self.player.pause();
-        let position = self.frame_position();
-        let time_base = self.time_base();
-        let pts = position.to_pts(time_base);
-        let target = self.index.as_ref().and_then(|index| {
-            if forward {
-                index.next_frame_after(pts)
-            } else {
-                index.previous_frame_before(pts)
-            }
-        });
-        if let Some(target) = target {
-            self.player.seek(Ticks::from_pts(target, time_base));
-        }
-    }
-
-    fn jump(&mut self, seconds: f64) {
-        let target = Ticks(self.player.position().0 + Ticks::from_seconds(seconds).0);
-        self.player.seek(target);
-    }
-}
-
 pub struct Editor {
-    loaded: Option<Loaded>,
+    media: Vec<MediaEntry>,
+    next_media: u64,
+    project: Snapshot,
+    history: History<Snapshot>,
+    preview: Preview,
+    picture: Option<TextureHandle>,
+    selected: Option<ClipId>,
+    /// A moment in the dead space that was clicked on.
+    selected_gap: Option<Ticks>,
+    timeline_state: TimelineState,
+    trim_origin: Option<TrimOrigin>,
     notice: Option<String>,
     export_state: ExportState,
     mode: CutMode,
-    logo: Option<(bool, TextureHandle)>,
+    confirm_remove: Option<MediaId>,
+    logo: Option<TextureHandle>,
     loaded_fallbacks: Vec<&'static str>,
-    use_sound: bool,
+    /// Where things were drawn in the last frame.
+    media_panel_rect: egui::Rect,
+    timeline_panel_rect: egui::Rect,
+    card_thumbnails: Vec<(MediaId, egui::Rect)>,
+}
+
+fn media_info(media: &[MediaEntry], id: MediaId) -> Option<MediaInfo> {
+    media
+        .iter()
+        .find(|entry| entry.id == id)
+        .map(|entry| entry.info.clone())
 }
 
 impl Editor {
-    pub fn new(use_sound: bool) -> Self {
+    pub fn new(ctx: &egui::Context, use_sound: bool) -> Self {
+        let repaint = ctx.clone();
         Self {
-            loaded: None,
+            media: Vec::new(),
+            next_media: 1,
+            project: Snapshot {
+                timeline: Timeline::default(),
+                hidden: Vec::new(),
+            },
+            history: History::default(),
+            preview: Preview::new(use_sound, Arc::new(move || repaint.request_repaint())),
+            picture: None,
+            selected: None,
+            selected_gap: None,
+            timeline_state: TimelineState::default(),
+            trim_origin: None,
             notice: None,
             export_state: ExportState::Closed,
             mode: CutMode::FrameExact,
+            confirm_remove: None,
             logo: None,
             loaded_fallbacks: Vec::new(),
-            use_sound,
+            media_panel_rect: egui::Rect::NOTHING,
+            timeline_panel_rect: egui::Rect::NOTHING,
+            card_thumbnails: Vec::new(),
         }
     }
 
-    /// Opens a video, replacing any open one. The current video stays if this fails.
-    pub fn open(&mut self, ctx: &egui::Context, path: &Path) {
-        match self.load(ctx, path) {
-            Ok(loaded) => {
-                let name = path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned());
-                if let Some(name) = name {
-                    fonts::load_fallbacks_for(ctx, &name, &mut self.loaded_fallbacks);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
-                        "{name} - BareClip"
-                    )));
+    fn position(&self) -> Ticks {
+        self.preview.position(&self.project.timeline)
+    }
+
+    fn entry(&self, id: MediaId) -> Option<&MediaEntry> {
+        self.media.iter().find(|entry| entry.id == id)
+    }
+
+    fn visible_media(&self) -> impl Iterator<Item = &MediaEntry> {
+        self.media
+            .iter()
+            .filter(|entry| !self.project.hidden.contains(&entry.id))
+    }
+
+    fn seek(&mut self, time: Ticks) {
+        let Self {
+            preview,
+            project,
+            media,
+            ..
+        } = self;
+        preview.seek(&project.timeline, &|id| media_info(media, id), time);
+        if self.project.timeline.is_empty() {
+            self.picture = None;
+        }
+    }
+
+    fn toggle_playback(&mut self) {
+        let Self {
+            preview,
+            project,
+            media,
+            ..
+        } = self;
+        preview.toggle(&project.timeline, &|id| media_info(media, id));
+    }
+
+    /// Remembers the project as it is now, ready for a change that can be undone.
+    fn record(&mut self) {
+        self.history.record(self.project.clone());
+    }
+
+    /// Adds videos to the project. They wait in the panel until put on the timeline.
+    pub fn import(&mut self, ctx: &egui::Context, paths: &[PathBuf]) {
+        for path in paths {
+            match self.load(ctx, path) {
+                Ok(entry) => self.media.push(entry),
+                Err(error) => {
+                    let name = path.file_name().map_or_else(
+                        || "That file".to_owned(),
+                        |name| name.to_string_lossy().into_owned(),
+                    );
+                    self.notice = Some(format!("{name} could not be opened. {error}"));
                 }
-                self.loaded = Some(loaded);
-                self.notice = None;
-                self.export_state = ExportState::Closed;
             }
-            Err(error) => self.notice = Some(error.to_string()),
         }
     }
 
-    fn load(&self, ctx: &egui::Context, path: &Path) -> Result<Loaded, MediaError> {
+    fn load(&mut self, ctx: &egui::Context, path: &Path) -> Result<MediaEntry, MediaError> {
         let info = probe(path)?;
-        let repaint = ctx.clone();
-        let mut player = Player::open(
-            &info,
-            self.use_sound,
-            Arc::new(move || repaint.request_repaint()),
-        )
-        .map_err(|error| MediaError::Io(std::io::Error::other(error)))?;
-        player.seek(Ticks(0));
+        let name = path.file_name().map_or_else(
+            || "Untitled".to_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        fonts::load_fallbacks_for(ctx, &name, &mut self.loaded_fallbacks);
 
-        let (sender, result) = mpsc::channel();
+        let (sender, scan) = mpsc::channel();
         let progress = Arc::new(AtomicU32::new(0));
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_scan = Arc::new(AtomicBool::new(false));
         let scan_path = path.to_owned();
         let scan_progress = progress.clone();
-        let scan_cancel = cancel.clone();
+        let scan_cancel = cancel_scan.clone();
         let repaint = ctx.clone();
         thread::spawn(move || {
+            if let Ok(mut preview) =
+                VideoPreview::open(&scan_path, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT)
+                && let Ok(DecodeStep::Frame(frame)) = preview.next_step(None)
+            {
+                let _ = sender.send(ScanMessage::Thumbnail(frame));
+                repaint.request_repaint();
+            }
             let outcome = scan_frames(&scan_path, &scan_cancel, |fraction| {
                 scan_progress.store(fraction.to_bits(), Ordering::Relaxed);
                 repaint.request_repaint();
             });
-            let _ = sender.send(outcome);
+            let _ = sender.send(ScanMessage::Frames(outcome));
             repaint.request_repaint();
         });
 
-        Ok(Loaded {
-            cuts: CutList::new(info.duration),
+        let id = MediaId(self.next_media);
+        self.next_media += 1;
+        Ok(MediaEntry {
+            id,
             info,
-            player,
+            name,
             index: None,
-            clean_points: Vec::new(),
-            scan: Some(ScanTask {
-                result,
-                progress,
-                cancel,
-            }),
-            picture: None,
-            drag: TimelineDrag::None,
+            scan: Some(scan),
+            cancel_scan,
+            progress,
+            thumbnail: None,
         })
     }
 
-    fn pick_file(&mut self, ctx: &egui::Context) {
-        let picked = rfd::FileDialog::new()
-            .set_title("Open a video")
-            .add_filter("Video files", &VIDEO_EXTENSIONS)
-            .add_filter("All files", &["*"])
-            .pick_file();
-        if let Some(path) = picked {
-            self.open(ctx, &path);
+    fn full_range(&self, id: MediaId) -> Option<TimeRange> {
+        let entry = self.entry(id)?;
+        Some(TimeRange {
+            start: Ticks(0),
+            end: entry.info.duration,
+        })
+    }
+
+    /// Adds a whole video to the end of the timeline.
+    fn add_to_timeline(&mut self, id: MediaId) {
+        let Some(range) = self.full_range(id) else {
+            return;
+        };
+        self.record();
+        self.selected = Some(self.project.timeline.push(id, range));
+        self.after_clip_added();
+    }
+
+    /// Adds a whole video where it was dropped.
+    fn drop_on_timeline(&mut self, id: MediaId, time: Ticks) {
+        let Some(range) = self.full_range(id) else {
+            return;
+        };
+        self.record();
+        self.selected = Some(self.project.timeline.place(id, range, time));
+        self.after_clip_added();
+    }
+
+    fn after_clip_added(&mut self) {
+        self.selected_gap = None;
+        self.timeline_state
+            .content_added(self.project.timeline.duration());
+        let position = self.position();
+        self.seek(position);
+    }
+
+    /// Asks before removing a video that clips are using, since they go with it.
+    fn request_remove(&mut self, id: MediaId) {
+        if self.project.timeline.clips_using(id) > 0 {
+            self.confirm_remove = Some(id);
+        } else {
+            self.remove_media(id);
         }
     }
 
-    fn poll_background(&mut self, ctx: &egui::Context) {
-        if let Some(loaded) = &mut self.loaded {
-            if let Some(scan) = &loaded.scan {
-                match scan.result.try_recv() {
-                    Ok(Ok(index)) => {
-                        let time_base = loaded.info.video.time_base;
-                        loaded.clean_points = index
-                            .clean_points()
-                            .into_iter()
-                            .map(|pts| Ticks::from_pts(pts, time_base))
-                            .collect();
-                        loaded.index = Some(Arc::new(index));
-                        loaded.scan = None;
-                    }
-                    Ok(Err(error)) => {
-                        self.notice = Some(error.to_string());
-                        loaded.scan = None;
-                    }
-                    Err(_) => ctx.request_repaint_after(BACKGROUND_TICK),
-                }
-            }
+    fn remove_media(&mut self, id: MediaId) {
+        self.record();
+        self.project.timeline.remove_media(id);
+        self.project.hidden.push(id);
+        self.after_timeline_change();
+    }
 
-            if let Some(frame) = loaded.player.update() {
-                let image = egui::ColorImage::from_rgba_unmultiplied(
-                    [frame.width as usize, frame.height as usize],
-                    &frame.rgba,
-                );
-                match &mut loaded.picture {
-                    Some(picture) => picture.set(image, TextureOptions::LINEAR),
-                    None => {
-                        loaded.picture =
-                            Some(ctx.load_texture("video", image, TextureOptions::LINEAR));
+    /// Tidies up after clips changed, so nothing points at a clip that has gone.
+    fn after_timeline_change(&mut self) {
+        if let Some(selected) = self.selected
+            && self.project.timeline.index_of(selected).is_none()
+        {
+            self.selected = None;
+        }
+        if let Some(gap) = self.selected_gap
+            && self.project.timeline.gap_at(gap).is_none()
+        {
+            self.selected_gap = None;
+        }
+        let position = self.position();
+        self.seek(position);
+    }
+
+    /// The frame boundary on or before a moment in a source video.
+    fn snap_to_frame(&self, media: MediaId, source_time: Ticks) -> Ticks {
+        let Some(entry) = self.entry(media) else {
+            return source_time;
+        };
+        if source_time >= entry.info.duration {
+            return entry.info.duration;
+        }
+        let time_base = entry.info.video.time_base;
+        entry
+            .index
+            .as_ref()
+            .and_then(|index| index.frame_at(source_time.to_pts(time_base)))
+            .map_or(source_time, |pts| Ticks::from_pts(pts, time_base))
+    }
+
+    /// Splits the clip under the playhead. The frame on screen starts the second part.
+    fn split_at_playhead(&mut self) {
+        if self.project.timeline.is_empty() {
+            self.notice = Some("Add a video to the timeline first.".to_owned());
+            return;
+        }
+        let Some(location) = self.project.timeline.locate(self.position()) else {
+            self.notice = Some("Move the playhead inside a clip to split it there.".to_owned());
+            return;
+        };
+        self.preview.pause(&self.project.timeline);
+        let split_at = self.snap_to_frame(location.clip.media, location.source_time);
+        let before = self.project.clone();
+        if let Some(second) = self.project.timeline.split(location.clip.id, split_at) {
+            self.history.record(before);
+            self.selected = Some(second);
+            self.notice = None;
+        } else {
+            self.notice = Some("Move the playhead inside a clip to split it there.".to_owned());
+        }
+    }
+
+    /// Deletes the selected clip, leaving dead space, or closes the selected dead space.
+    fn delete_selected(&mut self) {
+        if let Some(selected) = self.selected {
+            self.record();
+            self.project.timeline.remove(selected);
+            self.after_timeline_change();
+        } else if let Some(gap) = self.selected_gap {
+            self.remove_gap(gap);
+        }
+    }
+
+    fn remove_gap(&mut self, time: Ticks) {
+        let before = self.project.clone();
+        if self.project.timeline.remove_gap(time) {
+            self.history.record(before);
+            self.after_timeline_change();
+        }
+    }
+
+    fn undo(&mut self) {
+        let current = self.project.clone();
+        if let Ok(previous) = self.history.undo(current) {
+            self.project = previous;
+            self.after_timeline_change();
+        }
+    }
+
+    fn redo(&mut self) {
+        let current = self.project.clone();
+        if let Ok(next) = self.history.redo(current) {
+            self.project = next;
+            self.after_timeline_change();
+        }
+    }
+
+    fn step_frame(&mut self, forward: bool) {
+        self.preview.pause(&self.project.timeline);
+        let position = self.position();
+        let gap_step = Ticks::from_seconds(if forward {
+            GAP_STEP_SECONDS
+        } else {
+            -GAP_STEP_SECONDS
+        });
+        let Some(location) = self.project.timeline.locate(position) else {
+            self.seek(Ticks(position.0 + gap_step.0));
+            return;
+        };
+        let Some(entry) = self.entry(location.clip.media) else {
+            return;
+        };
+        let time_base = entry.info.video.time_base;
+        let Some(index) = entry.index.as_ref() else {
+            return;
+        };
+        let shown = index
+            .frame_at(location.source_time.to_pts(time_base))
+            .unwrap_or_default();
+        let neighbour = if forward {
+            index.next_frame_after(shown)
+        } else {
+            index.previous_frame_before(shown)
+        };
+        let shown_time = Ticks::from_pts(shown, time_base);
+        // The source's first and last frames have no neighbour, but the timeline may
+        // carry on past them.
+        let target = neighbour.map_or(Ticks(position.0 + gap_step.0), |pts| {
+            let gap = Ticks::from_pts(pts, time_base).0 - shown_time.0;
+            Ticks(location.clip.start.0 + shown_time.0 - location.clip.source.start.0 + gap)
+        });
+        self.seek(target);
+    }
+
+    fn poll_background(&mut self, ctx: &egui::Context) {
+        let mut problem = None;
+        for entry in &mut self.media {
+            let Some(scan) = &entry.scan else {
+                continue;
+            };
+            let mut finished = false;
+            while let Ok(message) = scan.try_recv() {
+                match message {
+                    ScanMessage::Thumbnail(frame) => {
+                        let image = egui::ColorImage::from_rgba_unmultiplied(
+                            [frame.width as usize, frame.height as usize],
+                            &frame.rgba,
+                        );
+                        entry.thumbnail = Some(ctx.load_texture(
+                            format!("thumbnail-{}", entry.id.0),
+                            image,
+                            TextureOptions::LINEAR,
+                        ));
+                    }
+                    ScanMessage::Frames(Ok(index)) => {
+                        entry.index = Some(Arc::new(index));
+                        finished = true;
+                    }
+                    ScanMessage::Frames(Err(error)) => {
+                        problem = Some(format!("{} can't be edited. {error}", entry.name));
+                        finished = true;
                     }
                 }
             }
-            if let Some(error) = loaded.player.take_error() {
-                self.notice = Some(error);
+            if finished {
+                entry.scan = None;
+            } else {
+                ctx.request_repaint_after(BACKGROUND_TICK);
             }
-            if loaded.player.is_playing() {
-                ctx.request_repaint();
+        }
+        if problem.is_some() {
+            self.notice = problem;
+        }
+
+        let Self {
+            preview,
+            project,
+            media,
+            picture,
+            notice,
+            timeline_state,
+            ..
+        } = self;
+        let frame = preview.update(&project.timeline, &|id| media_info(media, id));
+        if let Some(frame) = frame {
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [frame.width as usize, frame.height as usize],
+                &frame.rgba,
+            );
+            match picture {
+                Some(picture) => picture.set(image, TextureOptions::LINEAR),
+                None => {
+                    *picture = Some(ctx.load_texture("video", image, TextureOptions::LINEAR));
+                }
             }
+        }
+        if let Some(error) = preview.take_error() {
+            *notice = Some(error);
+        }
+        if preview.is_playing() {
+            let position = preview.position(&project.timeline);
+            timeline_state.follow(position, project.timeline.duration());
+            ctx.request_repaint();
         }
 
         let finished = match &self.export_state {
@@ -280,11 +546,69 @@ impl Editor {
         }
     }
 
+    /// The timeline as parts to export, once every video on it has been read.
+    fn export_parts(&self) -> Option<Vec<ExportPart>> {
+        let mut previous_end = Ticks(0);
+        self.project
+            .timeline
+            .clips()
+            .iter()
+            .map(|clip| {
+                let entry = self.entry(clip.media)?;
+                let gap_before = Ticks(clip.start.0 - previous_end.0);
+                previous_end = clip.end();
+                Some(ExportPart {
+                    input: entry.info.path.clone(),
+                    frames: entry.index.clone()?,
+                    range: clip.source,
+                    gap_before,
+                })
+            })
+            .collect()
+    }
+
+    /// Why the videos on the timeline can't be exported together, if they can't.
+    fn export_problem(&self) -> Option<String> {
+        let mut infos = self
+            .project
+            .timeline
+            .clips()
+            .iter()
+            .filter_map(|clip| self.entry(clip.media).map(|entry| &entry.info));
+        let first = infos.next()?;
+        infos.find_map(|other| join_problem(first, other))
+    }
+
+    /// Why dead space can't be exported for the videos on the timeline, if it can't.
+    fn gap_problem(&self) -> Option<String> {
+        if self.project.timeline.gaps().is_empty() {
+            return None;
+        }
+        let first = self
+            .project
+            .timeline
+            .clips()
+            .first()
+            .and_then(|clip| self.entry(clip.media))?;
+        (!can_write_gaps(&first.info.video.codec)).then(|| {
+            format!(
+                "Dead space can't be written for {} video yet. Remove the gaps to export it.",
+                text::codec_name(&first.info.video.codec)
+            )
+        })
+    }
+
     fn start_export(&mut self, ctx: &egui::Context) {
-        let Some(loaded) = &self.loaded else {
+        let Some(first) = self
+            .project
+            .timeline
+            .clips()
+            .first()
+            .and_then(|clip| self.entry(clip.media))
+        else {
             return;
         };
-        let suggested = text::default_output_path(&loaded.info.path);
+        let suggested = text::default_output_path(&first.info.path);
         let mut dialog = rfd::FileDialog::new().set_title("Export video as");
         if let Some(folder) = suggested.parent() {
             dialog = dialog.set_directory(folder);
@@ -302,16 +626,12 @@ impl Editor {
     }
 
     fn start_export_to(&mut self, ctx: &egui::Context, output: PathBuf) {
-        let Some(loaded) = &self.loaded else {
-            return;
-        };
-        let Some(index) = loaded.index.clone() else {
+        let Some(parts) = self.export_parts() else {
             return;
         };
         let request = ExportRequest {
-            input: loaded.info.path.clone(),
             output: output.clone(),
-            ranges: loaded.cuts.export_ranges(),
+            parts,
             mode: self.mode,
         };
         let (sender, result) = mpsc::channel();
@@ -321,7 +641,7 @@ impl Editor {
         let worker_cancel = cancel.clone();
         let repaint = ctx.clone();
         thread::spawn(move || {
-            let outcome = export(&request, &index, &worker_cancel, &|fraction| {
+            let outcome = export(&request, &worker_cancel, &|fraction| {
                 worker_progress.store(fraction.to_bits(), Ordering::Relaxed);
             });
             let _ = sender.send(outcome);
@@ -335,80 +655,95 @@ impl Editor {
         });
     }
 
+    fn pick_files(&mut self, ctx: &egui::Context) {
+        let picked = rfd::FileDialog::new()
+            .set_title("Add videos")
+            .add_filter("Video files", &VIDEO_EXTENSIONS)
+            .add_filter("All files", &["*"])
+            .pick_files();
+        if let Some(paths) = picked {
+            self.import(ctx, &paths);
+        }
+    }
+
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let dialog_open = !matches!(self.export_state, ExportState::Closed);
+        let blocked =
+            !matches!(self.export_state, ExportState::Closed) || self.confirm_remove.is_some();
+        if blocked {
+            return;
+        }
         let consume = |modifiers, key| ctx.input_mut(|input| input.consume_key(modifiers, key));
 
-        if consume(Modifiers::COMMAND, Key::O) && !dialog_open {
-            self.pick_file(ctx);
+        if consume(Modifiers::COMMAND, Key::O) {
+            self.pick_files(ctx);
         }
-        if dialog_open {
-            return;
-        }
-        if consume(Modifiers::COMMAND, Key::E) && self.can_export() {
+        if consume(Modifiers::COMMAND, Key::E) && !self.project.timeline.is_empty() {
             self.export_state = ExportState::Choosing;
         }
-        let Some(loaded) = &mut self.loaded else {
-            return;
-        };
-
+        if consume(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z)
+            || consume(Modifiers::COMMAND, Key::Y)
+        {
+            self.redo();
+        }
+        if consume(Modifiers::COMMAND, Key::Z) {
+            self.undo();
+        }
         if consume(Modifiers::NONE, Key::Space) {
-            loaded.player.toggle();
+            self.toggle_playback();
         }
-        if consume(Modifiers::NONE, Key::I) {
-            loaded.cuts.mark_in(loaded.frame_position());
+        if consume(Modifiers::NONE, Key::S) {
+            self.split_at_playhead();
         }
-        if consume(Modifiers::NONE, Key::O) {
-            let position = loaded.frame_position();
-            if !loaded.cuts.mark_out(position) {
-                self.notice = Some("The end of a section has to come after its start.".to_owned());
-            }
+        if consume(Modifiers::NONE, Key::Delete) || consume(Modifiers::NONE, Key::Backspace) {
+            self.delete_selected();
         }
         if consume(Modifiers::SHIFT, Key::ArrowLeft) {
-            loaded.jump(-SHIFT_STEP_SECONDS);
+            let target = Ticks(self.position().0 - Ticks::from_seconds(SHIFT_STEP_SECONDS).0);
+            self.seek(target);
         }
         if consume(Modifiers::SHIFT, Key::ArrowRight) {
-            loaded.jump(SHIFT_STEP_SECONDS);
+            let target = Ticks(self.position().0 + Ticks::from_seconds(SHIFT_STEP_SECONDS).0);
+            self.seek(target);
         }
         if consume(Modifiers::NONE, Key::ArrowLeft) {
-            loaded.step_frame(false);
+            self.step_frame(false);
         }
         if consume(Modifiers::NONE, Key::ArrowRight) {
-            loaded.step_frame(true);
+            self.step_frame(true);
         }
         if consume(Modifiers::NONE, Key::Home) {
-            loaded.player.seek(Ticks(0));
+            self.seek(Ticks(0));
         }
         if consume(Modifiers::NONE, Key::End) {
-            let duration = loaded.player.duration();
-            loaded.player.seek(duration);
+            let end = self.project.timeline.duration();
+            self.seek(end);
         }
     }
 
-    fn can_export(&self) -> bool {
-        self.loaded
-            .as_ref()
-            .is_some_and(|loaded| !loaded.cuts.export_ranges().is_empty())
+    fn take_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<PathBuf> = ctx.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .map(|file| file.path().to_owned())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            self.import(ctx, &dropped);
+        }
     }
 
-    fn logo(&mut self, ctx: &egui::Context, dark: bool) -> Option<TextureHandle> {
-        if self
-            .logo
-            .as_ref()
-            .is_none_or(|(is_dark, _)| *is_dark != dark)
-        {
-            let bytes = if dark { LOGO_DARK } else { LOGO_LIGHT };
-            let icon = eframe::icon_data::from_png_bytes(bytes).ok()?;
+    fn logo(&mut self, ctx: &egui::Context) -> Option<TextureHandle> {
+        if self.logo.is_none() {
+            let icon = eframe::icon_data::from_png_bytes(LOGO_DARK).ok()?;
             let image = egui::ColorImage::from_rgba_unmultiplied(
                 [icon.width as usize, icon.height as usize],
                 &icon.rgba,
             );
-            self.logo = Some((
-                dark,
-                ctx.load_texture("logo", image, TextureOptions::LINEAR),
-            ));
+            self.logo = Some(ctx.load_texture("logo", image, TextureOptions::LINEAR));
         }
-        self.logo.as_ref().map(|(_, texture)| texture.clone())
+        self.logo.clone()
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui) {
@@ -417,29 +752,17 @@ impl Editor {
 
         self.poll_background(&ctx);
         self.handle_shortcuts(&ctx);
-        self.take_dropped_file(&ctx);
+        self.take_dropped_files(&ctx);
 
         self.top_bar(ui, palette);
-        if self.loaded.is_some() {
-            self.bottom_panel(ui, palette);
-            self.side_panel(ui, palette);
-        }
+        self.rail(ui, palette);
+        self.media_panel(ui, palette);
+        self.timeline_panel(ui, palette);
+        self.transport_panel(ui, palette);
         self.stage(ui, palette);
+        self.remove_dialog(&ctx, palette);
         self.export_dialog(&ctx, palette);
         drop_overlay(&ctx, palette);
-    }
-
-    fn take_dropped_file(&mut self, ctx: &egui::Context) {
-        let dropped = ctx.input(|input| {
-            input
-                .raw
-                .dropped_files
-                .first()
-                .map(|file| file.path().to_owned())
-        });
-        if let Some(path) = dropped {
-            self.open(ctx, &path);
-        }
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui, palette: &Palette) {
@@ -452,23 +775,23 @@ impl Editor {
             .frame(frame)
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
-                    let title = self.loaded.as_ref().map_or_else(
-                        || "BareClip".to_owned(),
-                        |loaded| {
-                            loaded.info.path.file_name().map_or_else(
-                                || "Untitled".to_owned(),
-                                |name| name.to_string_lossy().into_owned(),
-                            )
-                        },
-                    );
-                    ui.label(RichText::new(title).font(fonts::strong(14.0)));
+                    ui.label(RichText::new("BareClip").font(fonts::strong(15.0)));
+                    ui.add_space(14.0);
+                    let can_undo = self.history.can_undo();
+                    let can_redo = self.history.can_redo();
                     if ui
-                        .button("Open")
-                        .on_hover_text("Open a video (Ctrl+O)")
+                        .add_enabled(can_undo, Button::new("Undo"))
+                        .on_hover_text("Undo (Ctrl+Z)")
                         .clicked()
                     {
-                        let ctx = ui.ctx().clone();
-                        self.pick_file(&ctx);
+                        self.undo();
+                    }
+                    if ui
+                        .add_enabled(can_redo, Button::new("Redo"))
+                        .on_hover_text("Redo (Ctrl+Y)")
+                        .clicked()
+                    {
+                        self.redo();
                     }
                     if let Some(notice) = self.notice.clone() {
                         ui.add_space(8.0);
@@ -476,12 +799,12 @@ impl Editor {
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let can_export = self.can_export();
+                        let can_export = !self.project.timeline.is_empty();
                         let export = accent_button(ui, palette, "Export", can_export);
                         let export = if can_export {
-                            export.on_hover_text("Export the marked sections (Ctrl+E)")
+                            export.on_hover_text("Export the timeline (Ctrl+E)")
                         } else {
-                            export.on_disabled_hover_text("Mark a section to keep first")
+                            export.on_disabled_hover_text("Add a video to the timeline first")
                         };
                         if export.clicked() {
                             self.export_state = ExportState::Choosing;
@@ -489,79 +812,337 @@ impl Editor {
                         ui.menu_button("Theme", |ui| {
                             theme::theme_picker(ui);
                         });
-                        if let Some(scan) =
-                            self.loaded.as_ref().and_then(|loaded| loaded.scan.as_ref())
-                        {
-                            let fraction =
-                                f32::from_bits(scan.progress.load(Ordering::Relaxed)) * 100.0;
-                            ui.colored_label(
-                                palette.text_muted,
-                                format!("Reading frames {fraction:.0}%"),
-                            );
-                        }
                     });
                 });
             });
     }
 
-    fn bottom_panel(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+    /// The list of tools down the left. It only ever shows what works today.
+    fn rail(&mut self, ui: &mut egui::Ui, palette: &Palette) {
         let frame = Frame::new()
-            .fill(palette.surface)
-            .inner_margin(Margin::symmetric(8, 8))
+            .fill(palette.bg_app)
+            .inner_margin(Margin::symmetric(8, 10))
             .stroke(Stroke::new(1.0, palette.border));
-        egui::Panel::bottom("timeline")
-            .exact_size(164.0)
+        egui::Panel::left("rail")
+            .exact_size(RAIL_WIDTH)
             .frame(frame)
             .show(ui, |ui| {
-                let Some(loaded) = &mut self.loaded else {
-                    return;
-                };
-                transport(ui, palette, loaded);
-                ui.add_space(6.0);
-
-                let position = loaded.player.position();
-                let duration = loaded.player.duration();
-                let output = timeline::timeline(
-                    ui,
-                    palette,
-                    &mut loaded.cuts,
-                    position,
-                    duration,
-                    &loaded.clean_points,
-                    &mut loaded.drag,
+                let (rect, _) =
+                    ui.allocate_exact_size(vec2(ui.available_width(), 62.0), Sense::hover());
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, 6.0, palette.raised);
+                painter.rect_filled(
+                    egui::Rect::from_min_size(
+                        rect.left_top() + vec2(0.0, 12.0),
+                        vec2(3.0, rect.height() - 24.0),
+                    ),
+                    1.0,
+                    palette.accent,
                 );
-                if let Some(seek) = output.seek {
-                    loaded.player.seek(seek);
-                }
+                // A small film frame, drawn with the logo's slant.
+                let icon =
+                    egui::Rect::from_center_size(rect.center() - vec2(0.0, 10.0), vec2(26.0, 18.0));
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        icon.left_top() + vec2(5.0, 0.0),
+                        icon.right_top(),
+                        icon.right_bottom() - vec2(0.0, 3.0),
+                        icon.right_bottom() - vec2(5.0, 0.0),
+                        icon.left_bottom(),
+                        icon.left_top() + vec2(0.0, 3.0),
+                    ],
+                    palette.accent,
+                    Stroke::NONE,
+                ));
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        icon.center() + vec2(-3.5, -5.0),
+                        icon.center() + vec2(5.0, 0.0),
+                        icon.center() + vec2(-3.5, 5.0),
+                    ],
+                    palette.accent_text,
+                    Stroke::NONE,
+                ));
+                painter.text(
+                    rect.center() + vec2(0.0, 16.0),
+                    egui::Align2::CENTER_CENTER,
+                    "My media",
+                    FontId::new(11.0, FontFamily::Proportional),
+                    palette.text,
+                );
             });
     }
 
-    fn side_panel(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+    fn media_panel(&mut self, ui: &mut egui::Ui, palette: &Palette) {
         let frame = Frame::new()
             .fill(palette.surface)
             .inner_margin(Margin::same(14))
             .stroke(Stroke::new(1.0, palette.border));
-        egui::Panel::right("details")
-            .exact_size(290.0)
+        let panel = egui::Panel::left("media_panel")
+            .resizable(true)
+            .default_size(MEDIA_PANEL_WIDTH)
+            .size_range(MEDIA_PANEL_MIN_WIDTH..=MEDIA_PANEL_MAX_WIDTH)
             .frame(frame)
             .show(ui, |ui| {
-                let Some(loaded) = &mut self.loaded else {
+                ui.label(RichText::new("My media").font(fonts::strong(15.0)));
+                ui.add_space(10.0);
+                let width = ui.available_width();
+                let clicked = ui
+                    .add_sized(
+                        vec2(width, 34.0),
+                        Button::new(
+                            RichText::new("Add videos")
+                                .color(palette.accent_text)
+                                .strong(),
+                        )
+                        .fill(palette.accent)
+                        .corner_radius(CornerRadius::same(5)),
+                    )
+                    .on_hover_text("Add videos to this project (Ctrl+O)")
+                    .clicked();
+                if clicked {
+                    let ctx = ui.ctx().clone();
+                    self.pick_files(&ctx);
+                }
+                ui.add_space(12.0);
+
+                if self.visible_media().next().is_none() {
+                    empty_media_hint(ui, palette);
                     return;
-                };
+                }
+
+                let mut add = None;
+                let mut remove = None;
+                let mut thumbnails = Vec::new();
                 egui::ScrollArea::vertical()
                     .auto_shrink(false)
                     .show(ui, |ui| {
-                        sections_list(ui, palette, loaded);
-                        ui.add_space(18.0);
-                        details(ui, palette, &loaded.info);
-                        if !loaded.info.audio.is_empty() && !loaded.player.has_sound() {
-                            ui.add_space(8.0);
+                        let columns = media_columns(ui.available_width());
+                        let entries: Vec<&MediaEntry> = self.visible_media().collect();
+                        for row in entries.chunks(columns) {
+                            ui.columns(columns, |cells| {
+                                for (cell, entry) in cells.iter_mut().zip(row) {
+                                    let thumbnail =
+                                        media_card(cell, palette, entry, &mut add, &mut remove);
+                                    thumbnails.push((entry.id, thumbnail));
+                                }
+                            });
+                            ui.add_space(MEDIA_CARD_SPACING);
+                        }
+                    });
+                self.card_thumbnails = thumbnails;
+                if let Some(id) = add {
+                    self.add_to_timeline(id);
+                }
+                if let Some(id) = remove {
+                    self.request_remove(id);
+                }
+            });
+        self.media_panel_rect = panel.response.rect;
+    }
+
+    fn timeline_panel(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        let frame = Frame::new()
+            .fill(palette.surface)
+            .inner_margin(Margin::symmetric(8, 8))
+            .stroke(Stroke::new(1.0, palette.border));
+        let tallest = (ui.available_height() * TIMELINE_MAX_SHARE).max(TIMELINE_MIN_HEIGHT);
+        let panel = egui::Panel::bottom("timeline")
+            .resizable(true)
+            .default_size(TIMELINE_HEIGHT)
+            .size_range(TIMELINE_MIN_HEIGHT..=tallest)
+            .frame(frame)
+            .show(ui, |ui| {
+                self.timeline_tools(ui);
+                ui.add_space(4.0);
+                self.timeline_track(ui, palette);
+            });
+        self.timeline_panel_rect = panel.response.rect;
+    }
+
+    fn timeline_tools(&mut self, ui: &mut egui::Ui) {
+        let has_clips = !self.project.timeline.is_empty();
+        let can_delete = self.selected.is_some() || self.selected_gap.is_some();
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            if ui
+                .add_enabled(has_clips, Button::new("Split"))
+                .on_hover_text("Split the clip at the playhead (S)")
+                .clicked()
+            {
+                self.split_at_playhead();
+            }
+            if ui
+                .add_enabled(can_delete, Button::new("Delete"))
+                .on_hover_text("Delete the selected clip or dead space (Delete)")
+                .clicked()
+            {
+                self.delete_selected();
+            }
+        });
+    }
+
+    fn timeline_track(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        let clips: Vec<ClipView> = self
+            .project
+            .timeline
+            .clips()
+            .iter()
+            .map(|clip| ClipView {
+                id: clip.id,
+                start: clip.start,
+                end: clip.end(),
+                label: self
+                    .entry(clip.media)
+                    .map_or_else(String::new, |entry| entry.name.clone()),
+            })
+            .collect();
+        let view = TimelineView {
+            timeline: &self.project.timeline,
+            clips: &clips,
+            position: self.position(),
+            selected: self.selected,
+            selected_gap: self.selected_gap,
+        };
+        let events = timeline::timeline(ui, palette, &mut self.timeline_state, &view);
+        self.apply_timeline_events(events);
+    }
+
+    fn apply_timeline_events(&mut self, events: timeline::TimelineEvents) {
+        if let Some(selection) = events.select {
+            self.selected = selection;
+            self.selected_gap = events.select_gap;
+        }
+        if let Some((id, edge, pointer)) = events.trim_started
+            && let Some(clip) = self.project.timeline.clip(id)
+        {
+            self.preview.pause(&self.project.timeline);
+            self.record();
+            let source = match edge {
+                ClipEdge::Start => clip.source.start,
+                ClipEdge::End => clip.source.end,
+            };
+            self.trim_origin = Some(TrimOrigin { source, pointer });
+        }
+        if let (Some((id, edge, pointer)), Some(origin)) = (events.trim_to, self.trim_origin) {
+            self.trim_clip(id, edge, origin, pointer);
+        }
+        if events.trim_finished {
+            self.trim_origin = None;
+        }
+        if let Some((id, time)) = events.move_clip {
+            let before = self.project.clone();
+            self.project.timeline.move_clip(id, time);
+            if self.project != before {
+                self.history.record(before);
+                self.after_timeline_change();
+            }
+        }
+        if let Some(gap) = events.remove_gap {
+            self.remove_gap(gap);
+        }
+        if let Some((media, time)) = events.drop_media {
+            self.drop_on_timeline(media, time);
+        }
+        if let Some(seek) = events.seek {
+            self.seek(seek);
+        }
+    }
+
+    /// Moves a clip's edge by however far the pointer has travelled, and shows the
+    /// frame at the new cut so its effect can be judged.
+    fn trim_clip(&mut self, id: ClipId, edge: ClipEdge, origin: TrimOrigin, pointer: Ticks) {
+        let Some(clip) = self.project.timeline.clip(id) else {
+            return;
+        };
+        let Some(duration) = self.entry(clip.media).map(|entry| entry.info.duration) else {
+            return;
+        };
+        let wanted = Ticks(origin.source.0 + pointer.0 - origin.pointer.0);
+        let snapped = self.snap_to_frame(clip.media, wanted);
+        self.project.timeline.trim(
+            id,
+            edge,
+            snapped,
+            duration,
+            Ticks::from_seconds(MIN_CLIP_SECONDS),
+        );
+
+        let Some(clip) = self.project.timeline.clip(id) else {
+            return;
+        };
+        let shown = match edge {
+            ClipEdge::Start => clip.start,
+            ClipEdge::End => Ticks(clip.end().0 - Ticks::from_seconds(JUST_BEFORE_END_SECONDS).0),
+        };
+        self.seek(shown);
+    }
+
+    fn transport_panel(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        let frame = Frame::new()
+            .fill(palette.surface)
+            .inner_margin(Margin::symmetric(14, 8));
+        egui::Panel::bottom("transport")
+            .exact_size(52.0)
+            .frame(frame)
+            .show(ui, |ui| {
+                let has_clips = !self.project.timeline.is_empty();
+                let position = self.position();
+                let total = self.project.timeline.duration();
+                let playing = self.preview.is_playing();
+                ui.columns_const(|[left, middle, right]: &mut [egui::Ui; 3]| {
+                    left.horizontal_centered(|ui| {
+                        ui.label(
+                            RichText::new(format_timecode(position)).font(fonts::strong(15.0)),
+                        );
+                        ui.colored_label(
+                            palette.text_muted,
+                            format!("/ {}", format_timecode(total)),
+                        );
+                    });
+                    middle.with_layout(
+                        Layout::left_to_right(Align::Center).with_main_justify(false),
+                        |ui| {
+                            let spare = (ui.available_width() - 190.0).max(0.0);
+                            ui.add_space(spare / 2.0);
+                            if ui
+                                .add_enabled(has_clips, Button::new("Start"))
+                                .on_hover_text("Go to the start (Home)")
+                                .clicked()
+                            {
+                                self.seek(Ticks(0));
+                            }
+                            if ui
+                                .add_enabled(has_clips, Button::new("Back"))
+                                .on_hover_text("One frame back (Left arrow)")
+                                .clicked()
+                            {
+                                self.step_frame(false);
+                            }
+                            if play_button(ui, palette, playing, has_clips)
+                                .on_hover_text("Play or pause (Space)")
+                                .clicked()
+                            {
+                                self.toggle_playback();
+                            }
+                            if ui
+                                .add_enabled(has_clips, Button::new("Next"))
+                                .on_hover_text("One frame forward (Right arrow)")
+                                .clicked()
+                            {
+                                self.step_frame(true);
+                            }
+                        },
+                    );
+                    right.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if !self.preview.sound_works() {
                             ui.colored_label(
                                 palette.text_muted,
-                                "Sound can't play on this computer, so the preview is silent. Exports keep every audio track.",
+                                "Preview is silent on this computer",
                             );
                         }
                     });
+                });
             });
     }
 
@@ -569,49 +1150,101 @@ impl Editor {
         let frame = Frame::new().fill(palette.stage);
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             let rect = ui.available_rect_before_wrap();
-            if let Some(loaded) = &self.loaded {
-                if let Some(picture) = &loaded.picture {
-                    let size = picture.size_vec2();
+            if self.preview.in_gap(&self.project.timeline) {
+                if let Some(size) = self.picture_size() {
                     let scale = (rect.width() / size.x).min(rect.height() / size.y);
                     let shown = egui::Rect::from_center_size(rect.center(), size * scale);
-                    ui.painter().image(
-                        picture.id(),
-                        shown,
-                        egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                        Color32::WHITE,
-                    );
+                    ui.painter().rect_filled(shown, 0.0, Color32::BLACK);
                 }
+                return;
+            }
+            if let Some(picture) = &self.picture {
+                let size = picture.size_vec2();
+                let scale = (rect.width() / size.x).min(rect.height() / size.y);
+                let shown = egui::Rect::from_center_size(rect.center(), size * scale);
+                ui.painter().image(
+                    picture.id(),
+                    shown,
+                    egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+                return;
+            }
+            if !self.project.timeline.is_empty() {
                 return;
             }
 
             let ctx = ui.ctx().clone();
-            let logo = self.logo(&ctx, true);
-            let mut open_clicked = false;
+            let logo = self.logo(&ctx);
+            let hint = if self.visible_media().next().is_none() {
+                "Add a video to get started"
+            } else {
+                "Press + on a video to put it on the timeline"
+            };
             ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.add_space((rect.height() - 280.0).max(0.0) / 2.0);
+                    ui.add_space((rect.height() - 200.0).max(0.0) / 2.0);
                     if let Some(logo) = logo {
-                        ui.add(egui::Image::new(&logo).fit_to_exact_size(vec2(110.0, 128.0)));
-                        ui.add_space(20.0);
+                        ui.add(egui::Image::new(&logo).fit_to_exact_size(vec2(96.0, 111.0)));
+                        ui.add_space(18.0);
                     }
                     ui.label(
-                        RichText::new("Open a video to start trimming")
+                        RichText::new(hint)
                             .font(fonts::strong(18.0))
                             .color(Color32::from_rgb(0xF1, 0xEE, 0xE9)),
                     );
-                    ui.add_space(14.0);
-                    open_clicked = accent_button(ui, palette, "Open video", true).clicked();
-                    ui.add_space(10.0);
-                    ui.label(
-                        RichText::new("Or drop a file anywhere in this window")
-                            .color(Color32::from_rgb(0xAB, 0xA6, 0x9F)),
-                    );
                 });
             });
-            if open_clicked {
-                self.pick_file(&ctx);
-            }
         });
+    }
+
+    /// The shape of the picture, even before any frame of it has been shown.
+    fn picture_size(&self) -> Option<egui::Vec2> {
+        self.picture
+            .as_ref()
+            .map(TextureHandle::size_vec2)
+            .or_else(|| {
+                let first = self.project.timeline.clips().first()?;
+                let video = &self.entry(first.media)?.info.video;
+                Some(vec2(video.width as f32, video.height as f32))
+            })
+    }
+
+    fn remove_dialog(&mut self, ctx: &egui::Context, palette: &Palette) {
+        let Some(id) = self.confirm_remove else {
+            return;
+        };
+        let count = self.project.timeline.clips_using(id);
+        let name = self
+            .entry(id)
+            .map_or_else(String::new, |entry| entry.name.clone());
+        let mut confirmed = false;
+        let mut cancelled = false;
+        let frame = Frame::popup(&ctx.global_style()).inner_margin(Margin::same(20));
+        egui::Modal::new(egui::Id::unique("remove_dialog"))
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.set_width(400.0);
+                ui.label(RichText::new("Remove this video?").font(fonts::strong(18.0)));
+                ui.add_space(10.0);
+                ui.label(text::remove_warning(&name, count));
+                ui.add_space(4.0);
+                ui.colored_label(
+                    palette.text_muted,
+                    "The file on your computer is not touched.",
+                );
+                ui.add_space(16.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    confirmed = accent_button(ui, palette, "Remove", true).clicked();
+                    cancelled = ui.button("Cancel").clicked();
+                });
+            });
+        if confirmed {
+            self.confirm_remove = None;
+            self.remove_media(id);
+        } else if cancelled {
+            self.confirm_remove = None;
+        }
     }
 
     fn export_dialog(&mut self, ctx: &egui::Context, palette: &Palette) {
@@ -620,6 +1253,10 @@ impl Editor {
         }
         let mut next_state = None;
         let mut begin_export = false;
+        let problem = self.export_problem();
+        let gap_problem = self.gap_problem();
+        let ready = self.export_parts().is_some();
+        let summary = self.plan_description();
 
         let frame = Frame::popup(&ctx.global_style()).inner_margin(Margin::same(20));
         egui::Modal::new(egui::Id::unique("export_dialog")).frame(frame).show(ctx, |ui| {
@@ -632,7 +1269,7 @@ impl Editor {
                     ui.indent("exact", |ui| {
                         ui.colored_label(
                             palette.text_muted,
-                            "Cuts land exactly where you marked them. Short parts around each cut are re-encoded.",
+                            "Cuts land exactly where they are on the timeline. Short parts around each cut are re-encoded.",
                         );
                     });
                     ui.add_space(8.0);
@@ -645,15 +1282,24 @@ impl Editor {
                     });
                     ui.add_space(14.0);
 
-                    let ready = self.loaded.as_ref().is_some_and(|loaded| loaded.index.is_some());
-                    if let Some(summary) = self.plan_description() {
+                    if let Some(problem) = &problem {
+                        ui.colored_label(palette.danger, problem);
+                        ui.add_space(4.0);
+                        ui.colored_label(
+                            palette.text_muted,
+                            "Videos need the same format to export together for now. Mixing formats comes later.",
+                        );
+                    } else if let Some(gap_problem) = &gap_problem {
+                        ui.colored_label(palette.danger, gap_problem);
+                    } else if let Some(summary) = &summary {
                         ui.label(summary);
                     } else {
-                        ui.colored_label(palette.text_muted, "Still reading the video's frames.");
+                        ui.colored_label(palette.text_muted, "Still reading the videos' frames.");
                     }
                     ui.add_space(16.0);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if accent_button(ui, palette, "Choose file and export", ready).clicked() {
+                        let can_start = ready && problem.is_none() && gap_problem.is_none();
+                        if accent_button(ui, palette, "Choose file and export", can_start).clicked() {
                             begin_export = true;
                         }
                         if ui.button("Cancel").clicked() {
@@ -715,15 +1361,16 @@ impl Editor {
     }
 
     fn plan_description(&self) -> Option<String> {
-        let loaded = self.loaded.as_ref()?;
-        let index = loaded.index.as_ref()?;
-        let plan = plan_export(
-            index,
-            &loaded.cuts.export_ranges(),
-            loaded.time_base(),
-            self.mode,
-        );
-        Some(text::plan_summary(plan.copied_frames, plan.encoded_frames))
+        let mut copied = 0;
+        let mut encoded = 0;
+        for clip in self.project.timeline.clips() {
+            let entry = self.entry(clip.media)?;
+            let index = entry.index.as_ref()?;
+            let plan = plan_export(index, &[clip.source], entry.info.video.time_base, self.mode);
+            copied += plan.copied_frames;
+            encoded += plan.encoded_frames;
+        }
+        Some(text::plan_summary(copied, encoded))
     }
 }
 
@@ -742,12 +1389,24 @@ fn accent_button(
     )
 }
 
-/// Draws the play or pause symbol, since egui's fonts may not carry these glyphs.
-fn play_button(ui: &mut egui::Ui, palette: &Palette, playing: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::click());
+/// The play or pause symbol is drawn, since the fonts may not carry these glyphs.
+fn play_button(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    playing: bool,
+    enabled: bool,
+) -> egui::Response {
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(vec2(34.0, 34.0), sense);
     let painter = ui.painter_at(rect);
     let center = rect.center();
-    let fill = if response.hovered() {
+    let fill = if !enabled {
+        palette.border_strong
+    } else if response.hovered() {
         palette.accent_hover
     } else {
         palette.accent
@@ -775,143 +1434,187 @@ fn play_button(ui: &mut egui::Ui, palette: &Palette, playing: bool) -> egui::Res
     response
 }
 
-fn transport(ui: &mut egui::Ui, palette: &Palette, loaded: &mut Loaded) {
-    ui.horizontal(|ui| {
-        ui.add_space(8.0);
-        let position = loaded.player.position();
-        ui.label(RichText::new(format_timecode(position)).font(fonts::strong(15.0)));
-        ui.colored_label(
-            palette.text_muted,
-            format!("/ {}", format_timecode(loaded.player.duration())),
-        );
-        ui.add_space(14.0);
+fn empty_media_hint(ui: &mut egui::Ui, palette: &Palette) {
+    let rect = ui.available_rect_before_wrap();
+    let area = egui::Rect::from_min_size(rect.min, vec2(rect.width(), rect.height().max(120.0)));
+    let painter = ui.painter_at(area.expand(2.0));
+    let stroke = Stroke::new(1.5, palette.border_strong);
+    let corners = [
+        area.left_top(),
+        area.right_top(),
+        area.right_bottom(),
+        area.left_bottom(),
+        area.left_top(),
+    ];
+    painter.extend(egui::Shape::dashed_line(&corners, stroke, 6.0, 5.0));
+    painter.text(
+        area.center() - vec2(0.0, 12.0),
+        egui::Align2::CENTER_CENTER,
+        "Drop videos here",
+        fonts::strong(14.0),
+        palette.text,
+    );
+    painter.text(
+        area.center() + vec2(0.0, 12.0),
+        egui::Align2::CENTER_CENTER,
+        "MP4, MKV, MOV and more",
+        FontId::new(12.0, FontFamily::Proportional),
+        palette.text_muted,
+    );
+}
 
-        if play_button(ui, palette, loaded.player.is_playing())
-            .on_hover_text("Play or pause (Space)")
-            .clicked()
-        {
-            loaded.player.toggle();
-        }
-        if ui
-            .button("Back")
-            .on_hover_text("One frame back (Left arrow)")
-            .clicked()
-        {
-            loaded.step_frame(false);
-        }
-        if ui
-            .button("Next")
-            .on_hover_text("One frame forward (Right arrow)")
-            .clicked()
-        {
-            loaded.step_frame(true);
-        }
+/// How many media cards fit across the panel.
+fn media_columns(width: f32) -> usize {
+    let per_card = MEDIA_CARD_MIN_WIDTH + MEDIA_CARD_SPACING;
+    (((width + MEDIA_CARD_SPACING) / per_card).floor() as usize).max(1)
+}
 
-        ui.add_space(14.0);
-        if ui
-            .button("Mark in")
-            .on_hover_text("Start a section here (I)")
-            .clicked()
-        {
-            loaded.cuts.mark_in(loaded.frame_position());
-        }
-        if ui
-            .button("Mark out")
-            .on_hover_text("End the section here (O)")
-            .clicked()
-        {
-            let position = loaded.frame_position();
-            loaded.cuts.mark_out(position);
-        }
+/// A square button drawn over a thumbnail, shown while the pointer is on the card.
+fn card_button(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    rect: egui::Rect,
+    label: &str,
+    visible: bool,
+    fill: Color32,
+    draw: impl FnOnce(&egui::Painter),
+) -> egui::Response {
+    let response = ui.interact(rect, id, Sense::click()).on_hover_text(label);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label.to_owned()));
+    if visible || response.has_focus() {
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 5.0, fill);
+        draw(&painter);
+    }
+    response
+}
 
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.add_space(8.0);
-            let kept = loaded.cuts.kept_duration();
-            let label = if kept.0 > 0 {
-                format!("Keeping {}", text::short_duration(kept))
-            } else {
-                "Nothing marked yet".to_owned()
+/// Draws one video in the panel, and returns where its thumbnail is.
+fn media_card(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    entry: &MediaEntry,
+    add: &mut Option<MediaId>,
+    remove: &mut Option<MediaId>,
+) -> egui::Rect {
+    let mut thumbnail_rect = egui::Rect::NOTHING;
+    let card = Frame::new()
+        .fill(palette.raised)
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(Margin::same(8))
+        .stroke(Stroke::new(1.0, palette.border))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let drag_id = egui::Id::unique(("media-card", entry.id.0));
+            let payload = MediaDrag {
+                media: entry.id,
+                length: entry.info.duration,
             };
-            ui.colored_label(palette.text_muted, label);
-        });
-    });
-}
-
-fn sections_list(ui: &mut egui::Ui, palette: &Palette, loaded: &mut Loaded) {
-    ui.label(RichText::new("Sections to keep").font(fonts::strong(14.0)));
-    ui.add_space(8.0);
-
-    let ranges = loaded.cuts.ranges().to_vec();
-    let mut remove = None;
-    let mut jump = None;
-    for (position, range) in ranges.iter().enumerate() {
-        ui.horizontal(|ui| {
-            let label = format!(
-                "{}  {}",
-                format_timecode(range.start),
-                text::short_duration(range.duration())
-            );
-            if ui.link(label).on_hover_text("Go to this section").clicked() {
-                jump = Some(range.start);
-            }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.small_button("Remove").clicked() {
-                    remove = Some(position);
+            ui.dnd_drag_source(drag_id, payload, |ui| {
+                let width = ui.available_width();
+                let size = vec2(width, width * 9.0 / 16.0);
+                let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+                thumbnail_rect = rect;
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, 4.0, palette.stage);
+                if let Some(thumbnail) = &entry.thumbnail {
+                    let image = thumbnail.size_vec2();
+                    let scale = (rect.width() / image.x).min(rect.height() / image.y);
+                    painter.image(
+                        thumbnail.id(),
+                        egui::Rect::from_center_size(rect.center(), image * scale),
+                        egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
                 }
-            });
+            })
+            .response
+            .on_hover_text("Drag onto the timeline");
+            ui.add_space(6.0);
+            ui.add(egui::Label::new(RichText::new(&entry.name).strong()).truncate());
+            let mut details = format!(
+                "{}, {}",
+                text::short_duration(entry.info.duration),
+                text::file_size(entry.info.size_bytes)
+            );
+            if entry.scan.is_some() {
+                let fraction = f32::from_bits(entry.progress.load(Ordering::Relaxed)) * 100.0;
+                details = format!("Reading frames {fraction:.0}%");
+            }
+            ui.colored_label(palette.text_muted, details);
+            ui.colored_label(palette.text_muted, text::video_summary(&entry.info));
+            for (position, track) in entry.info.audio.iter().enumerate() {
+                ui.colored_label(
+                    palette.text_muted,
+                    text::audio_track_summary(position, track),
+                );
+            }
+            if entry.info.video.is_hdr {
+                ui.colored_label(
+                    palette.danger,
+                    "HDR video: the preview shows it without HDR.",
+                );
+            }
         });
-    }
-    if let Some(position) = remove {
-        loaded.cuts.remove(position);
-    }
-    if let Some(time) = jump {
-        loaded.player.seek(time);
-    }
 
-    if let Some(start) = loaded.cuts.pending_in() {
-        ui.colored_label(
-            palette.text_muted,
-            format!(
-                "{} to the end, unless you mark an out point",
-                format_timecode(start)
-            ),
-        );
+    let hovered = ui.rect_contains_pointer(card.response.rect);
+    let margin = 6.0;
+    let size = vec2(CARD_BUTTON_SIZE, CARD_BUTTON_SIZE);
+    let add_rect = egui::Rect::from_min_size(
+        thumbnail_rect.right_bottom() - size - vec2(margin, margin),
+        size,
+    );
+    let remove_rect = egui::Rect::from_min_size(
+        thumbnail_rect.right_top() + vec2(-CARD_BUTTON_SIZE - margin, margin),
+        size,
+    );
+    let plus_stroke = Stroke::new(2.5, palette.accent_text);
+    let added = card_button(
+        ui,
+        egui::Id::unique(("media-card-add", entry.id.0)),
+        add_rect,
+        "Add to timeline",
+        hovered,
+        palette.accent,
+        |painter| {
+            let center = add_rect.center();
+            painter.line_segment(
+                [center - vec2(7.0, 0.0), center + vec2(7.0, 0.0)],
+                plus_stroke,
+            );
+            painter.line_segment(
+                [center - vec2(0.0, 7.0), center + vec2(0.0, 7.0)],
+                plus_stroke,
+            );
+        },
+    );
+    if added.clicked() {
+        *add = Some(entry.id);
     }
-    if ranges.is_empty() && loaded.cuts.pending_in().is_none() {
-        ui.colored_label(
-            palette.text_muted,
-            "Press I where a section should start and O where it should end. Repeat to keep several sections.",
-        );
+    let cross_stroke = Stroke::new(2.0, palette.text);
+    let removed = card_button(
+        ui,
+        egui::Id::unique(("media-card-remove", entry.id.0)),
+        remove_rect,
+        "Remove from this project",
+        hovered,
+        palette.raised,
+        |painter| {
+            let center = remove_rect.center();
+            painter.line_segment(
+                [center - vec2(5.0, 5.0), center + vec2(5.0, 5.0)],
+                cross_stroke,
+            );
+            painter.line_segment(
+                [center - vec2(5.0, -5.0), center + vec2(5.0, -5.0)],
+                cross_stroke,
+            );
+        },
+    );
+    if removed.clicked() {
+        *remove = Some(entry.id);
     }
-    if !ranges.is_empty() {
-        ui.add_space(6.0);
-        if ui.small_button("Clear all").clicked() {
-            loaded.cuts.clear();
-        }
-    }
-}
-
-fn details(ui: &mut egui::Ui, palette: &Palette, info: &MediaInfo) {
-    ui.label(RichText::new("Details").font(fonts::strong(14.0)));
-    ui.add_space(8.0);
-    ui.colored_label(palette.text_muted, text::video_summary(info));
-    ui.colored_label(palette.text_muted, text::file_size(info.size_bytes));
-    if info.audio.is_empty() {
-        ui.colored_label(palette.text_muted, "No audio");
-    }
-    for (position, track) in info.audio.iter().enumerate() {
-        ui.colored_label(
-            palette.text_muted,
-            text::audio_track_summary(position, track),
-        );
-    }
-    if info.video.is_hdr {
-        ui.add_space(8.0);
-        ui.colored_label(
-            palette.danger,
-            "This video is HDR. The preview shows it without HDR, and re-encoded parts may look different. The Fastest export keeps it unchanged.",
-        );
-    }
+    thumbnail_rect
 }
 
 fn drop_overlay(ctx: &egui::Context, palette: &Palette) {
@@ -927,7 +1630,7 @@ fn drop_overlay(ctx: &egui::Context, palette: &Palette) {
     painter.text(
         screen.center(),
         egui::Align2::CENTER_CENTER,
-        "Drop to open",
+        "Drop to add to My media",
         FontId::new(24.0, FontFamily::Proportional),
         Color32::from_rgb(0xF1, 0xEE, 0xE9),
     );
@@ -943,32 +1646,45 @@ fn show_in_folder(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eframe::{egui_wgpu, wgpu};
     use std::{process::Command, sync::OnceLock, time::Instant};
+
+    fn make_clip(name: &str, size: &str) -> PathBuf {
+        let folder = std::env::temp_dir().join("bareclip-app-tests");
+        std::fs::create_dir_all(&folder).expect("the folder can be created");
+        let path = folder.join(format!("{name}-{}.mp4", std::process::id()));
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg(format!("testsrc2=s={size}:r=30:d=4,format=yuv420p"))
+            .args(["-c:v", "libopenh264", "-b:v", "2M", "-g", "30"])
+            .arg(&path)
+            .status()
+            .expect("ffmpeg is on PATH");
+        assert!(status.success());
+        path
+    }
 
     fn test_clip() -> &'static Path {
         static CLIP: OnceLock<PathBuf> = OnceLock::new();
-        CLIP.get_or_init(|| {
-            let folder = std::env::temp_dir().join("bareclip-app-tests");
-            std::fs::create_dir_all(&folder).expect("the folder can be created");
-            let path = folder.join(format!("editor-{}.mp4", std::process::id()));
-            let status = Command::new("ffmpeg")
-                .args([
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-y",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                ])
-                .arg("testsrc2=s=320x180:r=30:d=4,format=yuv420p")
-                .args(["-c:v", "libopenh264", "-b:v", "2M", "-g", "30"])
-                .arg(&path)
-                .status()
-                .expect("ffmpeg is on PATH");
-            assert!(status.success());
-            path
-        })
+        CLIP.get_or_init(|| make_clip("editor", "320x180"))
+    }
+
+    fn second_clip() -> &'static Path {
+        static CLIP: OnceLock<PathBuf> = OnceLock::new();
+        CLIP.get_or_init(|| make_clip("editor-second", "320x180"))
+    }
+
+    fn small_clip() -> &'static Path {
+        static CLIP: OnceLock<PathBuf> = OnceLock::new();
+        CLIP.get_or_init(|| make_clip("editor-small", "160x90"))
     }
 
     fn context() -> egui::Context {
@@ -992,218 +1708,1333 @@ mod tests {
             ..Default::default()
         };
         let mut output = ctx.run_ui(input, |ui| editor.show(ui));
-        output.textures_delta.clear();
+        let mut textures = std::mem::take(&mut output.textures_delta);
+        KEPT_TEXTURES.with_borrow_mut(|kept| match kept {
+            Some(kept) => kept.push(textures),
+            None => textures.clear(),
+        });
         output
     }
 
-    fn press(key: Key) -> Vec<egui::Event> {
+    thread_local! {
+        /// Texture changes saved for `Camera`, which draws frames some time later.
+        static KEPT_TEXTURES: std::cell::RefCell<Option<Vec<egui::TexturesDelta>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Draws the screen with the real renderer into a picture, with no window involved.
+    struct Camera {
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        renderer: egui_wgpu::Renderer,
+        folder: PathBuf,
+    }
+
+    const CAMERA_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+    const CAMERA_SIZE: [u32; 2] = [1280, 800];
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        loop {
+            if let std::task::Poll::Ready(value) = future.as_mut().poll(&mut context) {
+                return value;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    impl Camera {
+        fn new(folder: PathBuf) -> Self {
+            std::fs::create_dir_all(&folder).expect("the folder can be created");
+            let instance = wgpu::Instance::default();
+            let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                ..Default::default()
+            }))
+            .expect("a GPU is available");
+            let (device, queue) = block_on(adapter.request_device(&Default::default()))
+                .expect("the GPU can be opened");
+            let renderer = egui_wgpu::Renderer::new(&device, CAMERA_FORMAT, Default::default());
+            KEPT_TEXTURES.with_borrow_mut(|kept| *kept = Some(Vec::new()));
+            Self {
+                device,
+                queue,
+                renderer,
+                folder,
+            }
+        }
+
+        /// Runs one frame with these events and saves it as a PPM picture.
+        fn shoot(
+            &mut self,
+            ctx: &egui::Context,
+            editor: &mut Editor,
+            events: Vec<egui::Event>,
+            name: &str,
+        ) {
+            let output = run_frame(ctx, editor, events);
+            let mut textures = KEPT_TEXTURES
+                .with_borrow_mut(|kept| std::mem::take(kept.as_mut().expect("the camera is on")));
+            for delta in &textures {
+                for (id, images) in &delta.set {
+                    for image in images {
+                        self.renderer
+                            .update_texture(&self.device, &self.queue, *id, image);
+                    }
+                }
+            }
+            let jobs = ctx.tessellate(output.shapes, output.pixels_per_point);
+            let screen = egui_wgpu::ScreenDescriptor {
+                size_in_pixels: CAMERA_SIZE,
+                pixels_per_point: output.pixels_per_point,
+            };
+            let size = wgpu::Extent3d {
+                width: CAMERA_SIZE[0],
+                height: CAMERA_SIZE[1],
+                depth_or_array_layers: 1,
+            };
+            let target = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: CAMERA_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = target.create_view(&Default::default());
+            let row_bytes =
+                (CAMERA_SIZE[0] * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+            let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: u64::from(row_bytes * CAMERA_SIZE[1]),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+
+            let mut encoder = self.device.create_command_encoder(&Default::default());
+            let extra = self.renderer.update_buffers(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                &jobs,
+                &screen,
+            );
+            {
+                let mut pass = encoder
+                    .begin_render_pass(&wgpu::RenderPassDescriptor {
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        ..Default::default()
+                    })
+                    .forget_lifetime();
+                self.renderer.render(&mut pass, &jobs, &screen);
+            }
+            encoder.copy_texture_to_buffer(
+                target.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(row_bytes),
+                        rows_per_image: None,
+                    },
+                },
+                size,
+            );
+            self.queue
+                .submit(extra.into_iter().chain([encoder.finish()]));
+            readback.map_async(wgpu::MapMode::Read, .., |result| {
+                result.expect("the picture can be read back");
+            });
+            self.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("the GPU finishes");
+
+            let data = readback
+                .get_mapped_range(..)
+                .expect("the picture was mapped");
+            let mut picture =
+                format!("P6 {} {} 255\n", CAMERA_SIZE[0], CAMERA_SIZE[1]).into_bytes();
+            for row in data.chunks(row_bytes as usize) {
+                for pixel in row[..CAMERA_SIZE[0] as usize * 4].chunks(4) {
+                    picture.extend_from_slice(&pixel[..3]);
+                }
+            }
+            std::fs::write(self.folder.join(format!("{name}.ppm")), picture)
+                .expect("the picture can be saved");
+            drop(data);
+            for delta in &mut textures {
+                for id in &delta.free {
+                    self.renderer.free_texture(id);
+                }
+                delta.clear();
+            }
+        }
+    }
+
+    fn moved(at: egui::Pos2) -> Vec<egui::Event> {
+        vec![egui::Event::PointerMoved(at)]
+    }
+
+    /// Saves pictures of the screen to look at, in the folder named by `BARECLIP_SCREENS`.
+    /// Needs a GPU, and a person or tool to judge the results.
+    #[test]
+    #[ignore = "needs a GPU, and writes pictures to look at"]
+    fn draw_the_timeline_screens() {
+        let folder = std::env::var_os("BARECLIP_SCREENS").map_or_else(
+            || std::env::temp_dir().join("bareclip-screens"),
+            PathBuf::from,
+        );
+        let ctx = context();
+        let mut camera = Camera::new(folder);
+        let mut editor = in_panel_only(&ctx, &[test_clip(), second_clip()]);
+        camera.shoot(&ctx, &mut editor, vec![], "01-in-panel-only");
+
+        let thumbnail = editor.card_thumbnails[0].1;
+        camera.shoot(
+            &ctx,
+            &mut editor,
+            moved(thumbnail.center()),
+            "02-card-hover",
+        );
+
+        click(
+            &ctx,
+            &mut editor,
+            thumbnail.right_bottom() - vec2(20.0, 20.0),
+        );
+        let second = editor.card_thumbnails[1].1;
+        click(&ctx, &mut editor, second.right_bottom() - vec2(20.0, 20.0));
+        let scale = editor.timeline_state.scale;
+        let track = editor.timeline_state.track;
+        let y = track.center().y;
+        let x_of = |seconds: f64| scale.x_of(Ticks::from_seconds(seconds));
+        let wait_for_picture = |ctx: &egui::Context, editor: &mut Editor| {
+            for _ in 0..50 {
+                run_frame(ctx, editor, vec![]);
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        wait_for_picture(&ctx, &mut editor);
+        camera.shoot(
+            &ctx,
+            &mut editor,
+            moved(pos2(700.0, 150.0)),
+            "03-both-added",
+        );
+        camera.shoot(
+            &ctx,
+            &mut editor,
+            moved(pos2(x_of(2.5), track.top() - 12.0)),
+            "04-hover-ruler",
+        );
+        camera.shoot(
+            &ctx,
+            &mut editor,
+            moved(pos2(x_of(9.5), y)),
+            "05-hover-past-end",
+        );
+
+        // Trim the first clip's start, which leaves dead space in front of it.
+        pointer_drag(
+            &ctx,
+            &mut editor,
+            pos2(x_of(0.0) + 4.0, y),
+            pos2(x_of(1.5) + 4.0, y),
+        );
+        camera.shoot(
+            &ctx,
+            &mut editor,
+            moved(pos2(700.0, 150.0)),
+            "06-trimmed-start",
+        );
+        camera.shoot(&ctx, &mut editor, moved(pos2(x_of(0.2), y)), "07-hover-gap");
+        editor.seek(Ticks::from_seconds(0.5));
+        wait_for_picture(&ctx, &mut editor);
+        camera.shoot(
+            &ctx,
+            &mut editor,
+            moved(pos2(700.0, 150.0)),
+            "08-playhead-in-gap",
+        );
+        click(&ctx, &mut editor, pos2(x_of(0.1), y));
+        camera.shoot(
+            &ctx,
+            &mut editor,
+            moved(pos2(700.0, 150.0)),
+            "09-gap-selected",
+        );
+
+        // Halfway through dragging a clip over the other one.
+        let middle = pos2(x_of(6.0), y);
+        run_frame(&ctx, &mut editor, moved(middle));
+        let press = |pressed, pos| {
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            }]
+        };
+        run_frame(&ctx, &mut editor, press(true, middle));
+        let target = pos2(x_of(3.0), y);
+        for step in 1..=6 {
+            let point = middle + (target - middle) * (step as f32 / 6.0);
+            run_frame(&ctx, &mut editor, moved(point));
+        }
+        camera.shoot(&ctx, &mut editor, moved(target), "10-dragging-a-clip");
+        run_frame(&ctx, &mut editor, press(false, target));
+        editor.undo();
+        wait_for_picture(&ctx, &mut editor);
+
+        let edge = editor.media_panel_rect.right();
+        pointer_drag(
+            &ctx,
+            &mut editor,
+            pos2(edge, 300.0),
+            pos2(edge + 250.0, 300.0),
+        );
+        wait_for_picture(&ctx, &mut editor);
+        camera.shoot(
+            &ctx,
+            &mut editor,
+            moved(pos2(1000.0, 150.0)),
+            "11-wide-media-panel",
+        );
+        let edge = editor.media_panel_rect.right();
+        pointer_drag(
+            &ctx,
+            &mut editor,
+            pos2(edge, 300.0),
+            pos2(edge - 250.0, 300.0),
+        );
+
+        let top = editor.timeline_panel_rect.top();
+        pointer_drag(
+            &ctx,
+            &mut editor,
+            pos2(800.0, top),
+            pos2(800.0, top - 120.0),
+        );
+        camera.shoot(
+            &ctx,
+            &mut editor,
+            moved(pos2(1000.0, 150.0)),
+            "12-tall-timeline",
+        );
+
+        let [zoom_out, zoom_in, _] = editor.timeline_state.zoom_buttons;
+        for _ in 0..4 {
+            click(&ctx, &mut editor, zoom_in.center());
+        }
+        camera.shoot(
+            &ctx,
+            &mut editor,
+            moved(pos2(1000.0, 150.0)),
+            "13-zoomed-in",
+        );
+        for _ in 0..10 {
+            click(&ctx, &mut editor, zoom_out.center());
+        }
+        camera.shoot(
+            &ctx,
+            &mut editor,
+            moved(pos2(1000.0, 150.0)),
+            "14-zoomed-out",
+        );
+
+        ctx.set_theme(egui::Theme::Light);
+        theme::install(&ctx);
+        let [_, _, fit] = editor.timeline_state.zoom_buttons;
+        click(&ctx, &mut editor, fit.center());
+        let scale = editor.timeline_state.scale;
+        run_frame(&ctx, &mut editor, vec![]);
+        let hover = pos2(
+            scale.x_of(Ticks::from_seconds(0.5)),
+            editor.timeline_state.track.center().y,
+        );
+        camera.shoot(&ctx, &mut editor, moved(hover), "15-light-theme");
+        KEPT_TEXTURES.with_borrow_mut(|kept| *kept = None);
+    }
+
+    fn key_event(key: Key, modifiers: Modifiers) -> Vec<egui::Event> {
         vec![egui::Event::Key {
             key,
             physical_key: None,
             pressed: true,
             repeat: false,
-            modifiers: Modifiers::NONE,
+            modifiers,
         }]
     }
 
-    /// An editor with the test clip open and its frames read.
-    fn opened(ctx: &egui::Context) -> Editor {
-        let mut editor = Editor::new(false);
-        run_frame(ctx, &mut editor, vec![]);
-        editor.open(ctx, test_clip());
+    fn press(key: Key) -> Vec<egui::Event> {
+        key_event(key, Modifiers::NONE)
+    }
+
+    /// Runs frames until every video has been read.
+    fn settle(ctx: &egui::Context, editor: &mut Editor) {
         let started = Instant::now();
-        while editor
-            .loaded
-            .as_ref()
-            .is_some_and(|loaded| loaded.index.is_none())
-        {
+        while editor.media.iter().any(|entry| entry.scan.is_some()) {
             assert!(
                 started.elapsed() < Duration::from_secs(10),
                 "reading frames took too long"
             );
-            run_frame(ctx, &mut editor, vec![]);
+            run_frame(ctx, editor, vec![]);
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    fn with_videos(ctx: &egui::Context, paths: &[&Path]) -> Editor {
+        let mut editor = Editor::new(ctx, false);
+        run_frame(ctx, &mut editor, vec![]);
+        let paths: Vec<PathBuf> = paths.iter().map(|path| path.to_path_buf()).collect();
+        editor.import(ctx, &paths);
+        settle(ctx, &mut editor);
+        let added: Vec<MediaId> = editor.media.iter().map(|entry| entry.id).collect();
+        for id in added {
+            editor.add_to_timeline(id);
+        }
+        run_frame(ctx, &mut editor, vec![]);
         editor
     }
 
-    fn seek_and_settle(ctx: &egui::Context, editor: &mut Editor, seconds: f64) {
-        let loaded = editor.loaded.as_mut().expect("a video is open");
-        loaded.player.seek(Ticks::from_seconds(seconds));
+    /// Videos added to the project, but not yet put on the timeline.
+    fn in_panel_only(ctx: &egui::Context, paths: &[&Path]) -> Editor {
+        let mut editor = Editor::new(ctx, false);
+        run_frame(ctx, &mut editor, vec![]);
+        let paths: Vec<PathBuf> = paths.iter().map(|path| path.to_path_buf()).collect();
+        editor.import(ctx, &paths);
+        settle(ctx, &mut editor);
+        run_frame(ctx, &mut editor, vec![]);
+        editor
+    }
+
+    fn click(ctx: &egui::Context, editor: &mut Editor, at: egui::Pos2) {
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        run_frame(ctx, editor, vec![egui::Event::PointerMoved(at)]);
+        run_frame(ctx, editor, vec![button(true)]);
+        run_frame(ctx, editor, vec![button(false)]);
         run_frame(ctx, editor, vec![]);
+    }
+
+    fn clip_count(editor: &Editor) -> usize {
+        editor.project.timeline.clips().len()
     }
 
     #[test]
     fn the_empty_screen_draws_without_a_video() {
         let ctx = context();
-        let mut editor = Editor::new(false);
+        let mut editor = Editor::new(&ctx, false);
 
         for _ in 0..2 {
             run_frame(&ctx, &mut editor, vec![]);
         }
 
-        assert!(editor.loaded.is_none());
-        assert!(!editor.can_export());
+        assert!(editor.project.timeline.is_empty());
     }
 
     #[test]
-    fn opening_a_video_reads_its_details_and_frames() {
+    fn adding_a_video_only_puts_it_in_the_panel() {
         let ctx = context();
-        let editor = opened(&ctx);
-        let loaded = editor.loaded.as_ref().expect("a video is open");
+        let mut editor = in_panel_only(&ctx, &[test_clip(), second_clip()]);
 
-        assert_eq!(loaded.info.video.width, 320);
-        assert_eq!(
-            loaded
-                .index
-                .as_ref()
-                .expect("frames are read")
-                .frames()
-                .len(),
-            120
+        assert_eq!(editor.visible_media().count(), 2);
+        assert_eq!(clip_count(&editor), 0);
+        assert!(!editor.history.can_undo());
+
+        editor.seek(Ticks::from_seconds(1.0));
+        assert_eq!(editor.position(), Ticks(0));
+    }
+
+    #[test]
+    fn the_plus_on_a_card_adds_the_video_to_the_end_of_the_timeline() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip(), second_clip()]);
+
+        for (index, expected_start) in [(0, 0.0), (1, 4.0)] {
+            let thumbnail = editor.card_thumbnails[index].1;
+            let plus = thumbnail.right_bottom() - vec2(20.0, 20.0);
+            click(&ctx, &mut editor, plus);
+
+            let clip = editor.project.timeline.clips()[index];
+            assert_eq!(clip.media, editor.card_thumbnails[index].0);
+            assert!((clip.start.as_seconds() - expected_start).abs() < 0.1);
+        }
+    }
+
+    #[test]
+    fn the_cross_on_a_card_removes_the_video_from_the_project() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip()]);
+        let thumbnail = editor.card_thumbnails[0].1;
+
+        click(&ctx, &mut editor, thumbnail.right_top() + vec2(-20.0, 20.0));
+
+        assert_eq!(editor.visible_media().count(), 0);
+    }
+
+    #[test]
+    fn clicking_the_middle_of_a_thumbnail_does_not_add_the_video() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip()]);
+        let thumbnail = editor.card_thumbnails[0].1;
+
+        click(&ctx, &mut editor, thumbnail.center());
+
+        assert_eq!(clip_count(&editor), 0);
+    }
+
+    #[test]
+    fn dragging_a_card_onto_the_timeline_places_it_where_it_was_dropped() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip()]);
+        let from = editor.card_thumbnails[0].1.center();
+        let scale = editor.timeline_state.scale;
+        let to = pos2(
+            scale.x_of(Ticks::from_seconds(3.0)),
+            editor.timeline_state.track.center().y,
         );
-        assert_eq!(loaded.clean_points.len(), 4);
+
+        pointer_drag(&ctx, &mut editor, from, to);
+
+        assert_eq!(clip_count(&editor), 1);
+        let clip = editor.project.timeline.clips()[0];
+        assert!(
+            (clip.start.as_seconds() - 3.0).abs() < 0.1,
+            "it landed at {}",
+            clip.start.as_seconds()
+        );
     }
 
     #[test]
-    fn a_broken_file_keeps_the_current_video_and_explains() {
+    fn dragging_a_card_somewhere_else_does_nothing() {
         let ctx = context();
-        let mut editor = opened(&ctx);
+        let mut editor = in_panel_only(&ctx, &[test_clip()]);
+        let from = editor.card_thumbnails[0].1.center();
+
+        pointer_drag(&ctx, &mut editor, from, pos2(700.0, 200.0));
+
+        assert_eq!(clip_count(&editor), 0);
+    }
+
+    #[test]
+    fn a_video_can_be_added_from_the_panel_more_than_once() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let id = editor.media[0].id;
+
+        editor.add_to_timeline(id);
+
+        assert_eq!(clip_count(&editor), 2);
+        assert_eq!(editor.selected, Some(editor.project.timeline.clips()[1].id));
+    }
+
+    #[test]
+    fn dropping_a_video_past_the_end_leaves_dead_space_before_it() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        editor.import(&ctx, &[second_clip().to_path_buf()]);
+        let second = editor.media[1].id;
+
+        editor.drop_on_timeline(second, Ticks::from_seconds(6.0));
+
+        let clip = editor.project.timeline.clips()[1];
+        assert_eq!(clip.media, second);
+        assert_eq!(clip.start, Ticks::from_seconds(6.0));
+        assert_eq!(editor.project.timeline.gaps().len(), 1);
+    }
+
+    #[test]
+    fn dropping_a_video_on_a_clip_pushes_later_clips_along() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip(), test_clip()]);
+        let id = editor.media[0].id;
+
+        editor.drop_on_timeline(id, Ticks::from_seconds(1.0));
+
+        let starts: Vec<f64> = editor
+            .project
+            .timeline
+            .clips()
+            .iter()
+            .map(|clip| clip.start.as_seconds().round())
+            .collect();
+        assert_eq!(starts, [0.0, 4.0, 8.0]);
+    }
+
+    #[test]
+    fn a_broken_file_leaves_the_project_alone_and_explains() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
         let broken = std::env::temp_dir().join("bareclip-not-a-video.mp4");
         std::fs::write(&broken, "not a video").expect("the file can be written");
 
-        editor.open(&ctx, &broken);
+        editor.import(&ctx, &[broken]);
 
-        assert!(editor.loaded.is_some());
-        assert!(editor.notice.is_some());
+        assert_eq!(editor.visible_media().count(), 1);
+        assert!(
+            editor
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("could not be opened"))
+        );
     }
 
     #[test]
-    fn i_and_o_mark_a_section() {
+    fn s_splits_the_clip_at_the_frame_on_screen() {
         let ctx = context();
-        let mut editor = opened(&ctx);
-        assert!(!editor.can_export());
+        let mut editor = with_videos(&ctx, &[test_clip()]);
 
-        seek_and_settle(&ctx, &mut editor, 1.0);
-        run_frame(&ctx, &mut editor, press(Key::I));
-        seek_and_settle(&ctx, &mut editor, 2.0);
-        run_frame(&ctx, &mut editor, press(Key::O));
+        editor.seek(Ticks::from_seconds(1.51));
+        run_frame(&ctx, &mut editor, press(Key::S));
 
-        let loaded = editor.loaded.as_ref().expect("a video is open");
-        assert_eq!(loaded.cuts.ranges().len(), 1);
-        assert!((loaded.cuts.ranges()[0].start.as_seconds() - 1.0).abs() < 0.04);
-        assert!((loaded.cuts.ranges()[0].end.as_seconds() - 2.0).abs() < 0.04);
-        assert!(editor.can_export());
+        assert_eq!(clip_count(&editor), 2);
+        let clips = editor.project.timeline.clips();
+        // Frame 45 was on screen at 1.51 seconds, so the second part starts with it.
+        assert!((clips[1].source.start.as_seconds() - 1.5).abs() < 0.001);
+        assert_eq!(clips[0].source.end, clips[1].source.start);
+        assert_eq!(editor.selected, Some(clips[1].id));
     }
 
     #[test]
-    fn an_out_before_the_in_explains_the_problem() {
+    fn splitting_at_a_clips_very_start_explains_itself() {
         let ctx = context();
-        let mut editor = opened(&ctx);
+        let mut editor = with_videos(&ctx, &[test_clip()]);
 
-        seek_and_settle(&ctx, &mut editor, 2.0);
-        run_frame(&ctx, &mut editor, press(Key::I));
-        seek_and_settle(&ctx, &mut editor, 1.0);
-        run_frame(&ctx, &mut editor, press(Key::O));
+        editor.seek(Ticks(0));
+        run_frame(&ctx, &mut editor, press(Key::S));
+
+        assert_eq!(clip_count(&editor), 1);
+        assert!(
+            editor
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("inside a clip"))
+        );
+    }
+
+    #[test]
+    fn splitting_with_no_video_explains_itself() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+
+        run_frame(&ctx, &mut editor, press(Key::S));
 
         assert!(
             editor
                 .notice
                 .as_deref()
-                .is_some_and(|notice| notice.contains("after its start"))
-        );
-        assert!(
-            editor
-                .loaded
-                .as_ref()
-                .expect("a video is open")
-                .cuts
-                .ranges()
-                .is_empty()
+                .is_some_and(|notice| notice.contains("Add a video"))
         );
     }
 
     #[test]
-    fn arrow_keys_step_one_frame_exactly() {
+    fn deleting_a_clip_leaves_dead_space() {
         let ctx = context();
-        let mut editor = opened(&ctx);
+        let mut editor = with_videos(&ctx, &[test_clip(), second_clip()]);
+        let first = editor.project.timeline.clips()[0].id;
+        let second_start = editor.project.timeline.clips()[1].start;
+        editor.selected = Some(first);
 
-        seek_and_settle(&ctx, &mut editor, 1.0);
-        let before = editor
-            .loaded
-            .as_ref()
-            .expect("a video is open")
-            .frame_position();
+        run_frame(&ctx, &mut editor, press(Key::Delete));
+
+        assert_eq!(clip_count(&editor), 1);
+        assert!(editor.selected.is_none());
+        assert_eq!(editor.project.timeline.clips()[0].start, second_start);
+        assert_eq!(editor.project.timeline.gaps().len(), 1);
+    }
+
+    /// One clip with its first second trimmed away, and the playhead at the start.
+    fn with_leading_gap(ctx: &egui::Context) -> Editor {
+        let mut editor = with_videos(ctx, &[test_clip()]);
+        let id = editor.project.timeline.clips()[0].id;
+        let duration = editor.media[0].info.duration;
+        editor.project.timeline.trim(
+            id,
+            ClipEdge::Start,
+            Ticks::from_seconds(1.0),
+            duration,
+            Ticks::from_seconds(MIN_CLIP_SECONDS),
+        );
+        editor.selected = None;
+        editor.seek(Ticks(0));
+        run_frame(ctx, &mut editor, vec![]);
+        editor
+    }
+
+    #[test]
+    fn clicking_dead_space_selects_it_and_delete_removes_it() {
+        let ctx = context();
+        let mut editor = with_leading_gap(&ctx);
+        let scale = editor.timeline_state.scale;
+        let y = editor.timeline_state.track.center().y;
+
+        click(
+            &ctx,
+            &mut editor,
+            pos2(scale.x_of(Ticks::from_seconds(0.1)), y),
+        );
+        assert!(editor.selected_gap.is_some());
+        assert!(editor.selected.is_none());
+        run_frame(&ctx, &mut editor, press(Key::Delete));
+
+        assert!(editor.project.timeline.gaps().is_empty());
+        assert_eq!(editor.project.timeline.clips()[0].start, Ticks(0));
+        assert!(editor.selected_gap.is_none());
+
+        editor.undo();
+        assert_eq!(editor.project.timeline.gaps().len(), 1);
+    }
+
+    #[test]
+    fn the_button_on_dead_space_removes_it() {
+        let ctx = context();
+        let mut editor = with_leading_gap(&ctx);
+        let scale = editor.timeline_state.scale;
+        let center = pos2(
+            scale.x_of(Ticks::from_seconds(0.5)),
+            editor.timeline_state.track.center().y,
+        );
+
+        click(&ctx, &mut editor, center);
+
+        assert!(
+            editor.project.timeline.gaps().is_empty(),
+            "the gap is {} pixels wide",
+            scale.x_of(Ticks::from_seconds(1.0)) - scale.x_of(Ticks(0))
+        );
+    }
+
+    #[test]
+    fn clicking_a_clip_deselects_dead_space() {
+        let ctx = context();
+        let mut editor = with_leading_gap(&ctx);
+        editor.selected_gap = Some(Ticks::from_seconds(0.5));
+        let scale = editor.timeline_state.scale;
+        let y = editor.timeline_state.track.center().y;
+
+        click(
+            &ctx,
+            &mut editor,
+            pos2(scale.x_of(Ticks::from_seconds(2.0)), y),
+        );
+
+        assert!(editor.selected_gap.is_none());
+        assert!(editor.selected.is_some());
+    }
+
+    #[test]
+    fn the_preview_is_in_dead_space_when_the_playhead_is() {
+        let ctx = context();
+        let mut editor = with_leading_gap(&ctx);
+
+        assert!(editor.preview.in_gap(&editor.project.timeline));
+
+        editor.seek(Ticks::from_seconds(2.0));
+        assert!(!editor.preview.in_gap(&editor.project.timeline));
+    }
+
+    #[test]
+    fn splitting_in_dead_space_explains_itself() {
+        let ctx = context();
+        let mut editor = with_leading_gap(&ctx);
+
+        run_frame(&ctx, &mut editor, press(Key::S));
+
+        assert_eq!(clip_count(&editor), 1);
+        assert!(
+            editor
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("inside a clip"))
+        );
+    }
+
+    #[test]
+    fn arrow_keys_can_step_through_dead_space() {
+        let ctx = context();
+        let mut editor = with_leading_gap(&ctx);
+        editor.seek(Ticks::from_seconds(0.5));
+
         run_frame(&ctx, &mut editor, press(Key::ArrowRight));
-        let after = editor
-            .loaded
-            .as_ref()
-            .expect("a video is open")
-            .player
-            .position();
-
-        let gap = Ticks(after.0 - before.0).as_seconds();
-        assert!((gap - 1.0 / 30.0).abs() < 0.002, "stepped {gap}s");
+        assert!(editor.position() > Ticks::from_seconds(0.5));
 
         run_frame(&ctx, &mut editor, press(Key::ArrowLeft));
-        let back = editor
-            .loaded
-            .as_ref()
-            .expect("a video is open")
-            .player
-            .position();
-        assert!(Ticks(back.0 - before.0).as_seconds().abs() < 0.002);
+        assert!((editor.position().as_seconds() - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn arrow_keys_can_step_back_from_a_clip_into_dead_space() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip()]);
+        let id = editor.media[0].id;
+        editor.drop_on_timeline(id, Ticks::from_seconds(1.0));
+        editor.seek(Ticks::from_seconds(1.0));
+
+        run_frame(&ctx, &mut editor, press(Key::ArrowLeft));
+
+        assert!(editor.position() < Ticks::from_seconds(1.0));
+        assert!(editor.preview.in_gap(&editor.project.timeline));
+    }
+
+    #[test]
+    fn exporting_includes_dead_space_at_its_full_length() {
+        let ctx = context();
+        let mut editor = with_leading_gap(&ctx);
+        let output =
+            std::env::temp_dir().join(format!("bareclip-ui-gap-{}.mp4", std::process::id()));
+        let _ = std::fs::remove_file(&output);
+
+        editor.start_export_to(&ctx, output.clone());
+        wait_for_export(&ctx, &mut editor);
+
+        let ExportState::Done { report, .. } = &editor.export_state else {
+            panic!("the export did not finish");
+        };
+        assert_eq!(report.black_frames, 30);
+        let info = probe(&output).expect("the export can be read");
+        assert!((info.duration.as_seconds() - 4.0).abs() < 0.1);
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn hovering_anywhere_on_the_timeline_shows_the_time_there() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let scale = editor.timeline_state.scale;
+        let track = editor.timeline_state.track;
+
+        // On a clip, on the ruler, and on the empty timeline after the video.
+        for (time, y) in [
+            (1.5, track.center().y),
+            (2.5, track.top() - 12.0),
+            (4.8, track.center().y),
+        ] {
+            let at = pos2(scale.x_of(Ticks::from_seconds(time)), y);
+            run_frame(&ctx, &mut editor, vec![egui::Event::PointerMoved(at)]);
+            let shown = editor.timeline_state.hover_time.expect("a time is shown");
+            assert!((shown.as_seconds() - time).abs() < 0.02, "{shown:?}");
+        }
+
+        let away = pos2(track.center().x, 100.0);
+        run_frame(&ctx, &mut editor, vec![egui::Event::PointerMoved(away)]);
+        assert_eq!(editor.timeline_state.hover_time, None);
+    }
+
+    #[test]
+    fn the_timeline_is_longer_than_the_video_and_the_video_is_part_of_it() {
+        let ctx = context();
+        let editor = with_videos(&ctx, &[test_clip()]);
+        let scale = editor.timeline_state.scale;
+        let end = scale.x_of(editor.project.timeline.duration());
+
+        assert!(end < editor.timeline_state.track.right() - 50.0);
+    }
+
+    #[test]
+    fn the_zoom_buttons_change_how_much_is_shown() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let fitted = editor.timeline_state.scale.visible;
+        let [zoom_out, zoom_in, fit] = editor.timeline_state.zoom_buttons;
+
+        click(&ctx, &mut editor, zoom_out.center());
+        assert!(editor.timeline_state.scale.visible > fitted);
+
+        click(&ctx, &mut editor, fit.center());
+        assert_eq!(editor.timeline_state.scale.visible, fitted);
+
+        click(&ctx, &mut editor, zoom_in.center());
+        assert!(editor.timeline_state.scale.visible < fitted);
+    }
+
+    #[test]
+    fn dragging_the_scrollbar_scrolls_the_timeline() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let [_, zoom_in, _] = editor.timeline_state.zoom_buttons;
+        for _ in 0..3 {
+            click(&ctx, &mut editor, zoom_in.center());
+        }
+        editor.timeline_state.scroll = Ticks(0);
+        run_frame(&ctx, &mut editor, vec![]);
+        let bar = editor.timeline_state.scrollbar;
+        let y = bar.center().y;
+
+        pointer_drag(
+            &ctx,
+            &mut editor,
+            pos2(bar.left() + 10.0, y),
+            pos2(bar.left() + 200.0, y),
+        );
+
+        assert!(editor.timeline_state.scroll > Ticks(0));
+        assert_eq!(clip_count(&editor), 1);
+    }
+
+    #[test]
+    fn the_media_panel_can_be_dragged_wider_and_narrower() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip(), second_clip()]);
+        let start = editor.media_panel_rect;
+        assert!((start.width() - MEDIA_PANEL_WIDTH).abs() < 2.0, "{start:?}");
+        let y = start.center().y;
+
+        pointer_drag(
+            &ctx,
+            &mut editor,
+            pos2(start.right(), y),
+            pos2(start.right() + 200.0, y),
+        );
+
+        let wider = editor.media_panel_rect;
+        assert!(
+            (wider.width() - start.width() - 200.0).abs() < 4.0,
+            "{wider:?}"
+        );
+
+        pointer_drag(&ctx, &mut editor, pos2(wider.right(), y), pos2(0.0, y));
+        assert!(
+            (editor.media_panel_rect.width() - MEDIA_PANEL_MIN_WIDTH).abs() < 2.0,
+            "{:?}",
+            editor.media_panel_rect
+        );
+    }
+
+    #[test]
+    fn a_wider_media_panel_fits_cards_side_by_side() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip(), second_clip()]);
+        let [first, second] = [editor.card_thumbnails[0].1, editor.card_thumbnails[1].1];
+        assert!(second.top() > first.bottom());
+        let edge = editor.media_panel_rect.right();
+        let y = editor.media_panel_rect.center().y;
+
+        pointer_drag(&ctx, &mut editor, pos2(edge, y), pos2(edge + 250.0, y));
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let [first, second] = [editor.card_thumbnails[0].1, editor.card_thumbnails[1].1];
+        assert_eq!(first.top(), second.top());
+        assert!(second.left() > first.right());
+    }
+
+    #[test]
+    fn cards_stack_or_sit_side_by_side_by_width() {
+        assert_eq!(media_columns(150.0), 1);
+        assert_eq!(media_columns(MEDIA_CARD_MIN_WIDTH), 1);
+        assert_eq!(
+            media_columns(MEDIA_CARD_MIN_WIDTH * 2.0 + MEDIA_CARD_SPACING),
+            2
+        );
+        assert_eq!(
+            media_columns(MEDIA_CARD_MIN_WIDTH * 3.0 + MEDIA_CARD_SPACING * 2.0),
+            3
+        );
+    }
+
+    #[test]
+    fn the_timeline_can_be_dragged_taller_and_shorter() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let start = editor.timeline_panel_rect;
+        assert!((start.height() - TIMELINE_HEIGHT).abs() < 2.0, "{start:?}");
+        let x = start.center().x;
+
+        pointer_drag(
+            &ctx,
+            &mut editor,
+            pos2(x, start.top()),
+            pos2(x, start.top() - 100.0),
+        );
+        let taller = editor.timeline_panel_rect;
+        assert!(
+            (taller.height() - start.height() - 100.0).abs() < 4.0,
+            "{taller:?}"
+        );
+
+        pointer_drag(&ctx, &mut editor, pos2(x, taller.top()), pos2(x, 790.0));
+        assert!(
+            (editor.timeline_panel_rect.height() - TIMELINE_MIN_HEIGHT).abs() < 2.0,
+            "{:?}",
+            editor.timeline_panel_rect
+        );
+    }
+
+    #[test]
+    fn the_panels_hold_their_size_from_frame_to_frame() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let timeline = editor.timeline_panel_rect;
+        let media = editor.media_panel_rect;
+
+        for _ in 0..60 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+
+        assert_eq!(editor.timeline_panel_rect, timeline);
+        assert_eq!(editor.media_panel_rect, media);
+    }
+
+    #[test]
+    fn the_timeline_can_never_squeeze_out_the_preview() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let top = editor.timeline_panel_rect.top();
+        let x = editor.timeline_panel_rect.center().x;
+
+        pointer_drag(&ctx, &mut editor, pos2(x, top), pos2(x, 0.0));
+
+        assert!(editor.timeline_panel_rect.height() < 800.0 * TIMELINE_MAX_SHARE);
+    }
+
+    #[test]
+    fn undo_and_redo_bring_changes_back_and_forth() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        editor.seek(Ticks::from_seconds(1.0));
+        run_frame(&ctx, &mut editor, press(Key::S));
+        assert_eq!(clip_count(&editor), 2);
+
+        run_frame(&ctx, &mut editor, key_event(Key::Z, Modifiers::COMMAND));
+        assert_eq!(clip_count(&editor), 1);
+
+        run_frame(&ctx, &mut editor, key_event(Key::Y, Modifiers::COMMAND));
+        assert_eq!(clip_count(&editor), 2);
+
+        run_frame(&ctx, &mut editor, key_event(Key::Z, Modifiers::COMMAND));
+        run_frame(
+            &ctx,
+            &mut editor,
+            key_event(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT),
+        );
+        assert_eq!(clip_count(&editor), 2);
+    }
+
+    #[test]
+    fn removing_a_video_in_use_asks_first() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let id = editor.media[0].id;
+
+        editor.request_remove(id);
+
+        assert_eq!(editor.confirm_remove, Some(id));
+        assert_eq!(clip_count(&editor), 1);
+        assert_eq!(editor.visible_media().count(), 1);
+    }
+
+    #[test]
+    fn removing_an_unused_video_needs_no_question() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        editor.import(&ctx, &[second_clip().to_path_buf()]);
+        let unused = editor.media[1].id;
+
+        editor.request_remove(unused);
+
+        assert_eq!(editor.confirm_remove, None);
+        assert_eq!(editor.visible_media().count(), 1);
+    }
+
+    #[test]
+    fn removing_a_video_takes_its_clips_and_undo_restores_both() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip(), second_clip()]);
+        let id = editor.media[0].id;
+
+        editor.remove_media(id);
+        assert_eq!(clip_count(&editor), 1);
+        assert_eq!(editor.visible_media().count(), 1);
+
+        editor.undo();
+        assert_eq!(clip_count(&editor), 2);
+        assert_eq!(editor.visible_media().count(), 2);
+    }
+
+    #[test]
+    fn the_last_clip_going_clears_the_picture() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        editor.selected = Some(editor.project.timeline.clips()[0].id);
+
+        editor.delete_selected();
+
+        assert!(editor.project.timeline.is_empty());
+        assert!(editor.picture.is_none());
+    }
+
+    #[test]
+    fn dragging_a_clips_end_handle_trims_it() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        let scale = editor.timeline_state.scale;
+        let track = editor.timeline_state.track;
+        let y = track.center().y;
+        let end_x = scale.x_of(editor.project.timeline.duration()) - 4.0;
+        let target_x = scale.x_of(Ticks::from_seconds(2.0));
+
+        pointer_drag(&ctx, &mut editor, pos2(end_x, y), pos2(target_x, y));
+
+        let clip = editor.project.timeline.clips()[0];
+        assert!(
+            (clip.source.end.as_seconds() - 2.0).abs() < 0.1,
+            "the clip now ends at {}",
+            clip.source.end.as_seconds()
+        );
+        assert_eq!(clip.source.start, Ticks(0));
+        assert!(editor.project.timeline.gaps().is_empty());
+
+        editor.undo();
+        assert!(editor.project.timeline.clips()[0].source.end.as_seconds() > 3.9);
+    }
+
+    #[test]
+    fn one_trim_drag_is_one_undo_step() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        let before = editor.project.clone();
+        let scale = editor.timeline_state.scale;
+        let y = editor.timeline_state.track.center().y;
+        let end_x = scale.x_of(editor.project.timeline.duration()) - 4.0;
+
+        pointer_drag(
+            &ctx,
+            &mut editor,
+            pos2(end_x, y),
+            pos2(scale.x_of(Ticks::from_seconds(2.0)), y),
+        );
+        editor.undo();
+
+        assert_eq!(editor.project, before);
+    }
+
+    #[test]
+    fn trimming_lands_on_a_real_frame() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        let scale = editor.timeline_state.scale;
+        let y = editor.timeline_state.track.center().y;
+        let end_x = scale.x_of(editor.project.timeline.duration()) - 4.0;
+
+        pointer_drag(
+            &ctx,
+            &mut editor,
+            pos2(end_x, y),
+            pos2(scale.x_of(Ticks::from_seconds(2.013)), y),
+        );
+
+        let frames = editor.project.timeline.clips()[0].source.end.as_seconds() * 30.0;
+        assert!(
+            (frames - frames.round()).abs() < 0.01,
+            "ended {frames} frames in"
+        );
+    }
+
+    #[test]
+    fn dragging_a_clips_start_handle_trims_it() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        let scale = editor.timeline_state.scale;
+        let y = editor.timeline_state.track.center().y;
+        let start_x = scale.x_of(Ticks(0)) + 4.0;
+        let target_x = scale.x_of(Ticks::from_seconds(1.0)) + 4.0;
+
+        pointer_drag(&ctx, &mut editor, pos2(start_x, y), pos2(target_x, y));
+
+        let clip = editor.project.timeline.clips()[0];
+        assert!(
+            (clip.source.start.as_seconds() - 1.0).abs() < 0.1,
+            "the clip now starts at {}",
+            clip.source.start.as_seconds()
+        );
+        assert!(clip.source.end.as_seconds() > 3.9);
+
+        // The footage it keeps stays where it was, with dead space in front of it.
+        assert_eq!(clip.start, clip.source.start);
+        assert!((editor.project.timeline.duration().as_seconds() - 4.0).abs() < 0.001);
+        assert_eq!(editor.project.timeline.gaps().len(), 1);
+    }
+
+    #[test]
+    fn dragging_a_clip_into_empty_space_puts_it_there_and_undo_brings_it_back() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let before = editor.project.clone();
+        let scale = editor.timeline_state.scale;
+        let y = editor.timeline_state.track.center().y;
+
+        pointer_drag(
+            &ctx,
+            &mut editor,
+            pos2(scale.x_of(Ticks::from_seconds(1.0)), y),
+            pos2(scale.x_of(Ticks::from_seconds(1.5)), y),
+        );
+
+        let clip = editor.project.timeline.clips()[0];
+        assert!((clip.start.as_seconds() - 0.5).abs() < 0.1, "{clip:?}");
+        assert_eq!(editor.project.timeline.gaps().len(), 1);
+
+        editor.undo();
+        assert_eq!(editor.project, before);
+    }
+
+    #[test]
+    fn a_dragged_clip_snaps_back_against_the_start() {
+        let ctx = context();
+        let mut editor = with_leading_gap(&ctx);
+        let scale = editor.timeline_state.scale;
+        let y = editor.timeline_state.track.center().y;
+        let px_per_second = scale.x_of(Ticks::from_seconds(1.0)) - scale.x_of(Ticks(0));
+
+        // Ends just short of the start of the timeline, within snapping distance.
+        let from = scale.x_of(Ticks::from_seconds(2.0));
+        pointer_drag(
+            &ctx,
+            &mut editor,
+            pos2(from, y),
+            pos2(from - px_per_second + 4.0, y),
+        );
+
+        assert_eq!(editor.project.timeline.clips()[0].start, Ticks(0));
+        assert!(editor.project.timeline.gaps().is_empty());
+    }
+
+    #[test]
+    fn dragging_a_clip_past_another_changes_the_order() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip(), second_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        let first = editor.project.timeline.clips()[0].id;
+        let scale = editor.timeline_state.scale;
+        let y = editor.timeline_state.track.center().y;
+
+        pointer_drag(
+            &ctx,
+            &mut editor,
+            pos2(scale.x_of(Ticks::from_seconds(2.0)), y),
+            pos2(scale.x_of(Ticks::from_seconds(7.9)), y),
+        );
+
+        assert_eq!(editor.project.timeline.clips()[1].id, first);
+
+        assert_eq!(editor.project.timeline.gaps().len(), 1);
+
+        editor.undo();
+        assert_eq!(editor.project.timeline.clips()[0].id, first);
+    }
+
+    #[test]
+    fn dragging_on_the_ruler_moves_the_playhead_only() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        let before = editor.project.clone();
+        let scale = editor.timeline_state.scale;
+        let y = editor.timeline_state.track.top() - 12.0;
+
+        pointer_drag(
+            &ctx,
+            &mut editor,
+            pos2(scale.x_of(Ticks::from_seconds(1.0)), y),
+            pos2(scale.x_of(Ticks::from_seconds(3.0)), y),
+        );
+
+        assert!((editor.position().as_seconds() - 3.0).abs() < 0.1);
+        assert_eq!(editor.project, before);
+    }
+
+    /// Presses at one point, moves in steps to another, and lets go.
+    fn pointer_drag(ctx: &egui::Context, editor: &mut Editor, from: egui::Pos2, to: egui::Pos2) {
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        run_frame(ctx, editor, vec![egui::Event::PointerMoved(from)]);
+        run_frame(ctx, editor, vec![button(from, true)]);
+        for step in 1..=8 {
+            let point = from + (to - from) * (step as f32 / 8.0);
+            run_frame(ctx, editor, vec![egui::Event::PointerMoved(point)]);
+        }
+        run_frame(ctx, editor, vec![button(to, false)]);
+        run_frame(ctx, editor, vec![]);
+    }
+
+    #[test]
+    fn shortcuts_are_ignored_while_a_dialog_is_open() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        editor.export_state = ExportState::Choosing;
+        editor.seek(Ticks::from_seconds(1.0));
+
+        run_frame(&ctx, &mut editor, press(Key::S));
+        run_frame(&ctx, &mut editor, press(Key::Space));
+
+        assert_eq!(clip_count(&editor), 1);
+        assert!(!editor.preview.is_playing());
     }
 
     #[test]
     fn space_toggles_playback() {
         let ctx = context();
-        let mut editor = opened(&ctx);
+        let mut editor = with_videos(&ctx, &[test_clip()]);
 
         run_frame(&ctx, &mut editor, press(Key::Space));
-        assert!(
-            editor
-                .loaded
-                .as_ref()
-                .expect("a video is open")
-                .player
-                .is_playing()
-        );
+        assert!(editor.preview.is_playing());
 
         run_frame(&ctx, &mut editor, press(Key::Space));
-        assert!(
-            !editor
-                .loaded
-                .as_ref()
-                .expect("a video is open")
-                .player
-                .is_playing()
-        );
+        assert!(!editor.preview.is_playing());
     }
 
     #[test]
-    fn shortcuts_are_ignored_while_the_export_dialog_is_open() {
+    fn arrow_keys_step_one_frame_exactly() {
         let ctx = context();
-        let mut editor = opened(&ctx);
-        editor.export_state = ExportState::Choosing;
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        editor.seek(Ticks::from_seconds(1.0));
 
-        run_frame(&ctx, &mut editor, press(Key::Space));
-        run_frame(&ctx, &mut editor, press(Key::I));
+        run_frame(&ctx, &mut editor, press(Key::ArrowRight));
+        let gap = editor.position().as_seconds() - 1.0;
+        assert!((gap - 1.0 / 30.0).abs() < 0.002, "stepped {gap}s");
 
-        let loaded = editor.loaded.as_ref().expect("a video is open");
-        assert!(!loaded.player.is_playing());
-        assert_eq!(loaded.cuts.pending_in(), None);
+        run_frame(&ctx, &mut editor, press(Key::ArrowLeft));
+        assert!((editor.position().as_seconds() - 1.0).abs() < 0.002);
     }
 
     #[test]
     fn the_dialog_describes_what_the_export_will_do() {
         let ctx = context();
-        let mut editor = opened(&ctx);
-        {
-            let loaded = editor.loaded.as_mut().expect("a video is open");
-            loaded.cuts.mark_in(Ticks::from_seconds(0.5));
-            loaded.cuts.mark_out(Ticks::from_seconds(2.5));
-        }
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let id = editor.project.timeline.clips()[0].id;
+        let duration = editor.media[0].info.duration;
+        let min = Ticks::from_seconds(MIN_CLIP_SECONDS);
+        editor
+            .project
+            .timeline
+            .trim(id, ClipEdge::Start, Ticks::from_seconds(0.5), duration, min);
+        editor
+            .project
+            .timeline
+            .trim(id, ClipEdge::End, Ticks::from_seconds(2.5), duration, min);
 
         let exact = editor.plan_description().expect("the frames are read");
         editor.mode = CutMode::Keyframe;
@@ -1214,7 +3045,24 @@ mod tests {
         assert!(fast.contains("All 90 frames are copied"), "{fast}");
     }
 
-    /// Runs frames until the export finishes.
+    #[test]
+    fn videos_in_the_same_format_have_no_export_problem() {
+        let ctx = context();
+        let editor = with_videos(&ctx, &[test_clip(), second_clip()]);
+
+        assert_eq!(editor.export_problem(), None);
+    }
+
+    #[test]
+    fn videos_in_different_formats_explain_the_problem_before_exporting() {
+        let ctx = context();
+        let editor = with_videos(&ctx, &[test_clip(), small_clip()]);
+
+        let problem = editor.export_problem().expect("these cannot be joined");
+
+        assert!(problem.contains("160 x 90"), "{problem}");
+    }
+
     fn wait_for_export(ctx: &egui::Context, editor: &mut Editor) {
         let started = Instant::now();
         while matches!(editor.export_state, ExportState::Running(_)) {
@@ -1227,18 +3075,10 @@ mod tests {
         }
     }
 
-    fn marked_editor(ctx: &egui::Context) -> Editor {
-        let mut editor = opened(ctx);
-        let loaded = editor.loaded.as_mut().expect("a video is open");
-        loaded.cuts.mark_in(Ticks::from_seconds(0.5));
-        loaded.cuts.mark_out(Ticks::from_seconds(2.5));
-        editor
-    }
-
     #[test]
-    fn exporting_from_the_screen_writes_the_kept_sections() {
+    fn exporting_writes_the_timeline_in_order() {
         let ctx = context();
-        let mut editor = marked_editor(&ctx);
+        let mut editor = with_videos(&ctx, &[test_clip(), second_clip()]);
         let output =
             std::env::temp_dir().join(format!("bareclip-ui-export-{}.mp4", std::process::id()));
         let _ = std::fs::remove_file(&output);
@@ -1247,24 +3087,21 @@ mod tests {
         wait_for_export(&ctx, &mut editor);
 
         let ExportState::Done {
-            report,
-            output: written,
+            output: written, ..
         } = &editor.export_state
         else {
             panic!("the export did not finish");
         };
         assert_eq!(written, &output);
-        assert_eq!(report.copied_frames, 30);
-        assert_eq!(report.encoded_frames, 30);
         let info = probe(&output).expect("the export can be read");
-        assert!((info.duration.as_seconds() - 2.0).abs() < 0.1);
+        assert!((info.duration.as_seconds() - 8.0).abs() < 0.1);
         let _ = std::fs::remove_file(&output);
     }
 
     #[test]
-    fn a_failed_export_explains_itself_and_can_be_retried() {
+    fn a_failed_export_explains_itself() {
         let ctx = context();
-        let mut editor = marked_editor(&ctx);
+        let mut editor = with_videos(&ctx, &[test_clip()]);
         let output = std::env::temp_dir()
             .join("bareclip-no-such-folder")
             .join("out.mp4");
@@ -1274,13 +3111,13 @@ mod tests {
 
         assert!(matches!(editor.export_state, ExportState::Failed(_)));
         run_frame(&ctx, &mut editor, vec![]);
-        assert!(editor.loaded.is_some());
+        assert_eq!(clip_count(&editor), 1);
     }
 
     #[test]
-    fn exporting_over_the_original_is_refused() {
+    fn exporting_over_an_original_is_refused() {
         let ctx = context();
-        let mut editor = marked_editor(&ctx);
+        let mut editor = with_videos(&ctx, &[test_clip()]);
         let before = std::fs::metadata(test_clip())
             .expect("the clip exists")
             .len();
@@ -1297,30 +3134,6 @@ mod tests {
                 .expect("the clip exists")
                 .len(),
             before
-        );
-    }
-
-    #[test]
-    fn opening_another_video_starts_fresh() {
-        let ctx = context();
-        let mut editor = opened(&ctx);
-        editor
-            .loaded
-            .as_mut()
-            .expect("a video is open")
-            .cuts
-            .mark_out(Ticks::from_seconds(1.0));
-
-        editor.open(&ctx, test_clip());
-
-        assert!(
-            editor
-                .loaded
-                .as_ref()
-                .expect("a video is open")
-                .cuts
-                .ranges()
-                .is_empty()
         );
     }
 }

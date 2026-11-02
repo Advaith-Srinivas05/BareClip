@@ -3,14 +3,15 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
 use bareclip_core::{
-    cut::TimeRange,
     splice::{CutMode, CutPlan, FrameIndex, Piece, Section},
-    time::TimeBase,
+    time::{Ticks, TimeBase},
+    timeline::TimeRange,
 };
 use ffmpeg_next as ffmpeg;
 use ffmpeg_next::{
@@ -21,18 +22,27 @@ use ffmpeg_next::{
 use crate::{
     error::MediaError,
     nal,
-    probe::{discard_other_streams, to_time_base},
+    probe::{discard_other_streams, join_problem, probe, to_time_base},
 };
 
 const SEEK_MARGIN_SECONDS: i64 = 2;
 /// How far past a section to keep reading while waiting for its last audio.
 const AUDIO_READ_AHEAD_SECONDS: f64 = 10.0;
 
+/// A stretch of a source video to include, in playing order.
+#[derive(Clone, Debug)]
+pub struct ExportPart {
+    pub input: PathBuf,
+    pub frames: Arc<FrameIndex>,
+    pub range: TimeRange,
+    /// Dead space on the timeline before this part, written as black and silence.
+    pub gap_before: Ticks,
+}
+
 #[derive(Clone, Debug)]
 pub struct ExportRequest {
-    pub input: PathBuf,
     pub output: PathBuf,
-    pub ranges: Vec<TimeRange>,
+    pub parts: Vec<ExportPart>,
     pub mode: CutMode,
 }
 
@@ -43,6 +53,8 @@ pub struct ExportReport {
     pub sections: usize,
     pub copied_frames: usize,
     pub encoded_frames: usize,
+    /// Black frames written for dead space on the timeline.
+    pub black_frames: usize,
     /// The encoder used for the re-encoded parts, if any were needed.
     pub encoder: Option<String>,
     pub audio_tracks: usize,
@@ -248,15 +260,9 @@ struct VideoTimeline {
 }
 
 impl VideoTimeline {
-    fn new(frames: &FrameIndex) -> Self {
+    fn new(delay: i64) -> Self {
         Self {
-            delay: frames
-                .frames()
-                .iter()
-                .map(|frame| frame.pts - frame.dts)
-                .max()
-                .unwrap_or(0)
-                .max(0),
+            delay,
             last_dts: None,
         }
     }
@@ -271,29 +277,25 @@ impl VideoTimeline {
     }
 }
 
-struct AudioTrack {
+/// An audio track of the source being read.
+struct SourceAudioTrack {
     output_index: usize,
     time_base: Rational,
-    /// Where the previous packet written to this track ended.
-    next_free: Option<i64>,
     finished_section: bool,
 }
 
-/// The muxer and everything needed to place packets into it.
+/// The muxer and everything needed to place packets into it. All timestamps given
+/// to it are already in the output's own time base.
 struct Writer {
     output: format::context::Output,
     output_time_base: Vec<Rational>,
     video_timeline: VideoTimeline,
+    /// Where the previous packet written to each output stream ended.
+    next_free: Vec<Option<i64>>,
 }
 
 impl Writer {
-    fn write(
-        &mut self,
-        packet: &mut Packet,
-        output_index: usize,
-        from: Rational,
-    ) -> Result<(), ffmpeg::Error> {
-        packet.rescale_ts(from, self.output_time_base[output_index]);
+    fn write(&mut self, packet: &mut Packet, output_index: usize) -> Result<(), ffmpeg::Error> {
         packet.set_position(-1);
         packet.set_stream(output_index);
         packet.write_interleaved(&mut self.output)
@@ -332,8 +334,11 @@ struct SectionWriter<'a> {
     source: &'a SourceVideo,
     packaging: &'a Packaging,
     encoder_name: Option<&'a str>,
-    /// Added to source display times to get output display times.
-    offset: i64,
+    /// Display time in the source where this section starts.
+    section_start: i64,
+    /// Where this section starts in the output.
+    output_start: i64,
+    output_time_base: Rational,
     run: Option<EncodeRun>,
     /// A re-encoded part put different settings into the stream, so the next
     /// copied frame must bring back the source's settings.
@@ -342,16 +347,33 @@ struct SectionWriter<'a> {
 }
 
 impl SectionWriter<'_> {
+    /// Moves a source timestamp to its place in the output.
+    fn to_output(&self, timestamp: i64) -> i64 {
+        rescale(
+            timestamp - self.section_start,
+            self.source.time_base,
+            self.output_time_base,
+        ) + self.output_start
+    }
+
+    fn output_duration(&self, duration: i64) -> i64 {
+        rescale(duration, self.source.time_base, self.output_time_base).max(1)
+    }
+
     fn write_encoded(&mut self, writer: &mut Writer) -> Result<(), MediaError> {
-        let Some(run) = self.run.as_mut() else {
-            return Ok(());
-        };
         let mut encoded = Packet::empty();
-        while run.encoder.receive_packet(&mut encoded).is_ok() {
+        loop {
+            let Some(run) = self.run.as_mut() else {
+                return Ok(());
+            };
+            if run.encoder.receive_packet(&mut encoded).is_err() {
+                return Ok(());
+            }
             let Some(pts) = encoded.pts() else {
                 continue;
             };
-            let out_pts = pts + self.offset;
+            let out_pts = self.to_output(pts);
+            let duration = self.output_duration(self.durations.get(&pts).copied().unwrap_or(1));
             let (place_pts, place_dts) = writer
                 .video_timeline
                 .place(out_pts, out_pts - writer.video_timeline.delay);
@@ -366,10 +388,9 @@ impl SectionWriter<'_> {
             packet.set_flags(encoded.flags());
             packet.set_pts(Some(place_pts));
             packet.set_dts(Some(place_dts));
-            packet.set_duration(self.durations.get(&pts).copied().unwrap_or(1));
-            writer.write(&mut packet, 0, self.source.time_base)?;
+            packet.set_duration(duration);
+            writer.write(&mut packet, 0)?;
         }
-        Ok(())
     }
 
     fn encode_decoded(&mut self, writer: &mut Writer) -> Result<(), MediaError> {
@@ -432,7 +453,7 @@ impl SectionWriter<'_> {
         let dts = packet.dts().unwrap_or(pts);
         let (place_pts, place_dts) = writer
             .video_timeline
-            .place(pts + self.offset, dts + self.offset);
+            .place(self.to_output(pts), self.to_output(dts));
 
         let body = packet.data().unwrap_or_default();
         let mut output = if self.restore_settings && !self.packaging.source_settings.is_empty() {
@@ -448,14 +469,193 @@ impl SectionWriter<'_> {
         output.set_pts(Some(place_pts));
         output.set_dts(Some(place_dts));
         output.set_duration(
-            self.durations
-                .get(&pts)
-                .copied()
-                .unwrap_or_else(|| packet.duration()),
+            self.output_duration(
+                self.durations
+                    .get(&pts)
+                    .copied()
+                    .unwrap_or_else(|| packet.duration()),
+            ),
         );
-        writer.write(&mut output, 0, self.source.time_base)?;
+        writer.write(&mut output, 0)?;
         Ok(())
     }
+}
+
+/// A picture of pure black in the video's own format, whatever that is.
+fn black_frame(decoder: &decoder::Video) -> Result<frame::Video, ffmpeg::Error> {
+    let mut black = frame::Video::new(decoder.format(), decoder.width(), decoder.height());
+    let mut line_sizes = [0isize; 4];
+    // SAFETY: the frame was just allocated for this format and size, and FFmpeg writes
+    // only inside its planes.
+    let result = unsafe {
+        let raw = black.as_mut_ptr();
+        for (size, source) in line_sizes.iter_mut().zip((*raw).linesize.iter()) {
+            *size = *source as isize;
+        }
+        ffi::av_image_fill_black(
+            (*raw).data.as_ptr().cast(),
+            line_sizes.as_ptr(),
+            decoder.format().into(),
+            decoder.color_range().into(),
+            decoder.width() as i32,
+            decoder.height() as i32,
+        )
+    };
+    if result < 0 {
+        return Err(ffmpeg::Error::from(result));
+    }
+    Ok(black)
+}
+
+/// How many frames fill a stretch of dead space. Less than half a frame needs none.
+fn black_frame_count(gap: Ticks, frame_rate: Rational) -> usize {
+    (gap.as_seconds() * f64::from(frame_rate)).round().max(0.0) as usize
+}
+
+/// Writes dead space as black frames, with the same encoder that cut points use.
+fn write_black(
+    group: &SourceGroup,
+    job: &ExportJob,
+    writer: &mut Writer,
+    progress: &mut Progress,
+    cursor: Ticks,
+) -> Result<(), MediaError> {
+    let source = &group.video;
+    let frames = group.black_frames();
+    let encoder_name = job.encoder_name.ok_or(MediaError::GapNeedsEncoder)?;
+    let packaging = packaging_for(source.parameters.id(), &extradata_of(&source.parameters));
+    let frame_rate = source.frame_rate;
+    let frame_seconds = Rational(frame_rate.denominator(), frame_rate.numerator());
+    let pts_of = |number: usize| rescale(number as i64, frame_seconds, source.time_base);
+    let durations: HashMap<i64, i64> = (0..frames)
+        .map(|number| (pts_of(number), (pts_of(number + 1) - pts_of(number)).max(1)))
+        .collect();
+    let run = EncodeRun::new(source, encoder_name, 0, pts_of(frames))?;
+    let mut black = black_frame(&run.decoder)?;
+    let output_time_base = writer.output_time_base[0];
+    let mut section_writer = SectionWriter {
+        source,
+        packaging: &packaging,
+        encoder_name: Some(encoder_name),
+        section_start: 0,
+        output_start: cursor.to_pts(to_time_base(output_time_base)),
+        output_time_base,
+        run: Some(run),
+        restore_settings: true,
+        durations: &durations,
+    };
+    for number in 0..frames {
+        if job.cancel.load(Ordering::Relaxed) {
+            return Err(MediaError::Cancelled);
+        }
+        black.set_pts(Some(pts_of(number)));
+        black.set_kind(if number == 0 {
+            picture::Type::I
+        } else {
+            picture::Type::None
+        });
+        if let Some(run) = section_writer.run.as_mut() {
+            run.encoder.send_frame(&black)?;
+        }
+        section_writer.write_encoded(writer)?;
+        progress.tick();
+    }
+    section_writer.finish_run(writer)
+}
+
+/// Encodes silent packets in an audio track's own format.
+fn silent_packets(
+    parameters: &codec::Parameters,
+    wanted_samples: i64,
+) -> Result<(Vec<Packet>, i64, i32), ffmpeg::Error> {
+    let source = codec::context::Context::from_parameters(parameters.clone())?
+        .decoder()
+        .audio()?;
+    let found = encoder::find(parameters.id()).ok_or(ffmpeg::Error::EncoderNotFound)?;
+    let format = found
+        .audio()?
+        .formats()
+        .and_then(|mut formats| formats.next())
+        .ok_or(ffmpeg::Error::EncoderNotFound)?;
+    let mut audio = codec::context::Context::new_with_codec(found)
+        .encoder()
+        .audio()?;
+    let rate = source.rate() as i32;
+    audio.set_rate(rate);
+    audio.set_channel_layout(source.channel_layout());
+    audio.set_format(format);
+    audio.set_time_base(Rational(1, rate));
+    let mut audio = audio.open()?;
+
+    let frame_size = match audio.frame_size() {
+        0 => 1024,
+        size => i64::from(size),
+    };
+    let wanted = wanted_samples / frame_size;
+    let mut silence = frame::Audio::new(format, frame_size as usize, source.channel_layout());
+    silence.set_rate(rate as u32);
+    for plane in 0..silence.planes() {
+        silence.data_mut(plane).fill(0);
+    }
+
+    let mut packets = Vec::new();
+    let mut sent = 0;
+    let mut encoded = Packet::empty();
+    // Encoders hold on to some samples at first, so this keeps going until enough
+    // packets have come out.
+    while (packets.len() as i64) < wanted && sent < wanted + 16 {
+        silence.set_pts(Some(sent * frame_size));
+        audio.send_frame(&silence)?;
+        sent += 1;
+        while audio.receive_packet(&mut encoded).is_ok() {
+            packets.push(Packet::copy(encoded.data().unwrap_or_default()));
+        }
+    }
+    packets.truncate(wanted.max(0) as usize);
+    Ok((packets, frame_size, rate))
+}
+
+/// Writes silence into every audio track up to the end of some dead space. A track
+/// whose format has no encoder here is left empty for that stretch. Its later packets
+/// still carry the right times, so it stays in sync and players treat the hole as quiet.
+fn write_silence(until: Ticks, writer: &mut Writer) -> Result<(), MediaError> {
+    for track in 1..writer.output_time_base.len() {
+        let time_base = writer.output_time_base[track];
+        let parameters = writer
+            .output
+            .stream(track)
+            .ok_or(MediaError::NoVideoStream)?
+            .parameters();
+        let start = writer.next_free[track].unwrap_or(0);
+        let end = until.to_pts(to_time_base(time_base));
+        let room = end - start;
+        if room <= 0 {
+            continue;
+        }
+        let rate = codec::context::Context::from_parameters(parameters.clone())
+            .and_then(|context| context.decoder().audio())
+            .map(|audio| audio.rate() as i32);
+        let Ok(rate) = rate else {
+            continue;
+        };
+        let samples = rescale(room, time_base, Rational(1, rate));
+        let Ok((packets, frame_size, rate)) = silent_packets(&parameters, samples) else {
+            continue;
+        };
+        let mut pts_samples = 0;
+        for mut packet in packets {
+            let pts = start + rescale(pts_samples, Rational(1, rate), time_base);
+            let next = start + rescale(pts_samples + frame_size, Rational(1, rate), time_base);
+            packet.set_flags(codec::packet::Flags::KEY);
+            packet.set_pts(Some(pts));
+            packet.set_dts(Some(pts));
+            packet.set_duration((next - pts).max(1));
+            writer.write(&mut packet, track)?;
+            writer.next_free[track] = Some(next);
+            pts_samples += frame_size;
+        }
+    }
+    Ok(())
 }
 
 fn piece_end(piece: Piece) -> usize {
@@ -497,43 +697,56 @@ impl Progress<'_> {
     }
 }
 
+/// Consecutive parts from one source file, ready to write.
+struct SourceGroup {
+    input: PathBuf,
+    frames: Arc<FrameIndex>,
+    gap_before: Ticks,
+    video: SourceVideo,
+    plan: CutPlan,
+}
+
+impl SourceGroup {
+    fn black_frames(&self) -> usize {
+        black_frame_count(self.gap_before, self.video.frame_rate)
+    }
+}
+
 /// Everything one run of the export needs.
 struct ExportJob<'a> {
     request: &'a ExportRequest,
     temporary: &'a Path,
-    frames: &'a FrameIndex,
-    plan: &'a CutPlan,
-    source_video: &'a SourceVideo,
+    groups: &'a [SourceGroup],
     encoder_name: Option<&'a str>,
     cancel: &'a AtomicBool,
     progress: &'a dyn Fn(f32),
 }
 
-fn run_export(job: &ExportJob) -> Result<usize, MediaError> {
-    let ExportJob {
-        request,
-        temporary,
-        frames,
-        plan,
-        source_video,
-        encoder_name,
-        cancel,
-        progress,
-    } = *job;
-    let mut input = format::input(&request.input)?;
-    let mut output = format::output(temporary)?;
-    let same_container = request.input.extension() == request.output.extension();
-    let encoded_any = plan.encoded_frames > 0;
+fn clear_codec_tag(stream: &mut format::stream::StreamMut) {
+    // SAFETY: the parameters belong to this stream, and `codec_tag` is a plain field
+    // the muxer reads when writing the header.
+    unsafe {
+        (*stream.parameters().as_mut_ptr()).codec_tag = 0;
+    }
+}
 
-    let packaging = packaging_for(
-        source_video.parameters.id(),
-        &extradata_of(&source_video.parameters),
-    );
+/// Sets up the output's streams from the first source. Every other source has been
+/// checked to match it.
+fn open_output(job: &ExportJob) -> Result<(format::context::Output, usize), MediaError> {
+    let first = &job.groups[0];
+    let input = format::input(&first.input)?;
+    let mut output = format::output(job.temporary)?;
+    let same_container = first.input.extension() == job.request.output.extension();
+    let rewrites_video = job.groups.len() > 1
+        || job
+            .groups
+            .iter()
+            .any(|g| g.plan.encoded_frames > 0 || g.black_frames() > 0);
 
     // The video always becomes output stream 0.
     {
         let stream = input
-            .stream(source_video.index)
+            .stream(first.video.index)
             .ok_or(MediaError::NoVideoStream)?;
         let mut added = output.add_stream(encoder::find(Id::None))?;
         added.set_parameters(stream.parameters());
@@ -541,16 +754,13 @@ fn run_export(job: &ExportJob) -> Result<usize, MediaError> {
         added.set_avg_frame_rate(stream.avg_frame_rate());
         copy_stream_identity(&stream, &mut added);
         // A file header type that promises settings live only in the header would
-        // be untrue once re-encoded parts carry their own, so the muxer picks again.
-        if !same_container || encoded_any {
-            // SAFETY: the parameters belong to the stream just added.
-            unsafe {
-                (*added.parameters().as_mut_ptr()).codec_tag = 0;
-            }
+        // be untrue once other parts carry their own, so the muxer picks again.
+        if !same_container || rewrites_video {
+            clear_codec_tag(&mut added);
         }
     }
 
-    let mut audio_tracks: HashMap<usize, AudioTrack> = HashMap::new();
+    let mut audio_count = 0;
     for stream in input.streams() {
         if stream.parameters().medium() != Type::Audio {
             continue;
@@ -560,37 +770,117 @@ fn run_export(job: &ExportJob) -> Result<usize, MediaError> {
         added.set_time_base(stream.time_base());
         copy_stream_identity(&stream, &mut added);
         if !same_container {
-            // SAFETY: the parameters belong to the stream just added.
-            unsafe {
-                (*added.parameters().as_mut_ptr()).codec_tag = 0;
-            }
+            clear_codec_tag(&mut added);
         }
-        let output_index = added.index();
-        audio_tracks.insert(
-            stream.index(),
-            AudioTrack {
-                output_index,
-                time_base: stream.time_base(),
-                next_free: None,
-                finished_section: false,
-            },
-        );
+        audio_count += 1;
     }
-    let audio_count = audio_tracks.len();
 
     output.set_metadata(input.metadata().to_owned());
+    Ok((output, audio_count))
+}
+
+fn run_export(job: &ExportJob) -> Result<usize, MediaError> {
+    let (mut output, audio_count) = open_output(job)?;
     output.write_header()?;
 
+    let output_time_base: Vec<Rational> =
+        output.streams().map(|stream| stream.time_base()).collect();
+    let delay = job
+        .groups
+        .iter()
+        .map(|group| {
+            let most = group
+                .frames
+                .frames()
+                .iter()
+                .map(|frame| frame.pts - frame.dts)
+                .max()
+                .unwrap_or(0);
+            rescale(most.max(0), group.video.time_base, output_time_base[0])
+        })
+        .max()
+        .unwrap_or(0);
+    let mut writer = Writer {
+        next_free: vec![None; output_time_base.len()],
+        output,
+        output_time_base,
+        video_timeline: VideoTimeline::new(delay),
+    };
+
+    let total_frames: usize = job
+        .groups
+        .iter()
+        .flat_map(|group| &group.plan.sections)
+        .flat_map(|section| &section.pieces)
+        .map(|&piece| piece_end(piece) - piece_first(piece))
+        .sum::<usize>()
+        + job
+            .groups
+            .iter()
+            .map(SourceGroup::black_frames)
+            .sum::<usize>();
+    let mut progress = Progress {
+        report: job.progress,
+        total: total_frames,
+        done: 0,
+    };
+
+    let mut cursor = Ticks(0);
+    let mut restore_settings = false;
+    for (position, group) in job.groups.iter().enumerate() {
+        // A new source file means new decoder settings for whatever follows.
+        restore_settings |= position > 0;
+        if group.black_frames() > 0 {
+            write_black(group, job, &mut writer, &mut progress, cursor)?;
+            cursor = Ticks(cursor.0 + group.gap_before.0);
+            write_silence(cursor, &mut writer)?;
+            restore_settings = true;
+        }
+        write_group(
+            group,
+            job,
+            &mut writer,
+            &mut progress,
+            &mut cursor,
+            &mut restore_settings,
+        )?;
+    }
+
+    writer.output.write_trailer()?;
+    Ok(audio_count)
+}
+
+fn write_group(
+    group: &SourceGroup,
+    job: &ExportJob,
+    writer: &mut Writer,
+    progress: &mut Progress,
+    cursor: &mut Ticks,
+    restore_settings: &mut bool,
+) -> Result<(), MediaError> {
+    let source_video = &group.video;
+    let frames = &group.frames;
+    let mut input = format::input(&group.input)?;
+    let packaging = packaging_for(
+        source_video.parameters.id(),
+        &extradata_of(&source_video.parameters),
+    );
+
+    // Tracks line up by their order in each file, which the join check has confirmed.
+    let mut audio_tracks: HashMap<usize, SourceAudioTrack> = HashMap::new();
+    for stream in input.streams() {
+        if stream.parameters().medium() == Type::Audio {
+            let track = SourceAudioTrack {
+                output_index: audio_tracks.len() + 1,
+                time_base: stream.time_base(),
+                finished_section: false,
+            };
+            audio_tracks.insert(stream.index(), track);
+        }
+    }
     let mut keep_streams: Vec<usize> = audio_tracks.keys().copied().collect();
     keep_streams.push(source_video.index);
     discard_other_streams(&mut input, &keep_streams);
-
-    let output_time_base = output.streams().map(|stream| stream.time_base()).collect();
-    let mut writer = Writer {
-        output,
-        output_time_base,
-        video_timeline: VideoTimeline::new(frames),
-    };
 
     let positions: HashMap<i64, usize> = frames
         .frames()
@@ -603,22 +893,10 @@ fn run_export(job: &ExportJob) -> Result<usize, MediaError> {
         .iter()
         .map(|frame| (frame.pts, frame.duration))
         .collect();
+    let time_base = to_time_base(source_video.time_base);
+    let output_core_time_base = to_time_base(writer.output_time_base[0]);
 
-    let total_frames: usize = plan
-        .sections
-        .iter()
-        .flat_map(|section| &section.pieces)
-        .map(|&piece| piece_end(piece) - piece_first(piece))
-        .sum();
-    let mut progress = Progress {
-        report: progress,
-        total: total_frames,
-        done: 0,
-    };
-
-    let mut timeline_cursor = 0;
-    let mut restore_settings = false;
-    for section in &plan.sections {
+    for section in &group.plan.sections {
         let read_first = section
             .pieces
             .iter()
@@ -650,14 +928,15 @@ fn run_export(job: &ExportJob) -> Result<usize, MediaError> {
             track.finished_section = false;
         }
 
-        let offset = timeline_cursor - section.pts_start;
         let mut section_writer = SectionWriter {
             source: source_video,
             packaging: &packaging,
-            encoder_name,
-            offset,
+            encoder_name: job.encoder_name,
+            section_start: section.pts_start,
+            output_start: cursor.to_pts(output_core_time_base),
+            output_time_base: writer.output_time_base[0],
             run: None,
-            restore_settings,
+            restore_settings: *restore_settings,
             durations: &durations,
         };
 
@@ -669,7 +948,7 @@ fn run_export(job: &ExportJob) -> Result<usize, MediaError> {
         for (stream, packet) in input.packets() {
             let stream_index = stream.index();
             seen += 1;
-            if seen.is_multiple_of(64) && cancel.load(Ordering::Relaxed) {
+            if seen.is_multiple_of(64) && job.cancel.load(Ordering::Relaxed) {
                 return Err(MediaError::Cancelled);
             }
 
@@ -688,7 +967,7 @@ fn run_export(job: &ExportJob) -> Result<usize, MediaError> {
                     while piece_index < section.pieces.len()
                         && position >= piece_end(section.pieces[piece_index])
                     {
-                        section_writer.finish_run(&mut writer)?;
+                        section_writer.finish_run(writer)?;
                         piece_index += 1;
                         piece_started = false;
                     }
@@ -699,13 +978,13 @@ fn run_export(job: &ExportJob) -> Result<usize, MediaError> {
                         }
                         match piece {
                             Piece::Copy { .. } => {
-                                section_writer.write_copied(&packet, &mut writer)?;
+                                section_writer.write_copied(&packet, writer)?;
                             }
                             Piece::Encode { .. } => {
                                 if let Some(run) = section_writer.run.as_mut() {
                                     run.decoder.send_packet(&packet)?;
                                 }
-                                section_writer.encode_decoded(&mut writer)?;
+                                section_writer.encode_decoded(writer)?;
                             }
                         }
                         progress.tick();
@@ -717,16 +996,18 @@ fn run_export(job: &ExportJob) -> Result<usize, MediaError> {
                     &packet,
                     section,
                     source_video.time_base,
-                    timeline_cursor,
-                    &mut writer,
+                    *cursor,
+                    writer,
                 )?;
             }
 
             if video_done {
-                let time_base = input_time_base(&audio_tracks, stream_index, source_video);
+                let packet_time_base = audio_tracks
+                    .get(&stream_index)
+                    .map_or(source_video.time_base, |track| track.time_base);
                 let seconds = packet
                     .pts()
-                    .map_or(0.0, |pts| f64::from(time_base) * pts as f64);
+                    .map_or(0.0, |pts| f64::from(packet_time_base) * pts as f64);
                 let all_audio_done = audio_tracks.values().all(|track| track.finished_section);
                 if all_audio_done || seconds > section_end_seconds + AUDIO_READ_AHEAD_SECONDS {
                     break;
@@ -734,31 +1015,21 @@ fn run_export(job: &ExportJob) -> Result<usize, MediaError> {
             }
         }
 
-        section_writer.finish_run(&mut writer)?;
-        restore_settings = section_writer.restore_settings;
-        timeline_cursor += section.pts_end - section.pts_start;
+        section_writer.finish_run(writer)?;
+        *restore_settings = section_writer.restore_settings;
+        let length = Ticks::from_pts(section.pts_end, time_base).0
+            - Ticks::from_pts(section.pts_start, time_base).0;
+        *cursor = Ticks(cursor.0 + length);
     }
-
-    writer.output.write_trailer()?;
-    Ok(audio_count)
-}
-
-fn input_time_base(
-    tracks: &HashMap<usize, AudioTrack>,
-    stream_index: usize,
-    video: &SourceVideo,
-) -> Rational {
-    tracks
-        .get(&stream_index)
-        .map_or(video.time_base, |track| track.time_base)
+    Ok(())
 }
 
 fn write_audio_packet(
-    track: &mut AudioTrack,
+    track: &mut SourceAudioTrack,
     packet: &Packet,
     section: &Section,
     video_time_base: Rational,
-    timeline_cursor: i64,
+    cursor: Ticks,
     writer: &mut Writer,
 ) -> Result<(), MediaError> {
     let Some(pts) = packet.pts() else {
@@ -766,7 +1037,6 @@ fn write_audio_packet(
     };
     let start = rescale(section.pts_start, video_time_base, track.time_base);
     let end = rescale(section.pts_end, video_time_base, track.time_base);
-    let cursor = rescale(timeline_cursor, video_time_base, track.time_base);
     if pts >= end {
         track.finished_section = true;
         return Ok(());
@@ -776,23 +1046,26 @@ fn write_audio_packet(
         return Ok(());
     }
 
-    let mut out_pts = pts - start + cursor;
-    if let Some(next_free) = track.next_free {
+    let output_time_base = writer.output_time_base[track.output_index];
+    let output_start = cursor.to_pts(to_time_base(output_time_base));
+    let output_duration = rescale(duration, track.time_base, output_time_base).max(1);
+    let mut out_pts = rescale(pts - start, track.time_base, output_time_base) + output_start;
+    if let Some(next_free) = writer.next_free[track.output_index] {
         // Audio packets rarely line up exactly with a cut, so neighbouring
         // sections can overlap by part of a packet.
-        if out_pts + duration <= next_free {
+        if out_pts + output_duration <= next_free {
             return Ok(());
         }
         out_pts = out_pts.max(next_free);
     }
-    track.next_free = Some(out_pts + duration);
+    writer.next_free[track.output_index] = Some(out_pts + output_duration);
 
     let mut output = Packet::copy(packet.data().unwrap_or_default());
     output.set_flags(packet.flags());
     output.set_pts(Some(out_pts));
     output.set_dts(Some(out_pts));
-    output.set_duration(duration);
-    writer.write(&mut output, track.output_index, track.time_base)?;
+    output.set_duration(output_duration);
+    writer.write(&mut output, track.output_index)?;
     Ok(())
 }
 
@@ -819,62 +1092,139 @@ pub fn plan_export(
     frames.plan(&pts_ranges, mode)
 }
 
-/// Exports the kept sections. The output only appears once it is complete. If
-/// frame-exact cuts need an encoder this video has none for, the export falls back
-/// to keyframe cuts, and the report says so.
+fn load_source_video(path: &Path) -> Result<SourceVideo, MediaError> {
+    let input = format::input(path)?;
+    let stream = input
+        .streams()
+        .best(Type::Video)
+        .ok_or(MediaError::NoVideoStream)?;
+    let parameters = stream.parameters();
+    // SAFETY: the parameters are live, and this reads one plain integer field.
+    let declared = unsafe { (*parameters.as_ptr()).bit_rate };
+    let overall = input.bit_rate();
+    let rate = stream.avg_frame_rate();
+    Ok(SourceVideo {
+        index: stream.index(),
+        time_base: stream.time_base(),
+        frame_rate: if rate.denominator() == 0 || rate.numerator() == 0 {
+            Rational(30, 1)
+        } else {
+            rate
+        },
+        // Encoders without a quality setting use this. Staying above the source
+        // protects quality, and only short sections are ever encoded.
+        bit_rate: (declared.max(overall).max(2_000_000) as usize).saturating_mul(3) / 2,
+        parameters,
+    })
+}
+
+/// Neighbouring parts of one file with no dead space between them.
+#[derive(Clone)]
+struct PartGroup {
+    input: PathBuf,
+    frames: Arc<FrameIndex>,
+    ranges: Vec<TimeRange>,
+    gap_before: Ticks,
+}
+
+/// Groups neighbouring parts of the same file, since each file is opened once.
+fn group_parts(parts: &[ExportPart]) -> Vec<PartGroup> {
+    let mut groups: Vec<PartGroup> = Vec::new();
+    for part in parts {
+        match groups.last_mut() {
+            Some(group) if group.input == part.input && part.gap_before.0 <= 0 => {
+                group.ranges.push(part.range);
+            }
+            _ => groups.push(PartGroup {
+                input: part.input.clone(),
+                frames: part.frames.clone(),
+                ranges: vec![part.range],
+                gap_before: part.gap_before,
+            }),
+        }
+    }
+    groups
+}
+
+/// Checks that every source can share one output, and returns why not if it can't.
+fn check_joinable(parts: &[ExportPart]) -> Result<(), MediaError> {
+    let mut first = None;
+    for part in parts {
+        let info = probe(&part.input)?;
+        match &first {
+            None => first = Some(info),
+            Some(first) => {
+                if let Some(problem) = join_problem(first, &info) {
+                    return Err(MediaError::CannotJoin(problem));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Exports the parts in order. The output only appears once it is complete. If
+/// frame-exact cuts need an encoder a video has none for, the export falls back to
+/// keyframe cuts, and the report says so.
 pub fn export(
     request: &ExportRequest,
-    frames: &FrameIndex,
     cancel: &AtomicBool,
     progress: &dyn Fn(f32),
 ) -> Result<ExportReport, MediaError> {
     crate::init()?;
     let started = Instant::now();
-    if request.ranges.is_empty() {
+    if request.parts.is_empty() {
         return Err(MediaError::NothingToExport);
     }
-    if same_file(&request.input, &request.output) {
+    if request
+        .parts
+        .iter()
+        .any(|part| same_file(&part.input, &request.output))
+    {
         return Err(MediaError::SameInputAndOutput);
     }
+    check_joinable(&request.parts)?;
 
-    let source_video = {
-        let input = format::input(&request.input)?;
-        let stream = input
-            .streams()
-            .best(Type::Video)
-            .ok_or(MediaError::NoVideoStream)?;
-        let parameters = stream.parameters();
-        // SAFETY: the parameters are live, and this reads one plain integer field.
-        let declared = unsafe { (*parameters.as_ptr()).bit_rate };
-        let overall = input.bit_rate();
-        let rate = stream.avg_frame_rate();
-        SourceVideo {
-            index: stream.index(),
-            time_base: stream.time_base(),
-            frame_rate: if rate.denominator() == 0 || rate.numerator() == 0 {
-                Rational(30, 1)
-            } else {
-                rate
-            },
-            // Encoders without a quality setting use this. Staying above the source
-            // protects quality, and only short sections are ever encoded.
-            bit_rate: (declared.max(overall).max(2_000_000) as usize).saturating_mul(3) / 2,
-            parameters,
-        }
+    let plan_groups = |mode: CutMode, sources: Vec<PartGroup>| {
+        sources
+            .into_iter()
+            .map(|part| {
+                let video = load_source_video(&part.input)?;
+                let plan = plan_export(
+                    &part.frames,
+                    &part.ranges,
+                    to_time_base(video.time_base),
+                    mode,
+                );
+                Ok(SourceGroup {
+                    input: part.input,
+                    frames: part.frames,
+                    gap_before: part.gap_before,
+                    video,
+                    plan,
+                })
+            })
+            .collect::<Result<Vec<SourceGroup>, MediaError>>()
     };
-    let time_base = to_time_base(source_video.time_base);
 
     let mut mode_used = request.mode;
-    let mut plan = plan_export(frames, &request.ranges, time_base, mode_used);
+    let sources = group_parts(&request.parts);
+    let mut groups = plan_groups(mode_used, sources.clone())?;
     let mut encoder_name = None;
-    if plan.encoded_frames > 0 {
-        encoder_name = choose_encoder(source_video.parameters.id(), &source_video);
+    if let Some(needing) = groups
+        .iter()
+        .find(|group| group.plan.encoded_frames > 0 || group.black_frames() > 0)
+    {
+        encoder_name = choose_encoder(needing.video.parameters.id(), &needing.video);
         if encoder_name.is_none() {
+            if groups.iter().any(|group| group.black_frames() > 0) {
+                return Err(MediaError::GapNeedsEncoder);
+            }
             mode_used = CutMode::Keyframe;
-            plan = plan_export(frames, &request.ranges, time_base, mode_used);
+            groups = plan_groups(mode_used, sources)?;
         }
     }
-    if plan.sections.is_empty() {
+    if groups.iter().all(|group| group.plan.sections.is_empty()) {
         return Err(MediaError::NothingToExport);
     }
 
@@ -882,9 +1232,7 @@ pub fn export(
     let result = run_export(&ExportJob {
         request,
         temporary: &temporary,
-        frames,
-        plan: &plan,
-        source_video: &source_video,
+        groups: &groups,
         encoder_name: encoder_name.as_deref(),
         cancel,
         progress,
@@ -901,16 +1249,25 @@ pub fn export(
     })?;
     progress(1.0);
 
+    let total = |count: fn(&CutPlan) -> usize| groups.iter().map(|group| count(&group.plan)).sum();
     Ok(ExportReport {
         mode_requested: request.mode,
         mode_used,
-        sections: plan.sections.len(),
-        copied_frames: plan.copied_frames,
-        encoded_frames: plan.encoded_frames,
+        sections: total(|plan| plan.sections.len()),
+        copied_frames: total(|plan| plan.copied_frames),
+        encoded_frames: total(|plan| plan.encoded_frames),
+        black_frames: groups.iter().map(SourceGroup::black_frames).sum(),
         encoder: encoder_name,
         audio_tracks,
         elapsed: started.elapsed(),
     })
+}
+
+/// Whether dead space can be written for a video with this codec.
+pub fn can_write_gaps(codec: &str) -> bool {
+    encoder::find_by_name(codec)
+        .or_else(|| decoder::find_by_name(codec))
+        .is_some_and(|found| !encoder_candidates(found.id()).is_empty())
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {
@@ -942,8 +1299,7 @@ mod tests {
 
     #[test]
     fn the_stored_order_never_goes_backwards() {
-        let frames = FrameIndex::new(Vec::new());
-        let mut timeline = VideoTimeline::new(&frames);
+        let mut timeline = VideoTimeline::new(0);
 
         assert_eq!(timeline.place(10, 0), (10, 0));
         assert_eq!(timeline.place(20, 0), (20, 1));
@@ -952,8 +1308,7 @@ mod tests {
 
     #[test]
     fn a_display_time_never_comes_before_its_stored_time() {
-        let frames = FrameIndex::new(Vec::new());
-        let mut timeline = VideoTimeline::new(&frames);
+        let mut timeline = VideoTimeline::new(0);
 
         timeline.place(10, 50);
 
@@ -975,6 +1330,32 @@ mod tests {
     fn codecs_not_proven_to_join_cleanly_have_no_encoders() {
         assert!(encoder_candidates(Id::MPEG4).is_empty());
         assert!(encoder_candidates(Id::VP9).is_empty());
+    }
+
+    #[test]
+    fn dead_space_rounds_to_whole_frames() {
+        let thirty = Rational(30, 1);
+
+        assert_eq!(black_frame_count(Ticks::from_seconds(1.0), thirty), 30);
+        assert_eq!(black_frame_count(Ticks::from_seconds(0.05), thirty), 2);
+    }
+
+    #[test]
+    fn a_sliver_of_dead_space_needs_no_frames() {
+        assert_eq!(
+            black_frame_count(Ticks::from_seconds(0.01), Rational(30, 1)),
+            0
+        );
+        assert_eq!(black_frame_count(Ticks(0), Rational(30, 1)), 0);
+    }
+
+    #[test]
+    fn dead_space_is_only_written_for_codecs_that_join_cleanly() {
+        crate::init().expect("FFmpeg starts");
+
+        assert!(can_write_gaps("h264"));
+        assert!(can_write_gaps("hevc"));
+        assert!(!can_write_gaps("mpeg4"));
     }
 
     #[test]

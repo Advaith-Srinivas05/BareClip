@@ -7,7 +7,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use bareclip_core::splice::CutMode;
+use bareclip_core::{splice::CutMode, time::Ticks};
 use bareclip_media::{ExportRequest, MediaError, export, probe};
 use common::*;
 
@@ -430,9 +430,8 @@ fn a_different_container_can_be_chosen() {
 
 fn request(input: &Path, output: &Path) -> ExportRequest {
     ExportRequest {
-        input: input.to_owned(),
         output: output.to_owned(),
-        ranges: vec![range(1.0, 3.0)],
+        parts: parts_of(input, vec![range(1.0, 3.0)]),
         mode: CutMode::FrameExact,
     }
 }
@@ -441,11 +440,10 @@ fn request(input: &Path, output: &Path) -> ExportRequest {
 fn cancelling_leaves_no_files_behind() {
     let input = h264_mp4();
     let output = output_path("cancelled", "mp4");
-    let frames = index_of(&input);
     let cancel = AtomicBool::new(false);
     cancel.store(true, Ordering::Relaxed);
 
-    let result = export(&request(&input, &output), &frames, &cancel, &|_| {});
+    let result = export(&request(&input, &output), &cancel, &|_| {});
 
     assert!(matches!(result, Err(MediaError::Cancelled)), "{result:?}");
     assert!(!output.exists());
@@ -455,14 +453,8 @@ fn cancelling_leaves_no_files_behind() {
 #[test]
 fn the_original_file_cannot_be_overwritten() {
     let input = h264_mp4();
-    let frames = index_of(&input);
 
-    let result = export(
-        &request(&input, &input),
-        &frames,
-        &AtomicBool::new(false),
-        &|_| {},
-    );
+    let result = export(&request(&input, &input), &AtomicBool::new(false), &|_| {});
 
     assert!(
         matches!(result, Err(MediaError::SameInputAndOutput)),
@@ -475,16 +467,343 @@ fn the_original_file_cannot_be_overwritten() {
 fn exporting_nothing_is_refused() {
     let input = h264_mp4();
     let output = output_path("nothing", "mp4");
-    let frames = index_of(&input);
     let mut empty = request(&input, &output);
-    empty.ranges.clear();
+    empty.parts.clear();
 
-    let result = export(&empty, &frames, &AtomicBool::new(false), &|_| {});
+    let result = export(&empty, &AtomicBool::new(false), &|_| {});
 
     assert!(
         matches!(result, Err(MediaError::NothingToExport)),
         "{result:?}"
     );
+    assert!(!output.exists());
+}
+
+#[test]
+fn clips_from_two_files_join_in_order() {
+    let first = h264_mp4();
+    let second = second_h264_mp4();
+    let output = output_path("two-files", "mp4");
+    let mut parts = parts_of(&first, vec![range(0.5, 2.5)]);
+    parts.extend(parts_of(&second, vec![range(1.0, 3.0)]));
+
+    let report = run_parts(&output, parts, CutMode::FrameExact);
+
+    let mut wanted = expected(15..75);
+    wanted.extend(1030..1090);
+    let frames = decode_video(&output);
+    assert_eq!(numbers(&frames), wanted, "{report:?}");
+    assert_all_identical(&first, &output, 30..60);
+    assert_all_identical(&second, &output, 1030..1090);
+    let frame_time = 1.0 / FPS as f64;
+    for pair in frames.windows(2) {
+        let gap = pair[1].seconds - pair[0].seconds;
+        assert!(
+            (gap - frame_time).abs() < 0.002,
+            "gap of {gap}s at {}",
+            pair[0].number
+        );
+    }
+}
+
+#[test]
+fn audio_stays_in_sync_after_joining_two_files() {
+    let output = output_path("two-files-sync", "mp4");
+    let mut parts = parts_of(&h264_mp4(), vec![range(2.5, 5.5)]);
+    parts.extend(parts_of(&second_h264_mp4(), vec![range(1.5, 4.5)]));
+
+    run_parts(&output, parts, CutMode::FrameExact);
+
+    let frames = decode_video(&output);
+    let beeps = beep_times(&decode_audio(&output)[0]);
+    assert!(beeps.len() >= 4, "{beeps:?}");
+    for beep in beeps {
+        let shown = frames
+            .iter()
+            .min_by(|a, b| {
+                (a.seconds - beep)
+                    .abs()
+                    .total_cmp(&(b.seconds - beep).abs())
+            })
+            .expect("the video has frames");
+        // The second source numbers its frames from 1000, and beeps on its own seconds.
+        let source_frame = f64::from(shown.number % 1000);
+        let error = (source_frame / FPS as f64 - (source_frame / FPS as f64).round()).abs();
+        assert!(
+            error < 0.045,
+            "the beep at {beep:.3}s shows frame {}",
+            shown.number
+        );
+    }
+}
+
+#[test]
+fn clips_can_play_in_a_different_order_than_the_source() {
+    let input = h264_mp4();
+    let output = output_path("reordered", "mp4");
+
+    run_export(
+        &input,
+        &output,
+        vec![range(5.0, 6.0), range(1.0, 2.0)],
+        CutMode::FrameExact,
+    );
+
+    let mut wanted = expected(150..180);
+    wanted.extend(30..60);
+    assert_eq!(numbers(&decode_video(&output)), wanted);
+}
+
+#[test]
+fn the_same_footage_can_appear_twice() {
+    let input = h264_mp4();
+    let output = output_path("repeated", "mp4");
+
+    run_export(
+        &input,
+        &output,
+        vec![range(1.0, 2.0), range(1.0, 2.0)],
+        CutMode::FrameExact,
+    );
+
+    let mut wanted = expected(30..60);
+    wanted.extend(30..60);
+    assert_eq!(numbers(&decode_video(&output)), wanted);
+}
+
+#[test]
+fn keyframe_cuts_can_join_two_files_too() {
+    let output = output_path("two-files-keyframe", "mp4");
+    let mut parts = parts_of(&h264_mp4(), vec![range(1.0, 2.0)]);
+    parts.extend(parts_of(&second_h264_mp4(), vec![range(1.0, 2.0)]));
+
+    let report = run_parts(&output, parts, CutMode::Keyframe);
+
+    assert_eq!(report.encoded_frames, 0);
+    let mut wanted = expected(30..60);
+    wanted.extend(1030..1060);
+    assert_eq!(numbers(&decode_video(&output)), wanted);
+}
+
+/// Two parts of one video with dead space between them.
+fn parts_with_gap(input: &Path, gap: f64) -> Vec<bareclip_media::ExportPart> {
+    let mut parts = parts_of(input, vec![range(1.0, 2.0), range(3.0, 4.0)]);
+    parts[1].gap_before = seconds(gap);
+    parts
+}
+
+/// How loud a stretch of an audio track is.
+fn loudness(track: &AudioTrackInfo, from: f64, to: f64) -> f32 {
+    let rate = f64::from(track.rate);
+    let first = (((from - track.first_sample_seconds) * rate) as usize).min(track.samples.len());
+    let last = (((to - track.first_sample_seconds) * rate) as usize).min(track.samples.len());
+    let part = &track.samples[first..last];
+    assert!(!part.is_empty(), "no audio between {from}s and {to}s");
+    (part.iter().map(|sample| sample * sample).sum::<f32>() / part.len() as f32).sqrt()
+}
+
+#[test]
+fn dead_space_exports_as_black_between_untouched_frames() {
+    let input = h264_mp4();
+    let output = output_path("gap", "mp4");
+
+    let report = run_parts(&output, parts_with_gap(&input, 1.0), CutMode::FrameExact);
+
+    let frames = decode_video(&output);
+    let mut wanted = expected(30..60);
+    wanted.extend(std::iter::repeat_n(0, 30));
+    wanted.extend(90..120);
+    assert_eq!(numbers(&frames), wanted);
+    assert_eq!(report.black_frames, 30);
+    assert_eq!(report.encoded_frames, 0);
+    assert_all_identical(&input, &output, 30..60);
+    assert_all_identical(&input, &output, 90..120);
+
+    let frame_time = 1.0 / FPS as f64;
+    for pair in frames.windows(2) {
+        let gap = pair[1].seconds - pair[0].seconds;
+        assert!((gap - frame_time).abs() < 0.002, "gap of {gap}s");
+    }
+    assert!((probe(&output).expect("it opens").duration.as_seconds() - 3.0).abs() < 0.1);
+}
+
+#[test]
+fn every_black_frame_is_the_same_dark_picture() {
+    let input = h264_mp4();
+    let output = output_path("gap-black", "mp4");
+
+    run_parts(&output, parts_with_gap(&input, 0.5), CutMode::FrameExact);
+
+    let frames = decode_video(&output);
+    let black: Vec<_> = frames.iter().filter(|frame| frame.number == 0).collect();
+    assert_eq!(black.len(), 15);
+    assert!(black.iter().all(|frame| frame.hash == black[0].hash));
+}
+
+#[test]
+fn dead_space_is_silent_and_audio_stays_in_sync_after_it() {
+    let input = h264_mp4();
+    let output = output_path("gap-audio", "mp4");
+
+    run_parts(&output, parts_with_gap(&input, 1.0), CutMode::FrameExact);
+
+    assert_beeps_match_picture(&output);
+    let tracks = decode_audio(&output);
+    assert!(
+        (tracks[0].seconds - 3.0).abs() < 0.1,
+        "{}",
+        tracks[0].seconds
+    );
+    assert!(loudness(&tracks[0], 1.1, 1.9) < 0.001);
+    // Each second of the source starts with a beep, so the part after the gap does too.
+    assert!(loudness(&tracks[0], 2.0, 2.1) > 0.1);
+}
+
+#[test]
+fn dead_space_can_come_first() {
+    let input = h264_mp4();
+    let output = output_path("gap-first", "mp4");
+    let mut parts = parts_of(&input, vec![range(2.0, 3.0)]);
+    parts[0].gap_before = seconds(0.5);
+
+    run_parts(&output, parts, CutMode::FrameExact);
+
+    let mut wanted = vec![0; 15];
+    wanted.extend(60..90);
+    assert_eq!(numbers(&decode_video(&output)), wanted);
+    assert_all_identical(&input, &output, 60..90);
+    let tracks = decode_audio(&output);
+    assert!(loudness(&tracks[0], 0.0, 0.45) < 0.001);
+    assert!(loudness(&tracks[0], 0.5, 0.6) > 0.1);
+}
+
+#[test]
+fn dead_space_works_with_fastest_cuts_and_nothing_else_is_encoded() {
+    let input = h264_mp4();
+    let output = output_path("gap-keyframe", "mp4");
+
+    let report = run_parts(&output, parts_with_gap(&input, 1.0), CutMode::Keyframe);
+
+    assert_eq!(report.encoded_frames, 0);
+    assert_eq!(report.black_frames, 30);
+    assert_eq!(report.mode_used, CutMode::Keyframe);
+    assert_eq!(decode_video(&output).len(), 90);
+}
+
+#[test]
+fn dead_space_fills_every_audio_track() {
+    let input = b_frames_two_tracks_mkv();
+    let output = output_path("gap-tracks", "mkv");
+
+    run_parts(&output, parts_with_gap(&input, 1.0), CutMode::FrameExact);
+
+    let tracks = decode_audio(&output);
+    assert_eq!(tracks.len(), 2);
+    for track in &tracks {
+        assert!((track.seconds - 3.0).abs() < 0.1, "{}", track.seconds);
+        assert!(loudness(track, 1.1, 1.9) < 0.001);
+        // FFmpeg's sine source has an amplitude of 1/8, a level of about 0.088.
+        assert!(loudness(track, 0.2, 0.8) > 0.05);
+        assert!(loudness(track, 2.2, 2.8) > 0.05);
+    }
+    let frames = decode_video(&output);
+    let mut wanted = expected(30..60);
+    wanted.extend(std::iter::repeat_n(0, 30));
+    wanted.extend(90..120);
+    assert_eq!(numbers(&frames), wanted);
+}
+
+#[test]
+fn dead_space_works_in_a_video_with_no_sound() {
+    let input = hevc_mkv();
+    let output = output_path("gap-hevc", "mkv");
+
+    run_parts(&output, parts_with_gap(&input, 1.0), CutMode::FrameExact);
+
+    assert_eq!(decode_video(&output).len(), 90);
+}
+
+#[test]
+fn dead_space_works_in_av1() {
+    let input = av1_mkv();
+    let output = output_path("gap-av1", "mkv");
+
+    run_parts(&output, parts_with_gap(&input, 1.0), CutMode::FrameExact);
+
+    let numbers = numbers(&decode_video(&output));
+    assert_eq!(numbers.len(), 90);
+    assert_eq!(numbers[45], 0);
+    assert_eq!(numbers[60], 90);
+}
+
+#[test]
+fn a_sliver_of_dead_space_is_not_written() {
+    let input = h264_mp4();
+    let output = output_path("gap-sliver", "mp4");
+
+    let report = run_parts(&output, parts_with_gap(&input, 0.005), CutMode::FrameExact);
+
+    assert_eq!(report.black_frames, 0);
+    assert_eq!(decode_video(&output).len(), 60);
+}
+
+#[test]
+fn dead_space_in_a_format_without_an_encoder_is_refused_with_the_reason() {
+    let input = mpeg4_mkv();
+    let output = output_path("gap-mpeg4", "mkv");
+    let request = ExportRequest {
+        output: output.clone(),
+        parts: parts_with_gap(&input, 1.0),
+        mode: CutMode::FrameExact,
+    };
+
+    let result = export(&request, &AtomicBool::new(false), &|_| {});
+
+    let error = result.expect_err("there is nothing to write black frames with");
+    assert!(matches!(error, MediaError::GapNeedsEncoder));
+    assert!(error.to_string().contains("Remove the gaps"));
+    assert!(!output.exists());
+}
+
+#[test]
+fn cancelling_during_dead_space_leaves_no_files_behind() {
+    let input = h264_mp4();
+    let output = output_path("gap-cancel", "mp4");
+    let mut parts = parts_of(&input, vec![range(0.0, 1.0)]);
+    parts[0].gap_before = Ticks::from_seconds(60.0);
+    let request = ExportRequest {
+        output: output.clone(),
+        parts,
+        mode: CutMode::FrameExact,
+    };
+
+    let result = export(&request, &AtomicBool::new(true), &|_| {});
+
+    assert!(matches!(result, Err(MediaError::Cancelled)), "{result:?}");
+    assert!(!output.exists());
+    assert!(!output.with_file_name("out-gap-cancel.partial.mp4").exists());
+}
+
+#[test]
+fn videos_in_different_formats_are_refused_with_the_reason() {
+    let output = output_path("mismatch", "mp4");
+    let mut parts = parts_of(&h264_mp4(), vec![range(0.0, 1.0)]);
+    parts.extend(parts_of(&different_size_mp4(), vec![range(0.0, 1.0)]));
+
+    let result = export(
+        &ExportRequest {
+            output: output.clone(),
+            parts,
+            mode: CutMode::FrameExact,
+        },
+        &AtomicBool::new(false),
+        &|_| {},
+    );
+
+    let Err(MediaError::CannotJoin(reason)) = result else {
+        panic!("expected a refusal, got {result:?}");
+    };
+    assert!(reason.contains("160 x 90"), "{reason}");
     assert!(!output.exists());
 }
 

@@ -268,7 +268,9 @@ impl FrameIndex {
             }
             // Growing outward can make two sections overlap.
             match spans.last_mut() {
-                Some(previous) if first <= previous.1 => previous.1 = previous.1.max(last),
+                Some(previous) if (previous.0..=previous.1).contains(&first) => {
+                    previous.1 = previous.1.max(last);
+                }
                 _ => spans.push((first, last)),
             }
         }
@@ -614,6 +616,28 @@ mod tests {
 
         assert_eq!(plan.sections.len(), 1);
         assert_eq!(plan.sections[0].pieces, [Piece::Copy { first: 0, end: 10 }]);
+    }
+
+    #[test]
+    fn keyframe_mode_keeps_sections_in_the_order_given() {
+        let index = simple(30, 10);
+        let plan = index.plan(&[(200, 300), (0, 100)], CutMode::Keyframe);
+
+        assert_eq!(plan.sections.len(), 2);
+        assert_eq!(
+            plan.sections[0].pieces,
+            [Piece::Copy { first: 20, end: 30 }]
+        );
+        assert_eq!(plan.sections[1].pieces, [Piece::Copy { first: 0, end: 10 }]);
+    }
+
+    #[test]
+    fn frame_exact_keeps_sections_in_the_order_given() {
+        let index = simple(30, 10);
+        let plan = index.plan(&[(200, 300), (0, 100)], CutMode::FrameExact);
+
+        assert_eq!(plan.sections[0].pts_start, 200);
+        assert_eq!(plan.sections[1].pts_start, 0);
     }
 
     #[test]

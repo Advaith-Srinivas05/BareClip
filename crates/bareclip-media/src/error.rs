@@ -10,6 +10,8 @@ pub enum MediaError {
     NoFrames,
     NothingToExport,
     SameInputAndOutput,
+    CannotJoin(String),
+    GapNeedsEncoder,
     Cancelled,
 }
 
@@ -20,10 +22,14 @@ impl fmt::Display for MediaError {
             Self::Io(error) => write!(f, "The file could not be read or written: {error}"),
             Self::NoVideoStream => f.write_str("This file has no video track."),
             Self::NoFrames => f.write_str("No video frames could be read from this file."),
-            Self::NothingToExport => f.write_str("Mark a section to keep before exporting."),
+            Self::NothingToExport => f.write_str("Add a video to the timeline before exporting."),
             Self::SameInputAndOutput => {
                 f.write_str("Choose a different file name, so the original stays untouched.")
             }
+            Self::CannotJoin(reason) => f.write_str(reason),
+            Self::GapNeedsEncoder => f.write_str(
+                "Dead space can't be written for this video's format. Remove the gaps to export it.",
+            ),
             Self::Cancelled => f.write_str("Export cancelled."),
         }
     }
