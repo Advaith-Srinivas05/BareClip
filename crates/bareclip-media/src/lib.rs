@@ -7,7 +7,7 @@ mod preview;
 mod probe;
 
 pub use error::MediaError;
-pub use export::{ExportReport, ExportRequest, export};
+pub use export::{ExportReport, ExportRequest, export, plan_export};
 pub use preview::{
     AudioChunk, AudioPreview, AudioStep, DecodeStep, PreviewFrame, VideoPreview, fit_preview_size,
 };

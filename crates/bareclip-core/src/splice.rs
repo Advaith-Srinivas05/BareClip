@@ -192,7 +192,18 @@ impl FrameIndex {
     fn plan_exact(&self, (start, end): (i64, i64)) -> Option<Section> {
         let section_start = self.frame_at(start)?;
         let reaches_end = end >= self.end_pts();
-        let section_end = end.min(self.end_pts());
+        // A mark can fall partway through a frame. Ending on the next frame's start
+        // keeps the same frames, but gives the last one its full time on screen.
+        let section_end = if reaches_end {
+            self.end_pts()
+        } else {
+            let first_at_or_after = self
+                .display_order
+                .partition_point(|&index| self.frames[index].pts < end);
+            self.display_order
+                .get(first_at_or_after)
+                .map_or(self.end_pts(), |&index| self.frames[index].pts)
+        };
         if self.count_shown(section_start, section_end) == 0 {
             return None;
         }
@@ -496,6 +507,27 @@ mod tests {
         let plan = index.plan(&[(105, 200)], CutMode::FrameExact);
 
         assert_eq!(plan.sections[0].pts_start, 100);
+    }
+
+    #[test]
+    fn a_cut_ending_mid_frame_gives_the_last_frame_its_full_time() {
+        let index = simple(30, 10);
+        let plan = index.plan(&[(50, 123)], CutMode::FrameExact);
+
+        assert_eq!(plan.sections[0].pts_end, 130);
+        assert_eq!(shown_by(&index, &plan).last(), Some(&120));
+    }
+
+    #[test]
+    fn a_cut_ending_just_before_a_clean_point_needs_no_tail_encode() {
+        let index = simple(30, 10);
+        let plan = index.plan(&[(100, 195)], CutMode::FrameExact);
+
+        assert_eq!(
+            plan.sections[0].pieces,
+            [Piece::Copy { first: 10, end: 20 }]
+        );
+        assert_eq!(plan.sections[0].pts_end, 200);
     }
 
     #[test]

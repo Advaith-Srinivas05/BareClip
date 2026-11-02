@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Installs for the current user only, so no administrator prompt is needed. -->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="BareClip"
+           Language="1033"
+           Version="$(var.Version)"
+           Manufacturer="Advaith Srinivas"
+           UpgradeCode="6F2B7C1E-3A94-4D58-9E21-7C0D5A8B4F13">
+    <Package InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perUser"
+             InstallPrivileges="limited"
+             Description="A fast, offline video editor for Windows." />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of BareClip is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Icon Id="bareclip.ico" SourceFile="$(var.BrandDir)\windows\bareclip.ico" />
+    <Property Id="ARPPRODUCTICON" Value="bareclip.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/Advaith-Srinivas05/BareClip" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.InstallerDir)\license.rtf" />
+    <WixVariable Id="WixUIBannerBmp" Value="$(var.BrandDir)\windows\msi-banner.bmp" />
+    <WixVariable Id="WixUIDialogBmp" Value="$(var.BrandDir)\windows\msi-dialog.bmp" />
+    <UIRef Id="WixUI_Minimal" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="LocalAppDataFolder">
+        <Directory Id="ProgramsDir" Name="Programs">
+          <Directory Id="INSTALLFOLDER" Name="BareClip">
+            <Directory Id="LicensesDir" Name="licenses" />
+          </Directory>
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder" />
+    </Directory>
+
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="Application" Guid="A1D93E47-58C2-4B06-8F3A-92E16D7C0B54">
+        <RegistryValue Root="HKCU" Key="Software\BareClip" Name="Installed" Type="integer" Value="1" KeyPath="yes" />
+        <File Id="BareClipExe" Source="$(var.ExePath)" />
+        <File Id="AvCodec" Source="$(var.FfmpegBin)\avcodec-63.dll" />
+        <File Id="AvFormat" Source="$(var.FfmpegBin)\avformat-63.dll" />
+        <File Id="AvUtil" Source="$(var.FfmpegBin)\avutil-61.dll" />
+        <File Id="SwResample" Source="$(var.FfmpegBin)\swresample-7.dll" />
+        <File Id="SwScale" Source="$(var.FfmpegBin)\swscale-10.dll" />
+        <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
+        <RemoveFolder Id="RemoveProgramsDir" Directory="ProgramsDir" On="uninstall" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="LicensesDir">
+      <Component Id="Licenses" Guid="3C7E0F92-1B64-47AD-B8D5-6E2A90F1C347">
+        <RegistryValue Root="HKCU" Key="Software\BareClip" Name="Licenses" Type="integer" Value="1" KeyPath="yes" />
+        <File Id="BareClipLicense" Name="BareClip-MIT.txt" Source="$(var.RepoDir)\LICENSE" />
+        <File Id="ThirdPartyNotices" Name="THIRD-PARTY-NOTICES.txt" Source="$(var.RepoDir)\assets\licenses\THIRD-PARTY-NOTICES.txt" />
+        <File Id="FfmpegLgpl" Name="FFmpeg-LGPL-3.0.txt" Source="$(var.FfmpegDir)\LICENSE.txt" />
+        <File Id="Gpl3" Name="GPL-3.0.txt" Source="$(var.RepoDir)\assets\licenses\GPL-3.0.txt" />
+        <File Id="FontLicense" Name="HankenGrotesk-OFL.txt" Source="$(var.RepoDir)\assets\fonts\OFL.txt" />
+        <RemoveFolder Id="RemoveLicensesDir" On="uninstall" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut" Guid="8E41C6D0-27B9-4F13-A5E8-1D3F70B96C22">
+        <Shortcut Id="BareClipShortcut"
+                  Name="BareClip"
+                  Description="Trim and edit video"
+                  Target="[INSTALLFOLDER]bareclip.exe"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="bareclip.ico" />
+        <RegistryValue Root="HKCU" Key="Software\BareClip" Name="Shortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="Complete" Title="BareClip" Level="1">
+      <ComponentRef Id="Application" />
+      <ComponentRef Id="Licenses" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Product>
+</Wix>
