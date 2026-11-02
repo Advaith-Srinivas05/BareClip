@@ -1,7 +1,9 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+mod components;
 mod editor;
 mod fonts;
+mod icons;
 mod player;
 mod preview;
 mod text;

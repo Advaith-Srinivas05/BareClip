@@ -22,12 +22,13 @@ use bareclip_media::{
     VideoPreview, can_write_gaps, export, join_problem, plan_export, probe, scan_frames,
 };
 use eframe::egui::{
-    self, Align, Button, Color32, CornerRadius, FontFamily, FontId, Frame, Key, Layout, Margin,
-    Modifiers, RichText, Sense, Stroke, TextureHandle, TextureOptions, pos2, vec2,
+    self, Align, Color32, CornerRadius, FontFamily, FontId, Frame, Key, Layout, Margin, Modifiers,
+    RichText, Sense, Stroke, TextureHandle, TextureOptions, pos2, vec2,
 };
 
 use crate::{
-    fonts,
+    components::{self, ActionButton, IconButton, Kind},
+    fonts, icons,
     preview::Preview,
     text,
     theme::{self, Palette},
@@ -50,7 +51,15 @@ const MEDIA_PANEL_MAX_WIDTH: f32 = 720.0;
 /// Each card is at least this wide, so a wider panel fits more of them across.
 const MEDIA_CARD_MIN_WIDTH: f32 = 220.0;
 const MEDIA_CARD_SPACING: f32 = 10.0;
-const CARD_BUTTON_SIZE: f32 = 30.0;
+const CARD_BUTTON_SIZE: f32 = 28.0;
+const CARD_RADIUS: u8 = 8;
+const EMPTY_HINT_MAX_HEIGHT: f32 = 200.0;
+const DIALOG_RADIUS: u8 = 10;
+/// A dialog's own buttons are never narrower than this, so short names still feel solid.
+const DIALOG_BUTTON_WIDTH: f32 = 84.0;
+/// The playback buttons: four of 32, the play button, and the spaces between them.
+const TRANSPORT_WIDTH: f32 = 180.0;
+const CONTROL_SPACING: f32 = 4.0;
 const TIMELINE_HEIGHT: f32 = 200.0;
 const TIMELINE_MIN_HEIGHT: f32 = 160.0;
 /// Whatever the timeline's height, the preview keeps this share of the room.
@@ -768,26 +777,36 @@ impl Editor {
     fn top_bar(&mut self, ui: &mut egui::Ui, palette: &Palette) {
         let frame = Frame::new()
             .fill(palette.surface)
-            .inner_margin(Margin::symmetric(14, 8))
-            .stroke(Stroke::new(1.0, palette.border));
+            .inner_margin(Margin::symmetric(14, 8));
         egui::Panel::top("top_bar")
             .exact_size(48.0)
             .frame(frame)
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
-                    ui.label(RichText::new("BareClip").font(fonts::strong(15.0)));
-                    ui.add_space(14.0);
+                    ui.spacing_mut().item_spacing.x = CONTROL_SPACING;
+                    ui.label(
+                        RichText::new("BareClip")
+                            .font(fonts::strong(15.0))
+                            .color(palette.accent),
+                    );
+                    components::divider(ui, palette);
                     let can_undo = self.history.can_undo();
                     let can_redo = self.history.can_redo();
                     if ui
-                        .add_enabled(can_undo, Button::new("Undo"))
+                        .add_enabled(
+                            can_undo,
+                            IconButton::new(palette, Kind::Ghost, icons::UNDO_2, "Undo"),
+                        )
                         .on_hover_text("Undo (Ctrl+Z)")
                         .clicked()
                     {
                         self.undo();
                     }
                     if ui
-                        .add_enabled(can_redo, Button::new("Redo"))
+                        .add_enabled(
+                            can_redo,
+                            IconButton::new(palette, Kind::Ghost, icons::REDO_2, "Redo"),
+                        )
                         .on_hover_text("Redo (Ctrl+Y)")
                         .clicked()
                     {
@@ -795,12 +814,16 @@ impl Editor {
                     }
                     if let Some(notice) = self.notice.clone() {
                         ui.add_space(8.0);
+                        components::symbol(ui, &icons::CIRCLE_ALERT, 16.0, palette.danger);
                         ui.colored_label(palette.danger, notice);
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let can_export = !self.project.timeline.is_empty();
-                        let export = accent_button(ui, palette, "Export", can_export);
+                        let export = ui.add_enabled(
+                            can_export,
+                            ActionButton::new(palette, Kind::Primary, "Export").icon(icons::UPLOAD),
+                        );
                         let export = if can_export {
                             export.on_hover_text("Export the timeline (Ctrl+E)")
                         } else {
@@ -809,8 +832,12 @@ impl Editor {
                         if export.clicked() {
                             self.export_state = ExportState::Choosing;
                         }
-                        ui.menu_button("Theme", |ui| {
-                            theme::theme_picker(ui);
+                        let icon = theme::current_icon(ui.ctx());
+                        let theme_button = ui
+                            .add(IconButton::new(palette, Kind::Ghost, icon, "Theme"))
+                            .on_hover_text("Theme");
+                        egui::Popup::menu(&theme_button).show(|ui| {
+                            theme::theme_picker(ui, palette);
                         });
                     });
                 });
@@ -821,14 +848,13 @@ impl Editor {
     fn rail(&mut self, ui: &mut egui::Ui, palette: &Palette) {
         let frame = Frame::new()
             .fill(palette.bg_app)
-            .inner_margin(Margin::symmetric(8, 10))
-            .stroke(Stroke::new(1.0, palette.border));
+            .inner_margin(Margin::symmetric(8, 10));
         egui::Panel::left("rail")
             .exact_size(RAIL_WIDTH)
             .frame(frame)
             .show(ui, |ui| {
                 let (rect, _) =
-                    ui.allocate_exact_size(vec2(ui.available_width(), 62.0), Sense::hover());
+                    ui.allocate_exact_size(vec2(ui.available_width(), 58.0), Sense::hover());
                 let painter = ui.painter_at(rect);
                 painter.rect_filled(rect, 6.0, palette.raised);
                 painter.rect_filled(
@@ -839,32 +865,14 @@ impl Editor {
                     1.0,
                     palette.accent,
                 );
-                // A small film frame, drawn with the logo's slant.
-                let icon =
-                    egui::Rect::from_center_size(rect.center() - vec2(0.0, 10.0), vec2(26.0, 18.0));
-                painter.add(egui::Shape::convex_polygon(
-                    vec![
-                        icon.left_top() + vec2(5.0, 0.0),
-                        icon.right_top(),
-                        icon.right_bottom() - vec2(0.0, 3.0),
-                        icon.right_bottom() - vec2(5.0, 0.0),
-                        icon.left_bottom(),
-                        icon.left_top() + vec2(0.0, 3.0),
-                    ],
+                icons::paint(
+                    &painter,
+                    icons::square_at(rect.center() - vec2(0.0, 9.0), 20.0),
+                    &icons::FILM,
                     palette.accent,
-                    Stroke::NONE,
-                ));
-                painter.add(egui::Shape::convex_polygon(
-                    vec![
-                        icon.center() + vec2(-3.5, -5.0),
-                        icon.center() + vec2(5.0, 0.0),
-                        icon.center() + vec2(-3.5, 5.0),
-                    ],
-                    palette.accent_text,
-                    Stroke::NONE,
-                ));
+                );
                 painter.text(
-                    rect.center() + vec2(0.0, 16.0),
+                    rect.center() + vec2(0.0, 14.0),
                     egui::Align2::CENTER_CENTER,
                     "My media",
                     FontId::new(11.0, FontFamily::Proportional),
@@ -876,8 +884,7 @@ impl Editor {
     fn media_panel(&mut self, ui: &mut egui::Ui, palette: &Palette) {
         let frame = Frame::new()
             .fill(palette.surface)
-            .inner_margin(Margin::same(14))
-            .stroke(Stroke::new(1.0, palette.border));
+            .inner_margin(Margin::same(14));
         let panel = egui::Panel::left("media_panel")
             .resizable(true)
             .default_size(MEDIA_PANEL_WIDTH)
@@ -887,16 +894,17 @@ impl Editor {
                 ui.label(RichText::new("My media").font(fonts::strong(15.0)));
                 ui.add_space(10.0);
                 let width = ui.available_width();
+                // Once there are videos, what comes next is on the cards and the timeline.
+                let kind = if self.visible_media().next().is_none() {
+                    Kind::Primary
+                } else {
+                    Kind::Secondary
+                };
                 let clicked = ui
-                    .add_sized(
-                        vec2(width, 34.0),
-                        Button::new(
-                            RichText::new("Add videos")
-                                .color(palette.accent_text)
-                                .strong(),
-                        )
-                        .fill(palette.accent)
-                        .corner_radius(CornerRadius::same(5)),
+                    .add(
+                        ActionButton::new(palette, kind, "Add videos")
+                            .icon(icons::PLUS)
+                            .width(width),
                     )
                     .on_hover_text("Add videos to this project (Ctrl+O)")
                     .clicked();
@@ -944,8 +952,7 @@ impl Editor {
     fn timeline_panel(&mut self, ui: &mut egui::Ui, palette: &Palette) {
         let frame = Frame::new()
             .fill(palette.surface)
-            .inner_margin(Margin::symmetric(8, 8))
-            .stroke(Stroke::new(1.0, palette.border));
+            .inner_margin(Margin::symmetric(8, 8));
         let tallest = (ui.available_height() * TIMELINE_MAX_SHARE).max(TIMELINE_MIN_HEIGHT);
         let panel = egui::Panel::bottom("timeline")
             .resizable(true)
@@ -953,27 +960,34 @@ impl Editor {
             .size_range(TIMELINE_MIN_HEIGHT..=tallest)
             .frame(frame)
             .show(ui, |ui| {
-                self.timeline_tools(ui);
+                self.timeline_tools(ui, palette);
                 ui.add_space(4.0);
                 self.timeline_track(ui, palette);
             });
         self.timeline_panel_rect = panel.response.rect;
     }
 
-    fn timeline_tools(&mut self, ui: &mut egui::Ui) {
+    fn timeline_tools(&mut self, ui: &mut egui::Ui, palette: &Palette) {
         let has_clips = !self.project.timeline.is_empty();
         let can_delete = self.selected.is_some() || self.selected_gap.is_some();
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = CONTROL_SPACING;
             ui.add_space(8.0);
+            let split = ActionButton::new(palette, Kind::Ghost, "Split")
+                .icon(icons::SCISSORS)
+                .small();
             if ui
-                .add_enabled(has_clips, Button::new("Split"))
+                .add_enabled(has_clips, split)
                 .on_hover_text("Split the clip at the playhead (S)")
                 .clicked()
             {
                 self.split_at_playhead();
             }
+            let delete = ActionButton::new(palette, Kind::Ghost, "Delete")
+                .icon(icons::TRASH_2)
+                .small();
             if ui
-                .add_enabled(can_delete, Button::new("Delete"))
+                .add_enabled(can_delete, delete)
                 .on_hover_text("Delete the selected clip or dead space (Delete)")
                 .clicked()
             {
@@ -1103,34 +1117,60 @@ impl Editor {
                     middle.with_layout(
                         Layout::left_to_right(Align::Center).with_main_justify(false),
                         |ui| {
-                            let spare = (ui.available_width() - 190.0).max(0.0);
+                            ui.spacing_mut().item_spacing.x = CONTROL_SPACING;
+                            let spare = (ui.available_width() - TRANSPORT_WIDTH).max(0.0);
                             ui.add_space(spare / 2.0);
+                            let quiet =
+                                |icon, name| IconButton::new(palette, Kind::Ghost, icon, name);
                             if ui
-                                .add_enabled(has_clips, Button::new("Start"))
+                                .add_enabled(has_clips, quiet(icons::SKIP_BACK, "Go to start"))
                                 .on_hover_text("Go to the start (Home)")
                                 .clicked()
                             {
                                 self.seek(Ticks(0));
                             }
                             if ui
-                                .add_enabled(has_clips, Button::new("Back"))
+                                .add_enabled(
+                                    has_clips,
+                                    quiet(icons::CHEVRON_LEFT, "One frame back"),
+                                )
                                 .on_hover_text("One frame back (Left arrow)")
                                 .clicked()
                             {
                                 self.step_frame(false);
                             }
-                            if play_button(ui, palette, playing, has_clips)
+                            let (icon, name) = if playing {
+                                (icons::PAUSE, "Pause")
+                            } else {
+                                (icons::PLAY, "Play")
+                            };
+                            let play = IconButton::new(palette, Kind::Primary, icon, name)
+                                .size(36.0, 16.0)
+                                .round()
+                                .solid();
+                            if ui
+                                .add_enabled(has_clips, play)
                                 .on_hover_text("Play or pause (Space)")
                                 .clicked()
                             {
                                 self.toggle_playback();
                             }
                             if ui
-                                .add_enabled(has_clips, Button::new("Next"))
+                                .add_enabled(
+                                    has_clips,
+                                    quiet(icons::CHEVRON_RIGHT, "One frame forward"),
+                                )
                                 .on_hover_text("One frame forward (Right arrow)")
                                 .clicked()
                             {
                                 self.step_frame(true);
+                            }
+                            if ui
+                                .add_enabled(has_clips, quiet(icons::SKIP_FORWARD, "Go to end"))
+                                .on_hover_text("Go to the end (End)")
+                                .clicked()
+                            {
+                                self.seek(total);
                             }
                         },
                     );
@@ -1220,23 +1260,33 @@ impl Editor {
             .map_or_else(String::new, |entry| entry.name.clone());
         let mut confirmed = false;
         let mut cancelled = false;
-        let frame = Frame::popup(&ctx.global_style()).inner_margin(Margin::same(20));
         egui::Modal::new(egui::Id::unique("remove_dialog"))
-            .frame(frame)
+            .frame(dialog_frame(ctx))
             .show(ctx, |ui| {
                 ui.set_width(400.0);
-                ui.label(RichText::new("Remove this video?").font(fonts::strong(18.0)));
-                ui.add_space(10.0);
+                components::dialog_title(
+                    ui,
+                    &icons::CIRCLE_ALERT,
+                    palette.danger,
+                    "Remove this video?",
+                );
+                ui.add_space(12.0);
                 ui.label(text::remove_warning(&name, count));
                 ui.add_space(4.0);
                 ui.colored_label(
                     palette.text_muted,
                     "The file on your computer is not touched.",
                 );
-                ui.add_space(16.0);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    confirmed = accent_button(ui, palette, "Remove", true).clicked();
-                    cancelled = ui.button("Cancel").clicked();
+                ui.add_space(18.0);
+                components::dialog_buttons(ui, |ui| {
+                    confirmed = ui
+                        .add(
+                            ActionButton::new(palette, Kind::Danger, "Remove")
+                                .icon(icons::X)
+                                .width(DIALOG_BUTTON_WIDTH),
+                        )
+                        .clicked();
+                    cancelled = ui.add(dialog_button(palette, "Cancel")).clicked();
                 });
             });
         if confirmed {
@@ -1258,28 +1308,37 @@ impl Editor {
         let ready = self.export_parts().is_some();
         let summary = self.plan_description();
 
-        let frame = Frame::popup(&ctx.global_style()).inner_margin(Margin::same(20));
-        egui::Modal::new(egui::Id::unique("export_dialog")).frame(frame).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("export_dialog")).frame(dialog_frame(ctx)).show(ctx, |ui| {
             ui.set_width(440.0);
             match &self.export_state {
                 ExportState::Choosing => {
-                    ui.label(RichText::new("Export").font(fonts::strong(18.0)));
-                    ui.add_space(12.0);
-                    ui.radio_value(&mut self.mode, CutMode::FrameExact, "Frame-exact");
-                    ui.indent("exact", |ui| {
-                        ui.colored_label(
-                            palette.text_muted,
-                            "Cuts land exactly where they are on the timeline. Short parts around each cut are re-encoded.",
-                        );
-                    });
+                    components::dialog_title(ui, &icons::UPLOAD, palette.accent, "Export");
+                    ui.add_space(14.0);
+                    if components::choice_card(
+                        ui,
+                        palette,
+                        &icons::TARGET,
+                        "Frame-exact",
+                        "Cuts land exactly where they are on the timeline. Short parts around each cut are re-encoded.",
+                        self.mode == CutMode::FrameExact,
+                    )
+                    .clicked()
+                    {
+                        self.mode = CutMode::FrameExact;
+                    }
                     ui.add_space(8.0);
-                    ui.radio_value(&mut self.mode, CutMode::Keyframe, "Fastest");
-                    ui.indent("fast", |ui| {
-                        ui.colored_label(
-                            palette.text_muted,
-                            "Nothing is re-encoded, but each cut moves outward to the nearest keyframe, keeping a little extra.",
-                        );
-                    });
+                    if components::choice_card(
+                        ui,
+                        palette,
+                        &icons::ZAP,
+                        "Fastest",
+                        "Nothing is re-encoded, but each cut moves outward to the nearest keyframe, keeping a little extra.",
+                        self.mode == CutMode::Keyframe,
+                    )
+                    .clicked()
+                    {
+                        self.mode = CutMode::Keyframe;
+                    }
                     ui.add_space(14.0);
 
                     if let Some(problem) = &problem {
@@ -1296,54 +1355,70 @@ impl Editor {
                     } else {
                         ui.colored_label(palette.text_muted, "Still reading the videos' frames.");
                     }
-                    ui.add_space(16.0);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.add_space(18.0);
+                    components::dialog_buttons(ui, |ui| {
                         let can_start = ready && problem.is_none() && gap_problem.is_none();
-                        if accent_button(ui, palette, "Choose file and export", can_start).clicked() {
+                        let start = ActionButton::new(palette, Kind::Primary, "Choose file and export")
+                            .icon(icons::UPLOAD);
+                        if ui.add_enabled(can_start, start).clicked() {
                             begin_export = true;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.add(dialog_button(palette, "Cancel")).clicked() {
                             next_state = Some(ExportState::Closed);
                         }
                     });
                 }
                 ExportState::Running(task) => {
-                    ui.label(RichText::new("Exporting").font(fonts::strong(18.0)));
-                    ui.add_space(12.0);
-                    let fraction = f32::from_bits(task.progress.load(Ordering::Relaxed));
-                    ui.add(egui::ProgressBar::new(fraction).show_percentage());
+                    components::dialog_title(ui, &icons::UPLOAD, palette.accent, "Exporting");
                     ui.add_space(14.0);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("Cancel").clicked() {
+                    let fraction = f32::from_bits(task.progress.load(Ordering::Relaxed));
+                    components::progress_bar(ui, palette, fraction);
+                    ui.add_space(18.0);
+                    components::dialog_buttons(ui, |ui| {
+                        if ui.add(dialog_button(palette, "Cancel")).clicked() {
                             task.cancel.store(true, Ordering::Relaxed);
                         }
                     });
                 }
                 ExportState::Done { report, output } => {
-                    ui.label(RichText::new("Export finished").font(fonts::strong(18.0)));
+                    components::dialog_title(
+                        ui,
+                        &icons::CIRCLE_CHECK,
+                        palette.success,
+                        "Export finished",
+                    );
                     ui.add_space(12.0);
                     for line in text::export_summary(report) {
                         ui.label(line);
                     }
                     ui.add_space(6.0);
                     ui.colored_label(palette.text_muted, output.display().to_string());
-                    ui.add_space(16.0);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if accent_button(ui, palette, "Done", true).clicked() {
+                    ui.add_space(18.0);
+                    components::dialog_buttons(ui, |ui| {
+                        let done = ActionButton::new(palette, Kind::Primary, "Done")
+                            .icon(icons::CHECK)
+                            .width(DIALOG_BUTTON_WIDTH);
+                        if ui.add(done).clicked() {
                             next_state = Some(ExportState::Closed);
                         }
-                        if ui.button("Show in folder").clicked() {
+                        let show = dialog_button(palette, "Show in folder").icon(icons::FOLDER_OPEN);
+                        if ui.add(show).clicked() {
                             show_in_folder(output);
                         }
                     });
                 }
                 ExportState::Failed(error) => {
-                    ui.label(RichText::new("Export failed").font(fonts::strong(18.0)));
+                    components::dialog_title(
+                        ui,
+                        &icons::CIRCLE_ALERT,
+                        palette.danger,
+                        "Export failed",
+                    );
                     ui.add_space(12.0);
                     ui.colored_label(palette.danger, error);
-                    ui.add_space(16.0);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("Close").clicked() {
+                    ui.add_space(18.0);
+                    components::dialog_buttons(ui, |ui| {
+                        if ui.add(dialog_button(palette, "Close")).clicked() {
                             next_state = Some(ExportState::Choosing);
                         }
                     });
@@ -1374,71 +1449,23 @@ impl Editor {
     }
 }
 
-fn accent_button(
-    ui: &mut egui::Ui,
-    palette: &Palette,
-    label: &str,
-    enabled: bool,
-) -> egui::Response {
-    ui.add_enabled(
-        enabled,
-        Button::new(RichText::new(label).color(palette.accent_text).strong())
-            .fill(palette.accent)
-            .corner_radius(CornerRadius::same(5))
-            .min_size(vec2(84.0, 30.0)),
-    )
+fn dialog_frame(ctx: &egui::Context) -> Frame {
+    Frame::popup(&ctx.global_style())
+        .inner_margin(Margin::same(20))
+        .corner_radius(CornerRadius::same(DIALOG_RADIUS))
 }
 
-/// The play or pause symbol is drawn, since the fonts may not carry these glyphs.
-fn play_button(
-    ui: &mut egui::Ui,
-    palette: &Palette,
-    playing: bool,
-    enabled: bool,
-) -> egui::Response {
-    let sense = if enabled {
-        Sense::click()
-    } else {
-        Sense::hover()
-    };
-    let (rect, response) = ui.allocate_exact_size(vec2(34.0, 34.0), sense);
-    let painter = ui.painter_at(rect);
-    let center = rect.center();
-    let fill = if !enabled {
-        palette.border_strong
-    } else if response.hovered() {
-        palette.accent_hover
-    } else {
-        palette.accent
-    };
-    painter.circle_filled(center, 16.0, fill);
-    if playing {
-        for offset in [-4.0, 4.0] {
-            painter.rect_filled(
-                egui::Rect::from_center_size(center + vec2(offset, 0.0), vec2(4.0, 14.0)),
-                1.0,
-                palette.accent_text,
-            );
-        }
-    } else {
-        painter.add(egui::Shape::convex_polygon(
-            vec![
-                center + vec2(-5.0, -8.0),
-                center + vec2(8.0, 0.0),
-                center + vec2(-5.0, 8.0),
-            ],
-            palette.accent_text,
-            Stroke::NONE,
-        ));
-    }
-    response
+/// The ordinary, secondary button of a dialog.
+fn dialog_button<'a>(palette: &'a Palette, label: &'a str) -> ActionButton<'a> {
+    ActionButton::new(palette, Kind::Secondary, label).width(DIALOG_BUTTON_WIDTH)
 }
 
 fn empty_media_hint(ui: &mut egui::Ui, palette: &Palette) {
     let rect = ui.available_rect_before_wrap();
-    let area = egui::Rect::from_min_size(rect.min, vec2(rect.width(), rect.height().max(120.0)));
+    let height = rect.height().clamp(120.0, EMPTY_HINT_MAX_HEIGHT);
+    let area = egui::Rect::from_min_size(rect.min, vec2(rect.width(), height));
     let painter = ui.painter_at(area.expand(2.0));
-    let stroke = Stroke::new(1.5, palette.border_strong);
+    let stroke = Stroke::new(1.0, palette.border_strong);
     let corners = [
         area.left_top(),
         area.right_top(),
@@ -1447,15 +1474,21 @@ fn empty_media_hint(ui: &mut egui::Ui, palette: &Palette) {
         area.left_top(),
     ];
     painter.extend(egui::Shape::dashed_line(&corners, stroke, 6.0, 5.0));
+    icons::paint(
+        &painter,
+        icons::square_at(area.center() - vec2(0.0, 28.0), 26.0),
+        &icons::FILM,
+        palette.text_muted,
+    );
     painter.text(
-        area.center() - vec2(0.0, 12.0),
+        area.center() + vec2(0.0, 4.0),
         egui::Align2::CENTER_CENTER,
         "Drop videos here",
         fonts::strong(14.0),
         palette.text,
     );
     painter.text(
-        area.center() + vec2(0.0, 12.0),
+        area.center() + vec2(0.0, 25.0),
         egui::Align2::CENTER_CENTER,
         "MP4, MKV, MOV and more",
         FontId::new(12.0, FontFamily::Proportional),
@@ -1469,26 +1502,6 @@ fn media_columns(width: f32) -> usize {
     (((width + MEDIA_CARD_SPACING) / per_card).floor() as usize).max(1)
 }
 
-/// A square button drawn over a thumbnail, shown while the pointer is on the card.
-fn card_button(
-    ui: &mut egui::Ui,
-    id: egui::Id,
-    rect: egui::Rect,
-    label: &str,
-    visible: bool,
-    fill: Color32,
-    draw: impl FnOnce(&egui::Painter),
-) -> egui::Response {
-    let response = ui.interact(rect, id, Sense::click()).on_hover_text(label);
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label.to_owned()));
-    if visible || response.has_focus() {
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 5.0, fill);
-        draw(&painter);
-    }
-    response
-}
-
 /// Draws one video in the panel, and returns where its thumbnail is.
 fn media_card(
     ui: &mut egui::Ui,
@@ -1500,11 +1513,12 @@ fn media_card(
     let mut thumbnail_rect = egui::Rect::NOTHING;
     let card = Frame::new()
         .fill(palette.raised)
-        .corner_radius(CornerRadius::same(6))
+        .corner_radius(CornerRadius::same(CARD_RADIUS))
         .inner_margin(Margin::same(8))
         .stroke(Stroke::new(1.0, palette.border))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 2.0;
             let drag_id = egui::Id::unique(("media-card", entry.id.0));
             let payload = MediaDrag {
                 media: entry.id,
@@ -1527,37 +1541,59 @@ fn media_card(
                         Color32::WHITE,
                     );
                 }
+                // The stage stays dark in both themes, so this label reads the same in both.
+                let length = painter.layout_no_wrap(
+                    text::short_duration(entry.info.duration),
+                    FontId::new(11.0, FontFamily::Proportional),
+                    palette.clip_video_text,
+                );
+                let badge = egui::Rect::from_min_size(
+                    rect.left_bottom() + vec2(6.0, -6.0 - length.size().y - 4.0),
+                    length.size() + vec2(10.0, 4.0),
+                );
+                painter.rect_filled(badge, 4.0, palette.stage.gamma_multiply(0.75));
+                painter.galley(badge.min + vec2(5.0, 2.0), length, palette.clip_video_text);
             })
             .response
             .on_hover_text("Drag onto the timeline");
             ui.add_space(6.0);
             ui.add(egui::Label::new(RichText::new(&entry.name).strong()).truncate());
-            let mut details = format!(
-                "{}, {}",
-                text::short_duration(entry.info.duration),
-                text::file_size(entry.info.size_bytes)
-            );
-            if entry.scan.is_some() {
+            let detail = |ui: &mut egui::Ui, line: String, color| {
+                ui.label(RichText::new(line).size(12.0).color(color));
+            };
+            let details = if entry.scan.is_some() {
                 let fraction = f32::from_bits(entry.progress.load(Ordering::Relaxed)) * 100.0;
-                details = format!("Reading frames {fraction:.0}%");
-            }
-            ui.colored_label(palette.text_muted, details);
-            ui.colored_label(palette.text_muted, text::video_summary(&entry.info));
+                format!("Reading frames {fraction:.0}%")
+            } else {
+                text::file_size(entry.info.size_bytes)
+            };
+            detail(ui, details, palette.text_muted);
+            detail(ui, text::video_summary(&entry.info), palette.text_muted);
             for (position, track) in entry.info.audio.iter().enumerate() {
-                ui.colored_label(
-                    palette.text_muted,
+                detail(
+                    ui,
                     text::audio_track_summary(position, track),
+                    palette.text_muted,
                 );
             }
             if entry.info.video.is_hdr {
-                ui.colored_label(
+                detail(
+                    ui,
+                    "HDR video: the preview shows it without HDR.".to_owned(),
                     palette.danger,
-                    "HDR video: the preview shows it without HDR.",
                 );
             }
         });
 
     let hovered = ui.rect_contains_pointer(card.response.rect);
+    if hovered {
+        ui.painter().rect_stroke(
+            card.response.rect,
+            CARD_RADIUS,
+            Stroke::new(1.0, palette.border_strong),
+            egui::StrokeKind::Inside,
+        );
+    }
     let margin = 6.0;
     let size = vec2(CARD_BUTTON_SIZE, CARD_BUTTON_SIZE);
     let add_rect = egui::Rect::from_min_size(
@@ -1568,49 +1604,32 @@ fn media_card(
         thumbnail_rect.right_top() + vec2(-CARD_BUTTON_SIZE - margin, margin),
         size,
     );
-    let plus_stroke = Stroke::new(2.5, palette.accent_text);
-    let added = card_button(
-        ui,
-        egui::Id::unique(("media-card-add", entry.id.0)),
-        add_rect,
-        "Add to timeline",
-        hovered,
-        palette.accent,
-        |painter| {
-            let center = add_rect.center();
-            painter.line_segment(
-                [center - vec2(7.0, 0.0), center + vec2(7.0, 0.0)],
-                plus_stroke,
-            );
-            painter.line_segment(
-                [center - vec2(0.0, 7.0), center + vec2(0.0, 7.0)],
-                plus_stroke,
-            );
-        },
-    );
+    let added = IconButton::new(palette, Kind::Primary, icons::PLUS, "Add to timeline")
+        .size(CARD_BUTTON_SIZE, 16.0)
+        .hidden(!hovered)
+        .show_at(
+            ui,
+            egui::Id::unique(("media-card-add", entry.id.0)),
+            add_rect,
+        )
+        .on_hover_text("Add to timeline");
     if added.clicked() {
         *add = Some(entry.id);
     }
-    let cross_stroke = Stroke::new(2.0, palette.text);
-    let removed = card_button(
+    let removed = IconButton::new(
+        palette,
+        Kind::Secondary,
+        icons::X,
+        "Remove from this project",
+    )
+    .size(CARD_BUTTON_SIZE, 16.0)
+    .hidden(!hovered)
+    .show_at(
         ui,
         egui::Id::unique(("media-card-remove", entry.id.0)),
         remove_rect,
-        "Remove from this project",
-        hovered,
-        palette.raised,
-        |painter| {
-            let center = remove_rect.center();
-            painter.line_segment(
-                [center - vec2(5.0, 5.0), center + vec2(5.0, 5.0)],
-                cross_stroke,
-            );
-            painter.line_segment(
-                [center - vec2(5.0, -5.0), center + vec2(5.0, -5.0)],
-                cross_stroke,
-            );
-        },
-    );
+    )
+    .on_hover_text("Remove from this project");
     if removed.clicked() {
         *remove = Some(entry.id);
     }
@@ -2053,6 +2072,75 @@ mod tests {
             "14-zoomed-out",
         );
 
+        let away = pos2(700.0, 150.0);
+        let [_, _, fit] = editor.timeline_state.zoom_buttons;
+        click(&ctx, &mut editor, fit.center());
+        let theme_button = named_rect(&ctx, &mut editor, "Theme");
+        click(&ctx, &mut editor, theme_button.center());
+        for _ in 0..12 {
+            run_frame(&ctx, &mut editor, moved(theme_button.center()));
+        }
+        camera.shoot(
+            &ctx,
+            &mut editor,
+            moved(theme_button.center()),
+            "16-theme-menu",
+        );
+        click(&ctx, &mut editor, theme_button.center());
+        run_frame(&ctx, &mut editor, vec![]);
+        let export_button = named_rect(&ctx, &mut editor, "Export");
+        camera.shoot(
+            &ctx,
+            &mut editor,
+            moved(export_button.center()),
+            "17-export-button-hover",
+        );
+
+        // A dialog takes a few frames to measure itself and fade in.
+        let shoot_dialog = |camera: &mut Camera, editor: &mut Editor, name: String| {
+            for _ in 0..12 {
+                run_frame(&ctx, editor, moved(away));
+            }
+            camera.shoot(&ctx, editor, moved(away), &name);
+        };
+        let show_dialogs = |camera: &mut Camera, editor: &mut Editor, prefix: &str| {
+            editor.export_state = ExportState::Choosing;
+            shoot_dialog(camera, editor, format!("{prefix}-export-choosing"));
+            let (_sender, result) = mpsc::channel();
+            editor.export_state = ExportState::Running(ExportTask {
+                result,
+                progress: Arc::new(AtomicU32::new(0.42_f32.to_bits())),
+                cancel: Arc::new(AtomicBool::new(false)),
+                output: PathBuf::from("export.mp4"),
+            });
+            shoot_dialog(camera, editor, format!("{prefix}-export-running"));
+            editor.export_state = ExportState::Done {
+                report: ExportReport {
+                    mode_requested: CutMode::FrameExact,
+                    mode_used: CutMode::FrameExact,
+                    sections: 2,
+                    copied_frames: 200,
+                    encoded_frames: 12,
+                    black_frames: 0,
+                    encoder: Some("h264_nvenc".to_owned()),
+                    audio_tracks: 2,
+                    elapsed: Duration::from_millis(2100),
+                },
+                output: PathBuf::from("C:\\Videos\\export.mp4"),
+            };
+            shoot_dialog(camera, editor, format!("{prefix}-export-done"));
+            editor.export_state = ExportState::Failed("The disk is full.".to_owned());
+            shoot_dialog(camera, editor, format!("{prefix}-export-failed"));
+            editor.export_state = ExportState::Closed;
+            editor.confirm_remove = editor.media.first().map(|entry| entry.id);
+            shoot_dialog(camera, editor, format!("{prefix}-remove-dialog"));
+            editor.confirm_remove = None;
+            for _ in 0..12 {
+                run_frame(&ctx, editor, vec![]);
+            }
+        };
+        show_dialogs(&mut camera, &mut editor, "18-dark");
+
         ctx.set_theme(egui::Theme::Light);
         theme::install(&ctx);
         let [_, _, fit] = editor.timeline_state.zoom_buttons;
@@ -2064,6 +2152,13 @@ mod tests {
             editor.timeline_state.track.center().y,
         );
         camera.shoot(&ctx, &mut editor, moved(hover), "15-light-theme");
+        show_dialogs(&mut camera, &mut editor, "19-light");
+        let mut empty = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut empty, vec![]);
+        camera.shoot(&ctx, &mut empty, vec![], "20-light-empty");
+        ctx.set_theme(egui::Theme::Dark);
+        run_frame(&ctx, &mut empty, vec![]);
+        camera.shoot(&ctx, &mut empty, vec![], "21-dark-empty");
         KEPT_TEXTURES.with_borrow_mut(|kept| *kept = None);
     }
 
@@ -2079,6 +2174,42 @@ mod tests {
 
     fn press(key: Key) -> Vec<egui::Event> {
         key_event(key, Modifiers::NONE)
+    }
+
+    /// Runs a frame and reads back what screen readers are told is on screen.
+    fn named_nodes(ctx: &egui::Context, editor: &mut Editor) -> Vec<(String, egui::Rect, bool)> {
+        ctx.enable_accesskit();
+        let output = run_frame(ctx, editor, vec![]);
+        let update = output
+            .platform_output
+            .accesskit_update
+            .expect("the tree is reported");
+        update
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| {
+                let bounds = node.bounds()?;
+                let rect = egui::Rect::from_min_max(
+                    pos2(bounds.x0 as f32, bounds.y0 as f32),
+                    pos2(bounds.x1 as f32, bounds.y1 as f32),
+                );
+                Some((node.label()?.to_owned(), rect, node.is_disabled()))
+            })
+            .collect()
+    }
+
+    /// Where the control with this name is, so a test presses it the way a person would.
+    fn named_rect(ctx: &egui::Context, editor: &mut Editor, name: &str) -> egui::Rect {
+        named_nodes(ctx, editor)
+            .into_iter()
+            .find(|(label, ..)| label == name)
+            .unwrap_or_else(|| panic!("nothing is named {name}"))
+            .1
+    }
+
+    fn click_named(ctx: &egui::Context, editor: &mut Editor, name: &str) {
+        let rect = named_rect(ctx, editor, name);
+        click(ctx, editor, rect.center());
     }
 
     /// Runs frames until every video has been read.
@@ -2399,6 +2530,205 @@ mod tests {
 
         editor.undo();
         assert_eq!(editor.project.timeline.gaps().len(), 1);
+    }
+
+    #[test]
+    fn every_button_that_is_only_a_symbol_has_a_name() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+
+        let nodes = named_nodes(&ctx, &mut editor);
+
+        for name in [
+            "Undo",
+            "Redo",
+            "Theme",
+            "Go to start",
+            "One frame back",
+            "Play",
+            "One frame forward",
+            "Go to end",
+            "Zoom out",
+            "Zoom in",
+            "Fit",
+            "Add to timeline",
+            "Remove from this project",
+        ] {
+            assert!(
+                nodes.iter().any(|(label, ..)| label == name),
+                "nothing is named {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn named_actions_keep_their_words() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+
+        let nodes = named_nodes(&ctx, &mut editor);
+
+        for name in ["Export", "Add videos", "Split", "Delete"] {
+            assert!(
+                nodes.iter().any(|(label, ..)| label == name),
+                "nothing is named {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn playback_buttons_are_disabled_with_nothing_to_play() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+
+        let nodes = named_nodes(&ctx, &mut editor);
+
+        for name in [
+            "Go to start",
+            "One frame back",
+            "Play",
+            "Go to end",
+            "Export",
+        ] {
+            let (_, _, disabled) = nodes
+                .iter()
+                .find(|(label, ..)| label == name)
+                .unwrap_or_else(|| panic!("nothing is named {name}"));
+            assert!(*disabled, "{name} can be pressed with nothing to play");
+        }
+    }
+
+    #[test]
+    fn the_start_and_end_buttons_move_the_playhead() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let total = editor.project.timeline.duration();
+
+        click_named(&ctx, &mut editor, "Go to end");
+        assert_eq!(editor.position(), total);
+
+        click_named(&ctx, &mut editor, "Go to start");
+        assert_eq!(editor.position(), Ticks(0));
+    }
+
+    #[test]
+    fn the_frame_buttons_step_one_frame_each_way() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+
+        click_named(&ctx, &mut editor, "One frame forward");
+        let stepped = editor.position();
+        assert!(stepped > Ticks(0));
+
+        click_named(&ctx, &mut editor, "One frame back");
+        assert!(editor.position() < stepped);
+    }
+
+    #[test]
+    fn the_play_button_names_what_it_will_do() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+
+        click_named(&ctx, &mut editor, "Play");
+
+        let nodes = named_nodes(&ctx, &mut editor);
+        assert!(nodes.iter().any(|(label, ..)| label == "Pause"));
+        assert!(!nodes.iter().any(|(label, ..)| label == "Play"));
+        click_named(&ctx, &mut editor, "Pause");
+        assert!(!editor.preview.is_playing());
+    }
+
+    #[test]
+    fn the_split_and_undo_buttons_work() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        click_named(&ctx, &mut editor, "One frame forward");
+
+        click_named(&ctx, &mut editor, "Split");
+        assert_eq!(editor.project.timeline.clips().len(), 2);
+
+        click_named(&ctx, &mut editor, "Undo");
+        assert_eq!(editor.project.timeline.clips().len(), 1);
+
+        click_named(&ctx, &mut editor, "Redo");
+        assert_eq!(editor.project.timeline.clips().len(), 2);
+    }
+
+    #[test]
+    fn the_theme_menu_changes_the_theme() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+
+        click_named(&ctx, &mut editor, "Theme");
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Light");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert_eq!(
+            ctx.options(|options| options.theme_preference),
+            egui::ThemePreference::Light
+        );
+    }
+
+    #[test]
+    fn the_export_dialog_switches_between_its_choices() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        editor.export_state = ExportState::Choosing;
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.mode == CutMode::FrameExact);
+
+        click_named(&ctx, &mut editor, "Fastest");
+        assert!(editor.mode == CutMode::Keyframe);
+
+        click_named(&ctx, &mut editor, "Frame-exact");
+        assert!(editor.mode == CutMode::FrameExact);
+
+        click_named(&ctx, &mut editor, "Cancel");
+        assert!(matches!(editor.export_state, ExportState::Closed));
+    }
+
+    #[test]
+    fn a_dialog_shrinks_to_what_it_is_showing() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let settle_dialog = |editor: &mut Editor| {
+            for _ in 0..12 {
+                run_frame(&ctx, editor, vec![]);
+            }
+            ctx.memory(|memory| memory.area_rect(egui::Id::unique("export_dialog")))
+                .expect("the dialog is on screen")
+        };
+
+        editor.export_state = ExportState::Choosing;
+        let choosing = settle_dialog(&mut editor);
+        editor.export_state = ExportState::Failed("The disk is full.".to_owned());
+        let failed = settle_dialog(&mut editor);
+
+        assert!(
+            failed.height() < choosing.height() - 100.0,
+            "the short dialog is {} tall and the long one {}",
+            failed.height(),
+            choosing.height()
+        );
+    }
+
+    #[test]
+    fn the_remove_dialog_can_be_cancelled_or_confirmed() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip()]);
+        let id = editor.media[0].id;
+
+        editor.confirm_remove = Some(id);
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Cancel");
+        assert_eq!(editor.confirm_remove, None);
+        assert_eq!(editor.visible_media().count(), 1);
+
+        editor.confirm_remove = Some(id);
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Remove");
+        assert_eq!(editor.visible_media().count(), 0);
     }
 
     #[test]

@@ -59,6 +59,7 @@
         <File Id="FfmpegLgpl" Name="FFmpeg-LGPL-3.0.txt" Source="$(var.FfmpegDir)\LICENSE.txt" />
         <File Id="Gpl3" Name="GPL-3.0.txt" Source="$(var.RepoDir)\assets\licenses\GPL-3.0.txt" />
         <File Id="FontLicense" Name="HankenGrotesk-OFL.txt" Source="$(var.RepoDir)\assets\fonts\OFL.txt" />
+        <File Id="IconLicense" Name="Lucide-ISC.txt" Source="$(var.RepoDir)\assets\licenses\Lucide-ISC.txt" />
         <RemoveFolder Id="RemoveLicensesDir" On="uninstall" />
       </Component>
     </DirectoryRef>

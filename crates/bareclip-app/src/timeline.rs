@@ -5,11 +5,16 @@ use bareclip_core::{
     timeline::{ClipEdge, ClipId, MediaId, TimeRange, Timeline},
 };
 use eframe::egui::{
-    self, Align2, Button, Color32, CursorIcon, FontId, Pos2, Rect, RichText, Sense, Shape, Stroke,
-    UiBuilder, pos2, vec2,
+    self, Align2, Color32, CursorIcon, FontId, Pos2, Rect, Sense, Shape, Stroke, UiBuilder, pos2,
+    vec2,
 };
 
-use crate::{text, theme::Palette};
+use crate::{
+    components::{ActionButton, IconButton, Kind},
+    icons::{self, Icon},
+    text,
+    theme::Palette,
+};
 
 const RULER_HEIGHT: f32 = 24.0;
 /// The row under the track, holding the scrollbar and the zoom buttons.
@@ -23,7 +28,10 @@ const RULER_LABEL_WIDTH: f32 = 60.0;
 /// The logo's 30 degree cut, as used on the clip corners.
 const CORNER_CUT_X: f32 = 10.0;
 const CORNER_CUT_Y: f32 = 5.8;
-const HANDLE_WIDTH: f32 = 7.0;
+const HANDLE_WIDTH: f32 = 3.0;
+/// A clip wider than this has room for a symbol in front of its name.
+const CLIP_ICON_MIN_WIDTH: f32 = 96.0;
+const CLIP_ICON_SIZE: f32 = 14.0;
 const HANDLE_GRAB_WIDTH: f32 = 10.0;
 const ZOOM_STEP: f64 = 1.5;
 /// Below this, a view of the timeline stops getting any closer.
@@ -39,7 +47,7 @@ const SNAP_PIXELS: f32 = 8.0;
 const EDGE_SCROLL_ZONE: f32 = 28.0;
 const EDGE_SCROLL_VIEWS_PER_SECOND: f64 = 0.8;
 /// A gap narrower than this has no room for its button. Delete still removes it.
-const GAP_BUTTON_WIDTH: f32 = 92.0;
+const GAP_BUTTON_WIDTH: f32 = 104.0;
 const HATCH_SPACING: f32 = 8.0;
 
 /// Maps a stretch of the timeline onto a stretch of the screen.
@@ -465,29 +473,38 @@ fn draw_clip(painter: &egui::Painter, palette: &Palette, rect: Rect, label: &str
 
     // A handle on each end shows the clip can be dragged shorter or longer.
     let width = HANDLE_WIDTH.min(rect.width() / 3.0);
-    let inset = 8.0;
-    for x in [rect.left() + 2.0, rect.right() - 2.0 - width] {
+    let height = (rect.height() * 0.4).max(4.0);
+    for x in [rect.left() + 4.0, rect.right() - 4.0 - width] {
         painter.rect_filled(
-            Rect::from_min_size(
-                pos2(x, rect.top() + inset),
-                vec2(width, (rect.height() - inset * 2.0).max(4.0)),
-            ),
-            2.0,
+            Rect::from_center_size(pos2(x + width / 2.0, rect.center().y), vec2(width, height)),
+            1.5,
             palette.clip_video_text,
         );
     }
 
     if rect.width() > 60.0 {
         let text_rect = rect.shrink2(vec2(14.0, 0.0));
-        painter
-            .with_clip_rect(text_rect.intersect(painter.clip_rect()))
-            .text(
-                pos2(text_rect.left(), rect.center().y),
-                Align2::LEFT_CENTER,
-                label,
-                FontId::proportional(12.0),
+        let clipped = painter.with_clip_rect(text_rect.intersect(painter.clip_rect()));
+        let mut left = text_rect.left();
+        if rect.width() > CLIP_ICON_MIN_WIDTH {
+            icons::paint(
+                &clipped,
+                icons::square_at(
+                    pos2(left + CLIP_ICON_SIZE / 2.0, rect.center().y),
+                    CLIP_ICON_SIZE,
+                ),
+                &icons::FILM,
                 palette.clip_video_text,
             );
+            left += CLIP_ICON_SIZE + 6.0;
+        }
+        clipped.text(
+            pos2(left, rect.center().y),
+            Align2::LEFT_CENTER,
+            label,
+            FontId::proportional(12.0),
+            palette.clip_video_text,
+        );
     }
 }
 
@@ -519,57 +536,17 @@ fn snap_targets(view: &TimelineView, moving: Option<ClipId>) -> Vec<Ticks> {
     targets
 }
 
-#[derive(Clone, Copy)]
-enum ZoomIcon {
-    Out,
-    In,
-    Fit,
-}
-
 fn zoom_button(
     ui: &mut egui::Ui,
     palette: &Palette,
     rect: Rect,
-    icon: ZoomIcon,
+    icon: Icon,
     label: &str,
     hint: &str,
 ) -> egui::Response {
-    let response = ui
-        .interact(
-            rect,
-            egui::Id::unique(("timeline-zoom", label)),
-            Sense::click(),
-        )
-        .on_hover_text(hint);
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label.to_owned()));
-    let painter = ui.painter_at(rect);
-    if response.hovered() {
-        painter.rect_filled(rect, 4.0, palette.raised);
-    }
-    let stroke = Stroke::new(1.6, palette.text);
-    let center = rect.center();
-    match icon {
-        ZoomIcon::Out | ZoomIcon::In => {
-            let lens = center - vec2(2.0, 2.0);
-            painter.circle_stroke(lens, 6.5, stroke);
-            painter.line_segment([lens + vec2(4.8, 4.8), lens + vec2(9.5, 9.5)], stroke);
-            painter.line_segment([lens - vec2(3.0, 0.0), lens + vec2(3.0, 0.0)], stroke);
-            if matches!(icon, ZoomIcon::In) {
-                painter.line_segment([lens - vec2(0.0, 3.0), lens + vec2(0.0, 3.0)], stroke);
-            }
-        }
-        ZoomIcon::Fit => {
-            for side in [-1.0, 1.0] {
-                let wall = center + vec2(side * 8.0, 0.0);
-                painter.line_segment([wall - vec2(0.0, 6.0), wall + vec2(0.0, 6.0)], stroke);
-                let tip = center + vec2(side * 5.5, 0.0);
-                painter.line_segment([tip, tip - vec2(side * 3.0, 3.0)], stroke);
-                painter.line_segment([tip, tip - vec2(side * 3.0, -3.0)], stroke);
-            }
-            painter.line_segment([center - vec2(5.5, 0.0), center + vec2(5.5, 0.0)], stroke);
-        }
-    }
-    response
+    IconButton::new(palette, Kind::Ghost, icon, label)
+        .show_at(ui, egui::Id::unique(("timeline-zoom", label)), rect)
+        .on_hover_text(hint)
 }
 
 /// Draws the scrollbar, which shows how much of the whole timeline is in view.
@@ -645,7 +622,7 @@ fn bottom_strip(
         ui,
         palette,
         out_rect,
-        ZoomIcon::Out,
+        icons::ZOOM_OUT,
         "Zoom out",
         "Zoom out (Ctrl + mouse wheel)",
     )
@@ -657,7 +634,7 @@ fn bottom_strip(
         ui,
         palette,
         in_rect,
-        ZoomIcon::In,
+        icons::ZOOM_IN,
         "Zoom in",
         "Zoom in (Ctrl + mouse wheel)",
     )
@@ -669,7 +646,7 @@ fn bottom_strip(
         ui,
         palette,
         fit_rect,
-        ZoomIcon::Fit,
+        icons::MAXIMIZE,
         "Fit",
         "Fit the whole video in view",
     )
@@ -966,9 +943,12 @@ pub fn timeline(
             let place = Rect::from_center_size(band.center(), vec2(GAP_BUTTON_WIDTH, 26.0))
                 .intersect(track);
             let mut child = ui.new_child(UiBuilder::new().max_rect(place));
-            let button = Button::new(RichText::new("Remove gap").size(12.0));
+            let button = ActionButton::new(palette, Kind::Secondary, "Remove gap")
+                .icon(icons::X)
+                .small()
+                .width(place.width());
             if child
-                .add_sized(place.size(), button)
+                .add(button)
                 .on_hover_text("Close this dead space (Delete when it is selected)")
                 .clicked()
             {
