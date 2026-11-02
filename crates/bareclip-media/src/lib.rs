@@ -1,5 +1,14 @@
 //! The only crate that calls FFmpeg.
 
+mod error;
+mod export;
+mod nal;
+mod probe;
+
+pub use error::MediaError;
+pub use export::{ExportReport, ExportRequest, export};
+pub use probe::{AudioInfo, MediaInfo, VideoInfo, probe, scan_frames};
+
 use ffmpeg_next as ffmpeg;
 
 /// Details of the FFmpeg libraries loaded at runtime.
