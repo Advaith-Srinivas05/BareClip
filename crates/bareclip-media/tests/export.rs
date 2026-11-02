@@ -124,6 +124,35 @@ fn several_sections_join_in_order_with_steady_timing() {
 }
 
 #[test]
+fn sections_marked_mid_frame_still_join_with_steady_timing() {
+    let input = h264_mp4();
+    let output = output_path("mid-frame", "mp4");
+    let frame_time = 1.0 / FPS as f64;
+
+    // Every mark here falls partway through a frame.
+    run_export(
+        &input,
+        &output,
+        vec![
+            range(0.5 + frame_time / 3.0, 1.5 + frame_time / 3.0),
+            range(5.2 + frame_time / 2.0, 6.1 + frame_time / 2.0),
+        ],
+        CutMode::FrameExact,
+    );
+
+    let frames = decode_video(&output);
+    for pair in frames.windows(2) {
+        let gap = pair[1].seconds - pair[0].seconds;
+        assert!(
+            (gap - frame_time).abs() < 0.002,
+            "gap of {gap}s between frames {} and {}",
+            pair[0].number,
+            pair[1].number
+        );
+    }
+}
+
+#[test]
 fn keyframe_mode_grows_outward_and_encodes_nothing() {
     let input = h264_mp4();
     let output = output_path("keyframe", "mp4");

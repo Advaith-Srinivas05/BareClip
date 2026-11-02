@@ -1,0 +1,35 @@
+BareClip includes the following software.
+
+
+FFmpeg
+------
+BareClip uses libraries from the FFmpeg project: avcodec, avformat, avutil,
+swresample and swscale. They are licensed under the GNU Lesser General Public
+License version 3 or later. See FFmpeg-LGPL-3.0.txt and GPL-3.0.txt.
+
+BareClip is not a derivative of these libraries, and it links to them as separate
+DLL files in the install folder. You can replace those DLLs with your own compatible
+build of the same FFmpeg version.
+
+Project site:  https://ffmpeg.org
+Build used:    n9.0.2-42-gd7643a0fe3, an LGPL shared build from BtbN/FFmpeg-Builds
+Source code:   https://github.com/FFmpeg/FFmpeg/tree/d7643a0fe3
+Build scripts: https://github.com/BtbN/FFmpeg-Builds/releases/tag/autobuild-2026-11-01-12-49
+
+These FFmpeg DLLs also contain other open-source libraries compiled into them, such
+as dav1d and SVT-AV1. The build scripts above list them and how they were built.
+
+
+Hanken Grotesk
+--------------
+The interface font. Copyright 2021 The Hanken Grotesk Project Authors, licensed
+under the SIL Open Font License version 1.1. See HankenGrotesk-OFL.txt.
+
+
+Rust libraries
+--------------
+BareClip is built with open-source Rust libraries, including egui, eframe, wgpu,
+cpal, rtrb, rfd and ffmpeg-next, and the libraries they depend on. These are
+mainly under the MIT and Apache 2.0 licenses. The project's Cargo.lock file lists
+every library and version used:
+https://github.com/Advaith-Srinivas05/BareClip/blob/release/Cargo.lock

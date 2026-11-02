@@ -92,6 +92,14 @@ const THEME_CHOICES: [(ThemePreference, &str); 3] = [
     (ThemePreference::Dark, "Dark"),
 ];
 
+/// The colours of the theme currently showing.
+pub fn palette(ctx: &egui::Context) -> &'static Palette {
+    match ctx.theme() {
+        Theme::Dark => &DARK,
+        Theme::Light => &LIGHT,
+    }
+}
+
 /// Registers both themes. The app follows the Windows setting until the user picks one.
 pub fn install(ctx: &egui::Context) {
     ctx.set_visuals_of(Theme::Dark, visuals(&DARK, Theme::Dark));

@@ -147,6 +147,12 @@ fn open_encoder(
     video.set_frame_rate(Some(source.frame_rate));
     video.set_colorspace(decoder.color_space());
     video.set_color_range(decoder.color_range());
+    // SAFETY: both contexts are live, and these are plain fields read when the
+    // encoder opens. The safe wrappers do not offer them.
+    unsafe {
+        (*video.as_mut_ptr()).color_primaries = decoder.color_primaries().into();
+        (*video.as_mut_ptr()).color_trc = decoder.color_transfer_characteristic().into();
+    }
     video.set_max_b_frames(0);
     video.set_gop(u32::MAX >> 8);
     // Encoders with a quality setting reject or ignore a target bitrate.
@@ -799,7 +805,8 @@ fn temporary_path(output: &Path) -> PathBuf {
     output.with_file_name(format!("{stem}.partial.{extension}"))
 }
 
-fn plan_for(
+/// Works out what an export would do, without doing it.
+pub fn plan_export(
     frames: &FrameIndex,
     ranges: &[TimeRange],
     time_base: TimeBase,
@@ -858,13 +865,13 @@ pub fn export(
     let time_base = to_time_base(source_video.time_base);
 
     let mut mode_used = request.mode;
-    let mut plan = plan_for(frames, &request.ranges, time_base, mode_used);
+    let mut plan = plan_export(frames, &request.ranges, time_base, mode_used);
     let mut encoder_name = None;
     if plan.encoded_frames > 0 {
         encoder_name = choose_encoder(source_video.parameters.id(), &source_video);
         if encoder_name.is_none() {
             mode_used = CutMode::Keyframe;
-            plan = plan_for(frames, &request.ranges, time_base, mode_used);
+            plan = plan_export(frames, &request.ranges, time_base, mode_used);
         }
     }
     if plan.sections.is_empty() {
