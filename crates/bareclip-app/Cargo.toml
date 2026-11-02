@@ -10,8 +10,11 @@ name = "bareclip"
 path = "src/main.rs"
 
 [dependencies]
+bareclip-audio.workspace = true
+bareclip-core.workspace = true
 bareclip-media.workspace = true
 eframe.workspace = true
+rfd.workspace = true
 
 [build-dependencies]
 winresource = "0.1"

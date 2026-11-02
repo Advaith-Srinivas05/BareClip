@@ -175,7 +175,7 @@ pub fn scan_frames(
             duration: packet.duration(),
             keyframe: packet.is_key(),
         });
-        if frames.len() % 256 == 0 {
+        if frames.len().is_multiple_of(256) {
             if cancel.load(Ordering::Relaxed) {
                 return Err(MediaError::Cancelled);
             }

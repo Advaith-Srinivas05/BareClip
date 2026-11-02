@@ -324,10 +324,8 @@ impl EncodeRun {
 
 struct SectionWriter<'a> {
     source: &'a SourceVideo,
-    frames: &'a FrameIndex,
     packaging: &'a Packaging,
     encoder_name: Option<&'a str>,
-    section: &'a Section,
     /// Added to source display times to get output display times.
     offset: i64,
     run: Option<EncodeRun>,
@@ -487,22 +485,35 @@ struct Progress<'a> {
 impl Progress<'_> {
     fn tick(&mut self) {
         self.done += 1;
-        if self.done % 32 == 0 {
+        if self.done.is_multiple_of(32) {
             (self.report)(self.done as f32 / self.total.max(1) as f32);
         }
     }
 }
 
-fn run_export(
-    request: &ExportRequest,
-    temporary: &Path,
-    frames: &FrameIndex,
-    plan: &CutPlan,
-    source_video: &SourceVideo,
-    encoder_name: Option<&str>,
-    cancel: &AtomicBool,
-    progress: &dyn Fn(f32),
-) -> Result<usize, MediaError> {
+/// Everything one run of the export needs.
+struct ExportJob<'a> {
+    request: &'a ExportRequest,
+    temporary: &'a Path,
+    frames: &'a FrameIndex,
+    plan: &'a CutPlan,
+    source_video: &'a SourceVideo,
+    encoder_name: Option<&'a str>,
+    cancel: &'a AtomicBool,
+    progress: &'a dyn Fn(f32),
+}
+
+fn run_export(job: &ExportJob) -> Result<usize, MediaError> {
+    let ExportJob {
+        request,
+        temporary,
+        frames,
+        plan,
+        source_video,
+        encoder_name,
+        cancel,
+        progress,
+    } = *job;
     let mut input = format::input(&request.input)?;
     let mut output = format::output(temporary)?;
     let same_container = request.input.extension() == request.output.extension();
@@ -636,10 +647,8 @@ fn run_export(
         let offset = timeline_cursor - section.pts_start;
         let mut section_writer = SectionWriter {
             source: source_video,
-            frames,
             packaging: &packaging,
             encoder_name,
-            section,
             offset,
             run: None,
             restore_settings,
@@ -654,7 +663,7 @@ fn run_export(
         for (stream, packet) in input.packets() {
             let stream_index = stream.index();
             seen += 1;
-            if seen % 64 == 0 && cancel.load(Ordering::Relaxed) {
+            if seen.is_multiple_of(64) && cancel.load(Ordering::Relaxed) {
                 return Err(MediaError::Cancelled);
             }
 
@@ -721,8 +730,6 @@ fn run_export(
 
         section_writer.finish_run(&mut writer)?;
         restore_settings = section_writer.restore_settings;
-        let _ = section_writer.frames;
-        let _ = section_writer.section;
         timeline_cursor += section.pts_end - section.pts_start;
     }
 
@@ -865,16 +872,16 @@ pub fn export(
     }
 
     let temporary = temporary_path(&request.output);
-    let result = run_export(
+    let result = run_export(&ExportJob {
         request,
-        &temporary,
+        temporary: &temporary,
         frames,
-        &plan,
-        &source_video,
-        encoder_name.as_deref(),
+        plan: &plan,
+        source_video: &source_video,
+        encoder_name: encoder_name.as_deref(),
         cancel,
         progress,
-    );
+    });
     let audio_tracks = match result {
         Ok(count) => count,
         Err(error) => {

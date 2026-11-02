@@ -258,6 +258,31 @@ pub fn hevc_mkv() -> PathBuf {
     })
 }
 
+/// A flat colour encoded and labelled with the HD colour standard.
+pub fn bt709_color_clip() -> PathBuf {
+    cached("bt709.mp4", |path| {
+        run_ffmpeg(
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=0x3080C0:s=320x180:r=30:d=1,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p",
+                "-c:v",
+                "libopenh264",
+                "-b:v",
+                "2M",
+                "-colorspace",
+                "bt709",
+                "-color_primaries",
+                "bt709",
+                "-color_trc",
+                "bt709",
+            ],
+            path,
+        );
+    })
+}
+
 /// A hardware-encoded clip with B-frames, which is how OBS commonly records.
 pub fn nvenc_clip(encoder: &str, extension: &str) -> PathBuf {
     cached(&format!("nvenc-{encoder}.{extension}"), |path| {
