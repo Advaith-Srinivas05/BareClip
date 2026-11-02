@@ -1,0 +1,19 @@
+# Rust build output
+/target/
+
+# Installer output
+/dist/
+*.msi
+
+# Test footage and generated media
+/samples/
+
+# Documentation
+*.md
+!README.md
+design/
+
+# Editor and OS files
+.vscode/
+Thumbs.db
+Desktop.ini
