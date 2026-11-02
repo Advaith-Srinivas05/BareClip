@@ -50,6 +50,47 @@ pub struct MediaInfo {
     pub audio: Vec<AudioInfo>,
 }
 
+/// Why two videos cannot be joined by copying, in words for the user. They must share
+/// a picture format and matching audio tracks, or a player could not read the result.
+pub fn join_problem(first: &MediaInfo, other: &MediaInfo) -> Option<String> {
+    let name = |info: &MediaInfo| {
+        info.path.file_name().map_or_else(
+            || "A video".to_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        )
+    };
+    let reason = if first.video.codec != other.video.codec {
+        format!(
+            "uses {} video instead of {}",
+            other.video.codec, first.video.codec
+        )
+    } else if (first.video.width, first.video.height) != (other.video.width, other.video.height) {
+        format!(
+            "is {} x {} instead of {} x {}",
+            other.video.width, other.video.height, first.video.width, first.video.height
+        )
+    } else if first.video.pixel_format != other.video.pixel_format {
+        "uses a different colour format".to_owned()
+    } else if first.audio.len() != other.audio.len() {
+        format!(
+            "has {} audio tracks instead of {}",
+            other.audio.len(),
+            first.audio.len()
+        )
+    } else if first.audio.iter().zip(&other.audio).any(|(a, b)| {
+        a.codec != b.codec || a.channels != b.channels || a.sample_rate != b.sample_rate
+    }) {
+        "has audio in a different format".to_owned()
+    } else {
+        return None;
+    };
+    Some(format!(
+        "{} {reason}, so it can't be exported together with {} yet.",
+        name(other),
+        name(first)
+    ))
+}
+
 pub(crate) fn to_time_base(rational: Rational) -> TimeBase {
     TimeBase {
         num: rational.numerator(),
@@ -223,6 +264,74 @@ mod tests {
             duration,
             keyframe: false,
         }
+    }
+
+    fn info(name: &str) -> MediaInfo {
+        MediaInfo {
+            path: PathBuf::from(name),
+            container: "matroska,webm".to_owned(),
+            size_bytes: 1,
+            duration: Ticks(1),
+            video: VideoInfo {
+                stream_index: 0,
+                codec: "h264".to_owned(),
+                width: 2560,
+                height: 1440,
+                pixel_format: "YUV420P".to_owned(),
+                time_base: TimeBase { num: 1, den: 1000 },
+                frame_rate: 60.0,
+                is_hdr: false,
+            },
+            audio: vec![AudioInfo {
+                stream_index: 1,
+                codec: "aac".to_owned(),
+                channels: 2,
+                sample_rate: 48_000,
+                title: None,
+                language: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn videos_in_the_same_format_can_join() {
+        let mut other = info("b.mkv");
+        other.video.frame_rate = 30.0;
+        other.video.time_base = TimeBase {
+            num: 1,
+            den: 90_000,
+        };
+
+        assert_eq!(join_problem(&info("a.mkv"), &other), None);
+    }
+
+    #[test]
+    fn differences_that_break_a_join_are_explained() {
+        let first = info("a.mkv");
+        let check = |change: fn(&mut MediaInfo), wanted: &str| {
+            let mut other = info("b.mkv");
+            change(&mut other);
+            let problem = join_problem(&first, &other).expect("these cannot join");
+            assert!(problem.starts_with("b.mkv"), "{problem}");
+            assert!(problem.contains(wanted), "{problem}");
+        };
+
+        check(|o| o.video.codec = "hevc".to_owned(), "hevc");
+        check(|o| o.video.width = 1920, "1920 x 1440");
+        check(
+            |o| o.video.pixel_format = "YUV420P10LE".to_owned(),
+            "colour format",
+        );
+        check(|o| o.audio.clear(), "0 audio tracks");
+        check(
+            |o| o.audio[0].sample_rate = 44_100,
+            "audio in a different format",
+        );
+        check(
+            |o| o.audio[0].codec = "opus".to_owned(),
+            "audio in a different format",
+        );
+        check(|o| o.audio[0].channels = 1, "audio in a different format");
     }
 
     #[test]

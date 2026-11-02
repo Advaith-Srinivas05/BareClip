@@ -3,16 +3,18 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::atomic::AtomicBool,
+    sync::{Arc, atomic::AtomicBool},
     time::Instant,
 };
 
 use bareclip_core::{
-    cut::TimeRange,
     splice::{CutMode, FrameIndex},
     time::Ticks,
+    timeline::TimeRange,
 };
-use bareclip_media::{DecodeStep, ExportRequest, VideoPreview, export, probe, scan_frames};
+use bareclip_media::{
+    DecodeStep, ExportPart, ExportRequest, VideoPreview, export, probe, scan_frames,
+};
 
 fn range(start: f64, end: f64) -> TimeRange {
     TimeRange {
@@ -23,7 +25,7 @@ fn range(start: f64, end: f64) -> TimeRange {
 
 fn run_export(
     input: &Path,
-    frames: &FrameIndex,
+    frames: &Arc<FrameIndex>,
     label: &str,
     ranges: Vec<TimeRange>,
     mode: CutMode,
@@ -37,13 +39,19 @@ fn run_export(
     ));
     let _ = std::fs::remove_file(&output);
     let request = ExportRequest {
-        input: input.to_owned(),
         output: output.clone(),
-        ranges,
+        parts: ranges
+            .into_iter()
+            .map(|range| ExportPart {
+                input: input.to_owned(),
+                frames: frames.clone(),
+                range,
+                gap_before: Ticks(0),
+            })
+            .collect(),
         mode,
     };
-    let report =
-        export(&request, frames, &AtomicBool::new(false), &|_| {}).expect("the export works");
+    let report = export(&request, &AtomicBool::new(false), &|_| {}).expect("the export works");
     let size = std::fs::metadata(&output).map_or(0, |meta| meta.len());
     println!(
         "export {label:<22} {:>7.2} s  copied {:>6}  encoded {:>5}  encoder {:<12} {:>7.1} MB  {}",
@@ -83,8 +91,9 @@ fn main() {
     );
 
     let started = Instant::now();
-    let frames =
-        scan_frames(&input, &AtomicBool::new(false), |_| {}).expect("the frames can be listed");
+    let frames = Arc::new(
+        scan_frames(&input, &AtomicBool::new(false), |_| {}).expect("the frames can be listed"),
+    );
     println!(
         "reading the frame table                {:>6.2} s  ({} frames, {} clean points)",
         started.elapsed().as_secs_f64(),

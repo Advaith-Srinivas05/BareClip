@@ -3,6 +3,7 @@
 mod editor;
 mod fonts;
 mod player;
+mod preview;
 mod text;
 mod theme;
 mod timeline;
@@ -14,12 +15,12 @@ use eframe::egui;
 const WINDOW_ICON: &[u8] = include_bytes!("../../../assets/brand/png/app-icon-64.png");
 
 fn main() -> eframe::Result {
-    let opened_with = std::env::args_os().nth(1).map(PathBuf::from);
+    let opened_with: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("BareClip")
         .with_inner_size([1280.0, 800.0])
-        .with_min_inner_size([800.0, 520.0])
+        .with_min_inner_size([960.0, 600.0])
         .with_drag_and_drop(true);
     if let Ok(icon) = eframe::icon_data::from_png_bytes(WINDOW_ICON) {
         viewport = viewport.with_icon(icon);
@@ -37,9 +38,9 @@ fn main() -> eframe::Result {
         Box::new(move |creation_context| {
             fonts::install(&creation_context.egui_ctx);
             theme::install(&creation_context.egui_ctx);
-            let mut editor = editor::Editor::new(true);
-            if let Some(path) = &opened_with {
-                editor.open(&creation_context.egui_ctx, path);
+            let mut editor = editor::Editor::new(&creation_context.egui_ctx, true);
+            if !opened_with.is_empty() {
+                editor.import(&creation_context.egui_ctx, &opened_with);
             }
             Ok(Box::new(BareClipApp { editor }))
         }),

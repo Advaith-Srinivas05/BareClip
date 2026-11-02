@@ -10,15 +10,15 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use bareclip_core::{
-    cut::TimeRange,
     splice::{CutMode, FrameIndex},
     time::{TICKS_PER_SECOND, Ticks},
+    timeline::TimeRange,
 };
-use bareclip_media::{ExportReport, ExportRequest, export, scan_frames};
+use bareclip_media::{ExportPart, ExportReport, ExportRequest, export, scan_frames};
 use ffmpeg_next as ffmpeg;
 use ffmpeg_next::{decoder, format, frame, media::Type};
 
@@ -258,6 +258,67 @@ pub fn hevc_mkv() -> PathBuf {
     })
 }
 
+/// Another clip in the same format as `h264_mp4`, with frame numbers from 1000, so
+/// a test can tell which source each frame in a joined export came from.
+pub fn second_h264_mp4() -> PathBuf {
+    cached("h264-second.mp4", |path| {
+        let video = format!(
+            "nullsrc=s={WIDTH}x{HEIGHT}:r={FPS}:d=6,\
+             geq=lum='255*mod(floor((N+1000)/pow(2,floor(X/20))),2)':cb=128:cr=128,format=yuv420p"
+        );
+        run_ffmpeg(
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                &video,
+                "-f",
+                "lavfi",
+                "-i",
+                &beep_source(6),
+                "-c:v",
+                "libopenh264",
+                "-b:v",
+                "4M",
+                "-g",
+                "30",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+            ],
+            path,
+        );
+    })
+}
+
+/// The same pictures at a different size, which cannot be joined by copying.
+pub fn different_size_mp4() -> PathBuf {
+    cached("h264-small.mp4", |path| {
+        run_ffmpeg(
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=160x90:r=30:d=2,format=yuv420p",
+                "-f",
+                "lavfi",
+                "-i",
+                &beep_source(2),
+                "-c:v",
+                "libopenh264",
+                "-b:v",
+                "1M",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+            ],
+            path,
+        );
+    })
+}
+
 /// A flat colour encoded and labelled with the HD colour standard.
 pub fn bt709_color_clip() -> PathBuf {
     cached("bt709.mp4", |path| {
@@ -352,21 +413,35 @@ pub fn range(start: f64, end: f64) -> TimeRange {
     }
 }
 
+pub fn parts_of(input: &Path, ranges: Vec<TimeRange>) -> Vec<ExportPart> {
+    let frames = Arc::new(index_of(input));
+    ranges
+        .into_iter()
+        .map(|range| ExportPart {
+            input: input.to_owned(),
+            frames: frames.clone(),
+            range,
+            gap_before: Ticks(0),
+        })
+        .collect()
+}
+
 pub fn run_export(
     input: &Path,
     output: &Path,
     ranges: Vec<TimeRange>,
     mode: CutMode,
 ) -> ExportReport {
-    let frames = index_of(input);
+    run_parts(output, parts_of(input, ranges), mode)
+}
+
+pub fn run_parts(output: &Path, parts: Vec<ExportPart>, mode: CutMode) -> ExportReport {
     export(
         &ExportRequest {
-            input: input.to_owned(),
             output: output.to_owned(),
-            ranges,
+            parts,
             mode,
         },
-        &frames,
         &std::sync::atomic::AtomicBool::new(false),
         &|_| {},
     )

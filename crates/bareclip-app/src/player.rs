@@ -386,6 +386,7 @@ pub struct Player {
     start_requested: Instant,
     silent_clock_start: Option<Instant>,
     error: Option<String>,
+    wanted_sound: bool,
 }
 
 impl Player {
@@ -400,7 +401,8 @@ impl Player {
             .spawn(move || video_worker(&worker_path, &command_receiver, &event_sender, &notify))
             .map_err(|error| format!("The video decoder could not start: {error}"))?;
 
-        let audio = if use_sound && !info.audio.is_empty() {
+        let wanted_sound = use_sound && !info.audio.is_empty();
+        let audio = if wanted_sound {
             connect_audio(path)
         } else {
             None
@@ -422,6 +424,7 @@ impl Player {
             start_requested: Instant::now(),
             silent_clock_start: None,
             error: None,
+            wanted_sound,
         })
     }
 
@@ -434,8 +437,9 @@ impl Player {
         self.audio.is_some()
     }
 
-    pub fn duration(&self) -> Ticks {
-        self.duration
+    /// Whether this video has sound that should be playing, were it possible.
+    pub fn expects_sound(&self) -> bool {
+        self.wanted_sound
     }
 
     /// The most recent problem, once. Playback continues as far as it can.
@@ -515,14 +519,6 @@ impl Player {
         let _ = self.commands.send(VideoCommand::Pause);
         if let Some(audio) = &self.audio {
             audio.state.set_paused(true);
-        }
-    }
-
-    pub fn toggle(&mut self) {
-        if self.is_playing() {
-            self.pause();
-        } else {
-            self.play();
         }
     }
 
@@ -738,7 +734,7 @@ mod tests {
             (0.8..2.5).contains(&took),
             "one second of video took {took}s"
         );
-        assert_eq!(player.position(), player.duration());
+        assert_eq!(player.position(), player.duration);
     }
 
     #[test]
@@ -765,7 +761,8 @@ mod tests {
     #[test]
     fn playing_again_from_the_end_starts_over() {
         let mut player = silent_player();
-        player.seek(player.duration());
+        let duration = player.duration;
+        player.seek(duration);
 
         player.play();
 
@@ -777,7 +774,7 @@ mod tests {
         let mut player = silent_player();
 
         player.seek(Ticks::from_seconds(99.0));
-        assert_eq!(player.position(), player.duration());
+        assert_eq!(player.position(), player.duration);
 
         player.seek(Ticks::from_seconds(-5.0));
         assert_eq!(player.position(), Ticks(0));

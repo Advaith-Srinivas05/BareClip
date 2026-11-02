@@ -92,18 +92,33 @@ pub fn audio_track_summary(position: usize, track: &AudioInfo) -> String {
     format!("{name}: {}, {channels}", codec_name(&track.codec))
 }
 
+/// A clip's length while it is being adjusted, precise enough to see each change.
+pub fn clip_length(time: Ticks) -> String {
+    if time.as_seconds() < 60.0 {
+        format!("{:.2} s", time.as_seconds().max(0.0))
+    } else {
+        short_duration(time)
+    }
+}
+
 /// What an export is about to do, in terms of what matters to the user.
 pub fn plan_summary(copied: usize, encoded: usize) -> String {
     if encoded == 0 {
         format!("All {copied} frames are copied untouched, so this will be very quick.")
     } else if copied == 0 {
-        format!(
-            "All {encoded} frames are re-encoded, because this section sits between two keyframes."
-        )
+        format!("All {encoded} frames are re-encoded, because they sit between two keyframes.")
     } else {
         format!(
             "{copied} frames are copied untouched and {encoded} around the cuts are re-encoded."
         )
+    }
+}
+
+/// The warning shown before a video and its clips leave the project.
+pub fn remove_warning(name: &str, clips: usize) -> String {
+    match clips {
+        1 => format!("{name} has 1 clip on the timeline, which will be removed too."),
+        count => format!("{name} has {count} clips on the timeline, which will be removed too."),
     }
 }
 
@@ -131,6 +146,12 @@ pub fn export_summary(report: &ExportReport) -> Vec<String> {
         ),
         _ => format!("All {} frames copied untouched.", report.copied_frames),
     });
+    if report.black_frames > 0 {
+        lines.push(format!(
+            "Dead space written as {} black frames.",
+            report.black_frames
+        ));
+    }
     if report.mode_requested == CutMode::FrameExact && report.mode_used == CutMode::Keyframe {
         lines.push(
             "Frame-exact cuts are not available for this video, so the cuts moved outward to \
@@ -152,11 +173,35 @@ mod tests {
             mode_used: CutMode::FrameExact,
             sections: 1,
             copied_frames: 100,
+            black_frames: 0,
             encoded_frames: 20,
             encoder: Some("h264_nvenc".to_owned()),
             audio_tracks: 1,
             elapsed: Duration::from_millis(2500),
         }
+    }
+
+    #[test]
+    fn clip_lengths_stay_precise_until_they_get_long() {
+        assert_eq!(clip_length(Ticks::from_seconds(5.9)), "5.90 s");
+        assert_eq!(clip_length(Ticks::from_seconds(84.0)), "1 min 24 s");
+    }
+
+    #[test]
+    fn dead_space_is_mentioned_after_an_export_that_had_some() {
+        let mut with_gap = report();
+        with_gap.black_frames = 30;
+
+        assert!(
+            export_summary(&with_gap)
+                .iter()
+                .any(|line| line.contains("30 black frames"))
+        );
+        assert!(
+            !export_summary(&report())
+                .iter()
+                .any(|line| line.contains("black"))
+        );
     }
 
     #[test]
@@ -224,6 +269,12 @@ mod tests {
         assert!(plan_summary(100, 0).contains("All 100 frames are copied"));
         assert!(plan_summary(0, 12).contains("All 12 frames are re-encoded"));
         assert!(plan_summary(100, 12).contains("100 frames are copied"));
+    }
+
+    #[test]
+    fn the_remove_warning_counts_the_clips() {
+        assert!(remove_warning("a.mp4", 1).contains("1 clip on"));
+        assert!(remove_warning("a.mp4", 3).contains("3 clips on"));
     }
 
     #[test]

@@ -7,11 +7,11 @@ mod preview;
 mod probe;
 
 pub use error::MediaError;
-pub use export::{ExportReport, ExportRequest, export, plan_export};
+pub use export::{ExportPart, ExportReport, ExportRequest, can_write_gaps, export, plan_export};
 pub use preview::{
     AudioChunk, AudioPreview, AudioStep, DecodeStep, PreviewFrame, VideoPreview, fit_preview_size,
 };
-pub use probe::{AudioInfo, MediaInfo, VideoInfo, probe, scan_frames};
+pub use probe::{AudioInfo, MediaInfo, VideoInfo, join_problem, probe, scan_frames};
 
 use ffmpeg_next as ffmpeg;
 
