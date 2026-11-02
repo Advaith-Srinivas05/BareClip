@@ -1,6 +1,9 @@
 # Rust build output
 /target/
 
+# Downloaded FFmpeg build
+/vendor/
+
 # Installer output
 /dist/
 *.msi

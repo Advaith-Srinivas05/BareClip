@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["crates/bareclip-app", "crates/bareclip-core", "crates/bareclip-media"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+bareclip-core = { path = "crates/bareclip-core" }
+bareclip-media = { path = "crates/bareclip-media" }
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "default_fonts", "wgpu"] }
+ffmpeg-next = "9.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

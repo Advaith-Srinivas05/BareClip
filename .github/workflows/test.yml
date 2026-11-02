@@ -1,0 +1,52 @@
+name: Tests
+
+on:
+  push:
+    branches: [dev, release-candidate, release]
+  pull_request:
+    branches: [release-candidate, release]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache FFmpeg
+        uses: actions/cache@v6
+        with:
+          path: vendor/ffmpeg
+          key: ffmpeg-${{ hashFiles('scripts/setup-ffmpeg.ps1') }}
+
+      - name: Cache Rust build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-
+
+      - name: Set up FFmpeg
+        shell: pwsh
+        run: |
+          ./scripts/setup-ffmpeg.ps1
+          "$PWD\vendor\ffmpeg\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run lints
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --locked
