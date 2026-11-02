@@ -31,6 +31,32 @@ impl Ticks {
     }
 }
 
+impl Ticks {
+    pub fn from_seconds(seconds: f64) -> Self {
+        Self((seconds * TICKS_PER_SECOND as f64).round() as i64)
+    }
+
+    pub fn as_seconds(self) -> f64 {
+        self.0 as f64 / TICKS_PER_SECOND as f64
+    }
+}
+
+/// Shows a time as hours, minutes, seconds and hundredths, such as `00:01:24.18`.
+/// Rounds down, so a time never displays as later than it is.
+pub fn format_timecode(time: Ticks) -> String {
+    let negative = time.0 < 0;
+    let hundredths = i128::from(time.0).abs() * 100 / i128::from(TICKS_PER_SECOND);
+    let seconds = hundredths / 100;
+    format!(
+        "{}{:02}:{:02}:{:02}.{:02}",
+        if negative { "-" } else { "" },
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60,
+        hundredths % 100
+    )
+}
+
 fn round_div(numerator: i128, denominator: i128) -> i128 {
     let half = denominator / 2;
     if numerator >= 0 {
@@ -52,6 +78,29 @@ mod tests {
 
     fn frame_rate(num: i32, den: i32) -> TimeBase {
         TimeBase { num: den, den: num }
+    }
+
+    #[test]
+    fn timecodes_show_each_unit() {
+        assert_eq!(format_timecode(Ticks(0)), "00:00:00.00");
+        assert_eq!(format_timecode(Ticks::from_seconds(84.18)), "00:01:24.18");
+        assert_eq!(format_timecode(Ticks::from_seconds(3723.5)), "01:02:03.50");
+    }
+
+    #[test]
+    fn timecodes_round_down() {
+        assert_eq!(format_timecode(Ticks(TICKS_PER_SECOND - 1)), "00:00:00.99");
+    }
+
+    #[test]
+    fn timecodes_can_be_negative() {
+        assert_eq!(format_timecode(Ticks::from_seconds(-1.5)), "-00:00:01.50");
+    }
+
+    #[test]
+    fn seconds_convert_both_ways() {
+        assert_eq!(Ticks::from_seconds(1.0), Ticks(TICKS_PER_SECOND));
+        assert!((Ticks(TICKS_PER_SECOND / 2).as_seconds() - 0.5).abs() < 1e-9);
     }
 
     #[test]

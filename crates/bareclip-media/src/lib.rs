@@ -3,10 +3,14 @@
 mod error;
 mod export;
 mod nal;
+mod preview;
 mod probe;
 
 pub use error::MediaError;
 pub use export::{ExportReport, ExportRequest, export};
+pub use preview::{
+    AudioChunk, AudioPreview, AudioStep, DecodeStep, PreviewFrame, VideoPreview, fit_preview_size,
+};
 pub use probe::{AudioInfo, MediaInfo, VideoInfo, probe, scan_frames};
 
 use ffmpeg_next as ffmpeg;
