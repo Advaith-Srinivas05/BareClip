@@ -1,0 +1,9 @@
+[package]
+name = "bareclip-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ffmpeg-next.workspace = true
