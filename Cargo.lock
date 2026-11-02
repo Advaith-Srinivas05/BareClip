@@ -396,6 +396,7 @@ version = "0.1.0"
 name = "bareclip-media"
 version = "0.1.0"
 dependencies = [
+ "bareclip-core",
  "ffmpeg-next",
 ]
 

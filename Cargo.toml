@@ -12,7 +12,7 @@ publish = false
 bareclip-core = { path = "crates/bareclip-core" }
 bareclip-media = { path = "crates/bareclip-media" }
 eframe = { version = "0.37", default-features = false, features = ["accesskit", "default_fonts", "wgpu"] }
-ffmpeg-next = "9.0"
+ffmpeg-next = { version = "9.0", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling"] }
 
 [profile.release]
 lto = "thin"
