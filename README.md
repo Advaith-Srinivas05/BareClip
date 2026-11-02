@@ -1,4 +1,7 @@
-# BareClip
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/brand/svg/lockup-horizontal-dark.svg">
+  <img src="assets/brand/svg/lockup-horizontal-light.svg" alt="BareClip" width="420">
+</picture>
 
 A fast, offline video editor for Windows, written in Rust.
 
