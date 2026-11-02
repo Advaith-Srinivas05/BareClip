@@ -1,6 +1,9 @@
 # Rust build output
 /target/
 
+# Python cache
+__pycache__/
+
 # Downloaded FFmpeg build
 /vendor/
 

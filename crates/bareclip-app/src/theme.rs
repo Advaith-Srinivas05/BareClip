@@ -1,0 +1,375 @@
+//! BareClip's light and dark themes. Colours match `assets/brand/tokens.json`.
+
+use eframe::egui::{self, Color32, CornerRadius, Stroke, Theme, ThemePreference, Visuals};
+
+// The timeline will use the clip, playhead and status colours.
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct Palette {
+    pub bg_app: Color32,
+    pub surface: Color32,
+    pub raised: Color32,
+    pub border: Color32,
+    pub border_strong: Color32,
+    pub text: Color32,
+    pub text_muted: Color32,
+    pub accent: Color32,
+    pub accent_hover: Color32,
+    pub accent_text: Color32,
+    pub selection: Color32,
+    pub selection_text: Color32,
+    pub playhead: Color32,
+    pub playhead_outline: Color32,
+    pub stage: Color32,
+    pub clip_video: Color32,
+    pub clip_video_text: Color32,
+    pub clip_audio: Color32,
+    pub clip_audio_text: Color32,
+    pub clip_overlay: Color32,
+    pub clip_overlay_text: Color32,
+    pub danger: Color32,
+    pub success: Color32,
+}
+
+const fn hex(value: u32) -> Color32 {
+    Color32::from_rgb((value >> 16) as u8, (value >> 8) as u8, value as u8)
+}
+
+pub const DARK: Palette = Palette {
+    bg_app: hex(0x111111),
+    surface: hex(0x1A1918),
+    raised: hex(0x262422),
+    border: hex(0x403E3E),
+    border_strong: hex(0x77726C),
+    text: hex(0xF1EEE9),
+    text_muted: hex(0xABA69F),
+    accent: hex(0xC9A06A),
+    accent_hover: hex(0xD9B98C),
+    accent_text: hex(0x111111),
+    selection: hex(0x806448),
+    selection_text: hex(0xFFFFFF),
+    playhead: hex(0xC9A06A),
+    playhead_outline: hex(0x111111),
+    stage: hex(0x000000),
+    clip_video: hex(0x806448),
+    clip_video_text: hex(0xFFFFFF),
+    clip_audio: hex(0x68635E),
+    clip_audio_text: hex(0xFFFFFF),
+    clip_overlay: hex(0xC9A06A),
+    clip_overlay_text: hex(0x111111),
+    danger: hex(0xE8836F),
+    success: hex(0x9CBF7F),
+};
+
+pub const LIGHT: Palette = Palette {
+    bg_app: hex(0xECEAE6),
+    surface: hex(0xF3F2EF),
+    raised: hex(0xFFFFFF),
+    border: hex(0xCFCBC4),
+    border_strong: hex(0x857F76),
+    text: hex(0x1A1918),
+    text_muted: hex(0x57534E),
+    accent: hex(0x806448),
+    accent_hover: hex(0x664E37),
+    accent_text: hex(0xFFFFFF),
+    selection: hex(0xC9A06A),
+    selection_text: hex(0x111111),
+    playhead: hex(0xC9A06A),
+    playhead_outline: hex(0x111111),
+    stage: hex(0x111111),
+    clip_video: hex(0x806448),
+    clip_video_text: hex(0xFFFFFF),
+    clip_audio: hex(0x403E3E),
+    clip_audio_text: hex(0xFFFFFF),
+    clip_overlay: hex(0xA07F55),
+    clip_overlay_text: hex(0x111111),
+    danger: hex(0xA93B2A),
+    success: hex(0x47702F),
+};
+
+const THEME_CHOICES: [(ThemePreference, &str); 3] = [
+    (ThemePreference::System, "System"),
+    (ThemePreference::Light, "Light"),
+    (ThemePreference::Dark, "Dark"),
+];
+
+/// Registers both themes. The app follows the Windows setting until the user picks one.
+pub fn install(ctx: &egui::Context) {
+    ctx.set_visuals_of(Theme::Dark, visuals(&DARK, Theme::Dark));
+    ctx.set_visuals_of(Theme::Light, visuals(&LIGHT, Theme::Light));
+}
+
+/// Shows the theme choices and returns where each button was placed.
+pub fn theme_picker(ui: &mut egui::Ui) -> Vec<(ThemePreference, egui::Rect)> {
+    let current = ui.ctx().options(|options| options.theme_preference);
+    ui.horizontal(|ui| {
+        THEME_CHOICES
+            .iter()
+            .map(|&(choice, label)| {
+                let response = ui.selectable_label(current == choice, label);
+                if response.clicked() {
+                    ui.ctx().set_theme(choice);
+                }
+                (choice, response.rect)
+            })
+            .collect()
+    })
+    .inner
+}
+
+fn visuals(palette: &Palette, theme: Theme) -> Visuals {
+    let mut visuals = match theme {
+        Theme::Dark => Visuals::dark(),
+        Theme::Light => Visuals::light(),
+    };
+
+    visuals.panel_fill = palette.surface;
+    visuals.window_fill = palette.raised;
+    visuals.window_stroke = Stroke::new(1.0, palette.border);
+    visuals.extreme_bg_color = palette.bg_app;
+    visuals.faint_bg_color = palette.raised;
+    visuals.code_bg_color = palette.raised;
+    visuals.hyperlink_color = palette.accent;
+    visuals.warn_fg_color = palette.accent;
+    visuals.error_fg_color = palette.danger;
+    visuals.selection.bg_fill = palette.selection;
+    visuals.selection.stroke = Stroke::new(1.0, palette.selection_text);
+
+    let corner_radius = CornerRadius::same(5);
+    let widgets = &mut visuals.widgets;
+
+    widgets.noninteractive.bg_fill = palette.surface;
+    widgets.noninteractive.weak_bg_fill = palette.surface;
+    widgets.noninteractive.bg_stroke = Stroke::new(1.0, palette.border);
+    widgets.noninteractive.fg_stroke = Stroke::new(1.0, palette.text);
+
+    for state in [&mut widgets.inactive, &mut widgets.open] {
+        state.bg_fill = palette.raised;
+        state.weak_bg_fill = palette.raised;
+        state.bg_stroke = Stroke::new(1.0, palette.border_strong);
+        state.fg_stroke = Stroke::new(1.0, palette.text);
+        state.corner_radius = corner_radius;
+    }
+
+    widgets.hovered.bg_fill = palette.raised;
+    widgets.hovered.weak_bg_fill = palette.raised;
+    widgets.hovered.bg_stroke = Stroke::new(1.0, palette.accent);
+    widgets.hovered.fg_stroke = Stroke::new(1.0, palette.text);
+    widgets.hovered.corner_radius = corner_radius;
+
+    widgets.active.bg_fill = palette.accent;
+    widgets.active.weak_bg_fill = palette.accent;
+    widgets.active.bg_stroke = Stroke::new(1.0, palette.accent_hover);
+    widgets.active.fg_stroke = Stroke::new(1.0, palette.accent_text);
+    widgets.active.corner_radius = corner_radius;
+
+    visuals
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TOKENS: &str = include_str!("../../../assets/brand/tokens.json");
+    const TEXT_MINIMUM: f64 = 4.5;
+    const SHAPE_MINIMUM: f64 = 3.0;
+
+    fn themes() -> [(&'static str, Palette); 2] {
+        [("dark", DARK), ("light", LIGHT)]
+    }
+
+    fn roles(palette: &Palette) -> Vec<(&'static str, Color32)> {
+        vec![
+            ("bg_app", palette.bg_app),
+            ("surface", palette.surface),
+            ("raised", palette.raised),
+            ("border", palette.border),
+            ("border_strong", palette.border_strong),
+            ("text", palette.text),
+            ("text_muted", palette.text_muted),
+            ("accent", palette.accent),
+            ("accent_hover", palette.accent_hover),
+            ("accent_text", palette.accent_text),
+            ("selection", palette.selection),
+            ("selection_text", palette.selection_text),
+            ("playhead", palette.playhead),
+            ("playhead_outline", palette.playhead_outline),
+            ("stage", palette.stage),
+            ("clip_video", palette.clip_video),
+            ("clip_video_text", palette.clip_video_text),
+            ("clip_audio", palette.clip_audio),
+            ("clip_audio_text", palette.clip_audio_text),
+            ("clip_overlay", palette.clip_overlay),
+            ("clip_overlay_text", palette.clip_overlay_text),
+            ("danger", palette.danger),
+            ("success", palette.success),
+        ]
+    }
+
+    fn token_section(name: &str) -> &'static str {
+        let start = TOKENS
+            .find(&format!("\"{name}\": {{"))
+            .expect("section exists");
+        let length = TOKENS[start..].find('}').expect("section ends");
+        &TOKENS[start..start + length]
+    }
+
+    fn hex_string(color: Color32) -> String {
+        format!("#{:02X}{:02X}{:02X}", color.r(), color.g(), color.b())
+    }
+
+    fn luminance(color: Color32) -> f64 {
+        let channel = |value: u8| {
+            let value = f64::from(value) / 255.0;
+            if value <= 0.03928 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
+    }
+
+    fn contrast(a: Color32, b: Color32) -> f64 {
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn contrast_matches_known_values() {
+        assert!((contrast(Color32::BLACK, Color32::WHITE) - 21.0).abs() < 0.001);
+        assert!((contrast(hex(0xC9A06A), hex(0x111111)) - 7.84).abs() < 0.01);
+    }
+
+    #[test]
+    fn palettes_match_the_brand_tokens() {
+        for (name, palette) in themes() {
+            let section = token_section(name);
+            for (role, color) in roles(&palette) {
+                let expected = format!("\"{role}\": \"{}\"", hex_string(color));
+                assert!(section.contains(&expected), "{name} {expected} differs");
+            }
+        }
+    }
+
+    #[test]
+    fn every_token_exists_in_the_palette() {
+        for (name, palette) in themes() {
+            let tokens = token_section(name).matches("\": \"#").count();
+            assert_eq!(tokens, roles(&palette).len(), "{name} role count differs");
+        }
+    }
+
+    #[test]
+    fn logo_colours_are_used_in_both_themes() {
+        let logo = token_section("logo");
+        for (name, palette) in themes() {
+            let colors: Vec<String> = roles(&palette)
+                .iter()
+                .map(|(_, color)| hex_string(*color))
+                .collect();
+            for logo_color in ["#111111", "#403E3E", "#806448", "#C9A06A"] {
+                assert!(logo.contains(logo_color));
+                assert!(
+                    colors.iter().any(|color| color == logo_color),
+                    "{name} does not use {logo_color}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn text_is_readable_in_both_themes() {
+        for (name, p) in themes() {
+            let pairs = [
+                ("text on app", p.text, p.bg_app),
+                ("text on panel", p.text, p.surface),
+                ("text on raised", p.text, p.raised),
+                ("muted on app", p.text_muted, p.bg_app),
+                ("muted on panel", p.text_muted, p.surface),
+                ("muted on raised", p.text_muted, p.raised),
+                ("accent on app", p.accent, p.bg_app),
+                ("accent on panel", p.accent, p.surface),
+                ("accent on raised", p.accent, p.raised),
+                ("button", p.accent_text, p.accent),
+                ("button hover", p.accent_text, p.accent_hover),
+                ("selection", p.selection_text, p.selection),
+                ("video clip", p.clip_video_text, p.clip_video),
+                ("audio clip", p.clip_audio_text, p.clip_audio),
+                ("overlay clip", p.clip_overlay_text, p.clip_overlay),
+                ("danger on panel", p.danger, p.surface),
+                ("danger on raised", p.danger, p.raised),
+                ("success on panel", p.success, p.surface),
+                ("success on raised", p.success, p.raised),
+            ];
+            for (label, foreground, background) in pairs {
+                let ratio = contrast(foreground, background);
+                assert!(ratio >= TEXT_MINIMUM, "{name} {label} is {ratio:.2}:1");
+            }
+        }
+    }
+
+    #[test]
+    fn controls_and_clips_stand_out_in_both_themes() {
+        for (name, p) in themes() {
+            let pairs = [
+                ("outline on app", p.border_strong, p.bg_app),
+                ("outline on panel", p.border_strong, p.surface),
+                ("outline on raised", p.border_strong, p.raised),
+                ("video clip", p.clip_video, p.bg_app),
+                ("audio clip", p.clip_audio, p.bg_app),
+                ("overlay clip", p.clip_overlay, p.bg_app),
+            ];
+            for (label, shape, background) in pairs {
+                let ratio = contrast(shape, background);
+                assert!(ratio >= SHAPE_MINIMUM, "{name} {label} is {ratio:.2}:1");
+            }
+        }
+    }
+
+    #[test]
+    fn playhead_stays_visible_over_everything_on_the_timeline() {
+        for (name, p) in themes() {
+            let backgrounds = [
+                ("timeline", p.bg_app),
+                ("video clip", p.clip_video),
+                ("audio clip", p.clip_audio),
+                ("overlay clip", p.clip_overlay),
+            ];
+            for (label, background) in backgrounds {
+                let ratio =
+                    contrast(p.playhead, background).max(contrast(p.playhead_outline, background));
+                assert!(
+                    ratio >= SHAPE_MINIMUM,
+                    "{name} playhead on {label} is {ratio:.2}:1"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stage_stays_dark_in_both_themes() {
+        for (name, palette) in themes() {
+            assert!(
+                luminance(palette.stage) < 0.01,
+                "{name} stage is too bright"
+            );
+        }
+    }
+
+    #[test]
+    fn themes_set_the_right_mode() {
+        assert!(visuals(&DARK, Theme::Dark).dark_mode);
+        assert!(!visuals(&LIGHT, Theme::Light).dark_mode);
+    }
+
+    #[test]
+    fn install_registers_both_themes() {
+        let ctx = egui::Context::default();
+        install(&ctx);
+
+        ctx.set_theme(Theme::Dark);
+        assert_eq!(ctx.global_style().visuals.panel_fill, DARK.surface);
+        ctx.set_theme(Theme::Light);
+        assert_eq!(ctx.global_style().visuals.panel_fill, LIGHT.surface);
+    }
+}
