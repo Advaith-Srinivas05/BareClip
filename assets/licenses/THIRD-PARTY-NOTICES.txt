@@ -26,6 +26,16 @@ The interface font. Copyright 2021 The Hanken Grotesk Project Authors, licensed
 under the SIL Open Font License version 1.1. See HankenGrotesk-OFL.txt.
 
 
+Lucide
+------
+The interface's symbols. Copyright Lucide Icons and Contributors, licensed under
+the ISC License, with some icons derived from Feather under the MIT License. See
+Lucide-ISC.txt. They reach BareClip through the shadcn-egui-icons-lucide package,
+which is under the MIT License.
+
+Project site:  https://lucide.dev
+
+
 Rust libraries
 --------------
 BareClip is built with open-source Rust libraries, including egui, eframe, wgpu,

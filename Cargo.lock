@@ -410,6 +410,8 @@ dependencies = [
  "bareclip-media",
  "eframe",
  "rfd",
+ "shadcn-egui-core",
+ "shadcn-egui-icons-lucide",
  "winresource",
 ]
 
@@ -2719,6 +2721,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7523beb55eece201a2356bee0bbca0d1ab466c14c07703b2e0ee6d42cb0c2c"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "shadcn-egui-core"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b41f98290c7acde226195be273ac83cc1cb15ba47d83ccab82c129eea1ac324"
+
+[[package]]
+name = "shadcn-egui-icons-lucide"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3df4d158cc41670acff76810f335c9708e3354ada5eb91aa6730ce0e23a9a33"
+dependencies = [
+ "shadcn-egui-core",
 ]
 
 [[package]]

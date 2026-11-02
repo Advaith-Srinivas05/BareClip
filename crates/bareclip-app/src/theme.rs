@@ -1,6 +1,11 @@
 //! BareClip's light and dark themes. Colours match `assets/brand/tokens.json`.
 
-use eframe::egui::{self, Color32, CornerRadius, Stroke, Theme, ThemePreference, Visuals};
+use eframe::egui::{self, Color32, CornerRadius, Shadow, Stroke, Theme, ThemePreference, Visuals};
+
+use crate::{
+    components::{ActionButton, Kind},
+    icons::{self, Icon},
+};
 
 // The timeline will use the clip, playhead and status colours.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -86,10 +91,10 @@ pub const LIGHT: Palette = Palette {
     success: hex(0x47702F),
 };
 
-const THEME_CHOICES: [(ThemePreference, &str); 3] = [
-    (ThemePreference::System, "System"),
-    (ThemePreference::Light, "Light"),
-    (ThemePreference::Dark, "Dark"),
+const THEME_CHOICES: [(ThemePreference, Icon, &str); 3] = [
+    (ThemePreference::System, icons::MONITOR, "System"),
+    (ThemePreference::Light, icons::SUN, "Light"),
+    (ThemePreference::Dark, icons::MOON, "Dark"),
 ];
 
 /// The colours of the theme currently showing.
@@ -106,14 +111,28 @@ pub fn install(ctx: &egui::Context) {
     ctx.set_visuals_of(Theme::Light, visuals(&LIGHT, Theme::Light));
 }
 
+/// The symbol for the theme choice in use.
+pub fn current_icon(ctx: &egui::Context) -> Icon {
+    let current = ctx.options(|options| options.theme_preference);
+    THEME_CHOICES
+        .iter()
+        .find(|(choice, ..)| *choice == current)
+        .map_or(icons::MONITOR, |&(_, icon, _)| icon)
+}
+
 /// Shows the theme choices and returns where each button was placed.
-pub fn theme_picker(ui: &mut egui::Ui) -> Vec<(ThemePreference, egui::Rect)> {
+pub fn theme_picker(ui: &mut egui::Ui, palette: &Palette) -> Vec<(ThemePreference, egui::Rect)> {
     let current = ui.ctx().options(|options| options.theme_preference);
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
         THEME_CHOICES
             .iter()
-            .map(|&(choice, label)| {
-                let response = ui.selectable_label(current == choice, label);
+            .map(|&(choice, icon, label)| {
+                let button = ActionButton::new(palette, Kind::Ghost, label)
+                    .icon(icon)
+                    .small()
+                    .selected(current == choice);
+                let response = ui.add(button);
                 if response.clicked() {
                     ui.ctx().set_theme(choice);
                 }
@@ -123,6 +142,8 @@ pub fn theme_picker(ui: &mut egui::Ui) -> Vec<(ThemePreference, egui::Rect)> {
     })
     .inner
 }
+
+const SHADOW_ALPHA: u8 = 70;
 
 fn visuals(palette: &Palette, theme: Theme) -> Visuals {
     let mut visuals = match theme {
@@ -142,7 +163,18 @@ fn visuals(palette: &Palette, theme: Theme) -> Visuals {
     visuals.selection.bg_fill = palette.selection;
     visuals.selection.stroke = Stroke::new(1.0, palette.selection_text);
 
-    let corner_radius = CornerRadius::same(5);
+    visuals.window_corner_radius = CornerRadius::same(10);
+    visuals.menu_corner_radius = CornerRadius::same(8);
+    let shadow = Shadow {
+        offset: [0, 6],
+        blur: 22,
+        spread: 0,
+        color: Color32::from_black_alpha(SHADOW_ALPHA),
+    };
+    visuals.window_shadow = shadow;
+    visuals.popup_shadow = shadow;
+
+    let corner_radius = CornerRadius::same(6);
     let widgets = &mut visuals.widgets;
 
     widgets.noninteractive.bg_fill = palette.surface;
@@ -176,7 +208,7 @@ fn visuals(palette: &Palette, theme: Theme) -> Visuals {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     const TOKENS: &str = include_str!("../../../assets/brand/tokens.json");
@@ -239,7 +271,20 @@ mod tests {
         0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
     }
 
-    fn contrast(a: Color32, b: Color32) -> f64 {
+    /// The colour seen when a see-through colour sits on a solid one.
+    pub fn over(top: Color32, bottom: Color32) -> Color32 {
+        let rest = 255 - u16::from(top.a());
+        let mix = |top: u8, bottom: u8| {
+            (u16::from(top) + (u16::from(bottom) * rest + 127) / 255).min(255) as u8
+        };
+        Color32::from_rgb(
+            mix(top.r(), bottom.r()),
+            mix(top.g(), bottom.g()),
+            mix(top.b(), bottom.b()),
+        )
+    }
+
+    pub fn contrast(a: Color32, b: Color32) -> f64 {
         let (a, b) = (luminance(a), luminance(b));
         (a.max(b) + 0.05) / (a.min(b) + 0.05)
     }
@@ -384,6 +429,32 @@ mod tests {
     fn themes_set_the_right_mode() {
         assert!(visuals(&DARK, Theme::Dark).dark_mode);
         assert!(!visuals(&LIGHT, Theme::Light).dark_mode);
+    }
+
+    #[test]
+    fn a_see_through_colour_mixes_with_what_is_under_it() {
+        assert_eq!(over(Color32::TRANSPARENT, hex(0x123456)), hex(0x123456));
+        assert_eq!(over(hex(0x123456), Color32::WHITE), hex(0x123456));
+        let half = Color32::WHITE.gamma_multiply(0.5);
+        let mixed = over(half, Color32::BLACK);
+        assert!((i16::from(mixed.r()) - i16::from(half.r())).abs() <= 1);
+    }
+
+    #[test]
+    fn the_theme_button_shows_the_current_choice() {
+        let ctx = egui::Context::default();
+        for (choice, icon, _) in THEME_CHOICES {
+            ctx.set_theme(choice);
+            assert_eq!(current_icon(&ctx).name, icon.name);
+        }
+    }
+
+    #[test]
+    fn every_theme_choice_has_its_own_symbol() {
+        let mut names: Vec<&str> = THEME_CHOICES.iter().map(|(_, icon, _)| icon.name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), THEME_CHOICES.len());
     }
 
     #[test]
