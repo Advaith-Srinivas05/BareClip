@@ -5,6 +5,7 @@ mod export;
 mod nal;
 mod preview;
 mod probe;
+mod strip;
 
 pub use error::MediaError;
 pub use export::{ExportPart, ExportReport, ExportRequest, can_write_gaps, export, plan_export};
@@ -12,6 +13,7 @@ pub use preview::{
     AudioChunk, AudioPreview, AudioStep, DecodeStep, PreviewFrame, VideoPreview, fit_preview_size,
 };
 pub use probe::{AudioInfo, MediaInfo, VideoInfo, join_problem, probe, scan_frames};
+pub use strip::{SoundShape, StripPicture, picture_spacing, read_sound_shape, read_strip_pictures};
 
 use ffmpeg_next as ffmpeg;
 

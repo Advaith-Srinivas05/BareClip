@@ -64,8 +64,52 @@ fn run_export(
     );
 }
 
+/// What it costs to read the pictures and sound shape clips show on the timeline.
+fn bench_strip(input: &std::path::Path, duration: bareclip_core::time::Ticks) {
+    let spacing = bareclip_media::picture_spacing(
+        duration,
+        bareclip_core::time::Ticks::from_seconds(2.0),
+        240,
+    );
+    let started = Instant::now();
+    let (mut count, mut bytes) = (0, 0);
+    bareclip_media::read_strip_pictures(
+        input,
+        duration,
+        spacing,
+        (128, 72),
+        &AtomicBool::new(false),
+        |picture| {
+            count += 1;
+            bytes += picture.rgba.len();
+        },
+    )
+    .expect("the pictures can be read");
+    println!(
+        "strip pictures: {count} in {:.2} s, {:.1} MB, spaced {:.1} s",
+        started.elapsed().as_secs_f64(),
+        bytes as f64 / 1_048_576.0,
+        spacing.as_seconds(),
+    );
+    let started = Instant::now();
+    let shape = bareclip_media::read_sound_shape(input, &AtomicBool::new(false), |_| {})
+        .expect("the sound can be read")
+        .expect("it was not cancelled");
+    println!(
+        "sound shape: {} peaks in {:.2} s, {:.2} MB",
+        shape.peaks.len(),
+        started.elapsed().as_secs_f64(),
+        shape.peaks.len() as f64 / 1_048_576.0,
+    );
+}
+
 fn main() {
     let input = PathBuf::from(std::env::args().nth(1).expect("pass a video file"));
+    if std::env::args().nth(2).as_deref() == Some("strip") {
+        let info = probe(&input).expect("the file can be read");
+        bench_strip(&input, info.duration);
+        return;
+    }
 
     let started = Instant::now();
     let info = probe(&input).expect("the file can be read");
