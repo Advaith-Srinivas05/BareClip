@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Installs for the current user only, so no administrator prompt is needed. -->
+<!-- Installs for one user with no administrator prompt, or for everyone with one. -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Product Id="*"
            Name="BareClip"
@@ -9,8 +9,6 @@
            UpgradeCode="6F2B7C1E-3A94-4D58-9E21-7C0D5A8B4F13">
     <Package InstallerVersion="500"
              Compressed="yes"
-             InstallScope="perUser"
-             InstallPrivileges="limited"
              Description="A fast, offline video editor for Windows." />
 
     <MajorUpgrade DowngradeErrorMessage="A newer version of BareClip is already installed." />
@@ -20,41 +18,270 @@
     <Property Id="ARPPRODUCTICON" Value="bareclip.ico" />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/Advaith-Srinivas05/BareClip" />
     <Property Id="ARPNOREPAIR" Value="1" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <!-- Windows' dual mode. It only asks for administrator permission when
+         MSIINSTALLPERUSER is cleared, which is what choosing Everyone does. -->
+    <Property Id="ALLUSERS" Value="2" />
+    <Property Id="MSIINSTALLPERUSER" Value="1" Secure="yes" />
+
+    <!-- The choices on the installer's pages. -->
+    <Property Id="INSTALLPARENT" Secure="yes" />
+    <Property Id="INSTALLFOLDER" Secure="yes" />
+    <Property Id="ADD_START_MENU" Value="1" Secure="yes" />
+    <Property Id="ADD_DESKTOP" Value="1" Secure="yes" />
+    <Property Id="INSTALL_SCOPE" Value="user" Secure="yes" />
+    <Property Id="LAST_SCOPE" Value="user" Secure="yes" />
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLPARENT" />
+
+    <!-- An upgrade keeps the earlier choices, and stays in the same place so there is only
+         ever one copy. Windows only finds an earlier copy installed the same way. -->
+    <Property Id="SAVED_PARENT_USER" Secure="yes">
+      <RegistrySearch Id="SavedParentUser" Root="HKCU" Key="Software\BareClip" Name="InstallParent" Type="raw" Win64="yes" />
+    </Property>
+    <Property Id="SAVED_PARENT_EVERYONE" Secure="yes">
+      <RegistrySearch Id="SavedParentEveryone" Root="HKLM" Key="Software\BareClip" Name="InstallParent" Type="raw" Win64="yes" />
+    </Property>
+    <Property Id="SAVED_START_MENU" Secure="yes">
+      <RegistrySearch Id="SavedStartMenuUser" Root="HKCU" Key="Software\BareClip" Name="StartMenu" Type="raw" Win64="yes" />
+    </Property>
+    <Property Id="SAVED_DESKTOP" Secure="yes">
+      <RegistrySearch Id="SavedDesktopUser" Root="HKCU" Key="Software\BareClip" Name="Desktop" Type="raw" Win64="yes" />
+    </Property>
+    <Property Id="SAVED_START_MENU_EVERYONE" Secure="yes">
+      <RegistrySearch Id="SavedStartMenuEveryone" Root="HKLM" Key="Software\BareClip" Name="StartMenu" Type="raw" Win64="yes" />
+    </Property>
+    <Property Id="SAVED_DESKTOP_EVERYONE" Secure="yes">
+      <RegistrySearch Id="SavedDesktopEveryone" Root="HKLM" Key="Software\BareClip" Name="Desktop" Type="raw" Win64="yes" />
+    </Property>
+
+    <!-- In dual mode, Windows points its own Program Files folders at the user's folder. -->
+    <SetProperty Action="FindProgramFiles" Id="REAL_PROGRAM_FILES" Value="[%ProgramW6432]\" After="AppSearch" Sequence="both">1</SetProperty>
+    <SetProperty Action="FindProgramFilesX86" Id="REAL_PROGRAM_FILES_X86" Value="[%ProgramW6432] (x86)\" After="FindProgramFiles" Sequence="both">1</SetProperty>
+    <SetProperty Action="RestoreEveryone" Id="MSIINSTALLPERUSER" Value="[NOTHING]" After="FindProgramFilesX86" Sequence="both">SAVED_PARENT_EVERYONE AND NOT Installed</SetProperty>
+    <SetProperty Action="RestoreEveryoneScope" Id="INSTALL_SCOPE" Value="everyone" After="RestoreEveryone" Sequence="both">SAVED_PARENT_EVERYONE AND NOT Installed</SetProperty>
+    <SetProperty Action="RestoreParentEveryone" Id="INSTALLPARENT" Value="[SAVED_PARENT_EVERYONE]" After="RestoreEveryoneScope" Sequence="both">SAVED_PARENT_EVERYONE AND NOT INSTALLPARENT</SetProperty>
+    <SetProperty Action="RestoreParentUser" Id="INSTALLPARENT" Value="[SAVED_PARENT_USER]" After="RestoreParentEveryone" Sequence="both">SAVED_PARENT_USER AND NOT INSTALLPARENT</SetProperty>
+    <SetProperty Action="DefaultParentEveryone" Id="INSTALLPARENT" Value="[REAL_PROGRAM_FILES]" After="RestoreParentUser" Sequence="both">NOT INSTALLPARENT AND NOT MSIINSTALLPERUSER</SetProperty>
+    <SetProperty Action="DefaultParent" Id="INSTALLPARENT" Value="[LocalAppDataFolder]Programs\" After="DefaultParentEveryone" Sequence="both">NOT INSTALLPARENT</SetProperty>
+    <!-- A nothing value clears a property, because a saved "no" still counts as ticked otherwise. -->
+    <SetProperty Action="RestoreNoStartMenu" Id="ADD_START_MENU" Value="[NOTHING]" After="DefaultParent" Sequence="both">SAVED_START_MENU = "no" OR SAVED_START_MENU_EVERYONE = "no"</SetProperty>
+    <SetProperty Action="RestoreNoDesktop" Id="ADD_DESKTOP" Value="[NOTHING]" After="RestoreNoStartMenu" Sequence="both">SAVED_DESKTOP = "no" OR SAVED_DESKTOP_EVERYONE = "no"</SetProperty>
 
     <WixVariable Id="WixUILicenseRtf" Value="$(var.InstallerDir)\license.rtf" />
     <WixVariable Id="WixUIBannerBmp" Value="$(var.BrandDir)\windows\msi-banner.bmp" />
     <WixVariable Id="WixUIDialogBmp" Value="$(var.BrandDir)\windows\msi-dialog.bmp" />
-    <UIRef Id="WixUI_Minimal" />
 
+    <UI Id="BareClipUI">
+      <TextStyle Id="WixUI_Font_Normal" FaceName="Tahoma" Size="8" />
+      <TextStyle Id="WixUI_Font_Bigger" FaceName="Tahoma" Size="12" />
+      <TextStyle Id="WixUI_Font_Title" FaceName="Tahoma" Size="9" Bold="yes" />
+      <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
+      <Property Id="WixUI_Mode" Value="InstallDir" />
+
+      <DialogRef Id="BrowseDlg" />
+      <DialogRef Id="ErrorDlg" />
+      <DialogRef Id="FatalError" />
+      <DialogRef Id="FilesInUse" />
+      <DialogRef Id="MsiRMFilesInUse" />
+      <DialogRef Id="PrepareDlg" />
+      <DialogRef Id="ProgressDlg" />
+      <DialogRef Id="ResumeDlg" />
+      <DialogRef Id="UserExit" />
+      <DialogRef Id="WelcomeDlg" />
+
+      <!-- WiX's own licence page, without its Print button. -->
+      <Dialog Id="AgreementDlg" Width="370" Height="270" Title="!(loc.WelcomeEulaDlg_Title)">
+        <Control Id="Bitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="234" TabSkip="no" Text="!(loc.WelcomeEulaDlgBitmap)" />
+        <Control Id="Title" Type="Text" X="130" Y="6" Width="225" Height="30" Transparent="yes" NoPrefix="yes" Text="!(loc.WelcomeEulaDlgTitle)" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="LicenseText" Type="ScrollableText" X="130" Y="36" Width="226" Height="162" Sunken="yes" TabSkip="no">
+          <Text SourceFile="!(wix.WixUILicenseRtf)" />
+        </Control>
+        <Control Id="LicenseAcceptedCheckBox" Type="CheckBox" X="130" Y="207" Width="226" Height="18" CheckBoxValue="1" Property="LicenseAccepted" Text="!(loc.WelcomeEulaDlgLicenseAcceptedCheckBox)" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Disabled="yes" Text="!(loc.WixUIBack)" />
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)">
+          <Condition Action="disable"><![CDATA[LicenseAccepted <> "1"]]></Condition>
+          <Condition Action="enable">LicenseAccepted = "1"</Condition>
+          <Publish Event="NewDialog" Value="ScopeDlg" Order="1"><![CDATA[NOT (SAVED_PARENT_USER OR SAVED_PARENT_EVERYONE)]]></Publish>
+          <Publish Event="NewDialog" Value="OptionsDlg" Order="2">SAVED_PARENT_USER OR SAVED_PARENT_EVERYONE</Publish>
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg">1</Publish>
+        </Control>
+      </Dialog>
+
+      <Dialog Id="ScopeDlg" Width="370" Height="270" Title="[ProductName] Setup">
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="!(loc.InstallDirDlgBannerBitmap)" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="280" Height="15" Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}Who is this for?" />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="280" Height="15" Transparent="yes" NoPrefix="yes" Text="Choose who can use [ProductName] on this PC." />
+        <Control Id="Scope" Type="RadioButtonGroup" X="20" Y="60" Width="330" Height="110" Property="INSTALL_SCOPE">
+          <RadioButtonGroup Property="INSTALL_SCOPE">
+            <RadioButton Value="user" X="0" Y="0" Width="330" Height="16" Text="Just &amp;me" />
+            <RadioButton Value="everyone" X="0" Y="56" Width="330" Height="16" Text="&amp;Everyone on this PC" />
+          </RadioButtonGroup>
+        </Control>
+        <Control Id="UserNote" Type="Text" X="33" Y="78" Width="315" Height="26" NoPrefix="yes" Text="Installs in your own user folder. No administrator permission is needed." />
+        <Control Id="EveryoneNote" Type="Text" X="33" Y="134" Width="315" Height="26" NoPrefix="yes" Text="Installs in Program Files by default. Windows will ask for administrator permission." />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)">
+          <Publish Event="NewDialog" Value="AgreementDlg">1</Publish>
+        </Control>
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)">
+          <Publish Property="MSIINSTALLPERUSER" Value="1" Order="1">INSTALL_SCOPE = "user"</Publish>
+          <Publish Property="MSIINSTALLPERUSER" Value="{}" Order="2">INSTALL_SCOPE = "everyone"</Publish>
+          <Publish Property="INSTALLPARENT" Value="[LocalAppDataFolder]Programs\" Order="3"><![CDATA[INSTALL_SCOPE = "user" AND LAST_SCOPE <> INSTALL_SCOPE]]></Publish>
+          <Publish Property="INSTALLPARENT" Value="[REAL_PROGRAM_FILES]" Order="4"><![CDATA[INSTALL_SCOPE = "everyone" AND LAST_SCOPE <> INSTALL_SCOPE]]></Publish>
+          <Publish Event="SetTargetPath" Value="INSTALLPARENT" Order="5"><![CDATA[LAST_SCOPE <> INSTALL_SCOPE]]></Publish>
+          <Publish Property="LAST_SCOPE" Value="[INSTALL_SCOPE]" Order="6">1</Publish>
+          <Publish Event="NewDialog" Value="OptionsDlg" Order="7">1</Publish>
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg">1</Publish>
+        </Control>
+      </Dialog>
+
+      <Dialog Id="OptionsDlg" Width="370" Height="270" Title="[ProductName] Setup">
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="!(loc.InstallDirDlgBannerBitmap)" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="280" Height="15" Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}Install location and shortcuts" />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="280" Height="15" Transparent="yes" NoPrefix="yes" Text="Choose where [ProductName] goes and how you open it." />
+        <Control Id="FolderLabel" Type="Text" X="20" Y="58" Width="330" Height="12" NoPrefix="yes" Text="Install in this folder. A [ProductName] folder is created inside it." />
+        <Control Id="Folder" Type="PathEdit" X="20" Y="73" Width="264" Height="18" Property="WIXUI_INSTALLDIR" Indirect="yes" />
+        <Control Id="ChangeFolder" Type="PushButton" X="290" Y="72" Width="60" Height="19" Text="&amp;Browse...">
+          <Publish Property="_BrowseProperty" Value="[WIXUI_INSTALLDIR]" Order="1">1</Publish>
+          <Publish Event="SpawnDialog" Value="BrowseDlg" Order="2">1</Publish>
+        </Control>
+        <Control Id="FinalLabel" Type="Text" X="20" Y="97" Width="330" Height="12" NoPrefix="yes" Text="[ProductName] will be installed in:" />
+        <Control Id="FinalFolder" Type="PathEdit" X="20" Y="110" Width="330" Height="18" Disabled="yes" Property="INSTALLFOLDER" />
+        <Control Id="ShortcutLabel" Type="Text" X="20" Y="140" Width="330" Height="12" NoPrefix="yes" Text="Shortcuts" />
+        <Control Id="StartMenu" Type="CheckBox" X="20" Y="156" Width="330" Height="16" CheckBoxValue="1" Property="ADD_START_MENU" Text="Add to the &amp;Start menu" />
+        <Control Id="Desktop" Type="CheckBox" X="20" Y="176" Width="330" Height="16" CheckBoxValue="1" Property="ADD_DESKTOP" Text="Add a &amp;desktop shortcut" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)">
+          <Publish Event="NewDialog" Value="ScopeDlg" Order="1"><![CDATA[NOT (SAVED_PARENT_USER OR SAVED_PARENT_EVERYONE)]]></Publish>
+          <Publish Event="NewDialog" Value="AgreementDlg" Order="2">SAVED_PARENT_USER OR SAVED_PARENT_EVERYONE</Publish>
+        </Control>
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)">
+          <Publish Event="SetTargetPath" Value="[WIXUI_INSTALLDIR]" Order="1">1</Publish>
+          <Publish Event="SpawnDialog" Value="NeedsAdminDlg" Order="2"><![CDATA[MSIINSTALLPERUSER AND (INSTALLFOLDER ~<< REAL_PROGRAM_FILES OR INSTALLFOLDER ~<< REAL_PROGRAM_FILES_X86 OR INSTALLFOLDER ~<< WindowsFolder)]]></Publish>
+          <Publish Event="NewDialog" Value="ReadyDlg" Order="3"><![CDATA[NOT MSIINSTALLPERUSER OR NOT (INSTALLFOLDER ~<< REAL_PROGRAM_FILES OR INSTALLFOLDER ~<< REAL_PROGRAM_FILES_X86 OR INSTALLFOLDER ~<< WindowsFolder)]]></Publish>
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg">1</Publish>
+        </Control>
+      </Dialog>
+
+      <Dialog Id="NeedsAdminDlg" Width="270" Height="105" Title="[ProductName] Setup">
+        <Control Id="Message" Type="Text" X="15" Y="15" Width="240" Height="50" NoPrefix="yes" Text="Only administrators can install in that folder. Choose another folder, or go back and choose Everyone on this PC." />
+        <Control Id="OK" Type="PushButton" X="107" Y="77" Width="56" Height="17" Default="yes" Cancel="yes" Text="!(loc.WixUIOK)">
+          <Publish Event="EndDialog" Value="Return">1</Publish>
+        </Control>
+      </Dialog>
+
+      <!-- WiX's own page would show the administrator shield on Install even for Just me. -->
+      <Dialog Id="ReadyDlg" Width="370" Height="270" Title="[ProductName] Setup">
+        <Control Id="InstallForEveryone" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Hidden="yes" Disabled="yes" ElevationShield="yes" Text="!(loc.VerifyReadyDlgInstall)">
+          <Condition Action="show">NOT MSIINSTALLPERUSER</Condition>
+          <Condition Action="enable">NOT MSIINSTALLPERUSER</Condition>
+          <Condition Action="default">NOT MSIINSTALLPERUSER</Condition>
+          <Publish Event="SpawnWaitDialog" Value="WaitForCostingDlg">!(wix.WixUICostingPopupOptOut) OR CostingComplete = 1</Publish>
+          <Publish Event="EndDialog" Value="Return"><![CDATA[OutOfDiskSpace <> 1]]></Publish>
+          <Publish Event="SpawnDialog" Value="OutOfDiskDlg">OutOfDiskSpace = 1</Publish>
+        </Control>
+        <Control Id="InstallForUser" Type="PushButton" X="236" Y="243" Width="56" Height="17" Hidden="yes" Disabled="yes" Text="!(loc.VerifyReadyDlgInstall)">
+          <Condition Action="show">MSIINSTALLPERUSER</Condition>
+          <Condition Action="enable">MSIINSTALLPERUSER</Condition>
+          <Condition Action="default">MSIINSTALLPERUSER</Condition>
+          <Publish Event="SpawnWaitDialog" Value="WaitForCostingDlg">!(wix.WixUICostingPopupOptOut) OR CostingComplete = 1</Publish>
+          <Publish Event="EndDialog" Value="Return"><![CDATA[OutOfDiskSpace <> 1]]></Publish>
+          <Publish Event="SpawnDialog" Value="OutOfDiskDlg">OutOfDiskSpace = 1</Publish>
+        </Control>
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)">
+          <Publish Event="NewDialog" Value="OptionsDlg">1</Publish>
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg">1</Publish>
+        </Control>
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="!(loc.InstallDirDlgBannerBitmap)" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="280" Height="15" Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}Ready to install" />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="280" Height="15" Transparent="yes" NoPrefix="yes" Text="Press Install to begin, or Back to change something." />
+        <Control Id="FolderLabel" Type="Text" X="20" Y="60" Width="330" Height="12" NoPrefix="yes" Text="[ProductName] will be installed in:" />
+        <Control Id="FinalFolder" Type="Text" X="20" Y="74" Width="330" Height="26" NoPrefix="yes" Text="[INSTALLFOLDER]" />
+        <Control Id="ForUser" Type="Text" X="20" Y="108" Width="330" Height="26" Hidden="yes" NoPrefix="yes" Text="It will be available to you only.">
+          <Condition Action="show">MSIINSTALLPERUSER</Condition>
+        </Control>
+        <Control Id="ForEveryone" Type="Text" X="20" Y="108" Width="330" Height="26" Hidden="yes" NoPrefix="yes" Text="It will be available to everyone on this PC. Windows will ask for administrator permission.">
+          <Condition Action="show">NOT MSIINSTALLPERUSER</Condition>
+        </Control>
+      </Dialog>
+
+      <InstallUISequence>
+        <Show Dialog="AgreementDlg" Before="ProgressDlg">NOT Installed</Show>
+        <Show Dialog="WelcomeDlg" Before="AgreementDlg">Installed AND PATCH</Show>
+      </InstallUISequence>
+
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="PrepareDlg">1</Publish>
+      <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999">1</Publish>
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg">1</Publish>
+      <Publish Dialog="MaintenanceWelcomeDlg" Control="Next" Event="NewDialog" Value="MaintenanceTypeDlg">1</Publish>
+      <Publish Dialog="MaintenanceTypeDlg" Control="RepairButton" Event="NewDialog" Value="VerifyReadyDlg">1</Publish>
+      <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="VerifyReadyDlg">1</Publish>
+      <Publish Dialog="MaintenanceTypeDlg" Control="Back" Event="NewDialog" Value="MaintenanceWelcomeDlg">1</Publish>
+    </UI>
+    <UIRef Id="WixUI_Common" />
+
+    <!-- The chosen folder replaces this name, so it never appears on disk. -->
     <Directory Id="TARGETDIR" Name="SourceDir">
-      <Directory Id="LocalAppDataFolder">
-        <Directory Id="ProgramsDir" Name="Programs">
-          <Directory Id="INSTALLFOLDER" Name="BareClip">
-            <Directory Id="LicensesDir" Name="licenses" />
-          </Directory>
+      <Directory Id="INSTALLPARENT" Name="ChosenFolder">
+        <Directory Id="INSTALLFOLDER" Name="BareClip">
+          <Directory Id="LicensesDir" Name="licenses" />
         </Directory>
       </Directory>
       <Directory Id="ProgramMenuFolder" />
+      <Directory Id="DesktopFolder" />
     </Directory>
 
+    <!-- HKMU is the current user's registry for one user, and the machine's for everyone. -->
     <DirectoryRef Id="INSTALLFOLDER">
       <Component Id="Application" Guid="A1D93E47-58C2-4B06-8F3A-92E16D7C0B54">
-        <RegistryValue Root="HKCU" Key="Software\BareClip" Name="Installed" Type="integer" Value="1" KeyPath="yes" />
-        <File Id="BareClipExe" Source="$(var.ExePath)" />
+        <File Id="BareClipExe" Source="$(var.ExePath)" KeyPath="yes" />
         <File Id="AvCodec" Source="$(var.FfmpegBin)\avcodec-63.dll" />
         <File Id="AvFormat" Source="$(var.FfmpegBin)\avformat-63.dll" />
         <File Id="AvUtil" Source="$(var.FfmpegBin)\avutil-61.dll" />
         <File Id="SwResample" Source="$(var.FfmpegBin)\swresample-7.dll" />
         <File Id="SwScale" Source="$(var.FfmpegBin)\swscale-10.dll" />
         <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
-        <RemoveFolder Id="RemoveProgramsDir" Directory="ProgramsDir" On="uninstall" />
+      </Component>
+      <Component Id="Choices" Guid="D7F2A614-90BE-4C3D-A1E8-5B06C94F7E21">
+        <RegistryKey Root="HKMU" Key="Software\BareClip">
+          <RegistryValue Name="InstallParent" Type="string" Value="[INSTALLPARENT]" KeyPath="yes" />
+        </RegistryKey>
+      </Component>
+      <Component Id="StartMenuChosen" Guid="1E6B8C39-74AD-42F0-9D17-C2A85E30F6B4">
+        <Condition>ADD_START_MENU</Condition>
+        <RegistryValue Root="HKMU" Key="Software\BareClip" Name="StartMenu" Type="string" Value="yes" KeyPath="yes" />
+      </Component>
+      <Component Id="StartMenuDeclined" Guid="5A0D3F72-E18C-4B96-87D4-39F1C6B2A05E">
+        <Condition>NOT ADD_START_MENU</Condition>
+        <RegistryValue Root="HKMU" Key="Software\BareClip" Name="StartMenu" Type="string" Value="no" KeyPath="yes" />
+      </Component>
+      <Component Id="DesktopChosen" Guid="B94E17C6-2F3A-4D85-A06B-81D7E5C34F92">
+        <Condition>ADD_DESKTOP</Condition>
+        <RegistryValue Root="HKMU" Key="Software\BareClip" Name="Desktop" Type="string" Value="yes" KeyPath="yes" />
+      </Component>
+      <Component Id="DesktopDeclined" Guid="62C8F0A3-D5E1-47B9-9C2F-A7346E81D05B">
+        <Condition>NOT ADD_DESKTOP</Condition>
+        <RegistryValue Root="HKMU" Key="Software\BareClip" Name="Desktop" Type="string" Value="no" KeyPath="yes" />
       </Component>
     </DirectoryRef>
 
     <DirectoryRef Id="LicensesDir">
       <Component Id="Licenses" Guid="3C7E0F92-1B64-47AD-B8D5-6E2A90F1C347">
-        <RegistryValue Root="HKCU" Key="Software\BareClip" Name="Licenses" Type="integer" Value="1" KeyPath="yes" />
-        <File Id="BareClipLicense" Name="BareClip-MIT.txt" Source="$(var.RepoDir)\LICENSE" />
+        <File Id="BareClipLicense" Name="BareClip-MIT.txt" Source="$(var.RepoDir)\LICENSE" KeyPath="yes" />
         <File Id="ThirdPartyNotices" Name="THIRD-PARTY-NOTICES.txt" Source="$(var.RepoDir)\assets\licenses\THIRD-PARTY-NOTICES.txt" />
         <File Id="FfmpegLgpl" Name="FFmpeg-LGPL-3.0.txt" Source="$(var.FfmpegDir)\LICENSE.txt" />
         <File Id="Gpl3" Name="GPL-3.0.txt" Source="$(var.RepoDir)\assets\licenses\GPL-3.0.txt" />
@@ -66,20 +293,40 @@
 
     <DirectoryRef Id="ProgramMenuFolder">
       <Component Id="StartMenuShortcut" Guid="8E41C6D0-27B9-4F13-A5E8-1D3F70B96C22">
+        <Condition>ADD_START_MENU</Condition>
         <Shortcut Id="BareClipShortcut"
                   Name="BareClip"
                   Description="Trim and edit video"
                   Target="[INSTALLFOLDER]bareclip.exe"
                   WorkingDirectory="INSTALLFOLDER"
                   Icon="bareclip.ico" />
-        <RegistryValue Root="HKCU" Key="Software\BareClip" Name="Shortcut" Type="integer" Value="1" KeyPath="yes" />
+        <RegistryValue Root="HKMU" Key="Software\BareClip" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Guid="F3A18E5D-6C27-4B04-9E73-0D82B6F1C4A9">
+        <Condition>ADD_DESKTOP</Condition>
+        <Shortcut Id="BareClipDesktopShortcut"
+                  Name="BareClip"
+                  Description="Trim and edit video"
+                  Target="[INSTALLFOLDER]bareclip.exe"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="bareclip.ico" />
+        <RegistryValue Root="HKMU" Key="Software\BareClip" Name="DesktopShortcut" Type="integer" Value="1" KeyPath="yes" />
       </Component>
     </DirectoryRef>
 
     <Feature Id="Complete" Title="BareClip" Level="1">
       <ComponentRef Id="Application" />
+      <ComponentRef Id="Choices" />
+      <ComponentRef Id="StartMenuChosen" />
+      <ComponentRef Id="StartMenuDeclined" />
+      <ComponentRef Id="DesktopChosen" />
+      <ComponentRef Id="DesktopDeclined" />
       <ComponentRef Id="Licenses" />
       <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
     </Feature>
   </Product>
 </Wix>

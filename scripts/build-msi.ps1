@@ -41,7 +41,9 @@ $Msi = Join-Path $Dist "BareClip-$Version.msi"
     -out $Object (Join-Path $Root 'installer\bareclip.wxs')
 if ($LASTEXITCODE -ne 0) { throw 'WiX could not compile the installer.' }
 
+# ICE38, ICE43 and ICE57 assume an install is for one user or for everyone, never either.
 & (Join-Path $Wix 'light.exe') -nologo -ext WixUIExtension -cultures:en-us `
+    -sice:ICE38 -sice:ICE43 -sice:ICE57 `
     -out $Msi $Object
 if ($LASTEXITCODE -ne 0) { throw 'WiX could not link the installer.' }
 
