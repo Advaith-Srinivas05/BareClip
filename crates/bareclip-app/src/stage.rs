@@ -5,8 +5,9 @@
 //! Turning only makes sense in pixels, because a canvas's width and height aren't equal.
 
 use bareclip_core::{
-    placement::{FULL_TURN, LARGEST_SCALE, Placement, SMALLEST_SCALE, WHOLE},
+    placement::{CanvasCorner, FULL_TURN, LARGEST_SCALE, Placement, SMALLEST_SCALE, WHOLE},
     timeline::ClipId,
+    tracks::OrderMove,
 };
 use eframe::egui::{self, CursorIcon, Pos2, Rect, Sense, Shape, Slider, Stroke, pos2, vec2};
 
@@ -507,6 +508,9 @@ pub struct StageView<'a> {
     pub selected: Option<ClipId>,
     /// Nothing is being said in the row above the picture, so the toolbar can use it.
     pub row_above_is_free: bool,
+    /// Whether the selected clip can go further forward, and further back.
+    pub can_go_forward: bool,
+    pub can_go_back: bool,
 }
 
 /// What happened on the stage this frame.
@@ -515,6 +519,7 @@ pub struct StageEvents {
     /// `Some(None)` clears the selection.
     pub select: Option<Option<ClipId>>,
     pub place: Option<(ClipId, Placement)>,
+    pub order: Option<(ClipId, OrderMove)>,
 }
 
 /// What a press at this place on the canvas would grab, trying the selected clip's handles first.
@@ -803,15 +808,27 @@ fn toolbar(
             egui::Popup::menu(&more)
                 .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                 .show(|ui| {
-                    more_menu(ui, palette, clip, placement, events);
+                    more_menu(ui, palette, view, clip, placement, events);
                 });
         });
+}
+
+fn menu_heading(ui: &mut egui::Ui, palette: &Palette, text: &str) {
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new(text)
+                .size(12.0)
+                .color(palette.text_muted),
+        );
+    });
 }
 
 /// What doesn't fit on the bar, or isn't needed as often.
 fn more_menu(
     ui: &mut egui::Ui,
     palette: &Palette,
+    view: &StageView,
     clip: &StageClip,
     placement: Placement,
     events: &mut StageEvents,
@@ -860,6 +877,58 @@ fn more_menu(
             slider.surrender_focus();
         }
     });
+    ui.separator();
+    menu_heading(ui, palette, "Picture in picture");
+    for (corner, name) in CanvasCorner::ALL {
+        if ui
+            .add(MenuItem::new(
+                palette,
+                icons::PICTURE_IN_PICTURE_2,
+                name,
+                "",
+            ))
+            .clicked()
+        {
+            let placed = placement.in_corner(corner, clip.size, view.canvas);
+            events.place = Some((clip.id, placed));
+        }
+    }
+    ui.separator();
+    menu_heading(ui, palette, "Order");
+    let orders = [
+        (
+            OrderMove::ToFront,
+            icons::CHEVRONS_UP,
+            "Bring to front",
+            view.can_go_forward,
+        ),
+        (
+            OrderMove::Forward,
+            icons::ARROW_UP,
+            "Bring forward",
+            view.can_go_forward,
+        ),
+        (
+            OrderMove::Backward,
+            icons::ARROW_DOWN,
+            "Send backward",
+            view.can_go_back,
+        ),
+        (
+            OrderMove::ToBack,
+            icons::CHEVRONS_DOWN,
+            "Send to back",
+            view.can_go_back,
+        ),
+    ];
+    for (order, icon, name, allowed) in orders {
+        if ui
+            .add_enabled(allowed, MenuItem::new(palette, icon, name, ""))
+            .clicked()
+        {
+            events.order = Some((clip.id, order));
+        }
+    }
     ui.separator();
     if ui
         .add(MenuItem::new(

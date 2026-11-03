@@ -18,6 +18,10 @@ const QUARTER_TURN: i32 = FULL_TURN / 4;
 /// How far a scale can be from a picture's best fit and still count as being at it, so that turning
 /// a picture back round finds its way home exactly.
 const CLOSE_TO_FIT: f64 = 0.002;
+/// How big a picture-in-picture is, compared with its normal size.
+const PICTURE_IN_PICTURE_SCALE: i32 = WHOLE * 3 / 10;
+/// How far a picture-in-picture sits from the canvas's edges, as a share of its shorter side.
+const PICTURE_IN_PICTURE_MARGIN: f64 = 0.04;
 /// How far a saved centre can be from the canvas. A hand-edited file can't lose a clip further
 /// away than this.
 const FURTHEST_CENTRE: i32 = WHOLE * 5;
@@ -87,6 +91,24 @@ pub struct Placement {
     pub rotation: i32,
     pub flip_x: bool,
     pub flip_y: bool,
+}
+
+/// A corner of the canvas.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CanvasCorner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl CanvasCorner {
+    pub const ALL: [(Self, &'static str); 4] = [
+        (Self::TopLeft, "Top left"),
+        (Self::TopRight, "Top right"),
+        (Self::BottomLeft, "Bottom left"),
+        (Self::BottomRight, "Bottom right"),
+    ];
 }
 
 /// How a picture is drawn in its place, beyond where that place is.
@@ -184,6 +206,36 @@ impl Placement {
             rotation,
             scale,
             ..self
+        }
+    }
+
+    /// Small, in a corner of the canvas with a little room around it. However it is turned, all of
+    /// it stays on the canvas.
+    pub fn in_corner(self, corner: CanvasCorner, picture: (u32, u32), canvas: (u32, u32)) -> Self {
+        let small = Self {
+            scale: PICTURE_IN_PICTURE_SCALE,
+            ..self
+        };
+        let rect = small.rect(picture, canvas);
+        let radians = small.degrees().to_radians();
+        let (width, height) = (f64::from(rect.width), f64::from(rect.height));
+        let half_across = (width * radians.cos().abs() + height * radians.sin().abs()) / 2.0;
+        let half_down = (width * radians.sin().abs() + height * radians.cos().abs()) / 2.0;
+        let (canvas_width, canvas_height) = (f64::from(canvas.0), f64::from(canvas.1));
+        let margin = canvas_width.min(canvas_height) * PICTURE_IN_PICTURE_MARGIN;
+        let (near_x, far_x) = (margin + half_across, canvas_width - margin - half_across);
+        let (near_y, far_y) = (margin + half_down, canvas_height - margin - half_down);
+        let (x, y) = match corner {
+            CanvasCorner::TopLeft => (near_x, near_y),
+            CanvasCorner::TopRight => (far_x, near_y),
+            CanvasCorner::BottomLeft => (near_x, far_y),
+            CanvasCorner::BottomRight => (far_x, far_y),
+        };
+        let whole = f64::from(WHOLE);
+        Self {
+            center_x: (x / canvas_width * whole).round() as i32,
+            center_y: (y / canvas_height * whole).round() as i32,
+            ..small
         }
     }
 
@@ -409,6 +461,54 @@ mod tests {
 
         assert_eq!(tilted.turned_quarter(CANVAS, CANVAS).rotation, 90_000);
         assert_eq!(nearly_round.turned_quarter(CANVAS, CANVAS).rotation, 0);
+    }
+
+    #[test]
+    fn a_picture_in_picture_sits_in_its_corner_with_room_around_it() {
+        for (corner, _) in CanvasCorner::ALL {
+            let placed = Placement::default().in_corner(corner, CANVAS, CANVAS);
+            let rect = placed.rect(CANVAS, CANVAS);
+
+            assert_eq!(placed.scale, PICTURE_IN_PICTURE_SCALE);
+            assert!(rect.x >= 40.0 && rect.y >= 40.0, "{corner:?} {rect:?}");
+            assert!(rect.x + rect.width <= 1880.0, "{corner:?} {rect:?}");
+            assert!(rect.y + rect.height <= 1040.0, "{corner:?} {rect:?}");
+            let left = matches!(corner, CanvasCorner::TopLeft | CanvasCorner::BottomLeft);
+            let top = matches!(corner, CanvasCorner::TopLeft | CanvasCorner::TopRight);
+            assert_eq!(rect.x < 960.0, left, "{corner:?} {rect:?}");
+            assert_eq!(rect.y < 540.0, top, "{corner:?} {rect:?}");
+        }
+    }
+
+    #[test]
+    fn a_turned_picture_in_picture_keeps_all_of_itself_on_the_canvas() {
+        let upright = Placement {
+            rotation: 90_000,
+            ..Placement::default()
+        };
+
+        let placed = upright.in_corner(CanvasCorner::TopLeft, CANVAS, CANVAS);
+
+        let rect = placed.rect(CANVAS, CANVAS);
+        let (middle_x, middle_y) = (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+        // It stands taller than it is wide, so it is the height that has to fit across.
+        assert!(middle_x - rect.height / 2.0 >= 0.0, "{rect:?}");
+        assert!(middle_y - rect.width / 2.0 >= 0.0, "{rect:?}");
+        assert_eq!(placed.rotation, 90_000);
+    }
+
+    #[test]
+    fn a_picture_in_picture_keeps_how_see_through_and_flipped_it_was() {
+        let look = Placement {
+            opacity: WHOLE / 2,
+            flip_x: true,
+            ..Placement::default()
+        };
+
+        let placed = look.in_corner(CanvasCorner::BottomRight, CANVAS, CANVAS);
+
+        assert_eq!(placed.opacity, WHOLE / 2);
+        assert!(placed.flip_x);
     }
 
     #[test]

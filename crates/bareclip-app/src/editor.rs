@@ -21,7 +21,7 @@ use bareclip_core::{
     splice::{CutMode, FrameIndex},
     time::{Ticks, format_timecode},
     timeline::{ClipEdge, ClipId, MediaId, TimeRange},
-    tracks::{TrackTarget, Tracks},
+    tracks::{OrderMove, TrackTarget, Tracks},
 };
 use bareclip_export::{
     FullPlan, LAYERED_REASON, LayeredClip, LayeredRequest, LayeredStretch, ProjectReport, Route,
@@ -3419,6 +3419,16 @@ impl Editor {
             clips: &clips,
             selected: self.selected,
             row_above_is_free: self.notice.is_none(),
+            can_go_forward: self.selected.is_some_and(|id| {
+                self.project
+                    .tracks
+                    .can_move_in_order(id, OrderMove::Forward)
+            }),
+            can_go_back: self.selected.is_some_and(|id| {
+                self.project
+                    .tracks
+                    .can_move_in_order(id, OrderMove::Backward)
+            }),
         };
         let events = stage::show(ui, palette, &mut self.stage_state, &view);
         let pointer_down = ui.input(|input| input.pointer.any_down());
@@ -3430,6 +3440,11 @@ impl Editor {
         if let Some(selection) = events.select {
             self.selected = selection;
             self.selected_gap = None;
+        }
+        if let Some((id, order)) = events.order {
+            self.record();
+            self.project.tracks.move_in_order(id, order);
+            self.after_timeline_change();
         }
         if let Some((id, placement)) = events.place {
             let before = self.project.clone();
@@ -5151,6 +5166,26 @@ mod tests {
             &mut layered,
             moved(pos2(1100.0, 80.0)),
             "70-background-menu",
+        );
+        run_frame(
+            &ctx,
+            &mut layered,
+            vec![egui::Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        run_frame(&ctx, &mut layered, vec![]);
+        click_named(&ctx, &mut layered, "More");
+        wait_for_layers(&ctx, &mut layered);
+        camera.shoot(
+            &ctx,
+            &mut layered,
+            moved(pos2(1100.0, 80.0)),
+            "71-more-menu",
         );
 
         // The project's shape, on a tall canvas and with its menu open.
@@ -10692,5 +10727,101 @@ mod tests {
         );
         run_frame(&ctx, &mut editor, vec![]);
         assert_eq!(editor.project.canvas.background, [0x12, 0x34, 0x56]);
+    }
+
+    fn open_more_menu(ctx: &egui::Context, editor: &mut Editor) {
+        click_named(ctx, editor, "More");
+        for _ in 0..3 {
+            run_frame(ctx, editor, vec![]);
+        }
+    }
+
+    #[test]
+    fn picture_in_picture_puts_a_clip_small_in_a_corner_as_one_undo_step() {
+        let ctx = context();
+        let mut editor = stacked_clips(&ctx);
+        let (top, _) = top_and_below(&editor);
+        editor.selected = Some(top);
+        run_frame(&ctx, &mut editor, vec![]);
+        open_more_menu(&ctx, &mut editor);
+
+        click_named(&ctx, &mut editor, "Bottom right");
+
+        let placed = placement_of(&editor, top);
+        assert!(placed.scale < WHOLE / 2, "{placed:?}");
+        assert!(
+            placed.center_x > WHOLE / 2 && placed.center_y > WHOLE / 2,
+            "{placed:?}"
+        );
+        editor.undo();
+        assert!(placement_of(&editor, top).is_default());
+    }
+
+    #[test]
+    fn the_order_control_changes_which_clip_is_in_front_as_one_undo_step() {
+        let ctx = context();
+        let mut editor = stacked_clips(&ctx);
+        let (top, below) = top_and_below(&editor);
+        editor.selected = Some(below);
+        run_frame(&ctx, &mut editor, vec![]);
+        open_more_menu(&ctx, &mut editor);
+
+        click_named(&ctx, &mut editor, "Bring to front");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert_eq!(editor.project.tracks.track_of(below), Some(0));
+        assert_eq!(editor.project.tracks.track_of(top), Some(1));
+        assert_eq!(editor.selected, Some(below), "it stays selected");
+        editor.undo();
+        assert_eq!(editor.project.tracks.track_of(top), Some(0));
+    }
+
+    #[test]
+    fn the_order_control_only_offers_what_can_happen() {
+        let ctx = context();
+        let mut editor = stacked_clips(&ctx);
+        let (top, _) = top_and_below(&editor);
+        editor.selected = Some(top);
+        run_frame(&ctx, &mut editor, vec![]);
+        open_more_menu(&ctx, &mut editor);
+
+        // The clip on top has nowhere further forward to go, so pressing that does nothing.
+        click_named(&ctx, &mut editor, "Bring forward");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.project.tracks.track_of(top), Some(0));
+        assert!(!editor.history.can_undo());
+
+        click_named(&ctx, &mut editor, "Send backward");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.project.tracks.track_of(top), Some(1));
+    }
+
+    #[test]
+    fn a_clip_selected_on_the_timeline_but_completely_hidden_can_be_brought_forward() {
+        let ctx = context();
+        let mut editor = stacked_clips(&ctx);
+        let (_, below) = top_and_below(&editor);
+        editor.selected = Some(below);
+        run_frame(&ctx, &mut editor, vec![]);
+        // The clip above covers it completely, so only the timeline can select it.
+        assert_eq!(editor.export_route(), Route::Fast);
+
+        open_more_menu(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Bring forward");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert_eq!(
+            editor
+                .project
+                .tracks
+                .topmost_at(Ticks::from_seconds(1.0))
+                .map(|c| c.id),
+            Some(below)
+        );
+        assert_eq!(
+            editor.export_route(),
+            Route::Fast,
+            "still one picture at a time"
+        );
     }
 }
