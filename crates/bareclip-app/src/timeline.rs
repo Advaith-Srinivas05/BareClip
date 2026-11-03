@@ -77,6 +77,9 @@ const EDGE_SCROLL_VIEWS_PER_SECOND: f64 = 0.8;
 const GAP_BUTTON_WIDTH: f32 = 104.0;
 /// A gap too narrow for the button's name still has room for its symbol down to this.
 const GAP_ICON_BUTTON_SIZE: f32 = 26.0;
+const PLAYHEAD_HEAD_HEIGHT: f32 = 16.0;
+const PLAYHEAD_HEAD_REACH: f32 = 8.0;
+const PLAYHEAD_LINE_REACH: f32 = 4.0;
 /// How strongly a hovered or selected gap stands out from the rest of the timeline.
 const GAP_HIGHLIGHT: f32 = 0.07;
 /// The selected clip's stretch of the ruler is tinted more than the rest of the project.
@@ -461,6 +464,10 @@ pub struct TimelineState {
     pub zoom_buttons: [Rect; 3],
     /// The moment under the pointer, if it is over the timeline.
     pub hover_time: Option<Ticks>,
+    /// The time shown under the pointer, which is only over empty parts of the timeline.
+    pub hover_readout: Option<Ticks>,
+    /// Where the playhead was last sent during this drag.
+    scrubbed_to: Option<Ticks>,
     pub menu_target: Option<MenuTarget>,
     /// What the last frame showed about whatever the pointer is doing.
     pub hovered_clip: Option<ClipId>,
@@ -499,6 +506,8 @@ impl Default for TimelineState {
             scrollbar: Rect::NOTHING,
             zoom_buttons: [Rect::NOTHING; 3],
             hover_time: None,
+            hover_readout: None,
+            scrubbed_to: None,
             menu_target: None,
             hovered_clip: None,
             hovered_gap: None,
@@ -667,6 +676,16 @@ fn draw_playhead(painter: &egui::Painter, palette: &Palette, x: f32, top: f32, b
         palette.playhead,
         Stroke::new(1.0, palette.playhead_outline),
     ));
+}
+
+/// Whether the pointer is on the playhead: its head at the top, or the line below it.
+fn on_playhead(pointer: Pos2, x: f32, top: f32, bottom: f32) -> bool {
+    let reach = if pointer.y <= top + PLAYHEAD_HEAD_HEIGHT {
+        PLAYHEAD_HEAD_REACH
+    } else {
+        PLAYHEAD_LINE_REACH
+    };
+    (top..=bottom).contains(&pointer.y) && (pointer.x - x).abs() <= reach
 }
 
 fn draw_ruler(painter: &egui::Painter, palette: &Palette, scale: &TimeScale, rect: Rect) {
@@ -1471,7 +1490,13 @@ pub fn timeline(
                 events.trim_snap = targets.contains(&snapped).then_some(snapped);
             }
             TimelineDrag::Scrub if response.dragged() => {
-                events.seek = Some(Ticks(time.0.clamp(0, total.0)));
+                // Only when it moves, because seeking again would stop the exact frame from
+                // ever being reached while the pointer rests.
+                let target = Ticks(time.0.clamp(0, total.0));
+                if state.scrubbed_to != Some(target) {
+                    state.scrubbed_to = Some(target);
+                    events.seek = Some(target);
+                }
             }
             TimelineDrag::Move { id, grab } => {
                 if let Some(clip) = clips.iter().find(|clip| clip.id == id) {
@@ -1516,6 +1541,7 @@ pub fn timeline(
         state.snap_line = None;
         state.trim_aligned = None;
         state.drag = TimelineDrag::None;
+        state.scrubbed_to = None;
         state.frozen_total = None;
     }
 
@@ -1713,6 +1739,7 @@ pub fn timeline(
     }
 
     // The button on a gap, the same way a hovered or selected clip shows its handles.
+    let mut on_gap_button = false;
     if let Some(gap) = hovered_gap.or(selected_gap)
         && state.drag == TimelineDrag::None
     {
@@ -1726,7 +1753,9 @@ pub fn timeline(
                 .icon(icons::X)
                 .small()
                 .width(place.width());
-            if child.add(button).on_hover_text(hint).clicked() {
+            let button = child.add(button).on_hover_text(hint);
+            on_gap_button = button.contains_pointer();
+            if button.clicked() {
                 events.remove_gap = Some(gap.start);
             }
         } else if band.width() >= GAP_ICON_BUTTON_SIZE + 4.0 {
@@ -1735,7 +1764,9 @@ pub fn timeline(
             let button = IconButton::new(palette, Kind::Secondary, icons::X, "Remove gap")
                 .size(GAP_ICON_BUTTON_SIZE, 14.0)
                 .show_at(ui, egui::Id::unique("timeline-gap-remove"), place);
-            if button.on_hover_text(hint).clicked() {
+            let button = button.on_hover_text(hint);
+            on_gap_button = button.contains_pointer();
+            if button.clicked() {
                 events.remove_gap = Some(gap.start);
             }
         }
@@ -1803,11 +1834,27 @@ pub fn timeline(
         draw_playhead(&painter, palette, x, ruler.top() + 2.0, area.bottom() + 4.0);
     }
 
-    // The time under the pointer goes on top of everything else, unless a drag is showing
-    // times of its own.
+    // The time under the pointer goes on top of everything else, but only over empty parts
+    // of the timeline. Anything that can be used has the pointer's attention instead: whatever
+    // sits on a track, the playhead, and controls such as a gap's button. It also stays away
+    // while a drag is showing times of its own.
+    let on_something = pointer_over.is_some_and(|hover| {
+        on_gap_button
+            || !response.hovered()
+            || (area.contains(hover) && clip_at(clips, &layout, &scale, hover).is_some())
+            || on_playhead(
+                hover,
+                scale.x_of(view.position),
+                ruler.top() + 2.0,
+                area.bottom() + 4.0,
+            )
+    });
+    state.hover_readout = None;
     if state.drag == TimelineDrag::None
+        && !on_something
         && let (Some(hover), Some(time)) = (pointer_over, hover_time)
     {
+        state.hover_readout = Some(time);
         painter.line_segment(
             [pos2(hover.x, ruler.bottom()), pos2(hover.x, rect.bottom())],
             Stroke::new(1.0, palette.text_muted),
@@ -1846,13 +1893,14 @@ pub fn timeline(
 }
 
 /// The seek bar that stands in for the timeline while it is collapsed. Returns where the
-/// user moved the playhead to.
+/// user moved the playhead to, and says whether it is being held.
 pub fn seek_bar(
     ui: &mut egui::Ui,
     palette: &Palette,
     width: f32,
     position: Ticks,
     total: Ticks,
+    held: &mut bool,
 ) -> Option<Ticks> {
     let (rect, response) =
         ui.allocate_exact_size(vec2(width, SEEK_BAR_HEIGHT), Sense::click_and_drag());
@@ -1880,7 +1928,11 @@ pub fn seek_bar(
             palette.playhead,
         );
     }
-    if total.0 <= 0 || !(response.dragged() || response.clicked()) {
+    *held = response.dragged();
+    // Only when it moves, because seeking again would stop the exact frame from ever being
+    // reached while the pointer rests.
+    let moved = response.dragged() && response.drag_delta() != vec2(0.0, 0.0);
+    if total.0 <= 0 || !(moved || response.clicked()) {
         return None;
     }
     let pointer = response.interact_pointer_pos()?;
@@ -1890,6 +1942,25 @@ pub fn seek_bar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_playhead_is_wider_at_its_head_than_along_its_line() {
+        let (x, top, bottom) = (100.0, 10.0, 200.0);
+
+        assert!(
+            on_playhead(pos2(107.0, 15.0), x, top, bottom),
+            "on the head"
+        );
+        assert!(
+            !on_playhead(pos2(107.0, 60.0), x, top, bottom),
+            "beside the line"
+        );
+        assert!(
+            on_playhead(pos2(103.0, 60.0), x, top, bottom),
+            "on the line"
+        );
+        assert!(!on_playhead(pos2(100.0, 205.0), x, top, bottom), "below it");
+    }
 
     fn scale() -> TimeScale {
         TimeScale {

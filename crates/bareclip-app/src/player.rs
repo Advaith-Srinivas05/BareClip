@@ -378,6 +378,8 @@ pub struct Player {
     time_base: TimeBase,
     duration: Ticks,
     generation: u64,
+    /// Pictures from seeks older than this are from before the player was last set aside.
+    fresh_from: u64,
     /// The position when playback last started or was moved.
     base: Ticks,
     state: PlayState,
@@ -417,6 +419,7 @@ impl Player {
             time_base: info.video.time_base,
             duration: info.duration,
             generation: 0,
+            fresh_from: 0,
             base: Ticks(0),
             state: PlayState::Paused,
             exact_frame_ready: false,
@@ -482,6 +485,17 @@ impl Player {
         }
     }
 
+    /// Ignores pictures still on their way, because the preview has been showing another video
+    /// and they no longer follow on from what is on screen.
+    pub fn forget_pictures(&mut self) {
+        self.fresh_from = self.generation + 1;
+    }
+
+    #[cfg(test)]
+    pub fn seeks_sent(&self) -> u64 {
+        self.generation
+    }
+
     /// Moves to a time. Playback carries on from there if it was running.
     pub fn seek(&mut self, time: Ticks) {
         self.base = time.clamp(Ticks(0), self.duration);
@@ -540,10 +554,15 @@ impl Player {
                     generation,
                     frame,
                     exact,
-                } if generation == self.generation => {
+                } => {
                     if self.state == PlayState::Paused {
-                        newest_paused = Some(frame);
-                    } else if exact {
+                        // While the playhead is dragged, a newer seek overtakes every picture
+                        // on its way, so insisting on the newest would show nothing at all.
+                        // They arrive in order, so the last one is always the right one.
+                        if generation >= self.fresh_from {
+                            newest_paused = Some(frame);
+                        }
+                    } else if exact && generation == self.generation {
                         self.exact_frame_ready = true;
                         self.queue.push(frame.time, frame);
                     }
@@ -696,6 +715,30 @@ mod tests {
 
         player.seek(Ticks::from_seconds(0.5));
         wait_for_frame(&mut player, 15);
+    }
+
+    /// Does what dragging the playhead does: every frame takes in what has arrived, then moves.
+    fn pictures_while_dragging(player: &mut Player, how_long: Duration) -> usize {
+        let started = Instant::now();
+        let mut pictures = 0;
+        let mut seconds = 0.0;
+        while started.elapsed() < how_long {
+            if player.update().is_some() {
+                pictures += 1;
+            }
+            seconds = (seconds + 0.01) % 3.5;
+            player.seek(Ticks::from_seconds(seconds));
+        }
+        pictures
+    }
+
+    #[test]
+    fn pictures_keep_coming_while_the_playhead_is_being_dragged() {
+        let mut player = silent_player();
+
+        let pictures = pictures_while_dragging(&mut player, Duration::from_secs(1));
+
+        assert!(pictures >= 5, "only {pictures} pictures in a second");
     }
 
     #[test]
