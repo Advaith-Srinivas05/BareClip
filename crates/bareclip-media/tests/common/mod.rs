@@ -120,6 +120,27 @@ pub fn h264_mp4() -> PathBuf {
     })
 }
 
+/// H.264 with no audio at all.
+pub fn silent_mp4() -> PathBuf {
+    cached("silent.mp4", |path| {
+        run_ffmpeg(
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                &video_source(3),
+                "-c:v",
+                "libopenh264",
+                "-b:v",
+                "1M",
+                "-g",
+                "30",
+            ],
+            path,
+        );
+    })
+}
+
 /// HEVC with B-frames in Matroska and two named audio tracks at different pitches,
 /// like an OBS recording with game and microphone audio kept apart.
 pub fn b_frames_two_tracks_mkv() -> PathBuf {

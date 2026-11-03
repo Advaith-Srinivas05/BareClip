@@ -21,7 +21,8 @@ use bareclip_core::{
 };
 use bareclip_media::{
     DecodeStep, ExportPart, ExportReport, ExportRequest, MediaError, MediaInfo, PreviewFrame,
-    VideoPreview, can_write_gaps, export, join_problem, plan_export, probe, scan_frames,
+    SoundShape, StripPicture, VideoPreview, can_write_gaps, export, join_problem, picture_spacing,
+    plan_export, probe, read_sound_shape, read_strip_pictures, scan_frames,
 };
 use eframe::egui::{
     self, Align, Color32, CornerRadius, FontFamily, FontId, Frame, Key, Layout, Margin, Modifiers,
@@ -35,7 +36,7 @@ use crate::{
     storage::{self, ExportCuts, Recovery, RecoveryRecord, Settings},
     text,
     theme::{self, Palette},
-    timeline::{self, ClipView, MediaDrag, MenuAction, TimelineState, TimelineView},
+    timeline::{self, ClipFace, ClipView, MediaDrag, MenuAction, TimelineState, TimelineView},
 };
 
 const VIDEO_EXTENSIONS: [&str; 6] = ["mp4", "mkv", "mov", "webm", "avi", "ts"];
@@ -51,6 +52,15 @@ const BACKGROUND_TICK: Duration = Duration::from_millis(50);
 const MIN_CLIP_SECONDS: f64 = 0.05;
 const THUMBNAIL_WIDTH: u32 = 160;
 const THUMBNAIL_HEIGHT: u32 = 90;
+/// The pictures along clips: at most one this often, and at most this many per video, so a
+/// long recording costs no more than about 8 MB and 10 seconds in the background.
+const STRIP_PICTURE_SIZE: (u32, u32) = (128, 72);
+const STRIP_SHORTEST_SPACING_SECONDS: f64 = 2.0;
+const STRIP_MOST_PICTURES: u32 = 240;
+/// How many pictures get handed to the GPU per frame, so a burst of them can't cause a stutter.
+const STRIP_UPLOADS_PER_FRAME: usize = 4;
+/// A reader holds this many pictures ready before it waits for the interface to catch up.
+const STRIP_CHANNEL: usize = 8;
 const RAIL_WIDTH: f32 = 78.0;
 const MEDIA_PANEL_WIDTH: f32 = 290.0;
 const MEDIA_PANEL_MIN_WIDTH: f32 = 240.0;
@@ -114,6 +124,73 @@ const TIMELINE_MAX_SHARE: f32 = 0.65;
 /// How far the arrow keys step in dead space, which has no frames of its own.
 const GAP_STEP_SECONDS: f64 = 1.0 / 30.0;
 
+/// What the reader of a video's pictures and sound sends back.
+enum StripMessage {
+    Picture(StripPicture),
+    PicturesDone,
+    Sound(SoundShape),
+}
+
+/// Reads a video's pictures and sound shape in the background, for showing on its clips.
+struct StripReader {
+    messages: Receiver<StripMessage>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for StripReader {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+fn start_strip_reader(
+    ctx: &egui::Context,
+    info: &MediaInfo,
+    want_pictures: bool,
+    want_sound: bool,
+) -> StripReader {
+    let (sender, messages) = mpsc::sync_channel(STRIP_CHANNEL);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = cancel.clone();
+    let path = info.path.clone();
+    let duration = info.duration;
+    let spacing = picture_spacing(
+        duration,
+        Ticks::from_seconds(STRIP_SHORTEST_SPACING_SECONDS),
+        STRIP_MOST_PICTURES,
+    );
+    let repaint = ctx.clone();
+    thread::spawn(move || {
+        // Sound first, since it takes a fraction of the time. Anything that goes wrong only
+        // costs the look of the clip, so there is nothing to report.
+        if want_sound && let Ok(Some(shape)) = read_sound_shape(&path, &worker_cancel, |_| {}) {
+            let _ = sender.send(StripMessage::Sound(shape));
+            repaint.request_repaint();
+        }
+        if want_pictures {
+            let read = read_strip_pictures(
+                &path,
+                duration,
+                spacing,
+                STRIP_PICTURE_SIZE,
+                &worker_cancel,
+                |picture| {
+                    if sender.send(StripMessage::Picture(picture)).is_ok() {
+                        repaint.request_repaint();
+                    } else {
+                        worker_cancel.store(true, Ordering::Relaxed);
+                    }
+                },
+            );
+            if read.is_ok() && !worker_cancel.load(Ordering::Relaxed) {
+                let _ = sender.send(StripMessage::PicturesDone);
+                repaint.request_repaint();
+            }
+        }
+    });
+    StripReader { messages, cancel }
+}
+
 /// What a video's background reading sends back.
 enum ScanMessage {
     Thumbnail(PreviewFrame),
@@ -175,6 +252,11 @@ struct MediaEntry {
     cancel_scan: Arc<AtomicBool>,
     progress: Arc<AtomicU32>,
     thumbnail: Option<TextureHandle>,
+    /// What its clips show, as far as it has been read, with pictures in order of time.
+    strip_pictures: Vec<(Ticks, TextureHandle)>,
+    strip_pictures_done: bool,
+    sound_shape: Option<SoundShape>,
+    strip_reader: Option<StripReader>,
 }
 
 impl Drop for MediaEntry {
@@ -823,6 +905,14 @@ impl Editor {
             repaint.request_repaint();
         });
 
+        let strip_reader = (self.settings.thumbnails || self.settings.waveforms).then(|| {
+            start_strip_reader(
+                ctx,
+                &info,
+                self.settings.thumbnails,
+                self.settings.waveforms,
+            )
+        });
         let id = MediaId(self.next_media);
         self.next_media += 1;
         Ok(MediaEntry {
@@ -835,6 +925,10 @@ impl Editor {
             cancel_scan,
             progress,
             thumbnail: None,
+            strip_pictures: Vec::new(),
+            strip_pictures_done: false,
+            sound_shape: None,
+            strip_reader,
         })
     }
 
@@ -1152,6 +1246,7 @@ impl Editor {
         if problem.is_some() {
             self.notice = problem;
         }
+        self.poll_strip_readers(ctx);
 
         let Self {
             preview,
@@ -1200,6 +1295,73 @@ impl Editor {
                 Err(MediaError::Cancelled) => ExportState::Choosing,
                 Err(error) => ExportState::Failed(error.to_string()),
             };
+        }
+    }
+
+    /// Takes in what the background readers have found for the clips.
+    fn poll_strip_readers(&mut self, ctx: &egui::Context) {
+        let mut uploads_left = STRIP_UPLOADS_PER_FRAME;
+        for entry in &mut self.media {
+            let Some(reader) = &entry.strip_reader else {
+                continue;
+            };
+            while uploads_left > 0 {
+                let message = match reader.messages.try_recv() {
+                    Ok(message) => message,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        entry.strip_reader = None;
+                        break;
+                    }
+                };
+                match message {
+                    StripMessage::Picture(picture) => {
+                        let image = egui::ColorImage::from_rgba_unmultiplied(
+                            [picture.width as usize, picture.height as usize],
+                            &picture.rgba,
+                        );
+                        let name = format!("strip-{}-{}", entry.id.0, entry.strip_pictures.len());
+                        let texture = ctx.load_texture(name, image, TextureOptions::LINEAR);
+                        entry.strip_pictures.push((picture.time, texture));
+                        uploads_left -= 1;
+                    }
+                    StripMessage::PicturesDone => entry.strip_pictures_done = true,
+                    StripMessage::Sound(shape) => entry.sound_shape = Some(shape),
+                }
+            }
+            if uploads_left == 0 {
+                ctx.request_repaint();
+                break;
+            }
+        }
+    }
+
+    /// Brings what is being read for the clips into line with the settings. Turning something
+    /// off stops reading the file for it and forgets what was read.
+    fn apply_strip_settings(&mut self, ctx: &egui::Context) {
+        let (thumbnails, waveforms) = (self.settings.thumbnails, self.settings.waveforms);
+        for entry in &mut self.media {
+            entry.strip_reader = None;
+            if !thumbnails {
+                entry.strip_pictures.clear();
+                entry.strip_pictures_done = false;
+            }
+            if !waveforms {
+                entry.sound_shape = None;
+            }
+            let want_pictures = thumbnails && !entry.strip_pictures_done;
+            let want_sound = waveforms && entry.sound_shape.is_none();
+            if want_pictures {
+                entry.strip_pictures.clear();
+            }
+            if want_pictures || want_sound {
+                entry.strip_reader = Some(start_strip_reader(
+                    ctx,
+                    &entry.info,
+                    want_pictures,
+                    want_sound,
+                ));
+            }
         }
     }
 
@@ -1658,6 +1820,7 @@ impl Editor {
             return;
         }
         let mut changed = false;
+        let mut strip_changed = false;
         let mut close = false;
         let modal = egui::Modal::new(egui::Id::unique("settings_dialog"))
             .frame(dialog_frame(ctx))
@@ -1720,12 +1883,37 @@ impl Editor {
                         }
                     }
                 });
+                ui.add_space(SETTINGS_ROW_GAP);
+
+                ui.label(RichText::new("On clips").font(fonts::strong(13.0)));
+                ui.colored_label(
+                    palette.text_muted,
+                    "Reading these takes a little while in the background for each video.",
+                );
+                ui.add_space(6.0);
+                for (name, setting) in [
+                    ("Thumbnails on clips", &mut self.settings.thumbnails),
+                    ("Waveforms on clips", &mut self.settings.waveforms),
+                ] {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        if ui.add(CheckBox::new(palette, *setting, name)).clicked() {
+                            *setting = !*setting;
+                            strip_changed = true;
+                        }
+                        ui.label(name);
+                    });
+                    ui.add_space(2.0);
+                }
                 ui.add_space(18.0);
                 components::dialog_buttons(ui, |ui| {
                     close = ui.add(dialog_button(palette, "Done")).clicked();
                 });
             });
-        if changed {
+        if strip_changed {
+            self.apply_strip_settings(ctx);
+        }
+        if changed || strip_changed {
             self.save_settings();
         }
         if close || modal.should_close() {
@@ -2481,11 +2669,25 @@ impl Editor {
                 label: self
                     .entry(clip.media)
                     .map_or_else(String::new, |entry| entry.name.clone()),
+                media: clip.media,
+                source_start: clip.source.start,
+            })
+            .collect();
+        let faces = self
+            .media
+            .iter()
+            .map(|entry| {
+                let face = ClipFace {
+                    pictures: &entry.strip_pictures,
+                    sound: entry.sound_shape.as_ref(),
+                };
+                (entry.id, face)
             })
             .collect();
         let view = TimelineView {
             tracks: &self.project.tracks,
             clips: &clips,
+            faces: &faces,
             position: self.position(),
             selected: self.selected,
             selected_gap: self.selected_gap,
@@ -3433,6 +3635,45 @@ mod tests {
         CLIP.get_or_init(|| make_clip("editor-small", "160x90"))
     }
 
+    /// A clip whose sound has a regular beat, so its shape is easy to judge by eye.
+    fn clip_with_sound() -> PathBuf {
+        static CLIP: OnceLock<PathBuf> = OnceLock::new();
+        CLIP.get_or_init(|| {
+            let folder = std::env::temp_dir().join("bareclip-app-tests");
+            std::fs::create_dir_all(&folder).expect("the folder can be created");
+            let path = folder.join(format!("editor-sound-{}.mp4", std::process::id()));
+            let status = Command::new("ffmpeg")
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                ])
+                .arg("testsrc2=s=320x180:r=30:d=8,format=yuv420p")
+                .args(["-f", "lavfi", "-i"])
+                .arg("sine=f=440:r=48000:d=8,volume='0.2+0.8*abs(sin(t*2))':eval=frame")
+                .args([
+                    "-c:v",
+                    "libopenh264",
+                    "-b:v",
+                    "2M",
+                    "-g",
+                    "30",
+                    "-c:a",
+                    "aac",
+                ])
+                .arg(&path)
+                .status()
+                .expect("ffmpeg is on PATH");
+            assert!(status.success());
+            path
+        })
+        .clone()
+    }
+
     fn context() -> egui::Context {
         let ctx = egui::Context::default();
         fonts::install(&ctx);
@@ -3978,6 +4219,7 @@ mod tests {
 
         // Tracks, the collapsed timeline and the two-column panel.
         let mut tracks = with_videos(&ctx, &[test_clip(), second_clip()]);
+        wait_for_strip(&ctx, &mut tracks);
         let upper = tracks.project.tracks.played().clips()[1].id;
         tracks.project.tracks.trim(
             upper,
@@ -4063,6 +4305,27 @@ mod tests {
         camera.shoot(&ctx, &mut aligned, moved(to), "44-trim-aligned");
 
         // Projects: the name, its menu and the dialogs that protect unsaved work.
+        // A clip with both pictures and sound, zoomed in on.
+        let mut sounding = with_videos(&ctx, &[&clip_with_sound()]);
+        wait_for_strip(&ctx, &mut sounding);
+        camera.shoot(
+            &ctx,
+            &mut sounding,
+            moved(pos2(640.0, 90.0)),
+            "50-pictures-and-sound",
+        );
+        ctx.set_theme(egui::Theme::Light);
+        for _ in 0..3 {
+            run_frame(&ctx, &mut sounding, vec![]);
+        }
+        camera.shoot(
+            &ctx,
+            &mut sounding,
+            moved(pos2(640.0, 90.0)),
+            "51-light-pictures-and-sound",
+        );
+        ctx.set_theme(egui::Theme::Dark);
+
         let mut named = with_videos(&ctx, &[test_clip()]);
         named.project_name = "Final round".to_owned();
         let settled = |editor: &mut Editor| {
@@ -6931,6 +7194,156 @@ mod tests {
         }
         run_frame(&ctx, &mut editor, vec![]);
         assert!(!editor.timeline_state.scrollbar.is_positive());
+    }
+
+    /// Runs frames until a video's pictures and sound have been read.
+    fn wait_for_strip(ctx: &egui::Context, editor: &mut Editor) {
+        let started = Instant::now();
+        while editor
+            .media
+            .iter()
+            .any(|entry| entry.strip_reader.is_some())
+        {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "reading pictures and sound took too long"
+            );
+            run_frame(ctx, editor, vec![]);
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_video_gets_pictures_in_order_for_its_clips() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip()]);
+
+        wait_for_strip(&ctx, &mut editor);
+
+        let entry = &editor.media[0];
+        assert!(entry.strip_pictures_done);
+        assert!(
+            entry.strip_pictures.len() >= 2,
+            "{}",
+            entry.strip_pictures.len()
+        );
+        for pair in entry.strip_pictures.windows(2) {
+            assert!(pair[0].0 < pair[1].0);
+        }
+        assert_eq!(entry.strip_pictures[0].0, Ticks(0));
+    }
+
+    #[test]
+    fn a_video_with_no_sound_has_an_empty_shape() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip()]);
+
+        wait_for_strip(&ctx, &mut editor);
+
+        let shape = editor.media[0].sound_shape.as_ref().expect("it was read");
+        assert!(shape.peaks.is_empty());
+    }
+
+    #[test]
+    fn pictures_never_get_in_the_way_of_using_the_video() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip()]);
+
+        // Straight away, whether or not any pictures have arrived.
+        let id = editor.media[0].id;
+        editor.add_to_timeline(id);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert_eq!(editor.project.tracks.played().clips().len(), 1);
+    }
+
+    #[test]
+    fn turning_thumbnails_off_stops_reading_and_forgets_them_and_on_reads_them_again() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip()]);
+        wait_for_strip(&ctx, &mut editor);
+
+        editor.settings.thumbnails = false;
+        editor.apply_strip_settings(&ctx);
+
+        assert!(editor.media[0].strip_pictures.is_empty());
+        assert!(
+            editor.media[0].strip_reader.is_none(),
+            "the sound was already read"
+        );
+        assert!(editor.media[0].sound_shape.is_some());
+
+        editor.settings.thumbnails = true;
+        editor.apply_strip_settings(&ctx);
+        wait_for_strip(&ctx, &mut editor);
+
+        assert!(!editor.media[0].strip_pictures.is_empty());
+    }
+
+    #[test]
+    fn turning_waveforms_off_forgets_them_and_on_reads_them_again() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip()]);
+        wait_for_strip(&ctx, &mut editor);
+
+        editor.settings.waveforms = false;
+        editor.apply_strip_settings(&ctx);
+        assert!(editor.media[0].sound_shape.is_none());
+        assert!(
+            !editor.media[0].strip_pictures.is_empty(),
+            "pictures are kept"
+        );
+
+        editor.settings.waveforms = true;
+        editor.apply_strip_settings(&ctx);
+        wait_for_strip(&ctx, &mut editor);
+        assert!(editor.media[0].sound_shape.is_some());
+    }
+
+    #[test]
+    fn with_both_off_a_new_video_is_never_read_for_its_clips() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        editor.settings.thumbnails = false;
+        editor.settings.waveforms = false;
+
+        editor.import(&ctx, &[test_clip().to_path_buf()]);
+
+        assert!(editor.media[0].strip_reader.is_none());
+    }
+
+    #[test]
+    fn the_settings_dialog_turns_clip_pictures_off_and_remembers_it() {
+        let ctx = context();
+        let folder = project_folder("strip-settings");
+        let mut editor = with_storage(&ctx, &folder);
+        editor.import(&ctx, &[test_clip().to_path_buf()]);
+        settle(&ctx, &mut editor);
+        wait_for_strip(&ctx, &mut editor);
+
+        click_named(&ctx, &mut editor, "Settings");
+        let_dialog_open(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Thumbnails on clips");
+
+        assert!(!editor.settings.thumbnails);
+        assert!(editor.media[0].strip_pictures.is_empty());
+        assert!(!with_storage(&ctx, &folder).settings.thumbnails);
+    }
+
+    #[test]
+    fn closing_a_project_stops_reading_its_videos() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip()]);
+        let cancel = editor.media[0]
+            .strip_reader
+            .as_ref()
+            .map(|reader| reader.cancel.clone());
+
+        editor.start_new_project();
+
+        if let Some(cancel) = cancel {
+            assert!(cancel.load(Ordering::Relaxed));
+        }
     }
 
     /// One clip with the playhead part way through, ready to have an end dragged.

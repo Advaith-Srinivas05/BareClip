@@ -5,11 +5,12 @@ use bareclip_core::{
     timeline::{ClipEdge, ClipId, MediaId, TimeRange},
     tracks::{TrackTarget, Tracks},
 };
+use bareclip_media::SoundShape;
 use eframe::egui::{
-    self, Align2, Color32, CursorIcon, FontId, Galley, Pos2, Rect, Sense, Shape, Stroke, UiBuilder,
-    Vec2, pos2, vec2,
+    self, Align2, Color32, CursorIcon, FontId, Galley, Mesh, Pos2, Rect, Sense, Shape, Stroke,
+    TextureHandle, UiBuilder, Vec2, pos2, vec2,
 };
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     components::{ActionButton, IconButton, Kind, MenuItem},
@@ -20,7 +21,7 @@ use crate::{
 
 const RULER_HEIGHT: f32 = 24.0;
 /// A track keeps this height however tall the timeline gets, so more height shows more space.
-const TRACK_HEIGHT: f32 = 48.0;
+const TRACK_HEIGHT: f32 = 56.0;
 const TRACK_GAP: f32 = 6.0;
 /// The dashed lanes above and below the tracks, which a clip can be dropped on.
 const NEW_LANE_HEIGHT: f32 = 26.0;
@@ -52,6 +53,13 @@ const HOVERED_OUTLINE: f32 = 1.5;
 /// A clip wider than this has room for a symbol in front of its name.
 const CLIP_ICON_MIN_WIDTH: f32 = 96.0;
 const CLIP_ICON_SIZE: f32 = 14.0;
+const CLIP_LABEL_HEIGHT: f32 = 20.0;
+const CLIP_LABEL_TOP: f32 = 3.0;
+const CLIP_LABEL_BACKING: f32 = 0.72;
+/// The sound's shape takes up this share of a clip, along its bottom.
+const SOUND_BAND_SHARE: f32 = 0.3;
+const SOUND_BAND_BACKING: f32 = 0.45;
+const SOUND_COLUMN_WIDTH: f32 = 2.0;
 const ZOOM_STEP: f64 = 1.5;
 /// Below this, a view of the timeline stops getting any closer.
 const MIN_VISIBLE_SECONDS: f64 = 0.5;
@@ -145,6 +153,30 @@ pub struct ClipView {
     pub start: Ticks,
     pub end: Ticks,
     pub label: String,
+    pub media: MediaId,
+    /// The moment in its video that the clip starts from.
+    pub source_start: Ticks,
+}
+
+/// What a video has to show on its clips so far. Each picture is paired with where it is in
+/// the video, and they stay in that order.
+#[derive(Clone, Copy, Default)]
+pub struct ClipFace<'a> {
+    pub pictures: &'a [(Ticks, TextureHandle)],
+    pub sound: Option<&'a SoundShape>,
+}
+
+/// The picture to show for a moment in a video: the last one at or before it.
+fn picture_index_at(pictures: &[(Ticks, TextureHandle)], time: Ticks) -> usize {
+    pictures
+        .partition_point(|(at, _)| *at <= time)
+        .saturating_sub(1)
+}
+
+/// The moment in a clip's video that a place on screen shows.
+fn source_time_at(clip: &ClipView, scale: &TimeScale, x: f32) -> Ticks {
+    let along = scale.time_of_pixels(x - scale.x_of(clip.start));
+    Ticks(clip.source_start.0 + along.0)
 }
 
 /// What the timeline needs to know to draw the project.
@@ -152,6 +184,7 @@ pub struct TimelineView<'a> {
     pub tracks: &'a Tracks,
     /// Every clip, in the order of its track and then its start.
     pub clips: &'a [ClipView],
+    pub faces: &'a HashMap<MediaId, ClipFace<'a>>,
     pub position: Ticks,
     pub selected: Option<ClipId>,
     pub selected_gap: Option<Ticks>,
@@ -763,8 +796,92 @@ fn handle_shapes(rect: Rect) -> [Vec<Pos2>; 2] {
     ]
 }
 
-fn draw_clip(painter: &egui::Painter, palette: &Palette, rect: Rect, label: &str, look: ClipLook) {
+/// Draws what a clip's video looks and sounds like across the clip. Both are read in the
+/// background, so either can still be missing.
+fn draw_face(
+    painter: &egui::Painter,
+    palette: &Palette,
+    rect: Rect,
+    clip: &ClipView,
+    face: &ClipFace,
+    scale: &TimeScale,
+) {
+    let visible = rect.intersect(painter.clip_rect());
+    if !visible.is_positive() {
+        return;
+    }
+    let shown = painter.with_clip_rect(visible);
+    if let Some((_, first)) = face.pictures.first() {
+        let size = first.size_vec2();
+        let tile = (rect.height() * size.x / size.y).max(1.0);
+        let whole = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        let mut x = rect.left() + ((visible.left() - rect.left()) / tile).floor() * tile;
+        while x < visible.right() {
+            let time = source_time_at(clip, scale, x + tile / 2.0);
+            let (_, picture) = &face.pictures[picture_index_at(face.pictures, time)];
+            let place = Rect::from_min_size(pos2(x, rect.top()), vec2(tile, rect.height()));
+            shown.image(picture.id(), place, whole, Color32::WHITE);
+            x += tile;
+        }
+        // A picture is square-cornered, so the track shows through where the clip is cut.
+        let cut = CORNER_CUT_X.min(rect.width() / 2.0);
+        for corner in [
+            [
+                rect.left_top(),
+                pos2(rect.left() + cut, rect.top()),
+                pos2(rect.left(), rect.top() + CORNER_CUT_Y),
+            ],
+            [
+                rect.right_bottom(),
+                pos2(rect.right() - cut, rect.bottom()),
+                pos2(rect.right(), rect.bottom() - CORNER_CUT_Y),
+            ],
+        ] {
+            shown.add(Shape::convex_polygon(
+                corner.to_vec(),
+                palette.bg_app,
+                Stroke::NONE,
+            ));
+        }
+    }
+    let Some(sound) = face.sound.filter(|sound| !sound.peaks.is_empty()) else {
+        return;
+    };
+    let band_height = rect.height() * SOUND_BAND_SHARE;
+    let band = rect.with_min_y(rect.bottom() - band_height);
+    shown.rect_filled(band, 0.0, palette.stage.gamma_multiply(SOUND_BAND_BACKING));
+    let mut mesh = Mesh::default();
+    let mut x = visible.left();
+    while x < visible.right() {
+        let start = source_time_at(clip, scale, x);
+        let end = source_time_at(clip, scale, x + SOUND_COLUMN_WIDTH);
+        let height = sound.peak_between(start, end) * band_height;
+        if height > 0.5 {
+            mesh.add_colored_rect(
+                Rect::from_min_max(
+                    pos2(x, band.bottom() - height),
+                    pos2(x + SOUND_COLUMN_WIDTH - 0.5, band.bottom()),
+                ),
+                palette.clip_video_text,
+            );
+        }
+        x += SOUND_COLUMN_WIDTH;
+    }
+    shown.add(Shape::mesh(mesh));
+}
+
+fn draw_clip(
+    painter: &egui::Painter,
+    palette: &Palette,
+    rect: Rect,
+    clip: &ClipView,
+    (face, scale): (Option<&ClipFace>, &TimeScale),
+    look: ClipLook,
+) {
     painter.add(clip_shape(rect, palette.clip_video, Stroke::NONE));
+    if let Some(face) = face {
+        draw_face(painter, palette, rect, clip, face, scale);
+    }
 
     // Handles only appear on a clip being pointed at or worked on, to keep the rest calm.
     let handle_colors = match look {
@@ -797,28 +914,38 @@ fn draw_clip(painter: &egui::Painter, palette: &Palette, rect: Rect, label: &str
     painter.add(clip_shape(rect, Color32::TRANSPARENT, outline));
 
     if rect.width() > 60.0 {
-        let text_rect = rect.shrink2(vec2(HANDLE_WIDTH + 4.0, 0.0));
-        let clipped = painter.with_clip_rect(text_rect.intersect(painter.clip_rect()));
-        let mut left = text_rect.left();
-        if rect.width() > CLIP_ICON_MIN_WIDTH {
+        // On its own small backing, because it can be sitting on any picture.
+        let room = rect.shrink2(vec2(HANDLE_WIDTH + 4.0, 0.0));
+        let galley = painter.layout_no_wrap(
+            clip.label.clone(),
+            FontId::proportional(12.0),
+            palette.clip_video_text,
+        );
+        let has_icon = rect.width() > CLIP_ICON_MIN_WIDTH;
+        let icon_room = if has_icon { CLIP_ICON_SIZE + 4.0 } else { 0.0 };
+        let width = (galley.size().x + icon_room + 12.0).min(room.width());
+        let label = Rect::from_min_size(
+            pos2(room.left(), rect.top() + CLIP_LABEL_TOP),
+            vec2(width, CLIP_LABEL_HEIGHT),
+        );
+        let backing = palette.stage.gamma_multiply(CLIP_LABEL_BACKING);
+        let clipped = painter.with_clip_rect(label.intersect(painter.clip_rect()));
+        clipped.rect_filled(label, 4.0, backing);
+        let mut left = label.left() + 6.0;
+        if has_icon {
             icons::paint(
                 &clipped,
                 icons::square_at(
-                    pos2(left + CLIP_ICON_SIZE / 2.0, rect.center().y),
+                    pos2(left + CLIP_ICON_SIZE / 2.0, label.center().y),
                     CLIP_ICON_SIZE,
                 ),
                 &icons::FILM,
                 palette.clip_video_text,
             );
-            left += CLIP_ICON_SIZE + 6.0;
+            left += icon_room;
         }
-        clipped.text(
-            pos2(left, rect.center().y),
-            Align2::LEFT_CENTER,
-            label,
-            FontId::proportional(12.0),
-            palette.clip_video_text,
-        );
+        let top = label.center().y - galley.size().y / 2.0;
+        clipped.galley(pos2(left, top), galley, palette.clip_video_text);
     }
 }
 
@@ -1515,7 +1642,8 @@ pub fn timeline(
             &clip_painter,
             palette,
             shape,
-            &clip.label,
+            clip,
+            (view.faces.get(&clip.media), &scale),
             clip_look(
                 view.selected == Some(clip.id),
                 state.hovered_clip == Some(clip.id),
@@ -1779,6 +1907,8 @@ mod tests {
             start: Ticks::from_seconds(start),
             end: Ticks::from_seconds(end),
             label: String::new(),
+            media: MediaId(1),
+            source_start: Ticks(0),
         }
     }
 
@@ -2204,6 +2334,19 @@ mod tests {
         state.keep_zoom_for_width(1000.0, 800.0, total);
         let back = state.visible_for(total);
         assert!((back.as_seconds() - before.as_seconds()).abs() < 0.001);
+    }
+
+    #[test]
+    fn a_place_on_a_clip_shows_the_footage_there_wherever_the_clip_is_trimmed_to() {
+        let scale = scale();
+        let trimmed = ClipView {
+            source_start: seconds(30.0),
+            ..view(1, 10.0, 60.0)
+        };
+
+        // Ten pixels a second, starting at 10 s on a scale that starts at x = 10.
+        assert_eq!(source_time_at(&trimmed, &scale, 110.0), seconds(30.0));
+        assert_eq!(source_time_at(&trimmed, &scale, 210.0), seconds(40.0));
     }
 
     fn layout(count: usize, height: f32) -> TrackLayout {

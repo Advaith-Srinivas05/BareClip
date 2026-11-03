@@ -83,6 +83,8 @@ pub struct Settings {
     pub theme: ThemeSetting,
     pub autosave_seconds: u32,
     pub export_cuts: ExportCuts,
+    pub thumbnails: bool,
+    pub waveforms: bool,
 }
 
 impl Default for Settings {
@@ -91,6 +93,8 @@ impl Default for Settings {
             theme: ThemeSetting::System,
             autosave_seconds: AUTOSAVE_CHOICES[0].0,
             export_cuts: ExportCuts::FrameExact,
+            thumbnails: true,
+            waveforms: true,
         }
     }
 }
@@ -301,6 +305,8 @@ mod tests {
             theme: ThemeSetting::Light,
             autosave_seconds: 30,
             export_cuts: ExportCuts::Fastest,
+            thumbnails: false,
+            waveforms: false,
         };
 
         settings.save(&folder).expect("they can be saved");

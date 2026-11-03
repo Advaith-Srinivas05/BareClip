@@ -49,6 +49,9 @@ pub fn fit_preview_size(width: u32, height: u32, max_width: u32, max_height: u32
     )
 }
 
+/// Sound always comes out as interleaved stereo.
+pub(crate) const PREVIEW_CHANNELS: usize = 2;
+
 /// One decoded picture, ready to draw.
 #[derive(Clone, Debug)]
 pub struct PreviewFrame {
