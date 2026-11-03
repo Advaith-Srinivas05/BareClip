@@ -115,15 +115,6 @@ pub fn install(ctx: &egui::Context) {
     ctx.all_styles_mut(|style| style.animation_time = ANIMATION_SECONDS);
 }
 
-/// The symbol for the theme choice in use.
-pub fn current_icon(ctx: &egui::Context) -> Icon {
-    let current = ctx.options(|options| options.theme_preference);
-    THEME_CHOICES
-        .iter()
-        .find(|(choice, ..)| *choice == current)
-        .map_or(icons::MONITOR, |&(_, icon, _)| icon)
-}
-
 /// Shows the theme choices and returns where each button was placed.
 pub fn theme_picker(ui: &mut egui::Ui, palette: &Palette) -> Vec<(ThemePreference, egui::Rect)> {
     let current = ui.ctx().options(|options| options.theme_preference);
@@ -442,15 +433,6 @@ pub mod tests {
         let half = Color32::WHITE.gamma_multiply(0.5);
         let mixed = over(half, Color32::BLACK);
         assert!((i16::from(mixed.r()) - i16::from(half.r())).abs() <= 1);
-    }
-
-    #[test]
-    fn the_theme_button_shows_the_current_choice() {
-        let ctx = egui::Context::default();
-        for (choice, icon, _) in THEME_CHOICES {
-            ctx.set_theme(choice);
-            assert_eq!(current_icon(&ctx).name, icon.name);
-        }
     }
 
     #[test]

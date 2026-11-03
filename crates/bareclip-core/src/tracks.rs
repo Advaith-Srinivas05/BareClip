@@ -2,6 +2,7 @@
 //! picture and sound win, so the whole stack plays as one sequence of clips.
 
 use crate::{
+    project::SavedClip,
     time::Ticks,
     timeline::{Clip, ClipEdge, ClipId, MediaId, TimeRange, Timeline},
 };
@@ -27,6 +28,22 @@ pub struct Tracks {
 }
 
 impl Tracks {
+    /// Puts saved tracks back. Clips of a video `media` doesn't recognise are left out.
+    pub fn restore(saved: &[Vec<SavedClip>], media: impl Fn(u64) -> Option<MediaId>) -> Self {
+        let tracks =
+            saved.iter().map(|track| {
+                Timeline::restore(track.iter().filter_map(|clip| {
+                    Some((media(clip.media)?, Ticks(clip.start), clip.source()))
+                }))
+            });
+        let mut restored = Self {
+            tracks: tracks.collect(),
+            played: Timeline::default(),
+        };
+        restored.refresh();
+        restored
+    }
+
     pub fn tracks(&self) -> &[Timeline] {
         &self.tracks
     }

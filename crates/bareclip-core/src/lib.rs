@@ -2,6 +2,7 @@
 
 pub mod history;
 pub mod playback;
+pub mod project;
 pub mod splice;
 pub mod time;
 pub mod timeline;

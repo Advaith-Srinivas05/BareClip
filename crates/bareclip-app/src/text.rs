@@ -188,6 +188,15 @@ pub fn export_summary(report: &ExportReport) -> Vec<String> {
     lines
 }
 
+/// A project's name as the top strip shows it, marked if it has unsaved changes.
+pub fn project_title(name: &str, unsaved: bool) -> String {
+    if unsaved {
+        format!("{name} *")
+    } else {
+        name.to_owned()
+    }
+}
+
 /// Orders names the way File Explorer does: ignoring case, with runs of digits compared
 /// as numbers, so "clip 2" comes before "clip 10".
 pub fn natural_order(a: &str, b: &str) -> Ordering {
