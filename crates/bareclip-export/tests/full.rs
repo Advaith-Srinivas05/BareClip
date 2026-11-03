@@ -1312,3 +1312,89 @@ fn a_full_picture_on_a_coloured_background_still_skips_the_gpu() {
     assert_eq!(report.gpu, None);
     assert_eq!(report.composited_frames, 0);
 }
+
+/// Red on the left half and blue on the right.
+fn half_and_half_clip() -> PathBuf {
+    clip(
+        "layer-half.mp4",
+        &encoded(
+            "color=c=red:s=160x180:r=30:d=2[a];color=c=blue:s=160x180:r=30:d=2[b];[a][b]hstack,format=yuv420p"
+                .to_owned(),
+            &[beeps(2)],
+        ),
+    )
+}
+
+#[test]
+fn a_cropped_clip_shows_only_what_is_kept_and_it_stays_where_it_was() {
+    let job = layered_request(
+        "layer-cropped",
+        vec![stretch(
+            0.0,
+            1.0,
+            vec![whole(
+                &half_and_half_clip(),
+                1,
+                0.0,
+                1.0,
+                Placement::default().cropped_to(
+                    bareclip_core::placement::CropSides {
+                        left: 0.5,
+                        ..Default::default()
+                    },
+                    (320, 180),
+                    (320, 180),
+                ),
+            )],
+        )],
+        Vec::new(),
+    );
+
+    let report = run_layered(&job);
+
+    assert_eq!((report.width, report.height), (320, 180));
+    let mut reader = PictureReader::open(&job.output).expect("the export opens");
+    let picture = reader
+        .next_picture()
+        .expect("it decodes")
+        .expect("a picture");
+    let view = picture.view();
+    assert!(
+        is_blue(colour_at(&view, 240, 90)),
+        "the blue half stays on the right"
+    );
+    assert!(
+        brightness_at(&view, 80, 90) < 30,
+        "the red half is cut away"
+    );
+}
+
+#[test]
+fn a_flipped_clip_comes_out_mirrored() {
+    let job = layered_request(
+        "layer-flipped",
+        vec![stretch(
+            0.0,
+            1.0,
+            vec![whole(
+                &half_and_half_clip(),
+                1,
+                0.0,
+                1.0,
+                Placement::default().flipped_across(),
+            )],
+        )],
+        Vec::new(),
+    );
+
+    run_layered(&job);
+
+    let mut reader = PictureReader::open(&job.output).expect("the export opens");
+    let picture = reader
+        .next_picture()
+        .expect("it decodes")
+        .expect("a picture");
+    let view = picture.view();
+    assert!(is_blue(colour_at(&view, 80, 90)), "blue is now on the left");
+    assert!(is_red(colour_at(&view, 240, 90)), "red is now on the right");
+}

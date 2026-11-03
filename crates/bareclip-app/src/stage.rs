@@ -5,7 +5,9 @@
 //! Turning only makes sense in pixels, because a canvas's width and height aren't equal.
 
 use bareclip_core::{
-    placement::{CanvasCorner, FULL_TURN, LARGEST_SCALE, Placement, SMALLEST_SCALE, WHOLE},
+    placement::{
+        CanvasCorner, CropSides, FULL_TURN, LARGEST_SCALE, Placement, SMALLEST_SCALE, WHOLE,
+    },
     timeline::ClipId,
     tracks::OrderMove,
 };
@@ -461,11 +463,99 @@ fn toolbar_rect(width: f32, clip: Rect, area: Rect, row_above_is_free: bool) -> 
     Rect::from_min_size(at, size)
 }
 
+/// Which sides of a crop a handle moves, with -1 for the left or top and 1 for the right or bottom.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CropHandle {
+    across: i8,
+    down: i8,
+}
+
+const CROP_HANDLES: [CropHandle; 8] = [
+    CropHandle {
+        across: -1,
+        down: -1,
+    },
+    CropHandle {
+        across: 0,
+        down: -1,
+    },
+    CropHandle {
+        across: 1,
+        down: -1,
+    },
+    CropHandle { across: 1, down: 0 },
+    CropHandle { across: 1, down: 1 },
+    CropHandle { across: 0, down: 1 },
+    CropHandle {
+        across: -1,
+        down: 1,
+    },
+    CropHandle {
+        across: -1,
+        down: 0,
+    },
+];
+/// The least a crop can leave, each way, which matches what a placement holds to.
+const SMALLEST_CROP_KEPT: f64 = 0.05;
+
+/// The kept part of a picture, in its own terms from -1 to 1 each way, before turning.
+fn crop_bounds(sides: CropSides) -> (f64, f64, f64, f64) {
+    (
+        sides.left * 2.0 - 1.0,
+        sides.top * 2.0 - 1.0,
+        1.0 - sides.right * 2.0,
+        1.0 - sides.bottom * 2.0,
+    )
+}
+
+/// Where a crop handle is on the whole picture.
+fn crop_handle_at(handle: CropHandle, sides: CropSides, full: &Shown) -> (f64, f64) {
+    let (left, top, right, bottom) = crop_bounds(sides);
+    let along = |side: i8, low: f64, high: f64| match side {
+        -1 => low,
+        1 => high,
+        _ => (low + high) / 2.0,
+    };
+    full.at(
+        along(handle.across, left, right),
+        along(handle.down, top, bottom),
+    )
+}
+
+/// A crop with a handle dragged to a place on the canvas. Sides stop at the picture's edges, and
+/// before they meet.
+fn crop_dragged(
+    handle: CropHandle,
+    start: CropSides,
+    full: &Shown,
+    pointer: (f64, f64),
+) -> CropSides {
+    let (across, down) = full.unturned(
+        pointer.0 * full.canvas.0 - full.center.0,
+        pointer.1 * full.canvas.1 - full.center.1,
+    );
+    let x = (across / full.half.0.max(f64::EPSILON) + 1.0) / 2.0;
+    let y = (down / full.half.1.max(f64::EPSILON) + 1.0) / 2.0;
+    let mut sides = start;
+    match handle.across {
+        -1 => sides.left = x.clamp(0.0, (1.0 - SMALLEST_CROP_KEPT - start.right).max(0.0)),
+        1 => sides.right = (1.0 - x).clamp(0.0, (1.0 - SMALLEST_CROP_KEPT - start.left).max(0.0)),
+        _ => {}
+    }
+    match handle.down {
+        -1 => sides.top = y.clamp(0.0, (1.0 - SMALLEST_CROP_KEPT - start.bottom).max(0.0)),
+        1 => sides.bottom = (1.0 - y).clamp(0.0, (1.0 - SMALLEST_CROP_KEPT - start.top).max(0.0)),
+        _ => {}
+    }
+    sides
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum DragKind {
     Move,
     Resize(Corner),
     Rotate,
+    Crop(CropHandle),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -487,9 +577,16 @@ pub struct StageState {
     pub frame: Option<Rect>,
     /// Where the rotate handle was in the last frame.
     pub rotate_handle: Option<Pos2>,
+    /// The clip being cropped, which shows whole until cropping ends.
+    cropping: Option<ClipId>,
 }
 
 impl StageState {
+    /// The clip being cropped, if any. It should be drawn whole, with its crop shown on top.
+    pub fn cropping(&self) -> Option<ClipId> {
+        self.cropping
+    }
+
     /// Whether a line is showing what something lined up with.
     #[cfg(test)]
     pub fn has_guides(&self) -> bool {
@@ -522,8 +619,31 @@ pub struct StageEvents {
     pub order: Option<(ClipId, OrderMove)>,
 }
 
+/// The crop handle at a place on the screen, on the clip being cropped.
+fn crop_handle_near(clip: &StageClip, view: &StageView, pointer: Pos2) -> Option<CropHandle> {
+    let full = Shown::of(
+        clip.placement.uncropped(clip.size, view.canvas),
+        clip.size,
+        view.canvas,
+    );
+    let sides = clip.placement.crop_sides();
+    CROP_HANDLES.into_iter().find(|handle| {
+        on_screen(crop_handle_at(*handle, sides, &full), view.frame).distance(pointer)
+            <= HANDLE_REACH
+    })
+}
+
 /// What a press at this place on the canvas would grab, trying the selected clip's handles first.
-fn grab_at(view: &StageView, pointer: Pos2) -> Option<(ClipId, DragKind)> {
+fn grab_at(
+    view: &StageView,
+    cropping: Option<ClipId>,
+    pointer: Pos2,
+) -> Option<(ClipId, DragKind)> {
+    if let Some(id) = cropping {
+        // Only the crop's own handles do anything until cropping ends.
+        let clip = view.clips.iter().find(|clip| clip.id == id)?;
+        return crop_handle_near(clip, view, pointer).map(|handle| (id, DragKind::Crop(handle)));
+    }
     if let Some(selected) = view
         .clips
         .iter()
@@ -559,6 +679,10 @@ pub fn show(
     let mut events = StageEvents::default();
     state.frame = Some(view.frame);
     state.rotate_handle = None;
+    // Cropping ends if its clip stops being selected or is no longer on the picture.
+    state.cropping = state
+        .cropping
+        .filter(|id| view.selected == Some(*id) && view.clips.iter().any(|clip| clip.id == *id));
     let response = ui.interact(
         view.area,
         ui.scope_id().with("stage"),
@@ -566,7 +690,13 @@ pub fn show(
     );
 
     if let Some(pointer) = response.hover_pos() {
-        let cursor = match grab_at(view, pointer) {
+        let cursor = match grab_at(view, state.cropping, pointer) {
+            Some((_, DragKind::Crop(handle))) => Some(match (handle.across, handle.down) {
+                (0, _) => CursorIcon::ResizeVertical,
+                (_, 0) => CursorIcon::ResizeHorizontal,
+                (across, down) if across == down => CursorIcon::ResizeNwSe,
+                _ => CursorIcon::ResizeNeSw,
+            }),
             Some((id, DragKind::Resize(corner))) => view
                 .clips
                 .iter()
@@ -585,13 +715,25 @@ pub fn show(
         && let Some(pointer) = response.interact_pointer_pos()
     {
         let (x, y) = canvas_share(pointer, view.frame);
-        events.select = Some(clip_at(view.clips, view.canvas, x, y));
+        match state
+            .cropping
+            .and_then(|id| view.clips.iter().find(|clip| clip.id == id))
+        {
+            // A click away from the picture being cropped means being done with it.
+            Some(clip) => {
+                let whole = clip.placement.uncropped(clip.size, view.canvas);
+                if !Shown::of(whole, clip.size, view.canvas).contains(x, y) {
+                    state.cropping = None;
+                }
+            }
+            None => events.select = Some(clip_at(view.clips, view.canvas, x, y)),
+        }
     }
 
     if response.drag_started() {
         let origin = ui.input(|input| input.pointer.press_origin());
         if let Some(pointer) = origin
-            && let Some((clip, kind)) = grab_at(view, pointer)
+            && let Some((clip, kind)) = grab_at(view, state.cropping, pointer)
             && let Some(found) = view.clips.iter().find(|found| found.id == clip)
         {
             state.drag = Some(StageDrag {
@@ -644,6 +786,15 @@ pub fn show(
                 state.rotation_snapped = snapped;
                 placement
             }
+            DragKind::Crop(handle) => {
+                let full = Shown::of(
+                    drag.start.uncropped(clip.size, view.canvas),
+                    clip.size,
+                    view.canvas,
+                );
+                let sides = crop_dragged(handle, drag.start.crop_sides(), &full, at);
+                drag.start.cropped_to(sides, clip.size, view.canvas)
+            }
         };
         events.place = Some((drag.clip, placement));
     }
@@ -679,6 +830,20 @@ pub fn show(
             .map_or(selected.placement, |(_, placement)| placement);
         let shown = Shown::of(placement, selected.size, view.canvas);
         let corners = CORNERS.map(|corner| on_screen(shown.corner(corner), view.frame));
+        if state.cropping == Some(selected.id) {
+            paint_crop(&painter, palette, view, selected, placement);
+            crop_toolbar(
+                ui,
+                palette,
+                view,
+                state,
+                selected,
+                placement,
+                corners,
+                &mut events,
+            );
+            return events;
+        }
         painter.add(Shape::closed_line(
             corners.to_vec(),
             Stroke::new(2.0, palette.playhead),
@@ -714,30 +879,151 @@ pub fn show(
                 palette.text,
             );
         }
-        let lowest = |pick: fn(&Pos2) -> f32| corners.iter().map(pick).fold(f32::MAX, f32::min);
-        let highest = |pick: fn(&Pos2) -> f32| corners.iter().map(pick).fold(f32::MIN, f32::max);
-        let around = Rect::from_min_max(
-            pos2(lowest(|c| c.x), lowest(|c| c.y)),
-            pos2(highest(|c| c.x), highest(|c| c.y)),
+        let box_around = around(&corners);
+        toolbar(
+            ui,
+            palette,
+            state,
+            view,
+            selected,
+            placement,
+            box_around,
+            &mut events,
         );
-        toolbar(ui, palette, view, selected, placement, around, &mut events);
     }
     events
+}
+
+/// The rectangle around some points on the screen.
+fn around(points: &[Pos2]) -> Rect {
+    let lowest = |pick: fn(&Pos2) -> f32| points.iter().map(pick).fold(f32::MAX, f32::min);
+    let highest = |pick: fn(&Pos2) -> f32| points.iter().map(pick).fold(f32::MIN, f32::max);
+    Rect::from_min_max(
+        pos2(lowest(|p| p.x), lowest(|p| p.y)),
+        pos2(highest(|p| p.x), highest(|p| p.y)),
+    )
+}
+
+/// Dims what a crop cuts away, and draws the kept part's outline and handles.
+fn paint_crop(
+    painter: &egui::Painter,
+    palette: &Palette,
+    view: &StageView,
+    clip: &StageClip,
+    placement: Placement,
+) {
+    let full = Shown::of(
+        placement.uncropped(clip.size, view.canvas),
+        clip.size,
+        view.canvas,
+    );
+    let sides = placement.crop_sides();
+    let (left, top, right, bottom) = crop_bounds(sides);
+    let dim = palette.stage.gamma_multiply(0.65);
+    let at = |x: f64, y: f64| on_screen(full.at(x, y), view.frame);
+    for strip in [
+        [(-1.0, -1.0), (left, -1.0), (left, 1.0), (-1.0, 1.0)],
+        [(right, -1.0), (1.0, -1.0), (1.0, 1.0), (right, 1.0)],
+        [(left, -1.0), (right, -1.0), (right, top), (left, top)],
+        [(left, bottom), (right, bottom), (right, 1.0), (left, 1.0)],
+    ] {
+        painter.add(Shape::convex_polygon(
+            strip.map(|(x, y)| at(x, y)).to_vec(),
+            dim,
+            Stroke::NONE,
+        ));
+    }
+    painter.add(Shape::closed_line(
+        [(left, top), (right, top), (right, bottom), (left, bottom)]
+            .map(|(x, y)| at(x, y))
+            .to_vec(),
+        Stroke::new(2.0, palette.playhead),
+    ));
+    for handle in CROP_HANDLES {
+        painter.circle(
+            on_screen(crop_handle_at(handle, sides, &full), view.frame),
+            HANDLE_SIZE / 2.0,
+            palette.playhead,
+            Stroke::new(1.5, palette.playhead_outline),
+        );
+    }
+}
+
+/// The bar while cropping: finish, or put back everything that was cut.
+#[allow(clippy::too_many_arguments)]
+fn crop_toolbar(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    view: &StageView,
+    state: &mut StageState,
+    clip: &StageClip,
+    placement: Placement,
+    corners: [Pos2; 4],
+    events: &mut StageEvents,
+) {
+    let width = TOOLBAR_PADDING * 2.0 + TOOLBAR_BUTTON * 2.0;
+    let full = Shown::of(
+        placement.uncropped(clip.size, view.canvas),
+        clip.size,
+        view.canvas,
+    );
+    let whole = CORNERS.map(|corner| on_screen(full.corner(corner), view.frame));
+    let all: Vec<Pos2> = corners.iter().chain(&whole).copied().collect();
+    let rect = toolbar_rect(width, around(&all), view.area, view.row_above_is_free);
+    let id = ui.scope_id().with("crop-toolbar");
+    egui::Area::new(id)
+        .order(egui::Order::Middle)
+        .fixed_pos(rect.min)
+        .fade_in(false)
+        .constrain(false)
+        .show(ui.ctx(), |ui| {
+            ui.set_min_size(rect.size());
+            ui.painter().rect(
+                rect,
+                8.0,
+                palette.raised,
+                Stroke::new(1.0, palette.border),
+                egui::StrokeKind::Inside,
+            );
+            let spot = |index: f32| {
+                Rect::from_min_size(
+                    pos2(
+                        rect.left() + TOOLBAR_PADDING + TOOLBAR_BUTTON * index,
+                        rect.center().y - TOOLBAR_BUTTON / 2.0,
+                    ),
+                    vec2(TOOLBAR_BUTTON, TOOLBAR_BUTTON),
+                )
+            };
+            let done = IconButton::new(palette, Kind::Ghost, icons::CHECK, "Finish cropping")
+                .show_at(ui, id.with("done"), spot(0.0))
+                .on_hover_text("Finish cropping");
+            if done.clicked() {
+                state.cropping = None;
+            }
+            let reset = IconButton::new(palette, Kind::Ghost, icons::ROTATE_CCW, "Reset crop")
+                .show_at(ui, id.with("reset"), spot(1.0))
+                .on_hover_text("Put back everything that was cut");
+            if reset.clicked() {
+                events.place = Some((clip.id, placement.uncropped(clip.size, view.canvas)));
+            }
+        });
 }
 
 /// The small bar above the selected clip. It only offers what works today. It sits in its own
 /// layer, because when a clip fills the picture the only place that covers nothing is the row
 /// above it, which the stage's own drawing can't reach.
+#[allow(clippy::too_many_arguments)]
 fn toolbar(
     ui: &mut egui::Ui,
     palette: &Palette,
+    state: &mut StageState,
     view: &StageView,
     clip: &StageClip,
     placement: Placement,
     clip_rect: Rect,
     events: &mut StageEvents,
 ) {
-    let buttons = 4.0;
+    let buttons = 5.0;
     let width = TOOLBAR_PADDING * 2.0 + TOOLBAR_BUTTON * buttons;
     let rect = toolbar_rect(width, clip_rect, view.area, view.row_above_is_free);
     let id = ui.scope_id().with("stage-toolbar");
@@ -771,9 +1057,12 @@ fn toolbar(
                         .on_hover_text(hint)
                 };
 
+            if button(ui, 0.0, icons::CROP, "Crop", "Crop").clicked() {
+                state.cropping = Some(clip.id);
+            }
             if button(
                 ui,
-                0.0,
+                1.0,
                 icons::ROTATE_CW,
                 "Rotate by 90 degrees",
                 "Rotate by 90°",
@@ -784,7 +1073,7 @@ fn toolbar(
             }
             if button(
                 ui,
-                1.0,
+                2.0,
                 icons::FLIP_HORIZONTAL_2,
                 "Flip left to right",
                 "Flip left to right",
@@ -795,7 +1084,7 @@ fn toolbar(
             }
             if button(
                 ui,
-                2.0,
+                3.0,
                 icons::FLIP_VERTICAL_2,
                 "Flip top to bottom",
                 "Flip top to bottom",
@@ -804,7 +1093,7 @@ fn toolbar(
             {
                 events.place = Some((clip.id, placement.flipped_down()));
             }
-            let more = button(ui, 3.0, icons::ELLIPSIS, "More", "More");
+            let more = button(ui, 4.0, icons::ELLIPSIS, "More", "More");
             egui::Popup::menu(&more)
                 .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                 .show(|ui| {
@@ -1469,5 +1758,106 @@ mod tests {
         let handle = rotate_handle_at(&small, area, area);
 
         assert_eq!(handle.y, 337.5 + ROTATE_HANDLE_GAP);
+    }
+
+    fn whole_picture(canvas: (u32, u32)) -> Shown {
+        Shown::of(Placement::default(), canvas, canvas)
+    }
+
+    #[test]
+    fn dragging_a_crop_handle_moves_only_its_own_sides() {
+        let full = whole_picture((1000, 1000));
+        let left_edge = CropHandle {
+            across: -1,
+            down: 0,
+        };
+        let corner = CropHandle { across: 1, down: 1 };
+
+        let sides = crop_dragged(left_edge, CropSides::default(), &full, (0.25, 0.8));
+        assert!((sides.left - 0.25).abs() < 1e-9, "{sides:?}");
+        assert_eq!((sides.right, sides.top, sides.bottom), (0.0, 0.0, 0.0));
+
+        let sides = crop_dragged(corner, CropSides::default(), &full, (0.75, 0.6));
+        assert!((sides.right - 0.25).abs() < 1e-9, "{sides:?}");
+        assert!((sides.bottom - 0.4).abs() < 1e-9, "{sides:?}");
+        assert_eq!((sides.left, sides.top), (0.0, 0.0));
+    }
+
+    #[test]
+    fn a_crop_stops_at_the_pictures_edge() {
+        let full = whole_picture((1000, 1000));
+        let left_edge = CropHandle {
+            across: -1,
+            down: 0,
+        };
+
+        let sides = crop_dragged(left_edge, CropSides::default(), &full, (-3.0, 0.5));
+
+        assert_eq!(sides.left, 0.0);
+    }
+
+    #[test]
+    fn a_crop_always_leaves_something() {
+        let full = whole_picture((1000, 1000));
+        let left_edge = CropHandle {
+            across: -1,
+            down: 0,
+        };
+        let start = CropSides {
+            right: 0.3,
+            ..CropSides::default()
+        };
+
+        let sides = crop_dragged(left_edge, start, &full, (5.0, 0.5));
+
+        assert!((1.0 - sides.left - sides.right - SMALLEST_CROP_KEPT).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_crop_on_a_turned_picture_goes_by_the_pictures_own_sides() {
+        let canvas = (1000, 1000);
+        let turned = Shown::of(
+            Placement {
+                rotation: 90_000,
+                scale: WHOLE / 2,
+                ..Placement::default()
+            },
+            canvas,
+            canvas,
+        );
+        let left_edge = CropHandle {
+            across: -1,
+            down: 0,
+        };
+
+        // Turned a quarter clockwise, its left side is at the top. Half size spans 0.25 to 0.75,
+        // so a pointer a quarter of the way down it is a quarter of the way in from that side.
+        let sides = crop_dragged(left_edge, CropSides::default(), &turned, (0.5, 0.375));
+
+        assert!((sides.left - 0.25).abs() < 1e-6, "{sides:?}");
+    }
+
+    #[test]
+    fn crop_handles_sit_on_what_is_kept() {
+        let full = whole_picture((1000, 1000));
+        let sides = CropSides {
+            left: 0.2,
+            top: 0.1,
+            right: 0.3,
+            bottom: 0.4,
+        };
+
+        let top_left = crop_handle_at(
+            CropHandle {
+                across: -1,
+                down: -1,
+            },
+            sides,
+            &full,
+        );
+        let right_middle = crop_handle_at(CropHandle { across: 1, down: 0 }, sides, &full);
+
+        assert!((top_left.0 - 0.2).abs() < 1e-6 && (top_left.1 - 0.1).abs() < 1e-6);
+        assert!((right_middle.0 - 0.7).abs() < 1e-6 && (right_middle.1 - 0.35).abs() < 1e-6);
     }
 }
