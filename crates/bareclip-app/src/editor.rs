@@ -33,7 +33,9 @@ use eframe::egui::{
 };
 
 use crate::{
-    components::{self, ActionButton, CheckBox, IconButton, Kind, MenuItem},
+    components::{
+        self, ActionButton, CheckBox, IconButton, Kind, MenuItem, NAME_BAR_PADDING, NameBar,
+    },
     fonts, icons,
     preview::Preview,
     storage::{self, ExportCuts, Recovery, RecoveryRecord, Settings},
@@ -44,7 +46,6 @@ use crate::{
     },
 };
 
-const VIDEO_EXTENSIONS: [&str; 6] = ["mp4", "mkv", "mov", "webm", "avi", "ts"];
 const LOGO_DARK: &[u8] = include_bytes!("../../../assets/brand/png/mark-dark-256.png");
 const LOGO_LIGHT: &[u8] = include_bytes!("../../../assets/brand/png/mark-light-256.png");
 // The brand rules call for the simplified mark at this size.
@@ -609,7 +610,11 @@ impl Editor {
     fn save_as(&mut self) -> bool {
         let mut dialog = rfd::FileDialog::new()
             .set_title("Save project")
-            .set_file_name(format!("{}.{}", self.project_name, project::EXTENSION))
+            .set_file_name(format!(
+                "{}.{}",
+                text::safe_file_name(&self.project_name),
+                project::EXTENSION
+            ))
             .add_filter("BareClip project", &[project::EXTENSION]);
         if let Some(folder) = self.project_path.as_deref().and_then(Path::parent) {
             dialog = dialog.set_directory(folder);
@@ -1586,21 +1591,27 @@ impl Editor {
         final_size(&sizes).map(|(width, height)| vec2(width as f32, height as f32))
     }
 
-    fn start_export(&mut self, ctx: &egui::Context) {
-        let Some(first) = self
+    /// The file the export dialog starts on, or nothing if no video is on the timeline.
+    fn suggested_output(&self) -> Option<PathBuf> {
+        let first = self
             .project
             .tracks
             .played()
             .clips()
             .first()
-            .and_then(|clip| self.entry(clip.media))
-        else {
+            .and_then(|clip| self.entry(clip.media))?;
+        let suggested = text::default_output_path(&self.project_name, &first.info.path);
+        Some(if matches!(self.export_route(), Route::Full(_)) {
+            full_output_path(&suggested)
+        } else {
+            suggested
+        })
+    }
+
+    fn start_export(&mut self, ctx: &egui::Context) {
+        let Some(suggested) = self.suggested_output() else {
             return;
         };
-        let mut suggested = text::default_output_path(&first.info.path);
-        if matches!(self.export_route(), Route::Full(_)) {
-            suggested = full_output_path(&suggested);
-        }
         let mut dialog = rfd::FileDialog::new().set_title("Export video as");
         if let Some(folder) = suggested.parent() {
             dialog = dialog.set_directory(folder);
@@ -1650,7 +1661,7 @@ impl Editor {
     fn pick_files(&mut self, ctx: &egui::Context) {
         let picked = rfd::FileDialog::new()
             .set_title("Add videos")
-            .add_filter("Video files", &VIDEO_EXTENSIONS)
+            .add_filter("Video files", &text::VIDEO_EXTENSIONS)
             .add_filter("All files", &["*"])
             .pick_files();
         if let Some(paths) = picked {
@@ -1922,6 +1933,8 @@ impl Editor {
             let edit = ui.add(
                 egui::TextEdit::singleline(&mut typed)
                     .id(egui::Id::unique("project_name_edit"))
+                    .font(FontId::new(12.0, FontFamily::Proportional))
+                    .margin(Margin::symmetric(NAME_BAR_PADDING as i8, 5))
                     .desired_width(PROJECT_NAME_WIDTH),
             );
             let cancelled = ui.input(|input| input.key_pressed(Key::Escape));
@@ -1939,8 +1952,12 @@ impl Editor {
         } else {
             let unsaved = self.has_unsaved_changes();
             let label = text::project_title(&self.project_name, unsaved);
-            let name = ActionButton::new(palette, Kind::Ghost, &label).small();
-            if ui.add(name).on_hover_text("Rename this project").clicked() {
+            let name = NameBar::new(palette, &label, PROJECT_NAME_WIDTH);
+            if ui
+                .add(name)
+                .on_hover_text("Rename this project and its exported video")
+                .clicked()
+            {
                 self.renaming = Some(self.project_name.clone());
             }
         }
@@ -2169,7 +2186,7 @@ impl Editor {
         if let Some(index) = find
             && let Some(path) = rfd::FileDialog::new()
                 .set_title("Find video")
-                .add_filter("Video files", &VIDEO_EXTENSIONS)
+                .add_filter("Video files", &text::VIDEO_EXTENSIONS)
                 .add_filter("All files", &["*"])
                 .pick_file()
         {
@@ -4080,6 +4097,16 @@ mod tests {
         editor.export_state = ExportState::Choosing;
         let_dialog_open(&ctx, &mut editor);
         camera.shoot(&ctx, &mut editor, vec![], "mixed-3-export");
+        editor.export_state = ExportState::Closed;
+        let_dialog_open(&ctx, &mut editor);
+
+        camera.shoot(&ctx, &mut editor, vec![], "name-1-at-rest");
+        editor.project_name = "a very long project name that does not fit ".repeat(4);
+        camera.shoot(&ctx, &mut editor, vec![], "name-2-long");
+        editor.project_name = project::DEFAULT_NAME.to_owned();
+        editor.renaming = Some("Final round".to_owned());
+        run_frame(&ctx, &mut editor, vec![]);
+        camera.shoot(&ctx, &mut editor, vec![], "name-3-typing");
     }
 
     /// Saves pictures of the screen to look at, in the folder named by `BARECLIP_SCREENS`.
@@ -7994,6 +8021,100 @@ mod tests {
         run_frame(&ctx, &mut editor, press(Key::Enter));
         run_frame(&ctx, &mut editor, vec![]);
         assert_eq!(editor.project_name, project::DEFAULT_NAME);
+    }
+
+    #[test]
+    fn a_new_project_exports_as_untitled_beside_the_first_video_with_its_type() {
+        let ctx = context();
+        let editor = with_videos(&ctx, &[test_clip()]);
+
+        let suggested = editor
+            .suggested_output()
+            .expect("a video is on the timeline");
+
+        assert_eq!(project::DEFAULT_NAME, "untitled");
+        assert_eq!(suggested.parent(), test_clip().parent());
+        assert_eq!(
+            suggested.file_name().and_then(|name| name.to_str()),
+            Some("untitled.mp4")
+        );
+    }
+
+    #[test]
+    fn renaming_the_project_renames_the_exported_video() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+
+        click_named(&ctx, &mut editor, &format!("{} *", project::DEFAULT_NAME));
+        run_frame(&ctx, &mut editor, vec![]);
+        run_frame(&ctx, &mut editor, key_event(Key::A, Modifiers::COMMAND));
+        type_text(&ctx, &mut editor, "Final round");
+        run_frame(&ctx, &mut editor, press(Key::Enter));
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let suggested = editor
+            .suggested_output()
+            .expect("a video is on the timeline");
+        assert_eq!(
+            suggested.file_name().and_then(|name| name.to_str()),
+            Some("Final round.mp4")
+        );
+    }
+
+    #[test]
+    fn a_full_export_is_suggested_as_an_mp4_under_the_project_name() {
+        let ctx = context();
+        let tall = make_clip("editor-suggested-tall", "180x320");
+        let mut editor = with_videos(&ctx, &[test_clip(), &tall]);
+        let_panel_finish(&ctx, &mut editor);
+        assert!(matches!(editor.export_route(), Route::Full(_)));
+        editor.project_name = "my.mixed cut".to_owned();
+
+        let suggested = editor
+            .suggested_output()
+            .expect("a video is on the timeline");
+
+        assert_eq!(
+            suggested.file_name().and_then(|name| name.to_str()),
+            Some("my.mixed cut.mp4")
+        );
+    }
+
+    #[test]
+    fn nothing_is_suggested_without_a_video_on_the_timeline() {
+        let ctx = context();
+        let editor = in_panel_only(&ctx, &[]);
+
+        assert!(editor.suggested_output().is_none());
+    }
+
+    #[test]
+    fn a_long_name_stays_inside_the_name_bar() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[]);
+        let short = named_rect(&ctx, &mut editor, project::DEFAULT_NAME);
+
+        let long = "a very long project name ".repeat(10);
+        let long = long.trim().to_owned();
+        editor.project_name.clone_from(&long);
+        let held = named_rect(&ctx, &mut editor, &format!("{long} *"));
+
+        assert_eq!(held.width(), PROJECT_NAME_WIDTH);
+        assert_eq!(held, short);
+    }
+
+    #[test]
+    fn opening_the_name_bar_for_typing_does_not_move_what_is_beside_it() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[]);
+        let at_rest = named_rect(&ctx, &mut editor, "Project menu");
+
+        click_named(&ctx, &mut editor, project::DEFAULT_NAME);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.renaming.is_some());
+        let typing = named_rect(&ctx, &mut editor, "Project menu");
+
+        assert_eq!(at_rest.left(), typing.left());
     }
 
     #[test]

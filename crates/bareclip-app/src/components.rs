@@ -18,6 +18,7 @@ const BUTTON_HEIGHT: f32 = 32.0;
 const SMALL_BUTTON_HEIGHT: f32 = 26.0;
 const BUTTON_PADDING: f32 = 12.0;
 const SMALL_BUTTON_PADDING: f32 = 8.0;
+pub const NAME_BAR_PADDING: f32 = 8.0;
 const ICON_GAP: f32 = 6.0;
 const FOCUS_RING_GAP: f32 = 2.0;
 const DIALOG_BUTTON_SPACING: f32 = 8.0;
@@ -537,6 +538,64 @@ impl Widget for MenuItem<'_> {
                 FontId::new(12.0, FontFamily::Proportional),
                 shortcut,
             );
+        }
+        response
+    }
+}
+
+/// A box showing a name that opens for typing when clicked. It stays one width, cutting a long
+/// name short, so a long name can't push the controls beside it around.
+pub struct NameBar<'a> {
+    palette: &'a Palette,
+    label: &'a str,
+    width: f32,
+}
+
+impl<'a> NameBar<'a> {
+    pub fn new(palette: &'a Palette, label: &'a str, width: f32) -> Self {
+        Self {
+            palette,
+            label,
+            width,
+        }
+    }
+}
+
+impl Widget for NameBar<'_> {
+    fn ui(self, ui: &mut Ui) -> Response {
+        let size = vec2(self.width, SMALL_BUTTON_HEIGHT);
+        let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+        let enabled = response.enabled();
+        let label = self.label;
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label));
+        if ui.is_rect_visible(rect) {
+            let palette = self.palette;
+            let border = if response.hovered() || response.has_focus() {
+                palette.accent
+            } else {
+                palette.border
+            };
+            ui.painter().rect(
+                rect,
+                f32::from(RADIUS),
+                palette.bg_app,
+                Stroke::new(1.0, border),
+                StrokeKind::Inside,
+            );
+            let mut job = egui::text::LayoutJob::simple_singleline(
+                label.to_owned(),
+                FontId::new(12.0, FontFamily::Proportional),
+                palette.text,
+            );
+            job.wrap.max_width = self.width - NAME_BAR_PADDING * 2.0;
+            job.wrap.max_rows = 1;
+            job.wrap.break_anywhere = true;
+            let galley = ui.painter().layout_job(job);
+            let text = pos2(
+                rect.left() + NAME_BAR_PADDING,
+                rect.center().y - galley.size().y / 2.0,
+            );
+            ui.painter().galley(text, galley, palette.text);
         }
         response
     }
