@@ -323,9 +323,10 @@ impl<'a> IconButton<'a> {
         self
     }
 
-    /// Places the button at an exact spot, without taking up room in the layout.
+    /// Places the button at an exact spot, without taking up room in the layout. These sit
+    /// on top of things that can be dragged, so it senses drags too, to keep them for itself.
     pub fn show_at(self, ui: &mut Ui, id: egui::Id, rect: Rect) -> Response {
-        let response = ui.interact(rect, id, Sense::click());
+        let response = ui.interact(rect, id, Sense::click_and_drag());
         self.finish(ui, rect, response)
     }
 
@@ -392,13 +393,15 @@ impl<'a> CheckBox<'a> {
         self
     }
 
-    /// Places the box at the top left of `area`, without taking up room in the layout.
+    /// Places the box at the top left of `area`, without taking up room in the layout. It
+    /// sits on top of things that can be dragged, so it senses drags too, to keep them for
+    /// itself.
     pub fn show_in_corner(self, ui: &mut Ui, id: egui::Id, area: Rect, margin: f32) -> Response {
         let rect = Rect::from_min_size(
             area.min + vec2(margin, margin),
             vec2(CHECK_BOX_SIZE, CHECK_BOX_SIZE),
         );
-        let response = ui.interact(rect, id, Sense::click());
+        let response = ui.interact(rect, id, Sense::click_and_drag());
         self.finish(ui, rect, response)
     }
 
