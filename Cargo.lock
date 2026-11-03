@@ -407,6 +407,7 @@ version = "0.1.0"
 dependencies = [
  "bareclip-audio",
  "bareclip-core",
+ "bareclip-export",
  "bareclip-media",
  "eframe",
  "rfd",
@@ -431,6 +432,16 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "bareclip-export"
+version = "0.1.0"
+dependencies = [
+ "bareclip-core",
+ "bareclip-media",
+ "bareclip-render",
+ "ffmpeg-next",
 ]
 
 [[package]]
