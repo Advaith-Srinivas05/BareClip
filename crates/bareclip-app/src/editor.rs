@@ -39,7 +39,7 @@ use crate::{
     },
     fonts, icons,
     layers::{LayerDisplay, LayerPictures, Moment},
-    preview::Preview,
+    preview::{PREPARE_AHEAD_SECONDS, Preview},
     stage::{self, StageClip, StageState, StageView},
     storage::{self, ExportCuts, Recovery, RecoveryRecord, Settings},
     text,
@@ -1467,6 +1467,12 @@ impl Editor {
                 now,
                 playing: preview.is_playing(),
                 jumped: preview.take_jump(),
+                coming: project.tracks.next_change(
+                    now,
+                    Ticks::from_seconds(PREPARE_AHEAD_SECONDS),
+                    canvas,
+                    &size_of,
+                ),
             };
             let top = frame.zip(preview.last_picture_from());
             let repaint = ctx.clone();

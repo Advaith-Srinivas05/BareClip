@@ -227,6 +227,30 @@ impl Tracks {
         stack
     }
 
+    /// The next moment within reach where what shows changes, and what shows from then on.
+    pub fn next_change(
+        &self,
+        time: Ticks,
+        within: Ticks,
+        canvas: (u32, u32),
+        size_of: &dyn Fn(MediaId) -> Option<(u32, u32)>,
+    ) -> Option<(Ticks, Vec<Clip>)> {
+        let now = self.stack_at(time, canvas, size_of);
+        let mut moments: Vec<Ticks> = self
+            .tracks
+            .iter()
+            .flat_map(|track| track.clips())
+            .flat_map(|clip| [clip.start, clip.end()])
+            .filter(|moment| *moment > time && moment.0 - time.0 <= within.0)
+            .collect();
+        moments.sort();
+        moments.dedup();
+        moments.into_iter().find_map(|moment| {
+            let stack = self.stack_at(moment, canvas, size_of);
+            (stack != now).then_some((moment, stack))
+        })
+    }
+
     /// Every stretch of the timeline with something showing, in order.
     pub fn stretches(
         &self,
@@ -1003,6 +1027,46 @@ mod tests {
                 (60, 100, vec![long]),
                 (200, 210, vec![later]),
             ]
+        );
+    }
+
+    #[test]
+    fn the_next_change_says_when_an_overlay_arrives_and_what_shows_then() {
+        let mut tracks = Tracks::default();
+        let long = tracks.place(VIDEO, range(0, 100), Ticks(0), TrackTarget::New(0));
+        let overlay = tracks.place(OTHER, range(0, 20), Ticks(40), TrackTarget::New(0));
+        tracks.set_placement(overlay, smaller());
+
+        let (at, stack) = tracks
+            .next_change(Ticks(30), Ticks(20), WIDE, &all_wide)
+            .expect("the overlay is in reach");
+
+        assert_eq!(at, Ticks(40));
+        assert_eq!(ids(&stack), [long, overlay]);
+    }
+
+    #[test]
+    fn a_change_out_of_reach_is_not_mentioned() {
+        let mut tracks = Tracks::default();
+        tracks.place(VIDEO, range(0, 100), Ticks(0), TrackTarget::New(0));
+        let overlay = tracks.place(OTHER, range(0, 20), Ticks(40), TrackTarget::New(0));
+        tracks.set_placement(overlay, smaller());
+
+        assert_eq!(
+            tracks.next_change(Ticks(0), Ticks(20), WIDE, &all_wide),
+            None
+        );
+    }
+
+    #[test]
+    fn a_clip_arriving_completely_hidden_is_no_change() {
+        let mut tracks = Tracks::default();
+        tracks.place(VIDEO, range(0, 100), Ticks(0), TrackTarget::New(0));
+        tracks.place(OTHER, range(0, 20), Ticks(40), TrackTarget::New(1));
+
+        assert_eq!(
+            tracks.next_change(Ticks(30), Ticks(20), WIDE, &all_wide),
+            None
         );
     }
 

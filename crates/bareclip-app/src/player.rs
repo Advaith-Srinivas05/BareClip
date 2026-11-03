@@ -366,6 +366,8 @@ fn connect_audio(path: PathBuf) -> Option<AudioLink> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PlayState {
     Paused,
+    /// Getting pictures and sound ready to start at once when asked, some time from now.
+    Prepared,
     /// Waiting for the first picture and enough sound.
     Starting,
     Playing,
@@ -544,6 +546,35 @@ impl Player {
         self.start_sound_from_base();
     }
 
+    /// Gets ready to play from a time without starting, so that `begin` can be instant.
+    pub fn prepare(&mut self, time: Ticks) {
+        self.base = time.clamp(Ticks(0), self.duration);
+        self.state = PlayState::Prepared;
+        self.silent_clock_start = None;
+        self.send_seek();
+        let _ = self.commands.send(VideoCommand::Play);
+        self.start_sound_from_base();
+    }
+
+    /// Starts playing from where `prepare` got ready.
+    pub fn begin(&mut self) {
+        if self.state == PlayState::Prepared {
+            self.state = PlayState::Starting;
+            self.start_requested = Instant::now();
+        }
+    }
+
+    /// Where `prepare` was told to get ready for.
+    pub fn prepared_for(&self) -> Option<Ticks> {
+        (self.state == PlayState::Prepared).then_some(self.base)
+    }
+
+    /// Whether a prepared player could start this instant.
+    #[cfg(test)]
+    pub fn is_ready_to_begin(&self) -> bool {
+        self.state == PlayState::Prepared && self.exact_frame_ready && self.sound_is_ready()
+    }
+
     pub fn pause(&mut self) {
         if !self.is_playing() {
             return;
@@ -663,6 +694,62 @@ mod tests {
     use std::{process::Command, sync::OnceLock};
 
     use bareclip_media::probe;
+
+    #[test]
+    fn a_prepared_player_fills_up_without_starting_and_begins_straight_away() {
+        let info = probe(test_clip()).expect("the clip can be read");
+        let mut player = Player::open(&info, false, Arc::new(|| {})).expect("it opens");
+
+        player.prepare(Ticks::from_seconds(1.0));
+        let started = Instant::now();
+        while !player.is_ready_to_begin() {
+            assert!(started.elapsed() < Duration::from_secs(10), "never ready");
+            assert!(player.update().is_none(), "it isn't showing anything yet");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            player.position(),
+            Ticks::from_seconds(1.0),
+            "not moving yet"
+        );
+        thread::sleep(Duration::from_millis(100));
+        player.update();
+        assert_eq!(
+            player.position(),
+            Ticks::from_seconds(1.0),
+            "still not moving"
+        );
+
+        player.begin();
+        let began = Instant::now();
+        let mut first = None;
+        while first.is_none() {
+            assert!(began.elapsed() < Duration::from_secs(5), "never showed");
+            first = player.update();
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(
+            began.elapsed() < Duration::from_millis(100),
+            "it took {:?} to start",
+            began.elapsed()
+        );
+        assert!(player.position() >= Ticks::from_seconds(1.0));
+    }
+
+    /// How long getting a clip ready holds up the interface. Nothing is ever heard, because it
+    /// never starts. `cargo test --release -p bareclip-app opening_with_sound -- --ignored --nocapture`
+    #[test]
+    #[ignore = "uses the real sound output and is only meaningful in a release build"]
+    fn opening_with_sound_is_quick_enough_for_the_interface() {
+        let info = probe(test_clip()).expect("the clip can be read");
+        for _ in 0..5 {
+            let started = Instant::now();
+            let mut player = Player::open(&info, true, Arc::new(|| {})).expect("it opens");
+            player.prepare(Ticks::from_seconds(1.0));
+            println!("opening and preparing took {:?}", started.elapsed());
+        }
+    }
 
     /// A clip whose frames show their own number as blocks, with a little sound.
     fn test_clip() -> &'static Path {
