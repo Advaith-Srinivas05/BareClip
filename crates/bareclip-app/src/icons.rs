@@ -7,11 +7,11 @@ use eframe::egui::{
 pub use shadcn_egui_core::Icon;
 use shadcn_egui_core::Seg;
 pub use shadcn_egui_icons_lucide::{
-    ARROW_UP_DOWN, CHECK, CIRCLE_ALERT, CIRCLE_CHECK, COPY, COPY_PLUS, FILM, FOLD_HORIZONTAL,
-    FOLDER_OPEN, LIST_FILTER, MINUS, MONITOR, MOON, MOVE_HORIZONTAL, PANEL_BOTTOM_CLOSE,
-    PANEL_BOTTOM_OPEN, PANEL_LEFT_CLOSE, PAUSE, PLAY, PLUS, REDO_2, ROTATE_CCW, ROTATE_CW,
-    SCISSORS, SKIP_BACK, SKIP_FORWARD, SQUARE, SUN, TARGET, TRASH_2, UNDO_2, UPLOAD, X, ZAP,
-    ZOOM_IN, ZOOM_OUT,
+    ARROW_UP_DOWN, CHECK, CHEVRON_DOWN, CIRCLE_ALERT, CIRCLE_CHECK, COPY, COPY_PLUS, FILE_PLUS,
+    FILM, FOLD_HORIZONTAL, FOLDER_OPEN, LIST_FILTER, MINUS, MONITOR, MOON, MOVE_HORIZONTAL,
+    PANEL_BOTTOM_CLOSE, PANEL_BOTTOM_OPEN, PANEL_LEFT_CLOSE, PAUSE, PLAY, PLUS, REDO_2, ROTATE_CCW,
+    ROTATE_CW, SAVE, SCISSORS, SETTINGS, SKIP_BACK, SKIP_FORWARD, SQUARE, SUN, TARGET, TRASH_2,
+    UNDO_2, UPLOAD, X, ZAP, ZOOM_IN, ZOOM_OUT,
 };
 
 /// Lucide draws its outlines 2 units wide on a 24 unit square.
@@ -138,13 +138,15 @@ pub fn square_at(center: Pos2, side: f32) -> Rect {
 mod tests {
     use super::*;
 
-    const USED: [Icon; 36] = [
+    const USED: [Icon; 40] = [
         ARROW_UP_DOWN,
         CHECK,
+        CHEVRON_DOWN,
         CIRCLE_ALERT,
         CIRCLE_CHECK,
         COPY,
         COPY_PLUS,
+        FILE_PLUS,
         FILM,
         FOLD_HORIZONTAL,
         FOLDER_OPEN,
@@ -162,7 +164,9 @@ mod tests {
         REDO_2,
         ROTATE_CCW,
         ROTATE_CW,
+        SAVE,
         SCISSORS,
+        SETTINGS,
         SKIP_BACK,
         SKIP_FORWARD,
         SQUARE,

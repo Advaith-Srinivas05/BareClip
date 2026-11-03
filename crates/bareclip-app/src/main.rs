@@ -6,6 +6,7 @@ mod fonts;
 mod icons;
 mod player;
 mod preview;
+mod storage;
 mod text;
 mod theme;
 mod timeline;
@@ -42,6 +43,9 @@ fn main() -> eframe::Result {
             fonts::install(&creation_context.egui_ctx);
             theme::install(&creation_context.egui_ctx);
             let mut editor = editor::Editor::new(&creation_context.egui_ctx, true);
+            if let Some(folder) = storage::app_folder() {
+                editor.use_storage(&creation_context.egui_ctx, folder);
+            }
             if !opened_with.is_empty() {
                 editor.import(&creation_context.egui_ctx, &opened_with);
             }

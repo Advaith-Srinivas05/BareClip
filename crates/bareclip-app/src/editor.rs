@@ -8,11 +8,12 @@ use std::{
         mpsc::{self, Receiver},
     },
     thread,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use bareclip_core::{
     history::History,
+    project::{self, ProjectFile, write_atomic},
     splice::{CutMode, FrameIndex},
     time::{Ticks, format_timecode},
     timeline::{ClipEdge, ClipId, MediaId, TimeRange},
@@ -31,6 +32,7 @@ use crate::{
     components::{self, ActionButton, CheckBox, IconButton, Kind, MenuItem},
     fonts, icons,
     preview::Preview,
+    storage::{self, ExportCuts, Recovery, RecoveryRecord, Settings},
     text,
     theme::{self, Palette},
     timeline::{self, ClipView, MediaDrag, MenuAction, TimelineState, TimelineView},
@@ -80,6 +82,8 @@ const STAGE_MARGIN: i8 = 8;
 /// The strip across the top of the window, standing in for the Windows title bar.
 const TITLE_STRIP_HEIGHT: f32 = 40.0;
 const WINDOW_BUTTON_SIZE: f32 = 32.0;
+const PROJECT_NAME_WIDTH: f32 = 220.0;
+const SETTINGS_ROW_GAP: f32 = 14.0;
 const STRIP_LOGO_HEIGHT: f32 = 22.0;
 /// How close to the window's edge the pointer has to be to resize it, and how far along
 /// from a corner still counts as that corner.
@@ -231,6 +235,26 @@ pub struct Editor {
     export_state: ExportState,
     mode: CutMode,
     confirm_remove: Vec<MediaId>,
+    project_name: String,
+    /// The file this project saves to, once it has one.
+    project_path: Option<PathBuf>,
+    /// The project as it last was on disk, which unsaved changes are measured against.
+    baseline: ProjectFile,
+    leave_for: Option<LeaveFor>,
+    missing_videos: Option<MissingVideos>,
+    /// The name being typed, while the project is being renamed.
+    renaming: Option<String>,
+    window_title: String,
+    closing: bool,
+    settings: Settings,
+    settings_open: bool,
+    /// Where settings and recovery copies live. Without it, the app keeps nothing.
+    app_folder: Option<PathBuf>,
+    recovery: Option<Recovery>,
+    last_autosaved: Option<ProjectFile>,
+    last_autosave_at: Instant,
+    /// Recovery copies from runs that never closed properly, waiting to be offered.
+    recovery_offers: Vec<PathBuf>,
     /// Videos ticked in the panel, in the order they were ticked.
     selected_media: Vec<MediaId>,
     media_panel_open: bool,
@@ -249,6 +273,25 @@ pub struct Editor {
     media_panel_rect: egui::Rect,
     timeline_panel_rect: egui::Rect,
     card_thumbnails: Vec<(MediaId, egui::Rect)>,
+}
+
+/// Something that would lose unsaved work, waiting on the user's answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LeaveFor {
+    NewProject,
+    OpenPicked,
+    Open(PathBuf),
+    CloseWindow,
+}
+
+/// A project that can't finish opening until the user deals with videos that have moved.
+struct MissingVideos {
+    project: ProjectFile,
+    path: Option<PathBuf>,
+    /// The recovery copy this came from. It stays on disk until the work is back in the
+    /// editor, so backing out of this dialog can't lose it.
+    restored_from: Option<PathBuf>,
+    missing: Vec<usize>,
 }
 
 /// How a media card relates to the timeline and to what is ticked.
@@ -298,6 +341,21 @@ impl Editor {
             export_state: ExportState::Closed,
             mode: CutMode::FrameExact,
             confirm_remove: Vec::new(),
+            project_name: project::DEFAULT_NAME.to_owned(),
+            project_path: None,
+            baseline: ProjectFile::default(),
+            leave_for: None,
+            missing_videos: None,
+            renaming: None,
+            window_title: String::new(),
+            closing: false,
+            settings: Settings::default(),
+            settings_open: false,
+            app_folder: None,
+            recovery: None,
+            last_autosaved: None,
+            last_autosave_at: Instant::now(),
+            recovery_offers: Vec::new(),
             selected_media: Vec::new(),
             media_panel_open: true,
             media_sort: MediaSort::Name,
@@ -311,6 +369,331 @@ impl Editor {
             media_panel_rect: egui::Rect::NOTHING,
             timeline_panel_rect: egui::Rect::NOTHING,
             card_thumbnails: Vec::new(),
+        }
+    }
+
+    /// Starts keeping settings and recovery copies in a folder, and looks for work left
+    /// behind by a run that never closed properly.
+    pub fn use_storage(&mut self, ctx: &egui::Context, folder: PathBuf) {
+        self.settings = Settings::load(&folder);
+        ctx.set_theme(egui::ThemePreference::from(self.settings.theme));
+        self.mode = self.settings.export_cuts.into();
+        self.recovery_offers = storage::orphaned_recoveries(&folder);
+        match Recovery::start(&folder) {
+            Ok(recovery) => self.recovery = Some(recovery),
+            Err(error) => {
+                self.notice = Some(format!("Your work can't be autosaved. {error}"));
+            }
+        }
+        self.app_folder = Some(folder);
+    }
+
+    fn save_settings(&mut self) {
+        if let Some(folder) = &self.app_folder
+            && let Err(error) = self.settings.save(folder)
+        {
+            self.notice = Some(format!("Your settings could not be saved. {error}"));
+        }
+    }
+
+    /// The project as it would be written down right now.
+    fn current_file(&self) -> ProjectFile {
+        let media = self
+            .visible_media()
+            .map(|entry| {
+                let path = &entry.info.path;
+                let absolute = std::path::absolute(path).unwrap_or_else(|_| path.clone());
+                (entry.id, absolute)
+            })
+            .collect();
+        ProjectFile::capture(&self.project_name, media, &self.project.tracks)
+    }
+
+    fn has_unsaved_changes(&self) -> bool {
+        self.current_file() != self.baseline
+    }
+
+    /// Does something that would replace the project, asking first if that would lose work.
+    fn leave_project(&mut self, ctx: &egui::Context, reason: LeaveFor) {
+        if self.has_unsaved_changes() {
+            self.leave_for = Some(reason);
+        } else {
+            self.carry_out(ctx, reason);
+        }
+    }
+
+    fn carry_out(&mut self, ctx: &egui::Context, reason: LeaveFor) {
+        self.leave_for = None;
+        match reason {
+            LeaveFor::NewProject => self.start_new_project(),
+            LeaveFor::OpenPicked => {
+                let picked = rfd::FileDialog::new()
+                    .set_title("Open project")
+                    .add_filter("BareClip project", &[project::EXTENSION])
+                    .pick_file();
+                if let Some(path) = picked {
+                    self.open_project(ctx, &path);
+                }
+            }
+            LeaveFor::Open(path) => self.open_project(ctx, &path),
+            LeaveFor::CloseWindow => {
+                if let Some(recovery) = &mut self.recovery {
+                    recovery.clear();
+                }
+                self.closing = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    /// Clears everything down to an empty project.
+    fn start_new_project(&mut self) {
+        self.preview.pause(self.project.tracks.played());
+        self.media.clear();
+        self.project = Snapshot {
+            tracks: Tracks::default(),
+            hidden: Vec::new(),
+        };
+        self.history = History::default();
+        self.selected = None;
+        self.selected_gap = None;
+        self.selected_media.clear();
+        self.confirm_remove.clear();
+        self.picture = None;
+        self.card_thumbnails.clear();
+        self.notice = None;
+        self.renaming = None;
+        let (height_kept, keep) = (self.timeline_height, self.timeline_open);
+        self.timeline_state = TimelineState::default();
+        self.timeline_height = height_kept;
+        self.timeline_open = keep;
+        self.seek(Ticks(0));
+        self.project_name = project::DEFAULT_NAME.to_owned();
+        self.project_path = None;
+        self.baseline = self.current_file();
+        self.last_autosaved = None;
+        if let Some(recovery) = &mut self.recovery {
+            recovery.clear();
+        }
+    }
+
+    /// Saves to the project's file, asking where if it doesn't have one yet.
+    fn save(&mut self) -> bool {
+        match self.project_path.clone() {
+            Some(path) => self.save_to(&path),
+            None => self.save_as(),
+        }
+    }
+
+    fn save_as(&mut self) -> bool {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Save project")
+            .set_file_name(format!("{}.{}", self.project_name, project::EXTENSION))
+            .add_filter("BareClip project", &[project::EXTENSION]);
+        if let Some(folder) = self.project_path.as_deref().and_then(Path::parent) {
+            dialog = dialog.set_directory(folder);
+        }
+        dialog.save_file().is_some_and(|path| self.save_to(&path))
+    }
+
+    fn save_to(&mut self, path: &Path) -> bool {
+        let mut path = path.to_owned();
+        if path.extension().is_none_or(|e| e != project::EXTENSION) {
+            let mut named = path.into_os_string();
+            named.push(".");
+            named.push(project::EXTENSION);
+            path = PathBuf::from(named);
+        }
+        // An unnamed project takes the name the user just gave its file.
+        if self.project_name == project::DEFAULT_NAME
+            && let Some(stem) = path.file_stem()
+        {
+            self.project_name = stem.to_string_lossy().into_owned();
+        }
+        let file = self.current_file();
+        match write_atomic(&path, file.to_text().as_bytes()) {
+            Ok(()) => {
+                self.baseline = file;
+                self.project_path = Some(path);
+                self.last_autosaved = None;
+                self.notice = None;
+                if let Some(recovery) = &mut self.recovery {
+                    recovery.clear();
+                }
+                true
+            }
+            Err(error) => {
+                self.notice = Some(format!("The project could not be saved. {error}"));
+                false
+            }
+        }
+    }
+
+    /// Opens a project file. What is open now stays open if this one can't be read.
+    fn open_project(&mut self, ctx: &egui::Context, path: &Path) {
+        match ProjectFile::read(path) {
+            Ok(file) => self.begin_loading(ctx, file, Some(path.to_owned()), None),
+            Err(error) => {
+                let name = path.file_name().map_or_else(
+                    || "That project".to_owned(),
+                    |name| name.to_string_lossy().into_owned(),
+                );
+                self.notice = Some(format!("{name} could not be opened. {error}"));
+            }
+        }
+    }
+
+    /// Starts opening a project, stopping to ask about any video that has moved. A video
+    /// that is simply beside the project file is found without asking, so a folder holding
+    /// both can be moved as a whole.
+    fn begin_loading(
+        &mut self,
+        ctx: &egui::Context,
+        mut file: ProjectFile,
+        path: Option<PathBuf>,
+        restored_from: Option<PathBuf>,
+    ) {
+        let folder = path.as_deref().and_then(Path::parent).map(Path::to_owned);
+        let mut missing = Vec::new();
+        for (index, media) in file.media.iter_mut().enumerate() {
+            if media.path.exists() {
+                continue;
+            }
+            let beside = folder.as_deref().zip(media.path.file_name());
+            match beside.map(|(folder, name)| folder.join(name)) {
+                Some(found) if found.exists() => media.path = found,
+                _ => missing.push(index),
+            }
+        }
+        let waiting = MissingVideos {
+            project: file,
+            path,
+            restored_from,
+            missing,
+        };
+        if waiting.missing.is_empty() {
+            self.finish_loading(ctx, waiting);
+        } else {
+            self.missing_videos = Some(waiting);
+        }
+    }
+
+    /// Replaces the project with a loaded one, leaving out videos still missing.
+    fn finish_loading(&mut self, ctx: &egui::Context, waiting: MissingVideos) {
+        let MissingVideos {
+            project: file,
+            path,
+            restored_from,
+            missing,
+        } = waiting;
+        self.start_new_project();
+        let mut new_ids = std::collections::HashMap::new();
+        let mut durations = std::collections::HashMap::new();
+        let mut unreadable = !missing.is_empty();
+        for (index, media) in file.media.iter().enumerate() {
+            if missing.contains(&index) {
+                continue;
+            }
+            match self.load(ctx, &media.path) {
+                Ok(entry) => {
+                    new_ids.insert(media.id, entry.id);
+                    durations.insert(media.id, entry.info.duration);
+                    self.media.push(entry);
+                }
+                Err(error) => {
+                    unreadable = true;
+                    let name = media.path.display();
+                    self.notice = Some(format!("{name} could not be opened. {error}"));
+                }
+            }
+        }
+        let fitted: Vec<Vec<project::SavedClip>> = file
+            .tracks
+            .iter()
+            .map(|track| {
+                track
+                    .iter()
+                    .filter_map(|clip| clip.fitted_to(*durations.get(&clip.media)?))
+                    .collect()
+            })
+            .collect();
+        self.project.tracks = Tracks::restore(&fitted, |id| new_ids.get(&id).copied());
+        self.project_name = file.name;
+        self.project_path = path;
+        self.media_panel_open = true;
+        // Work brought back from a crash, or missing parts of the file, is not what is on
+        // disk, so it counts as unsaved until the user saves it.
+        if restored_from.is_some() || unreadable {
+            self.baseline = ProjectFile::default();
+        } else {
+            self.baseline = self.current_file();
+        }
+        self.timeline_state
+            .content_added(self.project.tracks.duration());
+        self.seek(Ticks(0));
+        if let Some(old_copy) = restored_from {
+            // This run's own copy takes over from the old one.
+            let record = RecoveryRecord {
+                saved_path: self.project_path.clone(),
+                project: self.current_file(),
+            };
+            if let Some(recovery) = &mut self.recovery {
+                recovery.write(&record);
+            }
+            self.last_autosaved = Some(record.project);
+            self.last_autosave_at = Instant::now();
+            storage::discard_recovery(&old_copy);
+        }
+    }
+
+    /// Writes a recovery copy if there are changes it doesn't have yet, no more often than
+    /// the user's setting. The first change after a quiet spell is written straight away.
+    fn autosave(&mut self, ctx: &egui::Context) {
+        if self.recovery.is_none() {
+            return;
+        }
+        let file = self.current_file();
+        let unsaved = file != self.baseline;
+        let saved_path = self.project_path.clone();
+        let wait = Duration::from_secs(u64::from(self.settings.autosave_seconds));
+        let since = self.last_autosave_at.elapsed();
+        let Some(recovery) = &mut self.recovery else {
+            return;
+        };
+        if let Some(problem) = recovery.take_problem() {
+            self.notice = Some(problem);
+        }
+        if !unsaved {
+            if self.last_autosaved.take().is_some() {
+                recovery.clear();
+            }
+            return;
+        }
+        if recovery.is_busy() || self.last_autosaved.as_ref() == Some(&file) {
+            return;
+        }
+        if since < wait {
+            ctx.request_repaint_after(wait - since);
+            return;
+        }
+        recovery.write(&RecoveryRecord {
+            saved_path,
+            project: file.clone(),
+        });
+        self.last_autosaved = Some(file);
+        self.last_autosave_at = Instant::now();
+    }
+
+    /// The window's close button, Alt+F4 and the like all arrive here.
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        if self.closing {
+            return;
+        }
+        if self.has_unsaved_changes() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.leave_for = Some(LeaveFor::CloseWindow);
+        } else if let Some(recovery) = &mut self.recovery {
+            recovery.clear();
         }
     }
 
@@ -382,9 +765,14 @@ impl Editor {
         self.history.record(self.project.clone());
     }
 
-    /// Adds videos to the project. They wait in the panel until put on the timeline.
+    /// Adds videos to the project, where they wait in the panel until put on the timeline.
+    /// A project file among them is opened instead.
     pub fn import(&mut self, ctx: &egui::Context, paths: &[PathBuf]) {
         for path in paths {
+            if path.extension().is_some_and(|e| e == project::EXTENSION) {
+                self.leave_project(ctx, LeaveFor::Open(path.clone()));
+                return;
+            }
             match self.load(ctx, path) {
                 Ok(entry) => {
                     self.media.push(entry);
@@ -940,13 +1328,31 @@ impl Editor {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let blocked =
-            !matches!(self.export_state, ExportState::Closed) || !self.confirm_remove.is_empty();
+        let blocked = !matches!(self.export_state, ExportState::Closed)
+            || !self.confirm_remove.is_empty()
+            || self.leave_for.is_some()
+            || self.missing_videos.is_some()
+            || !self.recovery_offers.is_empty()
+            || self.settings_open
+            // Letters typed into a name are not commands.
+            || ctx.egui_wants_keyboard_input();
         if blocked {
             return;
         }
         let consume = |modifiers, key| ctx.input_mut(|input| input.consume_key(modifiers, key));
 
+        if consume(Modifiers::COMMAND | Modifiers::SHIFT, Key::S) {
+            self.save_as();
+        }
+        if consume(Modifiers::COMMAND, Key::S) {
+            self.save();
+        }
+        if consume(Modifiers::COMMAND, Key::N) {
+            self.leave_project(ctx, LeaveFor::NewProject);
+        }
+        if consume(Modifiers::COMMAND | Modifiers::SHIFT, Key::O) {
+            self.leave_project(ctx, LeaveFor::OpenPicked);
+        }
         if consume(Modifiers::COMMAND, Key::O) {
             self.pick_files(ctx);
         }
@@ -1062,9 +1468,14 @@ impl Editor {
         // The background shows through the gaps between the panels.
         ui.painter().rect_filled(ui.max_rect(), 0.0, palette.bg_app);
 
+        if ctx.input(|input| input.viewport().close_requested()) {
+            self.handle_close_request(&ctx);
+        }
         self.poll_background(&ctx);
         self.handle_shortcuts(&ctx);
         self.take_dropped_files(&ctx);
+        self.autosave(&ctx);
+        self.update_window_title(&ctx);
 
         self.title_strip(ui, palette);
         self.rail(ui, palette);
@@ -1075,6 +1486,10 @@ impl Editor {
         self.stage(ui, palette);
         self.remove_dialog(&ctx, palette);
         self.export_dialog(&ctx, palette);
+        self.settings_dialog(&ctx, palette);
+        self.missing_videos_dialog(&ctx, palette);
+        self.recovery_dialog(&ctx, palette);
+        self.unsaved_changes_dialog(&ctx, palette);
         drop_overlay(&ctx, palette);
         window_edges(&ctx);
     }
@@ -1119,6 +1534,8 @@ impl Editor {
                             .font(fonts::strong(15.0))
                             .color(palette.accent),
                     );
+                    ui.add_space(10.0);
+                    self.project_name_controls(ui, palette);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = CONTROL_SPACING;
                         let button = |icon, name| {
@@ -1148,16 +1565,341 @@ impl Editor {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                         }
                         ui.add_space(8.0);
-                        let icon = theme::current_icon(ui.ctx());
-                        let theme_button = ui
-                            .add(IconButton::new(palette, Kind::Ghost, icon, "Theme"))
-                            .on_hover_text("Theme");
-                        egui::Popup::menu(&theme_button).show(|ui| {
-                            theme::theme_picker(ui, palette);
-                        });
+                        if ui
+                            .add(IconButton::new(
+                                palette,
+                                Kind::Ghost,
+                                icons::SETTINGS,
+                                "Settings",
+                            ))
+                            .on_hover_text("Settings")
+                            .clicked()
+                        {
+                            self.settings_open = true;
+                        }
                     });
                 });
             });
+    }
+
+    /// The project's name, which a click renames, and the menu of things to do with files.
+    fn project_name_controls(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        let ctx = ui.ctx().clone();
+        if let Some(mut typed) = self.renaming.take() {
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut typed)
+                    .id(egui::Id::unique("project_name_edit"))
+                    .desired_width(PROJECT_NAME_WIDTH),
+            );
+            let cancelled = ui.input(|input| input.key_pressed(Key::Escape));
+            if edit.lost_focus() {
+                let name = typed.trim();
+                if !cancelled && !name.is_empty() {
+                    self.project_name = name.to_owned();
+                }
+            } else {
+                if !edit.has_focus() {
+                    edit.request_focus();
+                }
+                self.renaming = Some(typed);
+            }
+        } else {
+            let unsaved = self.has_unsaved_changes();
+            let label = text::project_title(&self.project_name, unsaved);
+            let name = ActionButton::new(palette, Kind::Ghost, &label).small();
+            if ui.add(name).on_hover_text("Rename this project").clicked() {
+                self.renaming = Some(self.project_name.clone());
+            }
+        }
+        let menu = ui
+            .add(
+                IconButton::new(palette, Kind::Ghost, icons::CHEVRON_DOWN, "Project menu")
+                    .size(26.0, 14.0),
+            )
+            .on_hover_text("Project");
+        egui::Popup::menu(&menu).show(|ui| {
+            let line = |icon, name, keys| MenuItem::new(palette, icon, name, keys);
+            if ui
+                .add(line(icons::FILE_PLUS, "New project", "Ctrl+N"))
+                .clicked()
+            {
+                self.leave_project(&ctx, LeaveFor::NewProject);
+            }
+            if ui
+                .add(line(icons::FOLDER_OPEN, "Open project", "Ctrl+Shift+O"))
+                .clicked()
+            {
+                self.leave_project(&ctx, LeaveFor::OpenPicked);
+            }
+            ui.separator();
+            if ui.add(line(icons::SAVE, "Save", "Ctrl+S")).clicked() {
+                self.save();
+            }
+            if ui
+                .add(line(icons::SAVE, "Save as", "Ctrl+Shift+S"))
+                .clicked()
+            {
+                self.save_as();
+            }
+        });
+    }
+
+    /// Keeps the name Windows shows on the taskbar up to date.
+    fn update_window_title(&mut self, ctx: &egui::Context) {
+        let title = format!("{} - BareClip", self.project_name);
+        if title != self.window_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.window_title = title;
+        }
+    }
+
+    fn settings_dialog(&mut self, ctx: &egui::Context, palette: &Palette) {
+        if !self.settings_open {
+            return;
+        }
+        let mut changed = false;
+        let mut close = false;
+        let modal = egui::Modal::new(egui::Id::unique("settings_dialog"))
+            .frame(dialog_frame(ctx))
+            .show(ctx, |ui| {
+                ui.set_width(440.0);
+                components::dialog_title(ui, &icons::SETTINGS, palette.accent, "Settings");
+                ui.add_space(SETTINGS_ROW_GAP);
+
+                ui.label(RichText::new("Theme").font(fonts::strong(13.0)));
+                ui.add_space(4.0);
+                theme::theme_picker(ui, palette);
+                let theme = ui.ctx().options(|options| options.theme_preference).into();
+                if theme != self.settings.theme {
+                    self.settings.theme = theme;
+                    changed = true;
+                }
+                ui.add_space(SETTINGS_ROW_GAP);
+
+                ui.label(RichText::new("Autosave").font(fonts::strong(13.0)));
+                ui.colored_label(
+                    palette.text_muted,
+                    "How often a recovery copy of unsaved work is written.",
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = CONTROL_SPACING;
+                    for (seconds, name) in storage::AUTOSAVE_CHOICES {
+                        let chosen = self.settings.autosave_seconds == seconds;
+                        let button = ActionButton::new(palette, Kind::Ghost, name)
+                            .small()
+                            .selected(chosen);
+                        if ui.add(button).clicked() && !chosen {
+                            self.settings.autosave_seconds = seconds;
+                            changed = true;
+                        }
+                    }
+                });
+                ui.add_space(SETTINGS_ROW_GAP);
+
+                ui.label(RichText::new("Export cuts").font(fonts::strong(13.0)));
+                ui.colored_label(
+                    palette.text_muted,
+                    "Which choice the export dialog starts on.",
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = CONTROL_SPACING;
+                    for (cuts, name) in [
+                        (ExportCuts::FrameExact, "Frame-exact"),
+                        (ExportCuts::Fastest, "Fastest"),
+                    ] {
+                        let chosen = self.settings.export_cuts == cuts;
+                        let button = ActionButton::new(palette, Kind::Ghost, name)
+                            .small()
+                            .selected(chosen);
+                        if ui.add(button).clicked() && !chosen {
+                            self.settings.export_cuts = cuts;
+                            self.mode = cuts.into();
+                            changed = true;
+                        }
+                    }
+                });
+                ui.add_space(18.0);
+                components::dialog_buttons(ui, |ui| {
+                    close = ui.add(dialog_button(palette, "Done")).clicked();
+                });
+            });
+        if changed {
+            self.save_settings();
+        }
+        if close || modal.should_close() {
+            self.settings_open = false;
+        }
+    }
+
+    /// Asks what to do with unsaved work before something would throw it away.
+    fn unsaved_changes_dialog(&mut self, ctx: &egui::Context, palette: &Palette) {
+        let Some(reason) = self.leave_for.clone() else {
+            return;
+        };
+        let mut save = false;
+        let mut discard = false;
+        let mut cancel = false;
+        let title = format!("Save changes to {}?", self.project_name);
+        egui::Modal::new(egui::Id::unique("unsaved_changes_dialog"))
+            .frame(dialog_frame(ctx))
+            .show(ctx, |ui| {
+                ui.set_width(400.0);
+                components::dialog_title(ui, &icons::CIRCLE_ALERT, palette.accent, &title);
+                ui.add_space(12.0);
+                ui.label("Your changes will be lost if you don't save them.");
+                ui.add_space(18.0);
+                components::dialog_buttons(ui, |ui| {
+                    let primary = ActionButton::new(palette, Kind::Primary, "Save")
+                        .icon(icons::SAVE)
+                        .width(DIALOG_BUTTON_WIDTH);
+                    save = ui.add(primary).clicked();
+                    discard = ui.add(dialog_button(palette, "Don't save")).clicked();
+                    cancel = ui.add(dialog_button(palette, "Cancel")).clicked();
+                });
+            });
+        if cancel {
+            self.leave_for = None;
+        } else if discard || (save && self.save()) {
+            self.carry_out(ctx, reason);
+        }
+    }
+
+    /// Lists videos a project can't find, so they can be pointed at or left out.
+    fn missing_videos_dialog(&mut self, ctx: &egui::Context, palette: &Palette) {
+        let Some(waiting) = &self.missing_videos else {
+            return;
+        };
+        let names: Vec<(usize, String)> = waiting
+            .missing
+            .iter()
+            .map(|&index| {
+                let path = &waiting.project.media[index].path;
+                (index, path.display().to_string())
+            })
+            .collect();
+        let mut find = None;
+        let mut without = false;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::unique("missing_videos_dialog"))
+            .frame(dialog_frame(ctx))
+            .show(ctx, |ui| {
+                ui.set_width(480.0);
+                components::dialog_title(
+                    ui,
+                    &icons::CIRCLE_ALERT,
+                    palette.danger,
+                    "Some videos can't be found",
+                );
+                ui.add_space(12.0);
+                for (index, name) in &names {
+                    ui.horizontal(|ui| {
+                        let room = ui.available_width() - DIALOG_BUTTON_WIDTH - 8.0;
+                        ui.allocate_ui_with_layout(
+                            vec2(room, 20.0),
+                            Layout::left_to_right(Align::Center),
+                            |ui| {
+                                ui.add(egui::Label::new(RichText::new(name).size(12.0)).truncate());
+                            },
+                        );
+                        let button = ActionButton::new(palette, Kind::Secondary, "Find")
+                            .icon(icons::FOLDER_OPEN)
+                            .small()
+                            .width(DIALOG_BUTTON_WIDTH);
+                        if ui.add(button).clicked() {
+                            find = Some(*index);
+                        }
+                    });
+                }
+                ui.add_space(8.0);
+                ui.colored_label(
+                    palette.text_muted,
+                    "Opening without them leaves out their clips. The file on disk only changes if you save.",
+                );
+                ui.add_space(18.0);
+                components::dialog_buttons(ui, |ui| {
+                    without = ui.add(dialog_button(palette, "Open without them")).clicked();
+                    cancel = ui.add(dialog_button(palette, "Cancel")).clicked();
+                });
+            });
+        if let Some(index) = find
+            && let Some(path) = rfd::FileDialog::new()
+                .set_title("Find video")
+                .add_filter("Video files", &VIDEO_EXTENSIONS)
+                .add_filter("All files", &["*"])
+                .pick_file()
+        {
+            self.point_video_at(ctx, index, path);
+        } else if without {
+            if let Some(waiting) = self.missing_videos.take() {
+                self.finish_loading(ctx, waiting);
+            }
+        } else if cancel {
+            self.missing_videos = None;
+        }
+    }
+
+    /// Records where a missing video is now, and carries on opening once none are left.
+    fn point_video_at(&mut self, ctx: &egui::Context, index: usize, path: PathBuf) {
+        let Some(waiting) = &mut self.missing_videos else {
+            return;
+        };
+        waiting.project.media[index].path = path;
+        waiting.missing.retain(|missing| *missing != index);
+        if waiting.missing.is_empty()
+            && let Some(waiting) = self.missing_videos.take()
+        {
+            self.finish_loading(ctx, waiting);
+        }
+    }
+
+    /// Offers back work from a run that never closed properly, one copy at a time.
+    fn recovery_dialog(&mut self, ctx: &egui::Context, palette: &Palette) {
+        // Another dialog goes first, and a copy that can't be read has nothing to offer.
+        if self.leave_for.is_some() || self.missing_videos.is_some() {
+            return;
+        }
+        let Some(path) = self.recovery_offers.first().cloned() else {
+            return;
+        };
+        let Some(record) = RecoveryRecord::read(&path) else {
+            storage::discard_recovery(&path);
+            self.recovery_offers.remove(0);
+            return;
+        };
+        let mut restore = false;
+        let mut discard = false;
+        egui::Modal::new(egui::Id::unique("recovery_dialog"))
+            .frame(dialog_frame(ctx))
+            .show(ctx, |ui| {
+                ui.set_width(400.0);
+                components::dialog_title(
+                    ui,
+                    &icons::CIRCLE_ALERT,
+                    palette.accent,
+                    "Restore unsaved work?",
+                );
+                ui.add_space(12.0);
+                ui.label(format!(
+                    "BareClip didn't close properly last time. Your changes to {} were kept.",
+                    record.project.name
+                ));
+                ui.add_space(18.0);
+                components::dialog_buttons(ui, |ui| {
+                    let primary = ActionButton::new(palette, Kind::Primary, "Restore")
+                        .width(DIALOG_BUTTON_WIDTH);
+                    restore = ui.add(primary).clicked();
+                    discard = ui.add(dialog_button(palette, "Discard")).clicked();
+                });
+            });
+        if restore {
+            self.recovery_offers.remove(0);
+            self.begin_loading(ctx, record.project, record.saved_path, Some(path));
+        } else if discard {
+            self.recovery_offers.remove(0);
+            storage::discard_recovery(&path);
+        }
     }
 
     /// The top of the card: undo and redo, anything that needs saying, and Export.
@@ -3060,7 +3802,7 @@ mod tests {
         let away = pos2(700.0, 150.0);
         let [_, _, fit] = editor.timeline_state.zoom_buttons;
         click(&ctx, &mut editor, fit.center());
-        let theme_button = named_rect(&ctx, &mut editor, "Theme");
+        let theme_button = named_rect(&ctx, &mut editor, "Settings");
         click(&ctx, &mut editor, theme_button.center());
         for _ in 0..12 {
             run_frame(&ctx, &mut editor, moved(theme_button.center()));
@@ -3069,9 +3811,9 @@ mod tests {
             &ctx,
             &mut editor,
             moved(theme_button.center()),
-            "16-theme-menu",
+            "16-settings",
         );
-        click(&ctx, &mut editor, theme_button.center());
+        click_named(&ctx, &mut editor, "Done");
         run_frame(&ctx, &mut editor, vec![]);
         let export_button = named_rect(&ctx, &mut editor, "Export");
         camera.shoot(
@@ -3319,6 +4061,74 @@ mod tests {
         begin_drag(&ctx, &mut aligned, from, to);
         run_frame(&ctx, &mut aligned, moved(to));
         camera.shoot(&ctx, &mut aligned, moved(to), "44-trim-aligned");
+
+        // Projects: the name, its menu and the dialogs that protect unsaved work.
+        let mut named = with_videos(&ctx, &[test_clip()]);
+        named.project_name = "Final round".to_owned();
+        let settled = |editor: &mut Editor| {
+            for _ in 0..12 {
+                run_frame(&ctx, editor, moved(pos2(640.0, 300.0)));
+            }
+        };
+        click_named(&ctx, &mut named, "Project menu");
+        settled(&mut named);
+        camera.shoot(
+            &ctx,
+            &mut named,
+            moved(pos2(640.0, 300.0)),
+            "45-project-menu",
+        );
+        run_frame(&ctx, &mut named, key_event(Key::Escape, Modifiers::NONE));
+        settled(&mut named);
+        named.leave_for = Some(LeaveFor::NewProject);
+        settled(&mut named);
+        camera.shoot(
+            &ctx,
+            &mut named,
+            moved(pos2(640.0, 300.0)),
+            "46-unsaved-changes",
+        );
+        named.leave_for = None;
+        named.missing_videos = Some(MissingVideos {
+            project: ProjectFile {
+                media: vec![project::SavedMedia {
+                    id: 1,
+                    path: PathBuf::from(r"D:\Recordings\2026\ranked-match-final.mkv"),
+                }],
+                ..ProjectFile::default()
+            },
+            path: None,
+            restored_from: None,
+            missing: vec![0],
+        });
+        settled(&mut named);
+        camera.shoot(
+            &ctx,
+            &mut named,
+            moved(pos2(640.0, 300.0)),
+            "47-missing-video",
+        );
+        named.missing_videos = None;
+        settled(&mut named);
+        let recovered = project_folder("screens");
+        let mut lost = with_storage(&ctx, &recovered);
+        lost.import(&ctx, &[test_clip().to_path_buf()]);
+        settle(&ctx, &mut lost);
+        autosave_now(&ctx, &mut lost);
+        crash(lost);
+        let mut offered = with_storage(&ctx, &recovered);
+        settled(&mut offered);
+        camera.shoot(
+            &ctx,
+            &mut offered,
+            moved(pos2(640.0, 300.0)),
+            "48-restore-offer",
+        );
+        run_frame(&ctx, &mut offered, vec![]);
+        offered.recovery_offers.clear();
+        offered.settings_open = true;
+        settled(&mut offered);
+        camera.shoot(&ctx, &mut offered, moved(pos2(640.0, 300.0)), "49-settings");
         KEPT_TEXTURES.with_borrow_mut(|kept| *kept = None);
     }
 
@@ -4504,7 +5314,7 @@ mod tests {
         for name in [
             "Undo",
             "Redo",
-            "Theme",
+            "Settings",
             "Go to start",
             "5 seconds back",
             "Play",
@@ -4606,12 +5416,12 @@ mod tests {
     }
 
     #[test]
-    fn the_theme_menu_changes_the_theme() {
+    fn settings_change_the_theme() {
         let ctx = context();
         let mut editor = Editor::new(&ctx, false);
 
-        click_named(&ctx, &mut editor, "Theme");
-        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Settings");
+        let_dialog_open(&ctx, &mut editor);
         click_named(&ctx, &mut editor, "Light");
         run_frame(&ctx, &mut editor, vec![]);
 
@@ -6194,6 +7004,765 @@ mod tests {
         end_drag(&ctx, &mut editor, back);
 
         assert_eq!(editor.position(), Ticks::from_seconds(3.0));
+    }
+
+    fn let_dialog_open(ctx: &egui::Context, editor: &mut Editor) {
+        for _ in 0..12 {
+            run_frame(ctx, editor, vec![]);
+        }
+    }
+
+    fn project_folder(name: &str) -> PathBuf {
+        let folder = std::env::temp_dir()
+            .join("bareclip-project-tests")
+            .join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).expect("the folder can be created");
+        folder
+    }
+
+    /// Every clip as (track, media's file, start, source), which stays the same across a
+    /// save and a load even though ids don't.
+    fn arrangement(editor: &Editor) -> Vec<(usize, PathBuf, Ticks, TimeRange)> {
+        editor
+            .project
+            .tracks
+            .tracks()
+            .iter()
+            .enumerate()
+            .flat_map(|(track, clips)| clips.clips().iter().map(move |clip| (track, *clip)))
+            .map(|(track, clip)| {
+                let path = editor.entry(clip.media).expect("the video is there");
+                (track, path.info.path.clone(), clip.start, clip.source)
+            })
+            .collect()
+    }
+
+    /// Two clips on two tracks with the top one covering part of the other.
+    fn stacked_project(ctx: &egui::Context) -> Editor {
+        let mut editor = two_videos(ctx);
+        let upper = editor.project.tracks.played().clips()[1].id;
+        editor
+            .project
+            .tracks
+            .move_clip(upper, Ticks::from_seconds(1.0), TrackTarget::New(0));
+        run_frame(ctx, &mut editor, vec![]);
+        editor
+    }
+
+    fn opened(ctx: &egui::Context, path: &Path) -> Editor {
+        let mut editor = Editor::new(ctx, false);
+        run_frame(ctx, &mut editor, vec![]);
+        editor.open_project(ctx, path);
+        settle(ctx, &mut editor);
+        run_frame(ctx, &mut editor, vec![]);
+        editor
+    }
+
+    #[test]
+    fn a_saved_project_opens_again_exactly_as_it_was() {
+        let ctx = context();
+        let mut editor = stacked_project(&ctx);
+        editor.project_name = "Final round".to_owned();
+        let path = project_folder("round-trip").join("final.bareclip");
+
+        assert!(editor.save_to(&path));
+        let back = opened(&ctx, &path);
+
+        assert_eq!(arrangement(&back), arrangement(&editor));
+        assert_eq!(back.project_name, "Final round");
+        assert_eq!(back.project_path.as_deref(), Some(path.as_path()));
+        assert!(!back.has_unsaved_changes());
+    }
+
+    #[test]
+    fn an_opened_project_plays_and_exports_what_was_saved() {
+        let ctx = context();
+        let mut editor = stacked_project(&ctx);
+        let path = project_folder("plays").join("a.bareclip");
+        editor.save_to(&path);
+
+        let mut back = opened(&ctx, &path);
+
+        let ranges = |editor: &Editor| -> Vec<TimeRange> {
+            let parts = editor.export_parts().expect("the frames are read");
+            parts.iter().map(|part| part.range).collect()
+        };
+        assert_eq!(ranges(&back), ranges(&editor));
+        back.seek(Ticks::from_seconds(2.0));
+        assert_eq!(back.position(), Ticks::from_seconds(2.0));
+    }
+
+    #[test]
+    fn opening_a_project_starts_with_nothing_to_undo() {
+        let ctx = context();
+        let mut editor = stacked_project(&ctx);
+        let path = project_folder("undo").join("a.bareclip");
+        editor.save_to(&path);
+
+        let back = opened(&ctx, &path);
+
+        assert!(!back.history.can_undo());
+    }
+
+    #[test]
+    fn saving_adds_the_extension_and_an_unnamed_project_takes_the_files_name() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let folder = project_folder("names");
+
+        assert!(editor.save_to(&folder.join("my edit")));
+
+        assert!(folder.join("my edit.bareclip").exists());
+        assert_eq!(editor.project_name, "my edit");
+    }
+
+    #[test]
+    fn a_project_with_its_own_name_keeps_it_whatever_the_file_is_called() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        editor.project_name = "Chosen".to_owned();
+
+        editor.save_to(&project_folder("own-name").join("other.bareclip"));
+
+        assert_eq!(editor.project_name, "Chosen");
+    }
+
+    #[test]
+    fn saving_to_somewhere_impossible_says_so_and_keeps_the_changes_unsaved() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let nowhere = project_folder("nowhere").join("no-such-folder").join("a");
+
+        assert!(!editor.save_to(&nowhere));
+
+        assert!(editor.has_unsaved_changes());
+        assert!(editor.project_path.is_none());
+        assert!(
+            editor
+                .notice
+                .as_deref()
+                .is_some_and(|n| n.contains("saved"))
+        );
+    }
+
+    #[test]
+    fn unsaved_changes_are_tracked_through_edits_saves_and_undo() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[]);
+        assert!(
+            !editor.has_unsaved_changes(),
+            "a new project has no work in it"
+        );
+
+        editor.import(&ctx, &[test_clip().to_path_buf()]);
+        settle(&ctx, &mut editor);
+        assert!(editor.has_unsaved_changes());
+
+        let id = editor.media[0].id;
+        editor.add_to_timeline(id);
+        assert!(editor.has_unsaved_changes());
+
+        assert!(editor.save_to(&project_folder("tracking").join("a.bareclip")));
+        assert!(!editor.has_unsaved_changes());
+
+        let clip = editor.project.tracks.played().clips()[0].id;
+        editor.selected = Some(clip);
+        editor.delete_selected();
+        assert!(editor.has_unsaved_changes());
+
+        editor.undo();
+        assert!(!editor.has_unsaved_changes(), "back to what is on disk");
+    }
+
+    #[test]
+    fn the_top_strip_marks_unsaved_changes_after_the_name() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        editor.project_name = "Edit".to_owned();
+
+        assert!(is_named(&ctx, &mut editor, "Edit *"));
+
+        editor.save_to(&project_folder("marker").join("a.bareclip"));
+        assert!(is_named(&ctx, &mut editor, "Edit"));
+        assert!(!is_named(&ctx, &mut editor, "Edit *"));
+    }
+
+    fn type_text(ctx: &egui::Context, editor: &mut Editor, text: &str) {
+        run_frame(ctx, editor, vec![egui::Event::Text(text.to_owned())]);
+    }
+
+    #[test]
+    fn clicking_the_name_renames_the_project_and_enter_keeps_it() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[]);
+
+        click_named(&ctx, &mut editor, project::DEFAULT_NAME);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.renaming.is_some());
+        run_frame(&ctx, &mut editor, key_event(Key::A, Modifiers::COMMAND));
+        type_text(&ctx, &mut editor, "Montage");
+        run_frame(&ctx, &mut editor, press(Key::Enter));
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert_eq!(editor.project_name, "Montage");
+        assert!(editor.renaming.is_none());
+        assert!(editor.has_unsaved_changes());
+    }
+
+    #[test]
+    fn escape_cancels_a_rename_and_an_empty_name_is_not_kept() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[]);
+
+        click_named(&ctx, &mut editor, project::DEFAULT_NAME);
+        run_frame(&ctx, &mut editor, vec![]);
+        type_text(&ctx, &mut editor, "Nope");
+        run_frame(&ctx, &mut editor, press(Key::Escape));
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.project_name, project::DEFAULT_NAME);
+
+        click_named(&ctx, &mut editor, project::DEFAULT_NAME);
+        run_frame(&ctx, &mut editor, vec![]);
+        run_frame(&ctx, &mut editor, key_event(Key::A, Modifiers::COMMAND));
+        run_frame(&ctx, &mut editor, press(Key::Backspace));
+        run_frame(&ctx, &mut editor, press(Key::Enter));
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.project_name, project::DEFAULT_NAME);
+    }
+
+    #[test]
+    fn typing_a_name_does_not_trigger_shortcuts() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        editor.seek(Ticks::from_seconds(1.0));
+        let before = editor.project.clone();
+
+        click_named(&ctx, &mut editor, &format!("{} *", project::DEFAULT_NAME));
+        run_frame(&ctx, &mut editor, vec![]);
+        run_frame(&ctx, &mut editor, vec![]);
+        for key in [Key::S, Key::Space, Key::Delete, Key::ArrowRight] {
+            run_frame(&ctx, &mut editor, press(key));
+        }
+
+        assert_eq!(editor.project, before);
+        assert!(!editor.preview.is_playing());
+        assert_eq!(editor.position(), Ticks::from_seconds(1.0));
+    }
+
+    #[test]
+    fn the_project_menu_offers_every_file_action() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[]);
+        click_named(&ctx, &mut editor, "Project menu");
+
+        for name in ["New project", "Open project", "Save", "Save as"] {
+            assert!(menu_item(&ctx, &mut editor, name).is_some(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_new_project_clears_everything_when_nothing_would_be_lost() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        editor.save_to(&project_folder("new-clean").join("a.bareclip"));
+
+        run_frame(&ctx, &mut editor, key_event(Key::N, Modifiers::COMMAND));
+
+        assert!(editor.leave_for.is_none());
+        assert!(editor.project.tracks.is_empty());
+        assert!(editor.media.is_empty());
+        assert!(editor.project_path.is_none());
+        assert!(!editor.history.can_undo());
+        assert_eq!(editor.project_name, project::DEFAULT_NAME);
+    }
+
+    #[test]
+    fn a_new_project_asks_first_when_work_would_be_lost() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+
+        run_frame(&ctx, &mut editor, key_event(Key::N, Modifiers::COMMAND));
+        assert_eq!(editor.leave_for, Some(LeaveFor::NewProject));
+        assert!(!editor.project.tracks.is_empty());
+
+        let_dialog_open(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Cancel");
+        assert!(editor.leave_for.is_none());
+        assert!(!editor.project.tracks.is_empty());
+
+        run_frame(&ctx, &mut editor, key_event(Key::N, Modifiers::COMMAND));
+        let_dialog_open(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Don't save");
+        assert!(editor.project.tracks.is_empty());
+    }
+
+    #[test]
+    fn save_in_the_dialog_saves_and_then_carries_on() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let path = project_folder("save-then-new").join("a.bareclip");
+        editor.save_to(&path);
+        let second = editor.media[0].id;
+        editor.add_to_timeline(second);
+        let saved_clips = editor.project.tracks.played().clips().len();
+
+        run_frame(&ctx, &mut editor, key_event(Key::N, Modifiers::COMMAND));
+        let_dialog_open(&ctx, &mut editor);
+        let button = named_nodes(&ctx, &mut editor)
+            .into_iter()
+            .rfind(|(label, ..)| label == "Save")
+            .expect("the dialog has Save")
+            .1;
+        click(&ctx, &mut editor, button.center());
+
+        assert!(editor.project.tracks.is_empty());
+        let back = ProjectFile::read(&path).expect("it was saved");
+        assert_eq!(back.tracks[0].len(), saved_clips);
+    }
+
+    #[test]
+    fn closing_with_unsaved_work_asks_and_cancel_keeps_the_window_open() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+
+        editor.handle_close_request(&ctx);
+        assert_eq!(editor.leave_for, Some(LeaveFor::CloseWindow));
+        assert!(!editor.closing);
+
+        let_dialog_open(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Cancel");
+        assert!(editor.leave_for.is_none());
+        assert!(!editor.closing);
+    }
+
+    #[test]
+    fn closing_with_nothing_unsaved_does_not_ask() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[]);
+
+        editor.handle_close_request(&ctx);
+
+        assert!(editor.leave_for.is_none());
+    }
+
+    #[test]
+    fn dont_save_lets_the_window_close_without_asking_again() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        editor.handle_close_request(&ctx);
+        let_dialog_open(&ctx, &mut editor);
+
+        click_named(&ctx, &mut editor, "Don't save");
+
+        assert!(editor.closing);
+        editor.handle_close_request(&ctx);
+        assert!(editor.leave_for.is_none());
+    }
+
+    #[test]
+    fn a_damaged_project_says_so_and_leaves_the_open_one_alone() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let before = editor.project.clone();
+        let path = project_folder("damaged").join("bad.bareclip");
+        std::fs::write(&path, "not a project").expect("it can be written");
+
+        editor.open_project(&ctx, &path);
+
+        assert_eq!(editor.project, before);
+        let notice = editor.notice.clone().expect("it says something");
+        assert!(
+            notice.contains("bad.bareclip") && notice.contains("damaged"),
+            "{notice}"
+        );
+    }
+
+    #[test]
+    fn a_project_from_a_newer_version_says_so_and_leaves_the_open_one_alone() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let before = editor.project.clone();
+        let path = project_folder("newer").join("new.bareclip");
+        std::fs::write(&path, r#"{"version":999}"#).expect("it can be written");
+
+        editor.open_project(&ctx, &path);
+
+        assert_eq!(editor.project, before);
+        assert!(
+            editor
+                .notice
+                .as_deref()
+                .is_some_and(|n| n.contains("newer"))
+        );
+    }
+
+    #[test]
+    fn dropping_a_project_file_opens_it_rather_than_adding_it_as_a_video() {
+        let ctx = context();
+        let mut editor = stacked_project(&ctx);
+        let path = project_folder("dropped").join("a.bareclip");
+        editor.save_to(&path);
+        let mut other = in_panel_only(&ctx, &[]);
+
+        other.import(&ctx, std::slice::from_ref(&path));
+        settle(&ctx, &mut other);
+
+        assert_eq!(other.project_path, Some(path));
+        assert_eq!(arrangement(&other), arrangement(&editor));
+    }
+
+    /// Retries a change to a video until whatever last had it open has let go of it.
+    fn once_free(mut change: impl FnMut() -> std::io::Result<()>) {
+        let started = Instant::now();
+        while let Err(error) = change() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the video stayed in use: {error}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A project whose video sits in its own folder, saved and closed.
+    fn project_with_movable_video(ctx: &egui::Context, name: &str) -> (PathBuf, PathBuf) {
+        let folder = project_folder(name);
+        let videos = folder.join("videos");
+        std::fs::create_dir_all(&videos).expect("the folder can be created");
+        let video = videos.join("clip.mp4");
+        std::fs::copy(test_clip(), &video).expect("the video can be copied");
+        let mut editor = in_panel_only(ctx, &[&video]);
+        let id = editor.media[0].id;
+        editor.add_to_timeline(id);
+        let project = folder.join("a.bareclip");
+        assert!(editor.save_to(&project));
+        (project, video)
+    }
+
+    #[test]
+    fn a_moved_video_is_asked_about_and_finding_it_finishes_opening() {
+        let ctx = context();
+        let (project, video) = project_with_movable_video(&ctx, "moved");
+        let moved = project.with_file_name("elsewhere.mp4");
+        once_free(|| std::fs::rename(&video, &moved));
+
+        let mut back = Editor::new(&ctx, false);
+        back.open_project(&ctx, &project);
+        assert!(back.missing_videos.is_some());
+        assert!(back.project.tracks.is_empty(), "it waits for an answer");
+
+        back.point_video_at(&ctx, 0, moved.clone());
+        settle(&ctx, &mut back);
+
+        assert!(back.missing_videos.is_none());
+        assert_eq!(back.project.tracks.played().clips().len(), 1);
+        assert_eq!(back.media[0].info.path, moved);
+    }
+
+    #[test]
+    fn opening_without_a_missing_video_leaves_its_clips_out_and_counts_as_unsaved() {
+        let ctx = context();
+        let (project, video) = project_with_movable_video(&ctx, "without");
+        once_free(|| std::fs::remove_file(&video));
+
+        let mut back = Editor::new(&ctx, false);
+        back.open_project(&ctx, &project);
+        let_dialog_open(&ctx, &mut back);
+        click_named(&ctx, &mut back, "Open without them");
+
+        assert!(back.missing_videos.is_none());
+        assert!(back.project.tracks.is_empty());
+        assert!(back.has_unsaved_changes());
+        let on_disk = ProjectFile::read(&project).expect("it can be read");
+        assert_eq!(on_disk.tracks[0].len(), 1, "the file itself is untouched");
+    }
+
+    #[test]
+    fn cancelling_over_a_missing_video_keeps_what_was_open() {
+        let ctx = context();
+        let (project, video) = project_with_movable_video(&ctx, "cancel");
+        once_free(|| std::fs::remove_file(&video));
+        let mut other = with_videos(&ctx, &[test_clip()]);
+        let before = other.project.clone();
+
+        other.open_project(&ctx, &project);
+        let_dialog_open(&ctx, &mut other);
+        click_named(&ctx, &mut other, "Cancel");
+
+        assert!(other.missing_videos.is_none());
+        assert_eq!(other.project, before);
+    }
+
+    #[test]
+    fn a_video_beside_the_project_file_is_found_without_asking() {
+        let ctx = context();
+        let (project, video) = project_with_movable_video(&ctx, "beside");
+        let beside = project.with_file_name("clip.mp4");
+        once_free(|| std::fs::rename(&video, &beside));
+
+        let back = opened(&ctx, &project);
+
+        assert!(back.missing_videos.is_none());
+        assert_eq!(back.media[0].info.path, beside);
+    }
+
+    fn with_storage(ctx: &egui::Context, folder: &Path) -> Editor {
+        let mut editor = Editor::new(ctx, false);
+        editor.use_storage(ctx, folder.to_owned());
+        run_frame(ctx, &mut editor, vec![]);
+        editor
+    }
+
+    /// Makes an autosave due, runs a frame and waits for the copy to reach the disk.
+    fn autosave_now(ctx: &egui::Context, editor: &mut Editor) {
+        editor.last_autosave_at = Instant::now() - Duration::from_secs(3600);
+        run_frame(ctx, editor, vec![]);
+        editor.recovery.as_mut().expect("it is on").wait();
+    }
+
+    /// Ends a run the way a crash does: the copy stays, and the lock is released.
+    fn crash(editor: Editor) {
+        let mut editor = editor;
+        editor.recovery.take().expect("it is on").abandon();
+    }
+
+    #[test]
+    fn after_a_crash_the_next_run_offers_the_work_back_and_restores_it() {
+        let ctx = context();
+        let folder = project_folder("crash");
+        let mut first = with_storage(&ctx, &folder);
+        let path = folder.join("saved.bareclip");
+        first.import(&ctx, &[test_clip().to_path_buf()]);
+        settle(&ctx, &mut first);
+        let id = first.media[0].id;
+        first.add_to_timeline(id);
+        first.project_name = "Lost work".to_owned();
+        first.save_to(&path);
+        first.add_to_timeline(id);
+        autosave_now(&ctx, &mut first);
+        let expected = arrangement(&first);
+        crash(first);
+
+        let mut second = with_storage(&ctx, &folder);
+        assert_eq!(second.recovery_offers.len(), 1);
+        let_dialog_open(&ctx, &mut second);
+        click_named(&ctx, &mut second, "Restore");
+        settle(&ctx, &mut second);
+
+        assert_eq!(arrangement(&second), expected);
+        assert_eq!(second.project_name, "Lost work");
+        assert_eq!(
+            second.project_path,
+            Some(path),
+            "saving goes to the same file"
+        );
+        assert!(second.has_unsaved_changes(), "it isn't on disk yet");
+        assert!(second.recovery_offers.is_empty());
+        second.recovery.as_mut().expect("it is on").wait();
+        assert!(storage::orphaned_recoveries(&folder).is_empty());
+    }
+
+    #[test]
+    fn restored_work_survives_a_second_crash() {
+        let ctx = context();
+        let folder = project_folder("crash-twice");
+        let mut first = with_storage(&ctx, &folder);
+        first.import(&ctx, &[test_clip().to_path_buf()]);
+        settle(&ctx, &mut first);
+        let id = first.media[0].id;
+        first.add_to_timeline(id);
+        autosave_now(&ctx, &mut first);
+        crash(first);
+
+        let mut second = with_storage(&ctx, &folder);
+        let_dialog_open(&ctx, &mut second);
+        click_named(&ctx, &mut second, "Restore");
+        settle(&ctx, &mut second);
+        second.recovery.as_mut().expect("it is on").wait();
+        crash(second);
+
+        let third = with_storage(&ctx, &folder);
+        assert_eq!(third.recovery_offers.len(), 1);
+    }
+
+    #[test]
+    fn discarding_recovered_work_removes_it_for_good() {
+        let ctx = context();
+        let folder = project_folder("crash-discard");
+        let mut first = with_storage(&ctx, &folder);
+        first.import(&ctx, &[test_clip().to_path_buf()]);
+        settle(&ctx, &mut first);
+        autosave_now(&ctx, &mut first);
+        crash(first);
+
+        let mut second = with_storage(&ctx, &folder);
+        let_dialog_open(&ctx, &mut second);
+        click_named(&ctx, &mut second, "Discard");
+
+        assert!(second.project.tracks.is_empty());
+        assert!(second.media.is_empty());
+        assert!(storage::orphaned_recoveries(&folder).is_empty());
+    }
+
+    #[test]
+    fn backing_out_of_a_restore_over_a_missing_video_keeps_the_copy() {
+        let ctx = context();
+        let folder = project_folder("crash-missing");
+        let video = folder.join("clip.mp4");
+        std::fs::copy(test_clip(), &video).expect("the video can be copied");
+        let mut first = with_storage(&ctx, &folder);
+        first.import(&ctx, std::slice::from_ref(&video));
+        settle(&ctx, &mut first);
+        autosave_now(&ctx, &mut first);
+        crash(first);
+        once_free(|| std::fs::remove_file(&video));
+
+        let mut second = with_storage(&ctx, &folder);
+        let_dialog_open(&ctx, &mut second);
+        click_named(&ctx, &mut second, "Restore");
+        assert!(second.missing_videos.is_some());
+        let_dialog_open(&ctx, &mut second);
+        click_named(&ctx, &mut second, "Cancel");
+
+        assert_eq!(storage::orphaned_recoveries(&folder).len(), 1);
+    }
+
+    #[test]
+    fn autosave_waits_for_its_interval_and_skips_what_it_already_has() {
+        let ctx = context();
+        let folder = project_folder("interval");
+        let mut editor = with_storage(&ctx, &folder);
+        editor.import(&ctx, &[test_clip().to_path_buf()]);
+        settle(&ctx, &mut editor);
+
+        editor.last_autosave_at = Instant::now();
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.last_autosaved.is_none(), "too soon");
+
+        autosave_now(&ctx, &mut editor);
+        let written = editor.last_autosaved.clone();
+        assert!(written.is_some());
+        let at = editor.last_autosave_at;
+
+        editor.last_autosave_at = at - Duration::from_secs(3600);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.last_autosaved, written);
+        assert!(editor.last_autosave_at < at, "nothing new to write");
+    }
+
+    #[test]
+    fn saving_removes_the_recovery_copy() {
+        let ctx = context();
+        let folder = project_folder("saved-clears");
+        let mut editor = with_storage(&ctx, &folder);
+        editor.import(&ctx, &[test_clip().to_path_buf()]);
+        settle(&ctx, &mut editor);
+        autosave_now(&ctx, &mut editor);
+
+        assert!(editor.save_to(&folder.join("a.bareclip")));
+        crash(editor);
+
+        assert!(storage::orphaned_recoveries(&folder).is_empty());
+    }
+
+    #[test]
+    fn an_empty_project_never_writes_a_recovery_copy() {
+        let ctx = context();
+        let folder = project_folder("empty");
+        let mut editor = with_storage(&ctx, &folder);
+
+        autosave_now(&ctx, &mut editor);
+        crash(editor);
+
+        assert!(storage::orphaned_recoveries(&folder).is_empty());
+    }
+
+    #[test]
+    fn a_recovery_copy_that_cannot_be_read_is_not_offered() {
+        let ctx = context();
+        let folder = project_folder("bad-copy");
+        let recovery = folder.join("recovery");
+        std::fs::create_dir_all(&recovery).expect("the folder can be created");
+        std::fs::write(recovery.join("1-1.recovery"), "garbage").expect("it can be written");
+
+        let mut editor = with_storage(&ctx, &folder);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert!(editor.recovery_offers.is_empty());
+        assert!(storage::orphaned_recoveries(&folder).is_empty());
+    }
+
+    #[test]
+    fn shortcuts_wait_while_a_recovery_is_being_offered() {
+        let ctx = context();
+        let folder = project_folder("offer-blocks");
+        let mut first = with_storage(&ctx, &folder);
+        first.import(&ctx, &[test_clip().to_path_buf()]);
+        settle(&ctx, &mut first);
+        autosave_now(&ctx, &mut first);
+        crash(first);
+
+        let mut second = with_storage(&ctx, &folder);
+        run_frame(&ctx, &mut second, key_event(Key::N, Modifiers::COMMAND));
+
+        assert_eq!(second.recovery_offers.len(), 1);
+        assert!(second.leave_for.is_none());
+    }
+
+    #[test]
+    fn the_settings_button_replaces_the_theme_button() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[]);
+
+        assert!(is_named(&ctx, &mut editor, "Settings"));
+        assert!(!is_named(&ctx, &mut editor, "Theme"));
+    }
+
+    #[test]
+    fn settings_are_kept_for_the_next_run() {
+        let ctx = context();
+        let folder = project_folder("settings");
+        let mut editor = with_storage(&ctx, &folder);
+
+        click_named(&ctx, &mut editor, "Settings");
+        let_dialog_open(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Light");
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "30 seconds");
+        click_named(&ctx, &mut editor, "Fastest");
+        assert_eq!(editor.mode, CutMode::Keyframe);
+        click_named(&ctx, &mut editor, "Done");
+        assert!(!editor.settings_open);
+        ctx.set_theme(egui::ThemePreference::System);
+
+        let next = with_storage(&ctx, &folder);
+
+        assert_eq!(next.settings.autosave_seconds, 30);
+        assert_eq!(next.mode, CutMode::Keyframe);
+        assert_eq!(
+            ctx.options(|options| options.theme_preference),
+            egui::ThemePreference::Light
+        );
+        ctx.set_theme(egui::ThemePreference::Dark);
+    }
+
+    #[test]
+    fn the_autosave_setting_changes_how_long_it_waits() {
+        let ctx = context();
+        let folder = project_folder("interval-setting");
+        let mut editor = with_storage(&ctx, &folder);
+        editor.settings.autosave_seconds = 60;
+        editor.import(&ctx, &[test_clip().to_path_buf()]);
+        settle(&ctx, &mut editor);
+
+        editor.last_autosave_at = Instant::now() - Duration::from_secs(30);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.last_autosaved.is_none());
+
+        editor.last_autosave_at = Instant::now() - Duration::from_secs(61);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.last_autosaved.is_some());
+        editor.recovery.as_mut().expect("it is on").wait();
     }
 
     #[test]

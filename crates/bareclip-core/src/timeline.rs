@@ -138,6 +138,30 @@ impl Timeline {
             .find(|gap| time >= gap.start && time < gap.end)
     }
 
+    /// Puts saved clips back, each with a new id. Going through the usual rules means a
+    /// file edited by hand can't produce an arrangement the editor couldn't.
+    pub(crate) fn restore(saved: impl IntoIterator<Item = (MediaId, Ticks, TimeRange)>) -> Self {
+        let mut clips: Vec<(MediaId, Ticks, TimeRange)> = saved
+            .into_iter()
+            .filter(|(_, _, source)| source.start < source.end)
+            .collect();
+        clips.sort_by_key(|(_, start, _)| *start);
+        let mut timeline = Self::default();
+        for (media, start, source) in clips {
+            let id = next_clip_id();
+            let wanted = start.max(Ticks(0));
+            // Past whatever is already there, since these arrive in order.
+            let start = wanted.max(timeline.duration());
+            timeline.clips.push(Clip {
+                id,
+                media,
+                start,
+                source,
+            });
+        }
+        timeline
+    }
+
     /// Clips already in order and not overlapping, such as what a stack of tracks plays.
     pub(crate) fn from_ordered(clips: Vec<Clip>) -> Self {
         Self { clips }
