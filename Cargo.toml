@@ -4,6 +4,7 @@ members = [
     "crates/bareclip-app",
     "crates/bareclip-audio",
     "crates/bareclip-core",
+    "crates/bareclip-export",
     "crates/bareclip-media",
     "crates/bareclip-render",
 ]
@@ -17,6 +18,7 @@ publish = false
 [workspace.dependencies]
 bareclip-audio = { path = "crates/bareclip-audio" }
 bareclip-core = { path = "crates/bareclip-core" }
+bareclip-export = { path = "crates/bareclip-export" }
 bareclip-media = { path = "crates/bareclip-media" }
 bareclip-render = { path = "crates/bareclip-render" }
 bytemuck = "1"

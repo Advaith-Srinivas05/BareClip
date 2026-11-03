@@ -6,6 +6,7 @@ use std::{
 };
 
 use bareclip_core::{splice::CutMode, time::Ticks};
+use bareclip_export::{FullPlan, FullReport, ProjectReport};
 use bareclip_media::{AudioInfo, ExportReport, MediaInfo};
 
 /// The file a video's export is saved as unless the user picks another name.
@@ -158,8 +159,64 @@ pub fn encoder_name(encoder: &str) -> &str {
     }
 }
 
-/// What happened in a finished export.
-pub fn export_summary(report: &ExportReport) -> Vec<String> {
+/// What a full export is going to write.
+pub fn full_export_plan(plan: &FullPlan) -> String {
+    let settings = &plan.settings;
+    format!(
+        "Every frame is redrawn and saved as an H.264 MP4 at {} x {} and {} fps. This takes longer than copying.",
+        settings.width,
+        settings.height,
+        frame_rate(plan.frame_rate()),
+    )
+}
+
+/// A frame rate with no needless decimals, such as `60` or `59.94`.
+fn frame_rate(rate: f64) -> String {
+    if (rate - rate.round()).abs() < 0.001 {
+        format!("{rate:.0}")
+    } else {
+        format!("{rate:.2}")
+    }
+}
+
+/// What happened in a finished export that redrew every frame.
+fn full_export_summary(report: &FullReport) -> Vec<String> {
+    let mut lines = vec![
+        format!("Finished in {}.", elapsed(report.elapsed.as_secs_f64())),
+        format!(
+            "{} frames written at {} x {} and {} fps, encoded using {}.",
+            report.frames,
+            report.width,
+            report.height,
+            frame_rate(report.frame_rate),
+            encoder_name(&report.encoder)
+        ),
+    ];
+    if report.composited_frames > 0 {
+        lines.push(format!(
+            "{} frames were fitted to that size on your graphics chip.",
+            report.composited_frames
+        ));
+    }
+    if report.black_frames > 0 {
+        lines.push(format!(
+            "Dead space written as {} black frames.",
+            report.black_frames
+        ));
+    }
+    lines
+}
+
+/// What happened in a finished export, whichever route it took.
+pub fn export_summary(report: &ProjectReport) -> Vec<String> {
+    match report {
+        ProjectReport::Fast(report) => fast_export_summary(report),
+        ProjectReport::Full(report) => full_export_summary(report),
+    }
+}
+
+/// What happened in a finished export that copied the video.
+fn fast_export_summary(report: &ExportReport) -> Vec<String> {
     let mut lines = vec![format!(
         "Finished in {}.",
         elapsed(report.elapsed.as_secs_f64())
@@ -302,6 +359,52 @@ mod tests {
         );
     }
 
+    fn full_report() -> FullReport {
+        FullReport {
+            width: 1920,
+            height: 1080,
+            frame_rate: 60000.0 / 1001.0,
+            frames: 600,
+            composited_frames: 240,
+            direct_frames: 300,
+            repeated_frames: 0,
+            black_frames: 60,
+            encoder: "h264_nvenc".to_owned(),
+            gpu: Some("NVIDIA GeForce RTX 3060".to_owned()),
+            audio_tracks: 2,
+            elapsed: Duration::from_millis(4000),
+        }
+    }
+
+    #[test]
+    fn a_full_export_reports_what_it_wrote() {
+        let lines = export_summary(&ProjectReport::Full(full_report()));
+
+        assert!(lines[1].contains("600 frames"), "{lines:?}");
+        assert!(lines[1].contains("1920 x 1080"), "{lines:?}");
+        assert!(lines[1].contains("59.94 fps"), "{lines:?}");
+        assert!(lines[1].contains("your NVIDIA GPU"), "{lines:?}");
+        assert!(lines[2].contains("240 frames"), "{lines:?}");
+        assert!(lines[3].contains("60 black frames"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_full_export_that_needed_no_fitting_doesnt_mention_it() {
+        let mut report = full_report();
+        report.composited_frames = 0;
+        report.black_frames = 0;
+
+        let lines = export_summary(&ProjectReport::Full(report));
+
+        assert_eq!(lines.len(), 2, "{lines:?}");
+    }
+
+    #[test]
+    fn whole_frame_rates_have_no_decimals() {
+        assert_eq!(frame_rate(60.0), "60");
+        assert_eq!(frame_rate(30000.0 / 1001.0), "29.97");
+    }
+
     fn report() -> ExportReport {
         ExportReport {
             mode_requested: CutMode::FrameExact,
@@ -328,12 +431,12 @@ mod tests {
         with_gap.black_frames = 30;
 
         assert!(
-            export_summary(&with_gap)
+            fast_export_summary(&with_gap)
                 .iter()
                 .any(|line| line.contains("30 black frames"))
         );
         assert!(
-            !export_summary(&report())
+            !fast_export_summary(&report())
                 .iter()
                 .any(|line| line.contains("black"))
         );
@@ -414,7 +517,7 @@ mod tests {
 
     #[test]
     fn the_report_says_what_did_the_work() {
-        let lines = export_summary(&report());
+        let lines = fast_export_summary(&report());
 
         assert_eq!(lines[0], "Finished in 2.5 seconds.");
         assert!(lines[1].contains("20 re-encoded using your NVIDIA GPU"));
@@ -428,7 +531,7 @@ mod tests {
         clean.encoder = None;
 
         assert_eq!(
-            export_summary(&clean)[1],
+            fast_export_summary(&clean)[1],
             "All 100 frames copied untouched."
         );
     }
@@ -440,7 +543,7 @@ mod tests {
         fallback.encoded_frames = 0;
         fallback.encoder = None;
 
-        let lines = export_summary(&fallback);
+        let lines = fast_export_summary(&fallback);
 
         assert!(lines[2].contains("moved outward"));
     }

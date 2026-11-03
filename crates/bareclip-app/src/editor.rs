@@ -19,10 +19,13 @@ use bareclip_core::{
     timeline::{ClipEdge, ClipId, MediaId, TimeRange},
     tracks::{TrackTarget, Tracks},
 };
+use bareclip_export::{
+    FullPlan, ProjectReport, Route, export_project, final_size, full_output_path, route_for,
+};
 use bareclip_media::{
-    DecodeStep, ExportPart, ExportReport, ExportRequest, MediaError, MediaInfo, PreviewFrame,
-    SoundShape, StripPicture, VideoPreview, can_write_gaps, export, join_problem, picture_spacing,
-    plan_export, probe, read_sound_shape, read_strip_pictures, scan_frames,
+    DecodeStep, ExportPart, ExportRequest, MediaError, MediaInfo, PreviewFrame, SoundShape,
+    StripPicture, VideoPreview, picture_spacing, plan_export, probe, read_sound_shape,
+    read_strip_pictures, scan_frames,
 };
 use eframe::egui::{
     self, Align, Color32, CornerRadius, FontFamily, FontId, Frame, Key, Layout, Margin, Modifiers,
@@ -289,7 +292,7 @@ struct TrimOrigin {
 }
 
 struct ExportTask {
-    result: Receiver<Result<ExportReport, MediaError>>,
+    result: Receiver<Result<ProjectReport, MediaError>>,
     progress: Arc<AtomicU32>,
     cancel: Arc<AtomicBool>,
     output: PathBuf,
@@ -302,7 +305,7 @@ enum ExportState {
     Choosing,
     Running(ExportTask),
     Done {
-        report: ExportReport,
+        report: ProjectReport,
         output: PathBuf,
     },
     Failed(String),
@@ -1546,37 +1549,41 @@ impl Editor {
             .collect()
     }
 
-    /// Why the videos on the timeline can't be exported together, if they can't.
-    fn export_problem(&self) -> Option<String> {
-        let mut infos = self
+    /// Each different video that shows on the timeline, in the order they first show.
+    fn videos_on_timeline(&self) -> Vec<MediaInfo> {
+        let mut seen = Vec::new();
+        let mut videos = Vec::new();
+        for clip in self.project.tracks.played().clips() {
+            if !seen.contains(&clip.media) {
+                seen.push(clip.media);
+                if let Some(entry) = self.entry(clip.media) {
+                    videos.push(entry.info.clone());
+                }
+            }
+        }
+        videos
+    }
+
+    /// How the timeline would be exported as it is now.
+    fn export_route(&self) -> Route {
+        route_for(
+            &self.videos_on_timeline(),
+            !self.project.tracks.gaps().is_empty(),
+        )
+    }
+
+    /// The shape and size of the finished video, which the preview shows too.
+    fn canvas_size(&self) -> Option<egui::Vec2> {
+        let sizes: Vec<(u32, u32)> = self
             .project
             .tracks
             .played()
             .clips()
             .iter()
-            .filter_map(|clip| self.entry(clip.media).map(|entry| &entry.info));
-        let first = infos.next()?;
-        infos.find_map(|other| join_problem(first, other))
-    }
-
-    /// Why dead space can't be exported for the videos on the timeline, if it can't.
-    fn gap_problem(&self) -> Option<String> {
-        if self.project.tracks.gaps().is_empty() {
-            return None;
-        }
-        let first = self
-            .project
-            .tracks
-            .played()
-            .clips()
-            .first()
-            .and_then(|clip| self.entry(clip.media))?;
-        (!can_write_gaps(&first.info.video.codec)).then(|| {
-            format!(
-                "Dead space can't be written for {} video yet. Remove the gaps to export it.",
-                text::codec_name(&first.info.video.codec)
-            )
-        })
+            .filter_map(|clip| self.entry(clip.media))
+            .map(|entry| (entry.info.video.width, entry.info.video.height))
+            .collect();
+        final_size(&sizes).map(|(width, height)| vec2(width as f32, height as f32))
     }
 
     fn start_export(&mut self, ctx: &egui::Context) {
@@ -1590,7 +1597,10 @@ impl Editor {
         else {
             return;
         };
-        let suggested = text::default_output_path(&first.info.path);
+        let mut suggested = text::default_output_path(&first.info.path);
+        if matches!(self.export_route(), Route::Full(_)) {
+            suggested = full_output_path(&suggested);
+        }
         let mut dialog = rfd::FileDialog::new().set_title("Export video as");
         if let Some(folder) = suggested.parent() {
             dialog = dialog.set_directory(folder);
@@ -1623,7 +1633,7 @@ impl Editor {
         let worker_cancel = cancel.clone();
         let repaint = ctx.clone();
         thread::spawn(move || {
-            let outcome = export(&request, &worker_cancel, &|fraction| {
+            let outcome = export_project(&request, &worker_cancel, &|fraction| {
                 worker_progress.store(fraction.to_bits(), Ordering::Relaxed);
             });
             let _ = sender.send(outcome);
@@ -2964,18 +2974,22 @@ impl Editor {
             });
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             let rect = ui.available_rect_before_wrap();
+            let canvas = self.canvas_size();
             if self.preview.in_gap(self.project.tracks.played()) {
-                if let Some(size) = self.picture_size() {
-                    let scale = (rect.width() / size.x).min(rect.height() / size.y);
-                    let shown = egui::Rect::from_center_size(rect.center(), size * scale);
-                    ui.painter().rect_filled(shown, 0.0, Color32::BLACK);
+                if let Some(size) = canvas {
+                    ui.painter()
+                        .rect_filled(fitted(size, rect), 0.0, Color32::BLACK);
                 }
                 return;
             }
             if let Some(picture) = &self.picture {
                 let size = picture.size_vec2();
-                let scale = (rect.width() / size.x).min(rect.height() / size.y);
-                let shown = egui::Rect::from_center_size(rect.center(), size * scale);
+                // A video of another shape gets black bars here, as it does in the export.
+                let frame = fitted(canvas.unwrap_or(size), rect);
+                let shown = fitted(size, frame);
+                if shown.size() != frame.size() {
+                    ui.painter().rect_filled(frame, 0.0, Color32::BLACK);
+                }
                 ui.painter().image(
                     picture.id(),
                     shown,
@@ -3013,17 +3027,6 @@ impl Editor {
     }
 
     /// The shape of the picture, even before any frame of it has been shown.
-    fn picture_size(&self) -> Option<egui::Vec2> {
-        self.picture
-            .as_ref()
-            .map(TextureHandle::size_vec2)
-            .or_else(|| {
-                let first = self.project.tracks.played().clips().first()?;
-                let video = &self.entry(first.media)?.info.video;
-                Some(vec2(video.width as f32, video.height as f32))
-            })
-    }
-
     fn remove_dialog(&mut self, ctx: &egui::Context, palette: &Palette) {
         if self.confirm_remove.is_empty() {
             return;
@@ -3088,8 +3091,8 @@ impl Editor {
         let mut remove_gaps = false;
         let gaps = self.project.tracks.gaps();
         let gap_length = Ticks(gaps.iter().map(|gap| gap.duration().0).sum());
-        let problem = self.export_problem();
-        let gap_problem = self.gap_problem();
+        let route = self.export_route();
+        let full_plan = FullPlan::for_videos(&self.videos_on_timeline());
         let ready = self.export_parts().is_some();
         let summary = self.plan_description();
 
@@ -3128,6 +3131,32 @@ impl Editor {
                 ExportState::Choosing => {
                     components::dialog_title(ui, &icons::UPLOAD, palette.accent, "Export");
                     ui.add_space(14.0);
+                    if let Route::Full(reason) = &route {
+                        ui.label(RichText::new("Full export").font(fonts::strong(13.0)));
+                        ui.add_space(4.0);
+                        ui.colored_label(palette.text_muted, reason);
+                        ui.add_space(8.0);
+                        ui.label(text::full_export_plan(&full_plan));
+                        ui.add_space(18.0);
+                        components::dialog_buttons(ui, |ui| {
+                            let start = ActionButton::new(palette, Kind::Primary, "Choose file and export")
+                                .icon(icons::UPLOAD);
+                            if ui.add_enabled(ready, start).clicked() {
+                                begin_export = true;
+                            }
+                            if ui.add(dialog_button(palette, "Cancel")).clicked() {
+                                next_state = Some(ExportState::Closed);
+                            }
+                        });
+                        return;
+                    }
+                    ui.label(RichText::new("Fast export").font(fonts::strong(13.0)));
+                    ui.add_space(4.0);
+                    ui.colored_label(
+                        palette.text_muted,
+                        "These videos match, so they can be copied rather than redrawn.",
+                    );
+                    ui.add_space(10.0);
                     if components::choice_card(
                         ui,
                         palette,
@@ -3155,26 +3184,16 @@ impl Editor {
                     }
                     ui.add_space(14.0);
 
-                    if let Some(problem) = &problem {
-                        ui.colored_label(palette.danger, problem);
-                        ui.add_space(4.0);
-                        ui.colored_label(
-                            palette.text_muted,
-                            "Videos need the same format to export together for now. Mixing formats comes later.",
-                        );
-                    } else if let Some(gap_problem) = &gap_problem {
-                        ui.colored_label(palette.danger, gap_problem);
-                    } else if let Some(summary) = &summary {
+                    if let Some(summary) = &summary {
                         ui.label(summary);
                     } else {
                         ui.colored_label(palette.text_muted, "Still reading the videos' frames.");
                     }
                     ui.add_space(18.0);
                     components::dialog_buttons(ui, |ui| {
-                        let can_start = ready && problem.is_none() && gap_problem.is_none();
                         let start = ActionButton::new(palette, Kind::Primary, "Choose file and export")
                             .icon(icons::UPLOAD);
-                        if ui.add_enabled(can_start, start).clicked() {
+                        if ui.add_enabled(ready, start).clicked() {
                             begin_export = true;
                         }
                         if ui.add(dialog_button(palette, "Cancel")).clicked() {
@@ -3265,6 +3284,12 @@ impl Editor {
         }
         Some(text::plan_summary(copied, encoded))
     }
+}
+
+/// The largest place something of this size fits inside a rectangle, in the middle.
+fn fitted(size: egui::Vec2, within: egui::Rect) -> egui::Rect {
+    let scale = (within.width() / size.x).min(within.height() / size.y);
+    egui::Rect::from_center_size(within.center(), size * scale)
 }
 
 /// A rounded panel. The gap on its right and below it keeps it clear of its neighbours,
@@ -4233,7 +4258,7 @@ mod tests {
             });
             shoot_dialog(camera, editor, format!("{prefix}-export-running"));
             editor.export_state = ExportState::Done {
-                report: ExportReport {
+                report: ProjectReport::Fast(bareclip_media::ExportReport {
                     mode_requested: CutMode::FrameExact,
                     mode_used: CutMode::FrameExact,
                     sections: 2,
@@ -4243,7 +4268,7 @@ mod tests {
                     encoder: Some("h264_nvenc".to_owned()),
                     audio_tracks: 2,
                     elapsed: Duration::from_millis(2100),
-                },
+                }),
                 output: PathBuf::from("C:\\Videos\\export.mp4"),
             };
             shoot_dialog(camera, editor, format!("{prefix}-export-done"));
@@ -6010,6 +6035,9 @@ mod tests {
         let ExportState::Done { report, .. } = &editor.export_state else {
             panic!("the export did not finish");
         };
+        let ProjectReport::Fast(report) = report else {
+            panic!("videos in one format take the fast route");
+        };
         assert_eq!(report.black_frames, 30);
         let info = probe(&output).expect("the export can be read");
         assert!((info.duration.as_seconds() - 4.0).abs() < 0.1);
@@ -6854,10 +6882,10 @@ mod tests {
     }
 
     #[test]
-    fn a_format_only_a_hidden_clip_uses_does_not_stop_the_export() {
+    fn a_format_only_a_hidden_clip_uses_does_not_force_a_full_export() {
         let ctx = context();
         let mut editor = with_videos(&ctx, &[test_clip(), small_clip()]);
-        assert!(editor.export_problem().is_some());
+        assert!(matches!(editor.export_route(), Route::Full(_)));
 
         let small = editor.project.tracks.played().clips()[1].id;
         editor.project.tracks.trim(
@@ -6873,7 +6901,7 @@ mod tests {
             .move_clip(small, Ticks::from_seconds(1.0), TrackTarget::New(1));
 
         assert_eq!(editor.project.tracks.played().clips().len(), 1);
-        assert!(editor.export_problem().is_none());
+        assert_eq!(editor.export_route(), Route::Fast);
     }
 
     #[test]
@@ -8887,21 +8915,101 @@ mod tests {
     }
 
     #[test]
-    fn videos_in_the_same_format_have_no_export_problem() {
+    fn videos_in_the_same_format_export_by_the_fast_route() {
         let ctx = context();
         let editor = with_videos(&ctx, &[test_clip(), second_clip()]);
 
-        assert_eq!(editor.export_problem(), None);
+        assert_eq!(editor.export_route(), Route::Fast);
     }
 
     #[test]
-    fn videos_in_different_formats_explain_the_problem_before_exporting() {
+    fn videos_in_different_formats_say_why_they_take_the_full_route() {
         let ctx = context();
         let editor = with_videos(&ctx, &[test_clip(), small_clip()]);
 
-        let problem = editor.export_problem().expect("these cannot be joined");
+        let Route::Full(reason) = editor.export_route() else {
+            panic!("these cannot be copied together");
+        };
 
-        assert!(problem.contains("160 x 90"), "{problem}");
+        assert!(reason.contains("160 x 90"), "{reason}");
+    }
+
+    #[test]
+    fn the_export_window_says_which_route_it_will_take() {
+        let ctx = context();
+        let mut fast = with_videos(&ctx, &[test_clip(), second_clip()]);
+        fast.export_state = ExportState::Choosing;
+        let_dialog_open(&ctx, &mut fast);
+        assert!(is_named(&ctx, &mut fast, "Frame-exact"));
+        assert!(is_named(&ctx, &mut fast, "Fastest"));
+
+        let mut full = with_videos(&ctx, &[test_clip(), small_clip()]);
+        full.export_state = ExportState::Choosing;
+        let_dialog_open(&ctx, &mut full);
+        assert!(
+            !is_named(&ctx, &mut full, "Frame-exact"),
+            "nothing to choose"
+        );
+        assert!(is_named(&ctx, &mut full, "Choose file and export"));
+    }
+
+    #[test]
+    fn videos_of_different_sizes_export_together_at_the_largest_size() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[small_clip(), test_clip()]);
+        let output =
+            std::env::temp_dir().join(format!("bareclip-ui-mixed-{}.mp4", std::process::id()));
+        let _ = std::fs::remove_file(&output);
+
+        editor.start_export_to(&ctx, output.clone());
+        wait_for_export(&ctx, &mut editor);
+
+        let ExportState::Done { report, .. } = &editor.export_state else {
+            panic!("the export did not finish: {:?}", failure_of(&editor));
+        };
+        assert!(matches!(report, ProjectReport::Full(_)), "{report:?}");
+        let info = probe(&output).expect("the export can be read");
+        assert_eq!((info.video.width, info.video.height), (320, 180));
+        assert_eq!(info.video.codec, "h264");
+        assert!((info.duration.as_seconds() - 8.0).abs() < 0.1);
+        let _ = std::fs::remove_file(&output);
+    }
+
+    fn failure_of(editor: &Editor) -> Option<&str> {
+        match &editor.export_state {
+            ExportState::Failed(message) => Some(message),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn the_canvas_is_the_largest_video_on_the_timeline() {
+        let ctx = context();
+        let editor = with_videos(&ctx, &[small_clip(), test_clip()]);
+
+        assert_eq!(editor.canvas_size(), Some(vec2(320.0, 180.0)));
+    }
+
+    #[test]
+    fn an_empty_timeline_has_no_canvas() {
+        let ctx = context();
+        let editor = in_panel_only(&ctx, &[test_clip()]);
+
+        assert_eq!(editor.canvas_size(), None);
+    }
+
+    #[test]
+    fn a_picture_of_another_shape_fits_inside_with_room_for_bars() {
+        let stage = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 1000.0));
+        let frame = fitted(vec2(1920.0, 1080.0), stage);
+        assert_eq!(frame.width(), 1000.0);
+        assert_eq!(frame.height(), 562.5);
+
+        let picture = fitted(vec2(1080.0, 1920.0), frame);
+
+        assert_eq!(picture.height(), 562.5);
+        assert!((picture.width() - 316.4).abs() < 0.1);
+        assert_eq!(picture.center(), frame.center());
     }
 
     fn wait_for_export(ctx: &egui::Context, editor: &mut Editor) {
