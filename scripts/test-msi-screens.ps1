@@ -1,7 +1,9 @@
 # Walks the installer's real pages the way a person would and checks the result. Run
 # scripts/build-msi.ps1 first, in Windows PowerShell. The installer's windows open on screen
-# for about a minute, so leave them alone. Pass -Pictures to save each page.
-param([string]$Pictures)
+# for about a minute, so leave them alone. Pass -Pictures to save each page. Pass
+# -InstallForEveryone on an administrator account to press Install on the Everyone path too,
+# which asks for administrator permission unless Windows is set not to.
+param([string]$Pictures, [switch]$InstallForEveryone)
 $ErrorActionPreference = 'Stop'
 
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Drawing
@@ -127,10 +129,12 @@ function Save-Picture([string]$Name, [string]$Inside) {
 
 if ((Test-Path $StartMenu) -or (Test-Path $Desktop)) { throw 'A BareClip shortcut already exists, so this test will not touch it.' }
 if (Test-Path 'HKCU:\Software\BareClip') { throw 'BareClip is already installed, so this test will not touch it.' }
+if (Test-Path 'HKLM:\Software\BareClip') { throw 'BareClip is already installed for everyone, so this test will not touch it.' }
 New-Item -ItemType Directory -Force $Parent | Out-Null
 
-# Everyone needs administrator permission to finish, so this walk stops at the last page.
-$Installer = Start-Process msiexec.exe -ArgumentList @('/i', "`"$Msi`"") -PassThru
+# Everyone needs administrator permission to finish, so this walk normally stops at the last page.
+$EveryoneLog = Join-Path $env:TEMP 'bareclip-msi-everyone-pages.log'
+$Installer = Start-Process msiexec.exe -ArgumentList @('/i', "`"$Msi`"", '/l*v', "`"$EveryoneLog`"") -PassThru
 try {
     [void](Wait-Control 'I accept the terms in the License Agreement')
     Set-Tick 'I accept the terms in the License Agreement' $true
@@ -148,6 +152,66 @@ try {
     $Text = Get-AllText (Get-Page)
     Assert-That ($Text -like "*$env:ProgramW6432\BareClip\*") 'Program Files is not refused for Everyone'
     Assert-That ($Text -like '*available to everyone*') 'the last page says it is for everyone'
+
+    if ($InstallForEveryone) {
+        $ProgramFilesDir = Join-Path $env:ProgramW6432 'BareClip'
+        $SharedStartMenu = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\BareClip.lnk'
+        $SharedDesktop = Join-Path $env:PUBLIC 'Desktop\BareClip.lnk'
+        Assert-That (-not (Test-Path $ProgramFilesDir)) 'Program Files has no BareClip yet'
+        try {
+            Invoke-Button 'Install'
+            [void](Wait-Control 'Finish')
+            Invoke-Button 'Finish'
+            Assert-That ($Installer.WaitForExit(30000)) 'the installer closes'
+            Assert-That ($Installer.ExitCode -eq 0) "the installer succeeded (exit $($Installer.ExitCode))"
+            Assert-That (Test-Path (Join-Path $ProgramFilesDir 'bareclip.exe')) 'the app is in Program Files'
+            Assert-That (Test-Path 'HKLM:\Software\BareClip') 'its choices are in the machine registry'
+            Assert-That (-not (Test-Path 'HKCU:\Software\BareClip')) 'and not in this user''s'
+            Assert-That (Test-Path $SharedStartMenu) 'the shared Start menu shortcut exists'
+            Assert-That (Test-Path $SharedDesktop) 'the shared desktop shortcut exists'
+            Assert-That (-not (Test-Path $StartMenu)) 'there is no separate shortcut for this user'
+
+            # The wizard works out for itself that an upgrade is for everyone, and skips the choice.
+            $Work = Join-Path $Root 'target\msi\everyone-pages'
+            [void](& (Join-Path $PSScriptRoot 'build-msi.ps1') -Version '0.1.1' -OutDir $Work -SkipBuild)
+            $Newer = Join-Path $Work 'BareClip-0.1.1.msi'
+            $UpgradeLog = Join-Path $env:TEMP 'bareclip-msi-everyone-upgrade.log'
+            $Installer = Start-Process msiexec.exe -ArgumentList @('/i', "`"$Newer`"", '/l*v', "`"$UpgradeLog`"") -PassThru
+            [void](Wait-Control 'I accept the terms in the License Agreement')
+            Set-Tick 'I accept the terms in the License Agreement' $true
+            Invoke-Button 'Next'
+            [void](Wait-Control 'Add to the Start menu')
+            Assert-That ((Get-AllText (Get-Page)) -like "*$ProgramFilesDir\*") 'the upgrade stays in Program Files without asking who it is for'
+            Invoke-Button 'Next'
+            [void](Wait-Control 'Install')
+            Assert-That ((Get-AllText (Get-Page)) -like '*available to everyone*') 'the upgrade says it is for everyone'
+            Invoke-Button 'Install'
+            [void](Wait-Control 'Finish')
+            Invoke-Button 'Finish'
+            Assert-That ($Installer.WaitForExit(30000)) 'the upgrade closes'
+            Assert-That ($Installer.ExitCode -eq 0) "the upgrade succeeded (exit $($Installer.ExitCode))"
+            $Windows = New-Object -ComObject WindowsInstaller.Installer
+            $Installed = @($Windows.RelatedProducts('{6F2B7C1E-3A94-4D58-9E21-7C0D5A8B4F13}'))
+            Assert-That ($Installed.Count -eq 1) 'there is still only one copy'
+            Assert-That ($Windows.ProductInfo($Installed[0], 'VersionString') -like '0.1.1*') 'and it is the newer one'
+            Assert-That (Test-Path (Join-Path $ProgramFilesDir 'bareclip.exe')) 'it stayed in Program Files'
+            Assert-That (-not (Test-Path 'HKCU:\Software\BareClip')) 'and did not also install for this user'
+        }
+        finally {
+            if (-not $Installer.HasExited) { Stop-Process -Id $Installer.Id -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2 }
+            $Windows = New-Object -ComObject WindowsInstaller.Installer
+            foreach ($Product in @($Windows.RelatedProducts('{6F2B7C1E-3A94-4D58-9E21-7C0D5A8B4F13}'))) {
+                $Removed = Start-Process msiexec.exe -ArgumentList @('/x', $Product, '/qb') -Wait -PassThru
+                Write-Host "uninstall exit $($Removed.ExitCode)"
+            }
+        }
+        Assert-That (-not (Test-Path $ProgramFilesDir)) 'the uninstaller removed it from Program Files'
+        Assert-That (-not (Test-Path $SharedStartMenu)) 'the shared Start menu shortcut is gone'
+        Assert-That (-not (Test-Path $SharedDesktop)) 'the shared desktop shortcut is gone'
+        Assert-That (-not (Test-Path 'HKLM:\Software\BareClip')) 'the registry entries are gone'
+        Write-Host 'The install for everyone passed.'
+        exit 0
+    }
 
     # Changing your mind puts the folder back.
     Invoke-Button 'Back'

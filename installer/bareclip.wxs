@@ -21,7 +21,8 @@
     <Property Id="ARPNOMODIFY" Value="1" />
 
     <!-- Windows' dual mode. It only asks for administrator permission when
-         MSIINSTALLPERUSER is cleared, which is what choosing Everyone does. -->
+         MSIINSTALLPERUSER is cleared. Windows settles who it's for as it starts, so choosing
+         Everyone on a page must set ALLUSERS to 1 as well, or it stays for one user. -->
     <Property Id="ALLUSERS" Value="2" />
     <Property Id="MSIINSTALLPERUSER" Value="1" Secure="yes" />
 
@@ -59,7 +60,8 @@
     <SetProperty Action="FindProgramFiles" Id="REAL_PROGRAM_FILES" Value="[%ProgramW6432]\" After="AppSearch" Sequence="both">1</SetProperty>
     <SetProperty Action="FindProgramFilesX86" Id="REAL_PROGRAM_FILES_X86" Value="[%ProgramW6432] (x86)\" After="FindProgramFiles" Sequence="both">1</SetProperty>
     <SetProperty Action="RestoreEveryone" Id="MSIINSTALLPERUSER" Value="[NOTHING]" After="FindProgramFilesX86" Sequence="both">SAVED_PARENT_EVERYONE AND NOT Installed</SetProperty>
-    <SetProperty Action="RestoreEveryoneScope" Id="INSTALL_SCOPE" Value="everyone" After="RestoreEveryone" Sequence="both">SAVED_PARENT_EVERYONE AND NOT Installed</SetProperty>
+    <SetProperty Action="RestoreEveryoneAllUsers" Id="ALLUSERS" Value="1" After="RestoreEveryone" Sequence="both">SAVED_PARENT_EVERYONE AND NOT Installed</SetProperty>
+    <SetProperty Action="RestoreEveryoneScope" Id="INSTALL_SCOPE" Value="everyone" After="RestoreEveryoneAllUsers" Sequence="both">SAVED_PARENT_EVERYONE AND NOT Installed</SetProperty>
     <SetProperty Action="RestoreParentEveryone" Id="INSTALLPARENT" Value="[SAVED_PARENT_EVERYONE]" After="RestoreEveryoneScope" Sequence="both">SAVED_PARENT_EVERYONE AND NOT INSTALLPARENT</SetProperty>
     <SetProperty Action="RestoreParentUser" Id="INSTALLPARENT" Value="[SAVED_PARENT_USER]" After="RestoreParentEveryone" Sequence="both">SAVED_PARENT_USER AND NOT INSTALLPARENT</SetProperty>
     <SetProperty Action="DefaultParentEveryone" Id="INSTALLPARENT" Value="[REAL_PROGRAM_FILES]" After="RestoreParentUser" Sequence="both">NOT INSTALLPARENT AND NOT MSIINSTALLPERUSER</SetProperty>
@@ -67,6 +69,15 @@
     <!-- A nothing value clears a property, because a saved "no" still counts as ticked otherwise. -->
     <SetProperty Action="RestoreNoStartMenu" Id="ADD_START_MENU" Value="[NOTHING]" After="DefaultParent" Sequence="both">SAVED_START_MENU = "no" OR SAVED_START_MENU_EVERYONE = "no"</SetProperty>
     <SetProperty Action="RestoreNoDesktop" Id="ADD_DESKTOP" Value="[NOTHING]" After="RestoreNoStartMenu" Sequence="both">SAVED_DESKTOP = "no" OR SAVED_DESKTOP_EVERYONE = "no"</SetProperty>
+
+    <!-- Windows only finds an earlier copy installed the same way, so this has to wait until it
+         is known that an earlier copy was for everyone. Otherwise that copy stays alongside. -->
+    <InstallExecuteSequence>
+      <FindRelatedProducts After="RestoreEveryoneAllUsers" />
+    </InstallExecuteSequence>
+    <InstallUISequence>
+      <FindRelatedProducts After="RestoreEveryoneAllUsers" />
+    </InstallUISequence>
 
     <WixVariable Id="WixUILicenseRtf" Value="$(var.InstallerDir)\license.rtf" />
     <WixVariable Id="WixUIBannerBmp" Value="$(var.BrandDir)\windows\msi-banner.bmp" />
@@ -130,12 +141,14 @@
         </Control>
         <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)">
           <Publish Property="MSIINSTALLPERUSER" Value="1" Order="1">INSTALL_SCOPE = "user"</Publish>
-          <Publish Property="MSIINSTALLPERUSER" Value="{}" Order="2">INSTALL_SCOPE = "everyone"</Publish>
-          <Publish Property="INSTALLPARENT" Value="[LocalAppDataFolder]Programs\" Order="3"><![CDATA[INSTALL_SCOPE = "user" AND LAST_SCOPE <> INSTALL_SCOPE]]></Publish>
-          <Publish Property="INSTALLPARENT" Value="[REAL_PROGRAM_FILES]" Order="4"><![CDATA[INSTALL_SCOPE = "everyone" AND LAST_SCOPE <> INSTALL_SCOPE]]></Publish>
-          <Publish Event="SetTargetPath" Value="INSTALLPARENT" Order="5"><![CDATA[LAST_SCOPE <> INSTALL_SCOPE]]></Publish>
-          <Publish Property="LAST_SCOPE" Value="[INSTALL_SCOPE]" Order="6">1</Publish>
-          <Publish Event="NewDialog" Value="OptionsDlg" Order="7">1</Publish>
+          <Publish Property="ALLUSERS" Value="2" Order="2">INSTALL_SCOPE = "user"</Publish>
+          <Publish Property="MSIINSTALLPERUSER" Value="{}" Order="3">INSTALL_SCOPE = "everyone"</Publish>
+          <Publish Property="ALLUSERS" Value="1" Order="4">INSTALL_SCOPE = "everyone"</Publish>
+          <Publish Property="INSTALLPARENT" Value="[LocalAppDataFolder]Programs\" Order="5"><![CDATA[INSTALL_SCOPE = "user" AND LAST_SCOPE <> INSTALL_SCOPE]]></Publish>
+          <Publish Property="INSTALLPARENT" Value="[REAL_PROGRAM_FILES]" Order="6"><![CDATA[INSTALL_SCOPE = "everyone" AND LAST_SCOPE <> INSTALL_SCOPE]]></Publish>
+          <Publish Event="SetTargetPath" Value="INSTALLPARENT" Order="7"><![CDATA[LAST_SCOPE <> INSTALL_SCOPE]]></Publish>
+          <Publish Property="LAST_SCOPE" Value="[INSTALL_SCOPE]" Order="8">1</Publish>
+          <Publish Event="NewDialog" Value="OptionsDlg" Order="9">1</Publish>
         </Control>
         <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
           <Publish Event="SpawnDialog" Value="CancelDlg">1</Publish>
