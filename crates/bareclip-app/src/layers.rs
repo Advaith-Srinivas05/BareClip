@@ -770,26 +770,19 @@ mod tests {
     /// What one run of the speed test found.
     struct Run {
         seconds: f64,
-        frame_rate: f64,
-        /// Different pictures shown per second, for each layer from the bottom.
-        shown_per_second: Vec<f64>,
+        /// Different pictures shown, and how many the video has in that stretch, for each layer
+        /// from the bottom. Recordings have no one frame rate, so this counts the real frames.
+        shown: Vec<(u64, u64)>,
         /// The longest wait between new pictures on any layer.
         longest_gap: f64,
+        /// The longest wait the videos themselves have between frames over the same stretch.
+        longest_gap_in_source: f64,
         draws_per_second: f64,
         slowest_draw_ms: f64,
     }
 
-    fn real_time_run(sources: &[PathBuf], run_for: Duration, overlays_from: Ticks) -> Run {
-        let infos: Vec<MediaInfo> = sources
-            .iter()
-            .map(|path| probe(path).expect("the video can be read"))
-            .collect();
-        let lookup = |id: MediaId| infos.get(id.0 as usize).cloned();
-        let size_of = |id: MediaId| {
-            infos
-                .get(id.0 as usize)
-                .map(|info| (info.video.width, info.video.height))
-        };
+    /// One full-size video with the others small over it, arriving at a moment on the timeline.
+    fn gate_layout(infos: &[MediaInfo], overlays_from: Ticks) -> Tracks {
         let mut tracks = Tracks::default();
         let length = infos
             .iter()
@@ -806,7 +799,6 @@ mod tests {
                 if index > 0 { overlays_from } else { Ticks(0) },
                 TrackTarget::New(0),
             );
-            // One full-size video with two smaller ones over it.
             if index > 0 {
                 tracks.set_placement(
                     id,
@@ -819,6 +811,35 @@ mod tests {
                 );
             }
         }
+        tracks
+    }
+
+    /// When each frame of a video appears, in order.
+    fn frame_times(info: &MediaInfo) -> Vec<Ticks> {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let index =
+            bareclip_media::scan_frames(&info.path, &cancel, |_| {}).expect("it can be scanned");
+        let mut times: Vec<Ticks> = index
+            .frames()
+            .iter()
+            .map(|frame| Ticks::from_pts(frame.pts, info.video.time_base))
+            .collect();
+        times.sort();
+        times
+    }
+
+    fn real_time_run(sources: &[PathBuf], run_for: Duration, overlays_from: Ticks) -> Run {
+        let infos: Vec<MediaInfo> = sources
+            .iter()
+            .map(|path| probe(path).expect("the video can be read"))
+            .collect();
+        let lookup = |id: MediaId| infos.get(id.0 as usize).cloned();
+        let size_of = |id: MediaId| {
+            infos
+                .get(id.0 as usize)
+                .map(|info| (info.video.width, info.video.height))
+        };
+        let tracks = gate_layout(&infos, overlays_from);
         let canvas = tracks.canvas(&size_of).expect("there is a canvas");
         assert!(tracks.needs_layers(canvas, &size_of));
 
@@ -837,10 +858,12 @@ mod tests {
         let mut draws = 0_u64;
         let mut slowest_draw = Duration::ZERO;
         let mut stack_seen = Vec::new();
-        while started.elapsed() < run_for {
+        let mut reached = Ticks(0);
+        while started.elapsed() < run_for && preview.is_playing() {
             let top = preview.update(tracks.played(), &lookup);
             let piece = preview.last_picture_from();
             let now = preview.position(tracks.played());
+            reached = now;
             let stack = tracks.stack_at(now, canvas, &size_of);
             let moment = Moment {
                 now,
@@ -874,52 +897,204 @@ mod tests {
                 slowest_draw = slowest_draw.max(before.elapsed());
                 draws += 1;
             }
-            stack_seen = stack;
+            if !stack.is_empty() {
+                stack_seen = stack;
+            }
             // About what a 144 Hz window does, so the loop isn't the limit.
             thread::sleep(Duration::from_millis(6));
         }
         let seconds = started.elapsed().as_secs_f64();
+        // What each layer should have shown between where it started and where playback got to.
+        let in_the_stretch = |clip: &Clip| -> Vec<Ticks> {
+            let info = &infos[clip.media.0 as usize];
+            let until = source_time(clip, reached);
+            frame_times(info)
+                .into_iter()
+                .filter(|time| *time >= clip.source.start && *time <= until)
+                .collect()
+        };
+        let mut shown = Vec::new();
+        let mut longest_gap_in_source = 0.0_f64;
+        for clip in &stack_seen {
+            let times = in_the_stretch(clip);
+            for pair in times.windows(2) {
+                longest_gap_in_source =
+                    longest_gap_in_source.max((pair[1].0 - pair[0].0) as f64 / 705_600_000.0);
+            }
+            shown.push((
+                counts.get(&clip.id).copied().unwrap_or(0),
+                times.len() as u64,
+            ));
+        }
         Run {
             seconds,
-            frame_rate: infos[0].video.frame_rate,
-            shown_per_second: stack_seen
-                .iter()
-                .map(|clip| counts.get(&clip.id).copied().unwrap_or(0) as f64 / seconds)
-                .collect(),
+            shown,
             longest_gap: longest_gap.as_secs_f64(),
+            longest_gap_in_source,
             draws_per_second: draws as f64 / seconds,
             slowest_draw_ms: slowest_draw.as_secs_f64() * 1000.0,
         }
     }
 
-    /// Prints a run and says whether its layers kept up. Clips that only arrive partway through
-    /// can't show as many pictures, so for those only the layer there all along is judged.
-    fn report(name: &str, run: &Run, arriving: bool) -> bool {
-        let rates: Vec<String> = run
-            .shown_per_second
+    /// Prints a run and says whether its layers kept up.
+    fn report(name: &str, run: &Run) -> bool {
+        let counts: Vec<String> = run
+            .shown
             .iter()
-            .map(|rate| format!("{rate:.1}"))
+            .map(|(shown, total)| format!("{shown}/{total}"))
             .collect();
         // Allows for the start, when nothing shows yet, and for the odd late picture.
-        let judged = if arriving {
-            1
-        } else {
-            run.shown_per_second.len()
-        };
-        let smooth = run.shown_per_second[..judged]
+        let smooth = run
+            .shown
             .iter()
-            .all(|rate| *rate >= run.frame_rate * 0.95);
+            .all(|(shown, total)| *shown as f64 >= *total as f64 * 0.95);
         println!(
-            "{name:<34} {} fps per layer (video is {:.0} fps), longest wait {:.0} ms, {:.0} draws/s, slowest draw {:.1} ms, over {:.0} s: {}",
-            rates.join(" / "),
-            run.frame_rate,
+            "{name:<34} pictures shown {}, longest wait {:.0} ms (the videos' own: {:.0} ms), {:.0} draws/s, slowest draw {:.1} ms, over {:.1} s: {}",
+            counts.join(" / "),
             run.longest_gap * 1000.0,
+            run.longest_gap_in_source * 1000.0,
             run.draws_per_second,
             run.slowest_draw_ms,
             run.seconds,
             if smooth { "PASS" } else { "MISS" },
         );
         smooth
+    }
+
+    /// Exports real recordings in layers, says how fast, and compares the export with the preview.
+    /// `cargo test --release -p bareclip-app real_recordings_export_like_the_preview -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs BARECLIP_LAYER_FILES and a GPU"]
+    fn real_recordings_export_like_the_preview() {
+        let Some(paths) = real_files() else {
+            eprintln!("set BARECLIP_LAYER_FILES");
+            return;
+        };
+        let infos: Vec<MediaInfo> = paths
+            .iter()
+            .map(|path| probe(path).expect("the video can be read"))
+            .collect();
+        let tracks = gate_layout(&infos, Ticks(0));
+        let size_of = |id: MediaId| {
+            infos
+                .get(id.0 as usize)
+                .map(|info| (info.video.width, info.video.height))
+        };
+        let canvas = tracks.canvas(&size_of).expect("there is a canvas");
+        let mut compositor = Compositor::new(canvas.0, canvas.1).expect("the GPU opens");
+        let output =
+            std::env::temp_dir().join(format!("bareclip-real-layers-{}.mp4", std::process::id()));
+        let stretches = tracks
+            .stretches(canvas, &size_of)
+            .into_iter()
+            .map(|stretch| bareclip_export::LayeredStretch {
+                start: stretch.start,
+                end: stretch.end,
+                stack: stretch
+                    .stack
+                    .iter()
+                    .map(|clip| bareclip_export::LayeredClip {
+                        key: clip.id.0,
+                        input: paths[clip.media.0 as usize].clone(),
+                        start: clip.start,
+                        source: clip.source,
+                        placement: clip.placement,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let sound = tracks
+            .played()
+            .clips()
+            .iter()
+            .map(|clip| bareclip_media::ExportPart {
+                input: paths[clip.media.0 as usize].clone(),
+                frames: Arc::new(
+                    bareclip_media::scan_frames(&paths[clip.media.0 as usize], &cancel, |_| {})
+                        .expect("it can be scanned"),
+                ),
+                range: clip.source,
+                gap_before: Ticks(0),
+            })
+            .collect();
+        let request = bareclip_export::LayeredRequest {
+            output: output.clone(),
+            stretches,
+            sound,
+        };
+        let report = bareclip_export::export_layered(&request, &cancel, &|_| {})
+            .expect("the export succeeds");
+        let length = tracks.duration().as_seconds();
+        println!(
+            "Exported {length:.1} s at {}x{} {:.2} fps in {:.1} s ({:.1}x real time), {} drawn, {} direct, {} repeated, encoder {}",
+            report.width,
+            report.height,
+            report.frame_rate,
+            report.elapsed.as_secs_f64(),
+            length / report.elapsed.as_secs_f64(),
+            report.composited_frames,
+            report.direct_frames,
+            report.repeated_frames,
+            report.encoder,
+        );
+        let out = probe(&output).expect("the export can be read");
+        println!(
+            "The file: {:.2} s, {} sound tracks, {:.1} MB",
+            out.duration.as_seconds(),
+            out.audio.len(),
+            out.size_bytes as f64 / 1_000_000.0,
+        );
+
+        for moment in [0.2, 0.4, 0.6, 0.8] {
+            let at = seconds(length * moment);
+            let previewed = drawn_by_the_preview(&tracks, &infos, at, &mut compositor);
+            // Recordings don't have a frame at every moment, so a frame next to this one can be the
+            // true match. A wrong place or colour would differ from all of them.
+            let mut reader =
+                bareclip_media::PictureReader::open(&output).expect("the export opens");
+            reader
+                .seek(Ticks((at.0 - seconds(1.0).0).max(0)))
+                .expect("it seeks");
+            let mut nearby = Vec::new();
+            while let Some(picture) = reader.next_picture().expect("it decodes") {
+                let off = picture.time().as_seconds() - at.as_seconds();
+                if off > 0.07 {
+                    break;
+                }
+                if off < -0.07 {
+                    continue;
+                }
+                let layer = Layer {
+                    picture: picture.view(),
+                    rect: bareclip_render::fit_inside(picture.size(), canvas),
+                    opacity: 1.0,
+                };
+                compositor.draw_for_display(&[layer]).expect("it draws");
+                let shown = compositor.read_display().expect("it reads back");
+                nearby.push((off, average_difference(&previewed, &shown)));
+            }
+            let found: Vec<String> = nearby
+                .iter()
+                .map(|(off, difference)| format!("{:+.0} ms: {difference:.2}", off * 1000.0))
+                .collect();
+            println!(
+                "At {:.1} s, difference from the preview by export frame: {}",
+                at.as_seconds(),
+                found.join(", ")
+            );
+        }
+        let mut reader = bareclip_media::PictureReader::open(&output).expect("the export opens");
+        let mut pictures = 0;
+        while reader.next_picture().expect("it decodes").is_some() {
+            pictures += 1;
+        }
+        println!(
+            "It holds {pictures} pictures, and {} were written",
+            report.frames
+        );
+        assert_eq!(pictures, report.frames);
+        let _ = std::fs::remove_file(&output);
     }
 
     fn real_files() -> Option<Vec<PathBuf>> {
@@ -937,9 +1112,9 @@ mod tests {
         let run_for = Duration::from_secs(20);
         if let Some(files) = real_files() {
             let run = real_time_run(&files, run_for, Ticks(0));
-            let smooth = report("Real recordings", &run, false);
+            let smooth = report("Real recordings", &run);
             let late = real_time_run(&files, run_for, seconds(5.0));
-            report("Real, overlays arriving at 5 s", &late, true);
+            report("Real, overlays arriving at 5 s", &late);
             assert!(smooth);
             return;
         }
@@ -947,15 +1122,10 @@ mod tests {
             .iter()
             .map(|(name, pattern)| busy_video(name, (1920, 1080), pattern))
             .collect();
-        let at_1080 = report(
-            "Three 1080p60",
-            &real_time_run(&sources, run_for, Ticks(0)),
-            false,
-        );
+        let at_1080 = report("Three 1080p60", &real_time_run(&sources, run_for, Ticks(0)));
         report(
             "1080p60, overlays arriving at 5 s",
             &real_time_run(&sources, run_for, seconds(5.0)),
-            true,
         );
         let sources: Vec<PathBuf> = [("a", "testsrc2"), ("b", "testsrc"), ("c", "smptebars")]
             .iter()
@@ -965,7 +1135,6 @@ mod tests {
         report(
             "Three 1440p60 (for information)",
             &real_time_run(&sources, run_for, Ticks(0)),
-            false,
         );
         assert!(at_1080);
     }
