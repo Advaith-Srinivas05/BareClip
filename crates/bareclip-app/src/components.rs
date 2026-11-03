@@ -14,6 +14,7 @@ use crate::{
 };
 
 const RADIUS: u8 = 6;
+const SWATCH_SIZE: f32 = 26.0;
 const BUTTON_HEIGHT: f32 = 32.0;
 const SMALL_BUTTON_HEIGHT: f32 = 26.0;
 const BUTTON_PADDING: f32 = 12.0;
@@ -538,6 +539,47 @@ impl Widget for MenuItem<'_> {
                 FontId::new(12.0, FontFamily::Proportional),
                 shortcut,
             );
+        }
+        response
+    }
+}
+
+/// A round colour to pick, with a ring around the chosen one. It shows the colour itself, so it
+/// sits outside the palette, and its name is what screen readers and tests go by.
+pub struct ColourSwatch<'a> {
+    palette: &'a Palette,
+    colour: Color32,
+    name: &'a str,
+    chosen: bool,
+}
+
+impl<'a> ColourSwatch<'a> {
+    pub fn new(palette: &'a Palette, colour: Color32, name: &'a str, chosen: bool) -> Self {
+        Self {
+            palette,
+            colour,
+            name,
+            chosen,
+        }
+    }
+}
+
+impl Widget for ColourSwatch<'_> {
+    fn ui(self, ui: &mut Ui) -> Response {
+        let (rect, response) =
+            ui.allocate_exact_size(vec2(SWATCH_SIZE, SWATCH_SIZE), Sense::click());
+        let name = self.name;
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, name));
+        if ui.is_rect_visible(rect) {
+            let ring = if self.chosen {
+                Stroke::new(2.0, self.palette.accent)
+            } else if response.hovered() {
+                Stroke::new(1.5, self.palette.text)
+            } else {
+                Stroke::new(1.0, self.palette.border_strong)
+            };
+            ui.painter()
+                .circle(rect.center(), SWATCH_SIZE / 2.0 - 2.0, self.colour, ring);
         }
         response
     }

@@ -330,6 +330,27 @@ impl Tracks {
         })
     }
 
+    /// Whether the canvas itself can be seen anywhere: in dead space, or around the lowest picture.
+    pub fn shows_canvas(
+        &self,
+        canvas: (u32, u32),
+        size_of: &dyn Fn(MediaId) -> Option<(u32, u32)>,
+    ) -> bool {
+        if !self.gaps().is_empty() {
+            return true;
+        }
+        self.stretches(canvas, size_of).iter().any(|stretch| {
+            stretch.stack.first().is_none_or(|lowest| {
+                !size_of(lowest.media).is_some_and(|size| {
+                    lowest
+                        .placement
+                        .at(Ticks(stretch.start.0 - lowest.start.0))
+                        .hides_below(size, canvas)
+                })
+            })
+        })
+    }
+
     /// Puts a copy of a clip straight after it on its own track.
     pub fn duplicate(&mut self, id: ClipId) -> Option<ClipId> {
         let track = self.track_of(id)?;
@@ -1068,6 +1089,40 @@ mod tests {
             tracks.next_change(Ticks(30), Ticks(20), WIDE, &all_wide),
             None
         );
+    }
+
+    #[test]
+    fn a_full_picture_with_no_dead_space_shows_no_canvas() {
+        let (tracks, ..) = two_tracks();
+
+        assert!(!tracks.shows_canvas(WIDE, &all_wide));
+    }
+
+    #[test]
+    fn dead_space_shows_the_canvas() {
+        let mut tracks = Tracks::default();
+        tracks.place(VIDEO, range(0, 100), Ticks(50), TrackTarget::New(0));
+
+        assert!(tracks.shows_canvas(WIDE, &all_wide));
+    }
+
+    #[test]
+    fn a_smaller_lowest_picture_shows_the_canvas_around_it() {
+        let mut tracks = Tracks::default();
+        let clip = tracks.push(VIDEO, range(0, 100));
+        assert!(!tracks.shows_canvas(WIDE, &all_wide));
+
+        tracks.set_placement(clip, smaller());
+
+        assert!(tracks.shows_canvas(WIDE, &all_wide));
+    }
+
+    #[test]
+    fn bars_show_the_canvas() {
+        let mut tracks = Tracks::default();
+        tracks.push(VIDEO, range(0, 100));
+
+        assert!(tracks.shows_canvas((1000, 1000), &all_wide));
     }
 
     #[test]

@@ -23,6 +23,48 @@ pub const ORIGINAL_NAME: &str = "Original";
 /// Larger than any encoder here takes, so a hand-edited file can't ask for something absurd.
 const LARGEST_SIDE: u32 = 16_384;
 
+/// A colour's red, green and blue, as stored values.
+pub type Colour = [u8; 3];
+pub const BLACK: Colour = [0, 0, 0];
+/// The colours offered for the background, and what screen readers call them.
+pub const BACKGROUND_SWATCHES: [(Colour, &str); 16] = [
+    ([255, 255, 255], "White"),
+    ([255, 0, 0], "Red"),
+    ([255, 148, 34], "Orange"),
+    ([255, 255, 0], "Yellow"),
+    ([173, 255, 47], "Lime"),
+    ([77, 238, 255], "Light blue"),
+    ([255, 105, 240], "Pink"),
+    ([110, 32, 255], "Purple"),
+    ([0, 0, 0], "Black"),
+    ([176, 0, 0], "Dark red"),
+    ([255, 106, 0], "Dark orange"),
+    ([255, 213, 0], "Gold"),
+    ([76, 175, 80], "Green"),
+    ([0, 122, 255], "Blue"),
+    ([186, 0, 240], "Magenta"),
+    ([0, 26, 122], "Navy"),
+];
+
+/// A colour written the usual way, such as #FF9422.
+pub fn colour_to_hex(colour: Colour) -> String {
+    format!("#{:02X}{:02X}{:02X}", colour[0], colour[1], colour[2])
+}
+
+/// Reads a colour written the usual way, with or without its #.
+pub fn colour_from_hex(text: &str) -> Option<Colour> {
+    let digits = text.trim().trim_start_matches('#');
+    if digits.len() != 6 || !digits.is_ascii() {
+        return None;
+    }
+    let part = |range: std::ops::Range<usize>| u8::from_str_radix(&digits[range], 16).ok();
+    Some([part(0..2)?, part(2..4)?, part(4..6)?])
+}
+
+fn is_black(colour: &Colour) -> bool {
+    *colour == BLACK
+}
+
 /// A size in this shape that keeps what a video of `base` size has: its longer side, or for a
 /// square its shorter one, because a square at the longer side would only add pixels nothing
 /// fills. Encoders need even sizes.
@@ -50,6 +92,9 @@ pub struct Canvas {
     /// A ratio picked by hand, which stays until another is picked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ratio: Option<(u32, u32)>,
+    /// What shows wherever no picture covers the canvas, including dead space.
+    #[serde(default, skip_serializing_if = "is_black")]
+    pub background: Colour,
 }
 
 impl Canvas {
@@ -120,6 +165,7 @@ impl Canvas {
             ratio: self
                 .ratio
                 .filter(|ratio| RATIOS.iter().any(|(known, _)| known == ratio)),
+            background: self.background,
         }
     }
 }
@@ -313,10 +359,35 @@ mod tests {
     }
 
     #[test]
+    fn a_colour_can_be_written_and_read_back() {
+        assert_eq!(colour_to_hex([255, 148, 34]), "#FF9422");
+        assert_eq!(colour_from_hex("#FF9422"), Some([255, 148, 34]));
+        assert_eq!(colour_from_hex("ff9422"), Some([255, 148, 34]));
+        assert_eq!(colour_from_hex("  #ff9422 "), Some([255, 148, 34]));
+    }
+
+    #[test]
+    fn something_that_isnt_a_colour_is_refused() {
+        for text in ["", "#FFF", "#FF94222", "#GG9422", "#ÿÿÿ", "red"] {
+            assert_eq!(colour_from_hex(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_black_background_writes_nothing_and_a_file_without_one_is_black() {
+        let plain = serde_json::to_string(&Canvas::default()).expect("it writes");
+        assert!(!plain.contains("background"), "{plain}");
+
+        let read: Canvas = serde_json::from_str("{}").expect("it reads");
+        assert_eq!(read.background, BLACK);
+    }
+
+    #[test]
     fn nonsense_from_a_file_is_dropped() {
         let canvas = Canvas {
             original: Some((0, 99_999)),
             ratio: Some((7, 0)),
+            background: BLACK,
         }
         .checked();
 
@@ -328,6 +399,7 @@ mod tests {
         let canvas = Canvas {
             original: Some((1920, 992)),
             ratio: Some((4, 5)),
+            background: [1, 2, 3],
         };
 
         assert_eq!(canvas.checked(), canvas);

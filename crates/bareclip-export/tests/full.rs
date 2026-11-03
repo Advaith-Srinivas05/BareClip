@@ -807,6 +807,7 @@ fn layered_request(
         stretches,
         sound,
         canvas: None,
+        background: [0, 0, 0],
     }
 }
 
@@ -1153,6 +1154,7 @@ fn a_layered_export_over_one_of_its_videos_is_refused() {
         )],
         sound: Vec::new(),
         canvas: None,
+        background: [0, 0, 0],
     };
 
     let result = export_layered(&job, &AtomicBool::new(false), &|_| {});
@@ -1243,4 +1245,70 @@ fn a_clip_turned_a_quarter_stands_upright_with_bars_at_its_sides() {
     assert!(is_red(colour_at(&view, 160, 90)), "it is in the middle");
     assert!(brightness_at(&view, 40, 90) < 30, "with a bar on the left");
     assert!(brightness_at(&view, 280, 90) < 30, "and on the right");
+}
+
+#[test]
+fn the_background_colour_fills_bars_and_dead_space_and_keeps_its_length() {
+    let mut job = layered_request(
+        "layer-background",
+        vec![
+            stretch(
+                0.0,
+                1.0,
+                vec![whole(&red_clip(), 1, 0.0, 1.0, top_left_quarter())],
+            ),
+            stretch(
+                2.0,
+                3.0,
+                vec![whole(&red_clip(), 2, 2.0, 1.0, Placement::default())],
+            ),
+        ],
+        Vec::new(),
+    );
+    job.background = [0, 0, 255];
+
+    let report = run_layered(&job);
+
+    assert_eq!(report.frames, 90);
+    let mut reader = PictureReader::open(&job.output).expect("the export opens");
+    let mut frame = 0;
+    while let Some(picture) = reader.next_picture().expect("it decodes") {
+        let view = picture.view();
+        let (corner, far_side) = (colour_at(&view, 80, 45), colour_at(&view, 240, 135));
+        match frame {
+            0..30 => {
+                assert!(is_red(corner), "the picture at {frame}");
+                assert!(is_blue(far_side), "the background around it at {frame}");
+            }
+            30..60 => {
+                assert!(is_blue(corner), "dead space at {frame}");
+                assert!(is_blue(far_side), "dead space at {frame}");
+            }
+            _ => {
+                assert!(is_red(corner), "a full picture hides it at {frame}");
+                assert!(is_red(far_side), "a full picture hides it at {frame}");
+            }
+        }
+        frame += 1;
+    }
+    assert_eq!(frame, 90);
+}
+
+#[test]
+fn a_full_picture_on_a_coloured_background_still_skips_the_gpu() {
+    let mut job = layered_request(
+        "layer-background-hidden",
+        vec![stretch(
+            0.0,
+            1.0,
+            vec![whole(&large_clip(), 1, 0.0, 1.0, Placement::default())],
+        )],
+        Vec::new(),
+    );
+    job.background = [0, 0, 255];
+
+    let report = run_layered(&job);
+
+    assert_eq!(report.gpu, None);
+    assert_eq!(report.composited_frames, 0);
 }
