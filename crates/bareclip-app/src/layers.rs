@@ -50,18 +50,22 @@ fn clip_of_piece(stack: &[Clip], piece: &Clip) -> Option<ClipId> {
 
 struct Follower {
     clip: ClipId,
+    /// Still getting ready for when this clip first goes under another.
+    waiting: bool,
     player: Player,
     shown: Option<Ticks>,
     last_jump: Instant,
 }
 
 /// What to do this frame, as `Preview` sees it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Moment {
     pub now: Ticks,
     pub playing: bool,
     /// The playhead was moved by hand, or playback started or stopped.
     pub jumped: bool,
+    /// What shows from the next change, if that is close enough to get ready for.
+    pub coming: Option<(Ticks, Vec<Clip>)>,
 }
 
 #[derive(Default)]
@@ -87,9 +91,44 @@ impl LayerPictures {
     ) -> Option<String> {
         let mut problem = None;
         let under = stack.split_last().map_or(&[][..], |(_, under)| under);
+        let (coming_at, coming) = match &moment.coming {
+            Some((at, stack)) if moment.playing => {
+                (*at, stack.split_last().map_or(&[][..], |(_, under)| under))
+            }
+            _ => (moment.now, &[][..]),
+        };
 
-        self.followers
-            .retain(|follower| under.iter().any(|clip| clip.id == follower.clip));
+        self.followers.retain(|follower| {
+            let wanted = under
+                .iter()
+                .chain(coming)
+                .any(|clip| clip.id == follower.clip);
+            // One that was getting ready for a moment that was jumped away from starts over.
+            wanted && !(follower.waiting && moment.jumped)
+        });
+        for clip in coming {
+            if under.iter().any(|shown| shown.id == clip.id)
+                || self.followers.iter().any(|f| f.clip == clip.id)
+            {
+                continue;
+            }
+            let Some(info) = lookup(clip.media) else {
+                continue;
+            };
+            match Player::open_as(&info, false, true, notify.clone()) {
+                Ok(mut player) => {
+                    player.prepare(source_time(clip, coming_at));
+                    self.followers.push(Follower {
+                        clip: clip.id,
+                        waiting: true,
+                        player,
+                        shown: None,
+                        last_jump: Instant::now(),
+                    });
+                }
+                Err(error) => problem = Some(error),
+            }
+        }
         for clip in under {
             let known = self.followers.iter().any(|f| f.clip == clip.id);
             if known {
@@ -106,6 +145,7 @@ impl LayerPictures {
                     }
                     self.followers.push(Follower {
                         clip: clip.id,
+                        waiting: false,
                         player,
                         shown: None,
                         last_jump: Instant::now(),
@@ -117,8 +157,14 @@ impl LayerPictures {
 
         for follower in &mut self.followers {
             let Some(clip) = under.iter().find(|clip| clip.id == follower.clip) else {
+                // Not on show yet, so it only fills up with pictures.
+                follower.player.update();
                 continue;
             };
+            if std::mem::take(&mut follower.waiting) {
+                follower.player.begin();
+                follower.last_jump = Instant::now();
+            }
             let wanted = source_time(clip, moment.now);
             if moment.jumped {
                 follower.player.seek(wanted);
@@ -536,6 +582,7 @@ mod tests {
                 now: at,
                 playing: false,
                 jumped: preview.take_jump(),
+                coming: None,
             };
             let top = top.zip(preview.last_picture_from());
             pictures.update(&stack, moment, top, &lookup, &notify);
@@ -869,6 +916,12 @@ mod tests {
                 now,
                 playing: preview.is_playing(),
                 jumped: preview.take_jump(),
+                coming: tracks.next_change(
+                    now,
+                    Ticks::from_seconds(crate::preview::PREPARE_AHEAD_SECONDS),
+                    canvas,
+                    &size_of,
+                ),
             };
             let top = top.zip(piece);
             if let Some(problem) = pictures.update(&stack, moment, top, &lookup, &notify) {

@@ -12,8 +12,18 @@ use crate::player::{Notify, Player};
 
 /// Open players hold decoders and a sound connection, so only a few stay open.
 const MAX_OPEN_PLAYERS: usize = 4;
+/// How long before it is needed the next clip gets its pictures and sound ready, so moving on to
+/// it needs no pause. Longer than the slowest seek.
+pub const PREPARE_AHEAD_SECONDS: f64 = 1.0;
 
 struct Slot {
+    media: MediaId,
+    player: Player,
+}
+
+/// A player getting ready for the clip that comes next.
+struct Prepared {
+    clip: ClipId,
     media: MediaId,
     player: Player,
 }
@@ -21,6 +31,7 @@ struct Slot {
 pub struct Preview {
     /// Most recently used last.
     slots: Vec<Slot>,
+    prepared: Option<Prepared>,
     current: Option<(ClipId, MediaId)>,
     playing: bool,
     position: Ticks,
@@ -41,6 +52,7 @@ impl Preview {
     pub fn new(use_sound: bool, notify: Notify) -> Self {
         Self {
             slots: Vec::new(),
+            prepared: None,
             current: None,
             playing: false,
             position: Ticks(0),
@@ -151,6 +163,7 @@ impl Preview {
         let position = self.position(timeline);
         self.planes = planes;
         self.slots.clear();
+        self.prepared = None;
         self.current = None;
         self.seek(timeline, lookup, position);
     }
@@ -174,7 +187,83 @@ impl Preview {
         time: Ticks,
     ) {
         self.jumped = true;
+        self.prepared = None;
         self.go_to(timeline, lookup, time);
+    }
+
+    /// Starts getting the clip after this moment ready, if it is about to be needed.
+    fn prepare_next(
+        &mut self,
+        timeline: &Timeline,
+        lookup: &dyn Fn(MediaId) -> Option<MediaInfo>,
+        now: Ticks,
+    ) {
+        let ahead = Ticks::from_seconds(PREPARE_AHEAD_SECONDS);
+        let next = timeline
+            .clips()
+            .iter()
+            .find(|clip| clip.start > now && clip.start.0 - now.0 <= ahead.0)
+            .copied();
+        let Some(next) = next else {
+            return;
+        };
+        let known = self
+            .prepared
+            .as_ref()
+            .is_some_and(|prepared| prepared.clip == next.id);
+        if known {
+            return;
+        }
+        let Some(info) = lookup(next.media) else {
+            return;
+        };
+        match Player::open_as(&info, self.use_sound, self.planes, self.notify.clone()) {
+            Ok(mut player) => {
+                player.prepare(next.source.start);
+                self.prepared = Some(Prepared {
+                    clip: next.id,
+                    media: next.media,
+                    player,
+                });
+            }
+            Err(error) => self.error = Some(error),
+        }
+    }
+
+    /// Takes in what the prepared player has decoded, so that it keeps going until it is full.
+    fn keep_preparing(&mut self) {
+        if let Some(prepared) = &mut self.prepared {
+            prepared.player.update();
+            if let Some(error) = prepared.player.take_error() {
+                self.error = Some(error);
+            }
+        }
+    }
+
+    /// Moves on to the prepared player if it is ready for exactly this clip and moment. A
+    /// player for the same video isn't needed any more, because this one has taken over.
+    fn take_prepared(&mut self, clip: ClipId, source_time: Ticks) -> bool {
+        let matches = self.prepared.as_ref().is_some_and(|prepared| {
+            prepared.clip == clip && prepared.player.prepared_for() == Some(source_time)
+        });
+        if !matches {
+            return false;
+        }
+        let Some(mut prepared) = self.prepared.take() else {
+            return false;
+        };
+        self.pause_all();
+        self.slots.retain(|slot| slot.media != prepared.media);
+        if self.slots.len() >= MAX_OPEN_PLAYERS {
+            self.slots.remove(0);
+        }
+        prepared.player.begin();
+        self.current = Some((clip, prepared.media));
+        self.slots.push(Slot {
+            media: prepared.media,
+            player: prepared.player,
+        });
+        true
     }
 
     fn go_to(
@@ -195,6 +284,10 @@ impl Preview {
             }
             return;
         };
+
+        if self.playing && self.take_prepared(location.clip.id, location.source_time) {
+            return;
+        }
 
         let media = location.clip.media;
         let changed_video = self.current.map(|(_, current)| current) != Some(media);
@@ -240,6 +333,7 @@ impl Preview {
         self.gap_clock = None;
         self.playing = false;
         self.jumped = true;
+        self.prepared = None;
         self.pause_all();
     }
 
@@ -259,6 +353,8 @@ impl Preview {
     ) -> Option<PreviewFrame> {
         let Some((clip_id, media)) = self.current else {
             if self.playing {
+                self.prepare_next(timeline, lookup, self.position(timeline));
+                self.keep_preparing();
                 self.leave_gap_when_due(timeline, lookup);
             }
             return None;
@@ -278,6 +374,9 @@ impl Preview {
 
         if self.playing {
             self.position = self.position(timeline);
+            let now = self.position;
+            self.prepare_next(timeline, lookup, now);
+            self.keep_preparing();
             if source_position >= clip.source.end || player_stopped {
                 match timeline.clips().get(index + 1) {
                     Some(_) => self.go_to(timeline, lookup, clip.end()),
