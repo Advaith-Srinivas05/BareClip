@@ -39,12 +39,14 @@ use crate::{
 const VIDEO_EXTENSIONS: [&str; 6] = ["mp4", "mkv", "mov", "webm", "avi", "ts"];
 const LOGO_DARK: &[u8] = include_bytes!("../../../assets/brand/png/mark-dark-256.png");
 const LOGO_LIGHT: &[u8] = include_bytes!("../../../assets/brand/png/mark-light-256.png");
+// The brand rules call for the simplified mark at this size.
+const SMALL_LOGO_DARK: &[u8] = include_bytes!("../../../assets/brand/png/mark-small-dark-256.png");
+const SMALL_LOGO_LIGHT: &[u8] =
+    include_bytes!("../../../assets/brand/png/mark-small-light-256.png");
 /// How far the arrow keys and the buttons beside play move the playhead.
 const SKIP_SECONDS: f64 = 5.0;
 const BACKGROUND_TICK: Duration = Duration::from_millis(50);
 const MIN_CLIP_SECONDS: f64 = 0.05;
-/// Moving to a trimmed clip's end shows its last frame rather than what follows it.
-const JUST_BEFORE_END_SECONDS: f64 = 0.001;
 const THUMBNAIL_WIDTH: u32 = 160;
 const THUMBNAIL_HEIGHT: u32 = 90;
 const RAIL_WIDTH: f32 = 78.0;
@@ -78,6 +80,7 @@ const STAGE_MARGIN: i8 = 8;
 /// The strip across the top of the window, standing in for the Windows title bar.
 const TITLE_STRIP_HEIGHT: f32 = 40.0;
 const WINDOW_BUTTON_SIZE: f32 = 32.0;
+const STRIP_LOGO_HEIGHT: f32 = 22.0;
 /// How close to the window's edge the pointer has to be to resize it, and how far along
 /// from a corner still counts as that corner.
 const RESIZE_EDGE: f32 = 5.0;
@@ -87,8 +90,9 @@ const TRANSPORT_HEIGHT: f32 = 52.0;
 /// dragged from.
 const TIMELINE_RESIZE_GRAB: f32 = 4.0;
 const TIMELINE_SLIDE_SECONDS: f32 = 0.2;
-/// Below this width the transport row drops the name from Remove all gaps.
-const TOOLS_FULL_NAMES_WIDTH: f32 = 720.0;
+/// The room a timeline tool takes: its button and the space after it. A tool with nothing
+/// to act on leaves this empty, so the others don't shift under the pointer.
+const TOOL_SLOT: f32 = 36.0;
 const TIME_READOUT_WIDTH: f32 = 170.0;
 const EMPTY_HINT_MAX_HEIGHT: f32 = 200.0;
 const DIALOG_RADIUS: u8 = 10;
@@ -183,11 +187,12 @@ struct Snapshot {
     hidden: Vec<MediaId>,
 }
 
-/// A trim in progress: where the clip's edge was when the drag started.
+/// A trim in progress: where the clip's edge and the playhead were when the drag started.
 #[derive(Clone, Copy, Debug)]
 struct TrimOrigin {
     source: Ticks,
     pointer: Ticks,
+    playhead: Ticks,
 }
 
 struct ExportTask {
@@ -237,6 +242,8 @@ pub struct Editor {
     timeline_open: bool,
     /// The logo on the empty stage, and which theme it was loaded for.
     logo: Option<(bool, TextureHandle)>,
+    /// The logo in the top strip, and the theme and shrinking it was loaded with.
+    strip_logo: Option<(bool, usize, TextureHandle)>,
     loaded_fallbacks: Vec<&'static str>,
     /// Where things were drawn in the last frame.
     media_panel_rect: egui::Rect,
@@ -299,6 +306,7 @@ impl Editor {
             timeline_height: TIMELINE_HEIGHT,
             timeline_open: true,
             logo: None,
+            strip_logo: None,
             loaded_fallbacks: Vec::new(),
             media_panel_rect: egui::Rect::NOTHING,
             timeline_panel_rect: egui::Rect::NOTHING,
@@ -1023,6 +1031,31 @@ impl Editor {
         Some(logo)
     }
 
+    /// The simplified logo for the top strip. Textures have no smaller copies to draw from,
+    /// so it is shrunk to about its size on screen, or its thin lines would break up.
+    fn strip_logo(&mut self, ctx: &egui::Context) -> Option<TextureHandle> {
+        let dark = ctx.global_style().visuals.dark_mode;
+        let bytes = if dark {
+            SMALL_LOGO_DARK
+        } else {
+            SMALL_LOGO_LIGHT
+        };
+        let icon = eframe::icon_data::from_png_bytes(bytes).ok()?;
+        let wanted = STRIP_LOGO_HEIGHT * ctx.pixels_per_point();
+        let factor = ((icon.height as f32 / wanted).floor() as usize).max(1);
+        if let Some((loaded_for, loaded_factor, logo)) = &self.strip_logo
+            && *loaded_for == dark
+            && *loaded_factor == factor
+        {
+            return Some(logo.clone());
+        }
+        let size = [icon.width as usize, icon.height as usize];
+        let image = shrunk_image(&icon.rgba, size, factor);
+        let logo = ctx.load_texture("strip-logo", image, TextureOptions::LINEAR);
+        self.strip_logo = Some((dark, factor, logo.clone()));
+        Some(logo)
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let palette = theme::palette(&ctx);
@@ -1071,7 +1104,16 @@ impl Editor {
                 } else if strip.drag_started_by(egui::PointerButton::Primary) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
+                let logo = self.strip_logo(&ctx);
                 ui.horizontal_centered(|ui| {
+                    if let Some(logo) = logo {
+                        let size = logo.size_vec2();
+                        let width = STRIP_LOGO_HEIGHT * size.x / size.y;
+                        ui.add(
+                            egui::Image::new(&logo)
+                                .fit_to_exact_size(vec2(width, STRIP_LOGO_HEIGHT)),
+                        );
+                    }
                     ui.label(
                         RichText::new("BareClip")
                             .font(fonts::strong(15.0))
@@ -1648,42 +1690,34 @@ impl Editor {
     fn timeline_tools(&mut self, ui: &mut egui::Ui, palette: &Palette) {
         let has_clips = !self.project.tracks.is_empty();
         let can_delete = self.selected.is_some() || self.selected_gap.is_some();
-        let full_names = ui.available_width() >= TOOLS_FULL_NAMES_WIDTH;
+        let has_gaps = !self.project.tracks.gaps().is_empty();
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = CONTROL_SPACING;
             ui.add_space(6.0);
-            let split = ActionButton::new(palette, Kind::Ghost, "Split")
-                .icon(icons::SCISSORS)
-                .small();
+            let tool = |icon, name| IconButton::new(palette, Kind::Ghost, icon, name);
             if ui
-                .add_enabled(has_clips, split)
+                .add_enabled(has_clips, tool(icons::SCISSORS, "Split"))
                 .on_hover_text("Split the clip at the playhead (S)")
                 .clicked()
             {
                 self.split_at_playhead();
             }
-            let delete = ActionButton::new(palette, Kind::Ghost, "Delete")
-                .icon(icons::TRASH_2)
-                .small();
-            if ui
-                .add_enabled(can_delete, delete)
+            if !can_delete {
+                ui.add_space(TOOL_SLOT);
+            } else if ui
+                .add(tool(icons::TRASH_2, "Delete"))
                 .on_hover_text("Delete the selected clip or dead space (Delete)")
                 .clicked()
             {
                 self.delete_selected();
             }
-            let has_gaps = !self.project.tracks.gaps().is_empty();
-            let hint = "Close all the dead space on the timeline";
-            let remove_gaps = if full_names {
-                let button = ActionButton::new(palette, Kind::Ghost, "Remove all gaps")
-                    .icon(icons::X)
-                    .small();
-                ui.add_enabled(has_gaps, button)
-            } else {
-                let button = IconButton::new(palette, Kind::Ghost, icons::X, "Remove all gaps");
-                ui.add_enabled(has_gaps, button)
-            };
-            if remove_gaps.on_hover_text(hint).clicked() {
+            if !has_gaps {
+                ui.add_space(TOOL_SLOT);
+            } else if ui
+                .add(tool(icons::FOLD_HORIZONTAL, "Remove all gaps"))
+                .on_hover_text("Remove all gaps")
+                .clicked()
+            {
                 self.remove_all_gaps();
             }
         });
@@ -1732,10 +1766,14 @@ impl Editor {
                 ClipEdge::Start => clip.source.start,
                 ClipEdge::End => clip.source.end,
             };
-            self.trim_origin = Some(TrimOrigin { source, pointer });
+            self.trim_origin = Some(TrimOrigin {
+                source,
+                pointer,
+                playhead: self.position(),
+            });
         }
         if let (Some((id, edge, pointer)), Some(origin)) = (events.trim_to, self.trim_origin) {
-            self.trim_clip(id, edge, origin, pointer);
+            self.trim_clip(id, edge, origin, pointer, events.trim_snap);
         }
         if events.trim_finished {
             self.trim_origin = None;
@@ -1773,9 +1811,19 @@ impl Editor {
         }
     }
 
-    /// Moves a clip's edge by however far the pointer has travelled, and shows the
-    /// frame at the new cut so its effect can be judged.
-    fn trim_clip(&mut self, id: ClipId, edge: ClipEdge, origin: TrimOrigin, pointer: Ticks) {
+    /// Moves a clip's edge by however far the pointer has travelled. The playhead stays
+    /// where it was, and the picture only changes if the trim changed what is under it.
+    /// An edge snapping to something lands exactly on it even if that falls partway through
+    /// one of its own frames, because missing by a fraction of a frame could export as a
+    /// flash of black between clips on different tracks.
+    fn trim_clip(
+        &mut self,
+        id: ClipId,
+        edge: ClipEdge,
+        origin: TrimOrigin,
+        pointer: Ticks,
+        snap: Option<Ticks>,
+    ) {
         let Some(clip) = self.project.tracks.clip(id) else {
             return;
         };
@@ -1783,23 +1831,29 @@ impl Editor {
             return;
         };
         let wanted = Ticks(origin.source.0 + pointer.0 - origin.pointer.0);
-        let snapped = self.snap_to_frame(clip.media, wanted);
+        let source_time = if snap.is_some() {
+            wanted
+        } else {
+            self.snap_to_frame(clip.media, wanted)
+        };
+        let under_playhead = self.project.tracks.played().locate(origin.playhead);
         self.project.tracks.trim(
             id,
             edge,
-            snapped,
+            source_time,
             duration,
             Ticks::from_seconds(MIN_CLIP_SECONDS),
         );
-
-        let Some(clip) = self.project.tracks.clip(id) else {
-            return;
-        };
-        let shown = match edge {
-            ClipEdge::Start => clip.start,
-            ClipEdge::End => Ticks(clip.end().0 - Ticks::from_seconds(JUST_BEFORE_END_SECONDS).0),
-        };
-        self.seek(shown);
+        let trimmed = self.project.tracks.clip(id);
+        self.timeline_state.trim_aligned = snap.filter(|moment| {
+            trimmed.is_some_and(|clip| match edge {
+                ClipEdge::Start => clip.start == *moment,
+                ClipEdge::End => clip.end() == *moment,
+            })
+        });
+        if self.project.tracks.played().locate(origin.playhead) != under_playhead {
+            self.seek(origin.playhead);
+        }
     }
 
     fn stage(&mut self, ui: &mut egui::Ui, palette: &Palette) {
@@ -2262,6 +2316,33 @@ fn skip_button(
     button
 }
 
+/// A smaller copy of a picture, averaging each square of `factor` pixels into one. It
+/// averages with colours weighted by their opacity, or edges would pick up a dark fringe from
+/// the invisible pixels next to them.
+fn shrunk_image(rgba: &[u8], [width, height]: [usize; 2], factor: usize) -> egui::ColorImage {
+    let size = [width.div_ceil(factor), height.div_ceil(factor)];
+    let mut shrunk = Vec::with_capacity(size[0] * size[1] * 4);
+    for y in 0..size[1] {
+        for x in 0..size[0] {
+            let mut sum = [0_u32; 4];
+            let mut count = 0;
+            for source_y in (y * factor)..((y + 1) * factor).min(height) {
+                for source_x in (x * factor)..((x + 1) * factor).min(width) {
+                    let pixel = &rgba[(source_y * width + source_x) * 4..][..4];
+                    let alpha = u32::from(pixel[3]);
+                    for channel in 0..3 {
+                        sum[channel] += u32::from(pixel[channel]) * alpha / 255;
+                    }
+                    sum[3] += alpha;
+                    count += 1;
+                }
+            }
+            shrunk.extend(sum.map(|total| (total / count) as u8));
+        }
+    }
+    egui::ColorImage::from_rgba_premultiplied(size, &shrunk)
+}
+
 /// Which way the window resizes from a point, if that point is on its edge.
 fn resize_direction(window: egui::Rect, at: egui::Pos2) -> Option<egui::ResizeDirection> {
     use egui::ResizeDirection as Direction;
@@ -2443,7 +2524,8 @@ fn media_card(
             egui::Id::unique(("media-card-add", entry.id.0)),
             add_rect,
         )
-        .on_hover_text("Add to timeline");
+        .on_hover_text("Add to timeline")
+        .on_hover_cursor(egui::CursorIcon::Default);
     if added.clicked() {
         actions.add = Some(entry.id);
     }
@@ -2460,7 +2542,8 @@ fn media_card(
         egui::Id::unique(("media-card-remove", entry.id.0)),
         remove_rect,
     )
-    .on_hover_text("Remove from this project");
+    .on_hover_text("Remove from this project")
+    .on_hover_cursor(egui::CursorIcon::Default);
     if removed.clicked() {
         actions.remove = Some(entry.id);
     }
@@ -2475,7 +2558,8 @@ fn media_card(
             thumbnail_rect,
             SELECT_BOX_MARGIN,
         )
-        .on_hover_text(if ticked { "Deselect" } else { "Select" });
+        .on_hover_text(if ticked { "Deselect" } else { "Select" })
+        .on_hover_cursor(egui::CursorIcon::Default);
     if select.clicked() {
         actions.toggle = Some(entry.id);
     }
@@ -3227,6 +3311,14 @@ mod tests {
         }
         camera.shoot(&ctx, &mut tracks, moved(away), "43-light-two-tracks");
         ctx.set_theme(egui::Theme::Dark);
+
+        let (mut aligned, _, _) = clips_on_two_tracks(&ctx, 1.0);
+        let y = aligned.timeline_state.layout.track(1).center().y;
+        let from = pos2(time_x(&aligned, 5.0) - 4.0, y);
+        let to = pos2(time_x(&aligned, 4.0) - 1.0, y);
+        begin_drag(&ctx, &mut aligned, from, to);
+        run_frame(&ctx, &mut aligned, moved(to));
+        camera.shoot(&ctx, &mut aligned, moved(to), "44-trim-aligned");
         KEPT_TEXTURES.with_borrow_mut(|kept| *kept = None);
     }
 
@@ -4021,20 +4113,6 @@ mod tests {
     }
 
     #[test]
-    fn the_remove_all_gaps_tool_is_disabled_with_no_gaps() {
-        let ctx = context();
-        let mut editor = with_videos(&ctx, &[test_clip()]);
-
-        let nodes = named_nodes(&ctx, &mut editor);
-
-        let tool = nodes
-            .iter()
-            .find(|(label, ..)| label == "Remove all gaps")
-            .expect("the tool is there");
-        assert!(tool.2);
-    }
-
-    #[test]
     fn the_zoom_card_has_its_own_row_and_never_covers_a_clip() {
         let ctx = context();
         let editor = with_videos(&ctx, &[test_clip()]);
@@ -4454,7 +4532,7 @@ mod tests {
 
         let nodes = named_nodes(&ctx, &mut editor);
 
-        for name in ["Export", "Add videos", "Split", "Delete", "Remove all gaps"] {
+        for name in ["Export", "Add videos", "Split", "Delete"] {
             assert!(
                 nodes.iter().any(|(label, ..)| label == name),
                 "nothing is named {name}"
@@ -5720,6 +5798,402 @@ mod tests {
         assert_eq!(clip.start, clip.source.start);
         assert!((editor.project.tracks.duration().as_seconds() - 4.0).abs() < 0.001);
         assert_eq!(editor.project.tracks.gaps().len(), 1);
+    }
+
+    /// A clip from 0 to 4 s on the top track, and one from `start` for 4 s on the track below.
+    fn clips_on_two_tracks(ctx: &egui::Context, start: f64) -> (Editor, ClipId, ClipId) {
+        let mut editor = two_videos(ctx);
+        let clips = editor.project.tracks.played().clips().to_vec();
+        let (upper, lower) = (clips[0].id, clips[1].id);
+        editor
+            .project
+            .tracks
+            .move_clip(lower, Ticks::from_seconds(start), TrackTarget::New(1));
+        run_frame(ctx, &mut editor, vec![]);
+        (editor, upper, lower)
+    }
+
+    fn time_x(editor: &Editor, seconds: f64) -> f32 {
+        editor
+            .timeline_state
+            .scale
+            .x_of(Ticks::from_seconds(seconds))
+    }
+
+    #[test]
+    fn trimming_an_end_up_to_a_clip_on_another_track_lines_up_exactly_and_shows_it() {
+        let ctx = context();
+        let (mut editor, _, lower) = clips_on_two_tracks(&ctx, 1.0);
+        let y = editor.timeline_state.layout.track(1).center().y;
+        let from = pos2(time_x(&editor, 5.0) - 4.0, y);
+        // A few pixels short of the other clip's end.
+        let to = pos2(time_x(&editor, 4.0) + 3.0 - 4.0, y);
+        let target = Ticks::from_seconds(4.0);
+
+        begin_drag(&ctx, &mut editor, from, to);
+        run_frame(&ctx, &mut editor, moved(to));
+
+        assert_eq!(editor.timeline_state.snap_line, Some(target));
+        assert_eq!(
+            editor.project.tracks.clip(lower).map(|c| c.end()),
+            Some(target)
+        );
+
+        end_drag(&ctx, &mut editor, to);
+        assert_eq!(editor.timeline_state.snap_line, None);
+        assert_eq!(
+            editor.project.tracks.clip(lower).map(|c| c.end()),
+            Some(target)
+        );
+    }
+
+    #[test]
+    fn trimming_a_start_up_to_a_clip_on_another_track_lines_up_exactly_and_shows_it() {
+        let ctx = context();
+        let (mut editor, _, lower) = clips_on_two_tracks(&ctx, 1.0);
+        let y = editor.timeline_state.layout.track(1).center().y;
+        let from = pos2(time_x(&editor, 1.0) + 4.0, y);
+        let to = pos2(time_x(&editor, 4.0) - 3.0 + 4.0, y);
+        let target = Ticks::from_seconds(4.0);
+
+        begin_drag(&ctx, &mut editor, from, to);
+        run_frame(&ctx, &mut editor, moved(to));
+
+        assert_eq!(editor.timeline_state.snap_line, Some(target));
+        let clip = editor
+            .project
+            .tracks
+            .clip(lower)
+            .expect("the clip is there");
+        assert_eq!(clip.start, target);
+        assert_eq!(clip.source.start, Ticks::from_seconds(3.0));
+        end_drag(&ctx, &mut editor, to);
+    }
+
+    #[test]
+    fn a_trim_snapped_to_another_track_leaves_no_sliver_even_partway_through_a_frame() {
+        let ctx = context();
+        // A hundredth of a second in, so the other clip's end falls between this one's frames.
+        let (mut editor, _, lower) = clips_on_two_tracks(&ctx, 1.01);
+        let y = editor.timeline_state.layout.track(1).center().y;
+        let from = pos2(time_x(&editor, 5.01) - 4.0, y);
+        let to = pos2(time_x(&editor, 4.0) + 2.0 - 4.0, y);
+
+        pointer_drag(&ctx, &mut editor, from, to);
+
+        let clip = editor
+            .project
+            .tracks
+            .clip(lower)
+            .expect("the clip is there");
+        assert_eq!(clip.end(), Ticks::from_seconds(4.0));
+    }
+
+    #[test]
+    fn a_trim_away_from_anything_shows_no_line_and_lands_on_a_frame() {
+        let ctx = context();
+        let (mut editor, _, lower) = clips_on_two_tracks(&ctx, 1.0);
+        let y = editor.timeline_state.layout.track(1).center().y;
+        let from = pos2(time_x(&editor, 5.0) - 4.0, y);
+        let to = pos2(time_x(&editor, 3.013) - 4.0, y);
+
+        begin_drag(&ctx, &mut editor, from, to);
+        run_frame(&ctx, &mut editor, moved(to));
+
+        assert_eq!(editor.timeline_state.snap_line, None);
+        let clip = editor
+            .project
+            .tracks
+            .clip(lower)
+            .expect("the clip is there");
+        let frames = clip.source.end.as_seconds() * 30.0;
+        assert!((frames - frames.round()).abs() < 0.01, "{frames}");
+        end_drag(&ctx, &mut editor, to);
+    }
+
+    #[test]
+    fn a_target_the_footage_cannot_reach_shows_no_line() {
+        let ctx = context();
+        // The upper clip is already its whole video, so its end can't reach 5 s.
+        let (mut editor, upper, _) = clips_on_two_tracks(&ctx, 1.0);
+        let y = editor.timeline_state.layout.track(0).center().y;
+        let from = pos2(time_x(&editor, 4.0) - 4.0, y);
+        let to = pos2(time_x(&editor, 5.0) - 3.0 - 4.0, y);
+
+        begin_drag(&ctx, &mut editor, from, to);
+        run_frame(&ctx, &mut editor, moved(to));
+
+        assert_eq!(editor.timeline_state.snap_line, None);
+        let end = editor.project.tracks.clip(upper).map(|clip| clip.end());
+        assert_eq!(end, Some(Ticks::from_seconds(4.0)));
+        end_drag(&ctx, &mut editor, to);
+    }
+
+    #[test]
+    fn a_trim_snaps_to_the_playhead() {
+        let ctx = context();
+        let (mut editor, y, _, end_x) = trim_setup(&ctx, 2.0);
+        let to = pos2(time_x(&editor, 2.0) + 3.0 - 4.0, y);
+
+        begin_drag(&ctx, &mut editor, pos2(end_x, y), to);
+        run_frame(&ctx, &mut editor, moved(to));
+
+        let target = Ticks::from_seconds(2.0);
+        assert_eq!(editor.timeline_state.snap_line, Some(target));
+        assert_eq!(editor.project.tracks.played().clips()[0].end(), target);
+        end_drag(&ctx, &mut editor, to);
+    }
+
+    fn cursor_over(ctx: &egui::Context, editor: &mut Editor, at: egui::Pos2) -> egui::CursorIcon {
+        run_frame(ctx, editor, moved(at));
+        let output = run_frame(ctx, editor, vec![]);
+        output.platform_output.cursor_icon
+    }
+
+    #[test]
+    fn the_buttons_on_a_card_show_an_ordinary_pointer_and_the_rest_of_it_shows_a_grab() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip()]);
+        let card = editor.card_thumbnails[0].1;
+
+        assert_eq!(
+            cursor_over(&ctx, &mut editor, card.center()),
+            egui::CursorIcon::Grab
+        );
+        for (name, at) in [
+            ("add", card.right_bottom() - vec2(20.0, 20.0)),
+            ("remove", card.right_top() + vec2(-20.0, 20.0)),
+            ("select", card.left_top() + vec2(16.0, 16.0)),
+        ] {
+            let cursor = cursor_over(&ctx, &mut editor, at);
+            assert_eq!(cursor, egui::CursorIcon::Default, "{name}");
+        }
+    }
+
+    #[test]
+    fn dragging_from_a_button_on_a_card_does_not_drag_the_card() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip()]);
+        let card = editor.card_thumbnails[0].1;
+        let plus = card.right_bottom() - vec2(20.0, 20.0);
+        let on_timeline = editor.timeline_state.track.center();
+
+        begin_drag(&ctx, &mut editor, plus, on_timeline);
+        end_drag(&ctx, &mut editor, on_timeline);
+
+        assert!(editor.project.tracks.is_empty());
+    }
+
+    #[test]
+    fn the_top_strip_loads_the_small_logo_for_the_theme_at_about_its_size() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[]);
+        ctx.set_theme(egui::Theme::Dark);
+        run_frame(&ctx, &mut editor, vec![]);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let (dark, _, logo) = editor.strip_logo.clone().expect("the logo is loaded");
+        assert!(dark);
+        let height = logo.size_vec2().y;
+        assert!(
+            (STRIP_LOGO_HEIGHT..STRIP_LOGO_HEIGHT * 1.2).contains(&height),
+            "{height}"
+        );
+
+        ctx.set_theme(egui::Theme::Light);
+        run_frame(&ctx, &mut editor, vec![]);
+        run_frame(&ctx, &mut editor, vec![]);
+        let (dark, ..) = editor.strip_logo.clone().expect("the logo is loaded");
+        assert!(!dark);
+        ctx.set_theme(egui::Theme::Dark);
+    }
+
+    #[test]
+    fn shrinking_a_picture_averages_without_a_dark_fringe() {
+        // Solid white beside invisible black.
+        let rgba = [255, 255, 255, 255, 0, 0, 0, 0];
+
+        let shrunk = shrunk_image(&rgba, [2, 1], 2);
+
+        assert_eq!(shrunk.size, [1, 1]);
+        assert_eq!(
+            shrunk.pixels[0],
+            Color32::from_rgba_premultiplied(127, 127, 127, 127)
+        );
+    }
+
+    #[test]
+    fn shrinking_a_picture_keeps_its_leftover_edge() {
+        let rgba = [200_u8; 4 * 5 * 3];
+
+        let shrunk = shrunk_image(&rgba, [5, 3], 2);
+
+        assert_eq!(shrunk.size, [3, 2]);
+    }
+
+    fn is_named(ctx: &egui::Context, editor: &mut Editor, name: &str) -> bool {
+        named_nodes(ctx, editor)
+            .iter()
+            .any(|(label, ..)| label == name)
+    }
+
+    #[test]
+    fn delete_only_appears_with_something_selected_to_delete() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        assert!(
+            is_named(&ctx, &mut editor, "Delete"),
+            "a new clip is selected"
+        );
+
+        editor.selected = None;
+        assert!(!is_named(&ctx, &mut editor, "Delete"));
+
+        editor.selected = editor.project.tracks.played().clips().first().map(|c| c.id);
+        click_named(&ctx, &mut editor, "Delete");
+        assert!(editor.project.tracks.is_empty());
+        assert!(!is_named(&ctx, &mut editor, "Delete"));
+    }
+
+    #[test]
+    fn delete_appears_for_selected_dead_space_too() {
+        let ctx = context();
+        let mut editor = with_leading_gap(&ctx);
+        editor.selected = None;
+        editor.selected_gap = Some(Ticks::from_seconds(0.5));
+
+        assert!(is_named(&ctx, &mut editor, "Delete"));
+    }
+
+    #[test]
+    fn remove_all_gaps_only_appears_while_there_are_gaps() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        assert!(!is_named(&ctx, &mut editor, "Remove all gaps"));
+
+        let mut editor = with_leading_gap(&ctx);
+        assert!(is_named(&ctx, &mut editor, "Remove all gaps"));
+
+        click_named(&ctx, &mut editor, "Remove all gaps");
+        assert!(editor.project.tracks.gaps().is_empty());
+        assert!(!is_named(&ctx, &mut editor, "Remove all gaps"));
+    }
+
+    #[test]
+    fn the_timeline_tools_are_only_symbols() {
+        let ctx = context();
+        let mut editor = with_leading_gap(&ctx);
+        editor.selected_gap = Some(Ticks::from_seconds(0.5));
+
+        for name in ["Split", "Delete", "Remove all gaps"] {
+            let rect = named_rect(&ctx, &mut editor, name);
+            assert!(rect.width() <= 32.0, "{name} is {} wide", rect.width());
+        }
+    }
+
+    #[test]
+    fn the_tools_stay_in_place_when_one_comes_or_goes() {
+        let ctx = context();
+        let mut editor = with_leading_gap(&ctx);
+        editor.selected = None;
+        editor.selected_gap = None;
+        let without_delete = named_rect(&ctx, &mut editor, "Remove all gaps");
+
+        editor.selected_gap = Some(Ticks::from_seconds(0.5));
+        let with_delete = named_rect(&ctx, &mut editor, "Remove all gaps");
+
+        assert_eq!(without_delete, with_delete);
+    }
+
+    #[test]
+    fn the_timeline_scrollbar_only_shows_when_there_is_somewhere_to_scroll() {
+        let ctx = context();
+        let mut empty = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut empty, vec![]);
+        assert!(!empty.timeline_state.scrollbar.is_positive());
+
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        assert!(editor.timeline_state.scrollbar.is_positive());
+
+        let [zoom_out, ..] = editor.timeline_state.zoom_buttons;
+        for _ in 0..10 {
+            click(&ctx, &mut editor, zoom_out.center());
+        }
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(!editor.timeline_state.scrollbar.is_positive());
+    }
+
+    /// One clip with the playhead part way through, ready to have an end dragged.
+    fn trim_setup(ctx: &egui::Context, playhead: f64) -> (Editor, f32, f32, f32) {
+        let mut editor = with_videos(ctx, &[test_clip()]);
+        editor.seek(Ticks::from_seconds(playhead));
+        run_frame(ctx, &mut editor, vec![]);
+        let scale = editor.timeline_state.scale;
+        let y = editor.timeline_state.track.center().y;
+        let start_x = scale.x_of(Ticks(0)) + 4.0;
+        let end_x = scale.x_of(editor.project.tracks.duration()) - 4.0;
+        (editor, y, start_x, end_x)
+    }
+
+    #[test]
+    fn trimming_either_end_leaves_the_playhead_where_it_is() {
+        let ctx = context();
+        let playhead = Ticks::from_seconds(2.0);
+
+        let (mut editor, y, start_x, end_x) = trim_setup(&ctx, 2.0);
+        let scale = editor.timeline_state.scale;
+        let to = pos2(scale.x_of(Ticks::from_seconds(3.0)), y);
+        pointer_drag(&ctx, &mut editor, pos2(end_x, y), to);
+        assert_eq!(editor.position(), playhead);
+
+        let to = pos2(scale.x_of(Ticks::from_seconds(1.0)) + 4.0, y);
+        pointer_drag(&ctx, &mut editor, pos2(start_x, y), to);
+        assert_eq!(editor.position(), playhead);
+        assert!(!editor.preview.in_gap(editor.project.tracks.played()));
+    }
+
+    #[test]
+    fn trimming_away_what_is_under_the_playhead_leaves_it_in_the_dead_space() {
+        let ctx = context();
+        let (mut editor, y, start_x, _) = trim_setup(&ctx, 1.0);
+        let scale = editor.timeline_state.scale;
+
+        let to = pos2(scale.x_of(Ticks::from_seconds(2.0)) + 4.0, y);
+        pointer_drag(&ctx, &mut editor, pos2(start_x, y), to);
+
+        assert_eq!(editor.position(), Ticks::from_seconds(1.0));
+        assert!(editor.preview.in_gap(editor.project.tracks.played()));
+    }
+
+    #[test]
+    fn trimming_the_project_shorter_than_the_playhead_stops_it_at_the_new_end() {
+        let ctx = context();
+        let (mut editor, y, _, end_x) = trim_setup(&ctx, 3.0);
+        let scale = editor.timeline_state.scale;
+
+        let to = pos2(scale.x_of(Ticks::from_seconds(2.0)), y);
+        pointer_drag(&ctx, &mut editor, pos2(end_x, y), to);
+
+        assert_eq!(editor.position(), editor.project.tracks.duration());
+    }
+
+    #[test]
+    fn dragging_an_end_back_out_in_one_go_returns_the_playhead_to_its_place() {
+        let ctx = context();
+        let (mut editor, y, _, end_x) = trim_setup(&ctx, 3.0);
+        let scale = editor.timeline_state.scale;
+
+        let short = pos2(scale.x_of(Ticks::from_seconds(2.0)), y);
+        begin_drag(&ctx, &mut editor, pos2(end_x, y), short);
+        assert!(editor.position() < Ticks::from_seconds(3.0));
+
+        let back = pos2(end_x, y);
+        for _ in 0..3 {
+            run_frame(&ctx, &mut editor, moved(back));
+        }
+        end_drag(&ctx, &mut editor, back);
+
+        assert_eq!(editor.position(), Ticks::from_seconds(3.0));
     }
 
     #[test]

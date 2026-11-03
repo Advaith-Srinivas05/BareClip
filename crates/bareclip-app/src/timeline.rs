@@ -434,6 +434,11 @@ pub struct TimelineState {
     pub hovered_gap: Option<TimeRange>,
     pub snap_line: Option<Ticks>,
     pub trim_readout: Option<(Ticks, Ticks)>,
+    /// How far the pointer was from the clip's edge when a trim began.
+    trim_grab: Ticks,
+    /// What a trimmed edge really lined up with in the last frame, which a target the
+    /// clip's footage can't reach does not count as.
+    pub trim_aligned: Option<Ticks>,
     pub playhead_bubble: bool,
 }
 
@@ -466,6 +471,8 @@ impl Default for TimelineState {
             hovered_gap: None,
             snap_line: None,
             trim_readout: None,
+            trim_grab: Ticks(0),
+            trim_aligned: None,
             playhead_bubble: false,
         }
     }
@@ -580,6 +587,8 @@ pub struct TimelineEvents {
     /// A trim began, with the pointer's time when it did.
     pub trim_started: Option<(ClipId, ClipEdge, Ticks)>,
     pub trim_to: Option<(ClipId, ClipEdge, Ticks)>,
+    /// Comes with `trim_to`: the moment the edge snapped to, if it did.
+    pub trim_snap: Option<Ticks>,
     pub trim_finished: bool,
     pub move_clip: Option<(ClipId, Ticks, TrackTarget)>,
     pub drop_media: Option<(MediaId, Ticks, TrackTarget)>,
@@ -1155,7 +1164,12 @@ fn bottom_strip(
         pos2(left, middle - SCROLLBAR_HEIGHT / 2.0),
         pos2(out_rect.left() - 12.0, middle + SCROLLBAR_HEIGHT / 2.0),
     );
-    scrollbar(ui, palette, state, bar, total);
+    // The whole timeline in view leaves nowhere to scroll to.
+    if state.visible_for(total) < TimelineState::extent(total) {
+        scrollbar(ui, palette, state, bar, total);
+    } else {
+        state.scrollbar = Rect::NOTHING;
+    }
     collapse
 }
 
@@ -1293,7 +1307,14 @@ pub fn timeline(
             .and_then(|pointer| clip_at(clips, &layout, &scale, pointer));
         let time = pointer.map_or(Ticks(0), |pointer| scale.time_at(pointer.x));
         state.drag = match part {
-            Some((clip, ClipPart::Handle(edge))) => TimelineDrag::Trim(clip.id, edge),
+            Some((clip, ClipPart::Handle(edge))) => {
+                let edge_time = match edge {
+                    ClipEdge::Start => clip.start,
+                    ClipEdge::End => clip.end,
+                };
+                state.trim_grab = Ticks(time.0 - edge_time.0);
+                TimelineDrag::Trim(clip.id, edge)
+            }
             Some((clip, ClipPart::Body)) => TimelineDrag::Move {
                 id: clip.id,
                 grab: Ticks(time.0 - clip.start.0),
@@ -1316,7 +1337,11 @@ pub fn timeline(
         let time = scale.time_at(pointer.x);
         match state.drag {
             TimelineDrag::Trim(id, edge) if response.dragged() => {
-                events.trim_to = Some((id, edge, time));
+                let targets = snap_targets(view, Some(id));
+                let wanted = Ticks(time.0 - state.trim_grab.0);
+                let snapped = snap_start(wanted, Ticks(0), &targets, tolerance);
+                events.trim_to = Some((id, edge, Ticks(snapped.0 + state.trim_grab.0)));
+                events.trim_snap = targets.contains(&snapped).then_some(snapped);
             }
             TimelineDrag::Scrub if response.dragged() => {
                 events.seek = Some(Ticks(time.0.clamp(0, total.0)));
@@ -1352,10 +1377,17 @@ pub fn timeline(
             }
         }
     }
+    if matches!(state.drag, TimelineDrag::Trim(..)) {
+        state.snap_line = state.trim_aligned;
+        // The trim is applied after this frame is drawn, so the result needs one more.
+        ui.ctx().request_repaint();
+    }
     if response.drag_stopped() {
         if matches!(state.drag, TimelineDrag::Trim(..)) {
             events.trim_finished = true;
         }
+        state.snap_line = None;
+        state.trim_aligned = None;
         state.drag = TimelineDrag::None;
         state.frozen_total = None;
     }
