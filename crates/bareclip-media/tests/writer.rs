@@ -79,3 +79,40 @@ fn every_encoder_here_finishes_a_whole_video() {
         }
     }
 }
+
+/// Windows' own encoder froze when one closed as another opened. Each thread keeps writing short
+/// videos with it, so that openings and closings overlap.
+#[test]
+fn encoders_used_at_the_same_time_all_finish() {
+    const THREADS: usize = 4;
+    const ROUNDS: usize = 10;
+    let folder = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("bareclip-writer-together");
+    std::fs::create_dir_all(&folder).expect("the folder can be created");
+    let (sender, finished) = mpsc::channel();
+    for thread_number in 0..THREADS {
+        let sender = sender.clone();
+        let folder = folder.clone();
+        thread::spawn(move || {
+            for round in 0..ROUNDS {
+                let path = folder.join(format!("{thread_number}-{round}.mp4"));
+                let mut writer = VideoWriter::create_with_any_of(
+                    &path,
+                    &settings(),
+                    &["h264_mf", "libopenh264"],
+                )
+                .expect("an encoder opens");
+                let picture = BlackPicture::new(320, 180);
+                writer
+                    .write_picture(&picture.view())
+                    .expect("a picture can be written");
+                writer.finish().expect("the video finishes");
+            }
+            let _ = sender.send(());
+        });
+    }
+    for _ in 0..THREADS {
+        finished
+            .recv_timeout(Duration::from_secs(120))
+            .expect("every thread finishes without freezing");
+    }
+}

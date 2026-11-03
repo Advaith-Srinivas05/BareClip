@@ -3,6 +3,7 @@
 mod error;
 mod export;
 mod full;
+mod media_foundation;
 mod nal;
 mod preview;
 mod probe;

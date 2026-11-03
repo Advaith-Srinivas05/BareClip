@@ -21,6 +21,7 @@ use ffmpeg_next::{
 
 use crate::{
     error::MediaError,
+    media_foundation::OpenEncoder,
     nal,
     probe::{discard_other_streams, join_problem, probe, to_time_base},
 };
@@ -146,7 +147,7 @@ fn open_encoder(
     name: &str,
     source: &SourceVideo,
     decoder: &decoder::Video,
-) -> Result<encoder::Video, ffmpeg::Error> {
+) -> Result<OpenEncoder, ffmpeg::Error> {
     let found = encoder::find_by_name(name).ok_or(ffmpeg::Error::EncoderNotFound)?;
     let mut video = codec::context::Context::new_with_codec(found)
         .encoder()
@@ -174,7 +175,7 @@ fn open_encoder(
     }
     // Leaving global headers off puts the settings inside the stream, so each
     // re-encoded section carries what a decoder needs to read it.
-    video.open_with(options)
+    OpenEncoder::open(video, name, options)
 }
 
 fn new_decoder(source: &SourceVideo) -> Result<decoder::Video, ffmpeg::Error> {
@@ -305,7 +306,7 @@ impl Writer {
 /// A re-encoded piece in progress.
 struct EncodeRun {
     decoder: decoder::Video,
-    encoder: encoder::Video,
+    encoder: OpenEncoder,
     pts_start: i64,
     pts_end: i64,
     first_frame: bool,

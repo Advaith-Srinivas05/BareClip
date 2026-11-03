@@ -19,6 +19,7 @@ use ffmpeg_next::{
 use crate::{
     error::MediaError,
     export::temporary_path,
+    media_foundation::OpenEncoder,
     preview::{seek_to_seconds, threaded_context},
     probe::{discard_other_streams, to_time_base},
 };
@@ -273,7 +274,7 @@ fn quality_options(name: &str) -> Dictionary<'static> {
 fn open_video_encoder(
     name: &str,
     settings: &VideoSettings,
-) -> Result<(encoder::Video, Pixel), ffmpeg::Error> {
+) -> Result<(OpenEncoder, Pixel), ffmpeg::Error> {
     let found = encoder::find_by_name(name).ok_or(ffmpeg::Error::EncoderNotFound)?;
     let offered: Vec<Pixel> = found
         .video()?
@@ -315,7 +316,7 @@ fn open_video_encoder(
     if options.iter().next().is_none() {
         video.set_bit_rate(settings.bit_rate);
     }
-    let opened = video.open_with(options)?;
+    let opened = OpenEncoder::open(video, name, options)?;
     Ok((opened, pixel))
 }
 
@@ -363,7 +364,7 @@ pub struct VideoWriter {
     output: Option<format::context::Output>,
     temporary: PathBuf,
     target: PathBuf,
-    encoder: encoder::Video,
+    encoder: OpenEncoder,
     encoder_name: String,
     pixel: Pixel,
     /// The picture last sent, kept so that showing it again costs almost nothing.
@@ -401,7 +402,7 @@ impl VideoWriter {
         let video_time_base = Rational(settings.frame_rate.1, settings.frame_rate.0);
         {
             let mut stream = output.add_stream(encoder::find(codec::Id::H264))?;
-            stream.set_parameters(&encoder);
+            stream.set_parameters(&*encoder);
             stream.set_time_base(video_time_base);
             stream.set_avg_frame_rate(Rational(settings.frame_rate.0, settings.frame_rate.1));
         }
