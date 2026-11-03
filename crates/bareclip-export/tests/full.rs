@@ -843,7 +843,7 @@ fn top_left_quarter() -> Placement {
         center_x: WHOLE / 4,
         center_y: WHOLE / 4,
         scale: WHOLE / 2,
-        opacity: WHOLE,
+        ..Placement::default()
     }
 }
 
@@ -979,6 +979,7 @@ fn an_overlay_comes_and_goes_on_the_exact_frame_and_footage_carries_on_under_it(
                             center_y: WHOLE / 8,
                             scale: WHOLE / 4,
                             opacity: WHOLE,
+                            ..Placement::default()
                         },
                     ),
                 ],
@@ -1210,4 +1211,36 @@ fn a_larger_video_is_scaled_down_to_a_smaller_project() {
 
     assert_eq!((report.width, report.height), (160, 90));
     assert!(report.composited_frames > 0, "fitting it takes the GPU");
+}
+
+#[test]
+fn a_clip_turned_a_quarter_stands_upright_with_bars_at_its_sides() {
+    let job = layered_request(
+        "layer-turned",
+        vec![stretch(
+            0.0,
+            1.0,
+            vec![whole(
+                &red_clip(),
+                1,
+                0.0,
+                1.0,
+                Placement::default().turned_quarter((320, 180), (320, 180)),
+            )],
+        )],
+        Vec::new(),
+    );
+
+    let report = run_layered(&job);
+
+    assert_eq!((report.width, report.height), (320, 180));
+    let mut reader = PictureReader::open(&job.output).expect("the export opens");
+    let picture = reader
+        .next_picture()
+        .expect("it decodes")
+        .expect("a picture");
+    let view = picture.view();
+    assert!(is_red(colour_at(&view, 160, 90)), "it is in the middle");
+    assert!(brightness_at(&view, 40, 90) < 30, "with a bar on the left");
+    assert!(brightness_at(&view, 280, 90) < 30, "and on the right");
 }

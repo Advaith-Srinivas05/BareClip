@@ -1,7 +1,7 @@
 //! What goes on a canvas, and whether that takes the GPU at all.
 
 use bareclip_core::picture::{ColorFormat, Yuv420};
-pub use bareclip_core::placement::{Rect, fit_inside};
+pub use bareclip_core::placement::{PictureLook, Rect, fit_inside};
 
 /// One picture on the canvas. Later layers are drawn over earlier ones.
 #[derive(Clone, Copy, Debug)]
@@ -10,6 +10,7 @@ pub struct Layer<'a> {
     pub rect: Rect,
     /// 0 is invisible, and 1 hides what is underneath.
     pub opacity: f32,
+    pub look: PictureLook,
 }
 
 /// Whether these layers take the GPU. A single picture that already fills the canvas exactly,
@@ -26,6 +27,7 @@ pub fn needs_compositor(layers: &[Layer], canvas: (u32, u32)) -> bool {
                 height: canvas.1 as f32,
             };
             only.opacity < 1.0
+                || !only.look.is_plain()
                 || only.rect != full_canvas
                 || (only.picture.width, only.picture.height) != canvas
                 || only.picture.color != ColorFormat::OUTPUT
@@ -45,6 +47,7 @@ mod tests {
             picture,
             rect: fit_inside((picture.width, picture.height), canvas),
             opacity: 1.0,
+            look: PictureLook::PLAIN,
         }
     }
 
@@ -117,6 +120,18 @@ mod tests {
         one.opacity = 0.5;
 
         assert!(needs_compositor(&[one], (64, 36)));
+    }
+
+    #[test]
+    fn a_turned_or_flipped_picture_needs_the_gpu() {
+        let black = BlackPicture::new(64, 36);
+        let mut turned = layer(&black, (64, 36));
+        turned.look.degrees = 180.0;
+        assert!(needs_compositor(&[turned], (64, 36)));
+
+        let mut flipped = layer(&black, (64, 36));
+        flipped.look.flip_x = true;
+        assert!(needs_compositor(&[flipped], (64, 36)));
     }
 
     #[test]

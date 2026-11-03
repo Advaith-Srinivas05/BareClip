@@ -242,6 +242,7 @@ impl LayerPictures {
                     picture,
                     rect: scaled_rect(placement.rect(size, canvas), canvas, target),
                     opacity: placement.opacity as f32 / bareclip_core::placement::WHOLE as f32,
+                    look: placement.look(),
                 })
             })
             .collect();
@@ -623,6 +624,7 @@ mod tests {
                 center_y: WHOLE * 4 / 10,
                 scale: WHOLE / 2,
                 opacity: WHOLE * 3 / 4,
+                ..Placement::default()
             },
         );
         let size_of = |id: MediaId| {
@@ -691,6 +693,7 @@ mod tests {
             picture: exported.view(),
             rect: bareclip_render::fit_inside(exported.size(), canvas),
             opacity: 1.0,
+            look: bareclip_render::PictureLook::PLAIN,
         };
         compositor.draw_for_display(&[layer]).expect("it draws");
         let shown = compositor.read_display().expect("it reads back");
@@ -709,6 +712,7 @@ mod tests {
                 center_y: WHOLE * 6 / 10,
                 scale: WHOLE / 2,
                 opacity: WHOLE * 3 / 4,
+                ..Placement::default()
             },
         );
         let elsewhere = drawn_by_the_preview(&moved, &infos, at, &mut compositor);
@@ -742,6 +746,7 @@ mod tests {
             picture: planes.view().expect("it has planes"),
             rect: bareclip_render::fit_inside(size, size),
             opacity: 1.0,
+            look: bareclip_render::PictureLook::PLAIN,
         };
         compositor.draw_for_display(&[layer]).expect("it draws");
         let drawn = compositor.read_display().expect("it reads back");
@@ -1129,6 +1134,7 @@ mod tests {
                     picture: picture.view(),
                     rect: bareclip_render::fit_inside(picture.size(), canvas),
                     opacity: 1.0,
+                    look: bareclip_render::PictureLook::PLAIN,
                 };
                 compositor.draw_for_display(&[layer]).expect("it draws");
                 let shown = compositor.read_display().expect("it reads back");

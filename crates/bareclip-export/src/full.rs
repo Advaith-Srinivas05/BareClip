@@ -278,6 +278,7 @@ pub fn export_full(
                         picture: picture.view(),
                         rect: fit_inside(picture.size(), canvas),
                         opacity: 1.0,
+                        look: bareclip_render::PictureLook::PLAIN,
                     };
                     if needs_compositor(&[layer], canvas) {
                         if compositor.is_none() {

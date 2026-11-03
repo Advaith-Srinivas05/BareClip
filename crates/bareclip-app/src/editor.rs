@@ -4975,6 +4975,7 @@ mod tests {
                 center_y: WHOLE / 2,
                 scale: WHOLE,
                 opacity: WHOLE / 2,
+                ..Placement::default()
             },
         );
         wait_for_layers(&ctx, &mut layered);
@@ -4992,6 +4993,7 @@ mod tests {
                 center_y: WHOLE / 8,
                 scale: WHOLE / 2,
                 opacity: WHOLE,
+                ..Placement::default()
             },
         );
         wait_for_layers(&ctx, &mut layered);
@@ -5002,6 +5004,26 @@ mod tests {
             "64-light-layers-off-the-edge",
         );
         ctx.set_theme(egui::Theme::Dark);
+
+        // Turned and flipped.
+        layered.project.tracks.set_placement(
+            top,
+            Placement {
+                center_x: WHOLE * 2 / 5,
+                center_y: WHOLE / 2,
+                scale: WHOLE / 2,
+                rotation: 30_000,
+                flip_x: true,
+                ..Placement::default()
+            },
+        );
+        wait_for_layers(&ctx, &mut layered);
+        camera.shoot(
+            &ctx,
+            &mut layered,
+            moved(pos2(1100.0, 80.0)),
+            "68-turned-and-flipped",
+        );
 
         // The project's shape, on a tall canvas and with its menu open.
         let mut tall = with_videos(&ctx, &[test_clip()]);
@@ -9874,10 +9896,13 @@ mod tests {
         let mut editor = stacked_clips(&ctx);
         editor.selected = None;
         run_frame(&ctx, &mut editor, vec![]);
-        assert!(!is_named(&ctx, &mut editor, "Reset size and place"));
+        assert!(!is_named(&ctx, &mut editor, "Rotate by 90 degrees"));
 
         let (top, _) = top_and_below(&editor);
         editor.selected = Some(top);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(is_named(&ctx, &mut editor, "Rotate by 90 degrees"));
+        click_named(&ctx, &mut editor, "More");
         run_frame(&ctx, &mut editor, vec![]);
         assert!(is_named(&ctx, &mut editor, "Reset size and place"));
         assert!(is_named(&ctx, &mut editor, "Opacity"));
@@ -9895,6 +9920,8 @@ mod tests {
         editor.selected = Some(top);
         run_frame(&ctx, &mut editor, vec![]);
 
+        click_named(&ctx, &mut editor, "More");
+        run_frame(&ctx, &mut editor, vec![]);
         click_named(&ctx, &mut editor, "Reset size and place");
 
         assert!(placement_of(&editor, top).is_default());
@@ -9914,6 +9941,8 @@ mod tests {
         editor.selected = Some(top);
         run_frame(&ctx, &mut editor, vec![]);
 
+        click_named(&ctx, &mut editor, "More");
+        run_frame(&ctx, &mut editor, vec![]);
         click_named(&ctx, &mut editor, "Opacity");
         run_frame(&ctx, &mut editor, vec![]);
 
@@ -9941,6 +9970,8 @@ mod tests {
         run_frame(&ctx, &mut editor, vec![]);
         let before = editor.project.clone();
 
+        click_named(&ctx, &mut editor, "More");
+        run_frame(&ctx, &mut editor, vec![]);
         let slider = named_rect(&ctx, &mut editor, "Opacity");
         let from = slider.center();
         let to = pos2(slider.left() + 4.0, from.y);
@@ -9958,6 +9989,8 @@ mod tests {
         let mut editor = stacked_clips(&ctx);
         let (top, _) = top_and_below(&editor);
         editor.selected = Some(top);
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "More");
         run_frame(&ctx, &mut editor, vec![]);
         click_named(&ctx, &mut editor, "Opacity");
         run_frame(&ctx, &mut editor, vec![]);
@@ -10297,5 +10330,88 @@ mod tests {
 
         assert_eq!(editor.final_canvas(), Some((320, 180)));
         assert!(!editor.has_unsaved_changes());
+    }
+
+    #[test]
+    fn the_rotate_button_turns_a_clip_a_quarter_and_takes_the_full_route() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let clip = editor.project.tracks.played().clips()[0].id;
+        editor.selected = Some(clip);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.export_route(), Route::Fast);
+
+        click_named(&ctx, &mut editor, "Rotate by 90 degrees");
+
+        assert_eq!(placement_of(&editor, clip).rotation, 90_000);
+        assert_eq!(
+            editor.export_route(),
+            Route::Full(LAYERED_REASON.to_owned())
+        );
+        editor.undo();
+        assert!(placement_of(&editor, clip).is_default());
+        assert_eq!(editor.export_route(), Route::Fast);
+    }
+
+    #[test]
+    fn the_flip_buttons_flip_a_clip_as_one_undo_step_each() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let clip = editor.project.tracks.played().clips()[0].id;
+        editor.selected = Some(clip);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        click_named(&ctx, &mut editor, "Flip left to right");
+        assert!(placement_of(&editor, clip).flip_x);
+        click_named(&ctx, &mut editor, "Flip top to bottom");
+        assert!(placement_of(&editor, clip).flip_y);
+
+        editor.undo();
+        assert!(!placement_of(&editor, clip).flip_y);
+        assert!(placement_of(&editor, clip).flip_x);
+        editor.undo();
+        assert!(!placement_of(&editor, clip).flip_x);
+    }
+
+    #[test]
+    fn dragging_the_rotate_handle_turns_a_clip_as_one_undo_step() {
+        let ctx = context();
+        let mut editor = stacked_clips(&ctx);
+        let (top, _) = top_and_below(&editor);
+        editor
+            .project
+            .tracks
+            .set_placement(top, small_in_a_corner());
+        editor.selected = Some(top);
+        run_frame(&ctx, &mut editor, vec![]);
+        let before = editor.project.clone();
+        let handle = editor.stage_state.rotate_handle.expect("the handle shows");
+        let middle = on_canvas(&editor, 0.3, 0.3);
+        let quarter_round = middle + vec2(-(handle.y - middle.y), 0.0);
+
+        begin_drag(&ctx, &mut editor, handle, quarter_round);
+        end_drag(&ctx, &mut editor, quarter_round);
+
+        assert_eq!(placement_of(&editor, top).rotation, 90_000);
+        assert_eq!(placement_of(&editor, top).scale, small_in_a_corner().scale);
+        editor.undo();
+        assert_eq!(editor.project, before);
+    }
+
+    #[test]
+    fn four_quarter_turns_put_a_project_back_on_the_fast_route() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let clip = editor.project.tracks.played().clips()[0].id;
+        editor.selected = Some(clip);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        for _ in 0..4 {
+            click_named(&ctx, &mut editor, "Rotate by 90 degrees");
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+
+        assert!(placement_of(&editor, clip).is_default());
+        assert_eq!(editor.export_route(), Route::Fast);
     }
 }

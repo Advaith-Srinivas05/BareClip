@@ -325,6 +325,7 @@ mod tests {
             center_y: 750_000,
             scale: 400_000,
             opacity: 600_000,
+            ..Placement::default()
         };
         tracks.set_placement(id, placement);
         let file = ProjectFile::capture("x", Vec::new(), &tracks);
