@@ -262,6 +262,7 @@ pub struct LayerDisplay {
     texture: Option<egui::TextureId>,
     /// The picture is up to date for the project as it now is, so it can be shown.
     drawn: bool,
+    drawn_on: Option<(u32, u32)>,
 }
 
 impl LayerDisplay {
@@ -281,6 +282,7 @@ impl LayerDisplay {
             compositor: None,
             texture: None,
             drawn: false,
+            drawn_on: None,
         }
     }
 
@@ -341,12 +343,15 @@ impl LayerDisplay {
         size_of: &dyn Fn(MediaId) -> Option<(u32, u32)>,
     ) -> Result<(), RenderError> {
         self.compositor_for(canvas)?;
-        let wanted = pictures.needs_drawing(stack);
+        // Places are worked out from the canvas, so a new one means drawing them again.
+        let new_canvas = self.drawn_on != Some(canvas);
+        let wanted = pictures.needs_drawing(stack) || new_canvas || !self.drawn;
         if !wanted || (!self.drawn && !pictures.is_ready(stack)) {
             return Ok(());
         }
         pictures.draw(self.compositor_for(canvas)?, stack, now, canvas, size_of)?;
         self.drawn = true;
+        self.drawn_on = Some(canvas);
         Ok(())
     }
 }
@@ -661,6 +666,7 @@ mod tests {
             output: output.clone(),
             stretches,
             sound: Vec::new(),
+            canvas: None,
         };
         bareclip_export::export_layered(
             &request,
@@ -1075,6 +1081,7 @@ mod tests {
             output: output.clone(),
             stretches,
             sound,
+            canvas: None,
         };
         let report = bareclip_export::export_layered(&request, &cancel, &|_| {})
             .expect("the export succeeds");

@@ -10,6 +10,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    canvas::Canvas,
     placement::Placement,
     time::Ticks,
     timeline::{MediaId, TimeRange},
@@ -18,7 +19,9 @@ use crate::{
 
 pub const EXTENSION: &str = "bareclip";
 /// Goes up whenever the format changes in a way older versions can't read.
-const CURRENT_VERSION: u32 = 2;
+const CURRENT_VERSION: u32 = 3;
+/// Files older than this had their size worked out from the largest video.
+const FIRST_VERSION_WITH_CANVAS: u32 = 3;
 pub const DEFAULT_NAME: &str = "untitled";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +66,8 @@ pub struct ProjectFile {
     pub media: Vec<SavedMedia>,
     /// Highest track first, each with its clips in order.
     pub tracks: Vec<Vec<SavedClip>>,
+    #[serde(default)]
+    pub canvas: Canvas,
 }
 
 impl Default for ProjectFile {
@@ -117,7 +122,13 @@ impl ProjectFile {
                         .collect()
                 })
                 .collect(),
+            canvas: Canvas::default(),
         }
+    }
+
+    /// Whether this file was saved before projects kept their own size.
+    pub fn predates_canvas(&self) -> bool {
+        self.version < FIRST_VERSION_WITH_CANVAS
     }
 
     pub fn to_text(&self) -> String {
@@ -264,6 +275,30 @@ mod tests {
             assert!(pair[0].end() <= pair[1].start, "{pair:?}");
         }
         assert!(clips[0].start >= Ticks(0));
+    }
+
+    #[test]
+    fn a_projects_size_survives_being_written_and_read_back() {
+        let mut project = file();
+        project.canvas = Canvas {
+            original: Some((1920, 992)),
+            ratio: Some((9, 16)),
+        };
+
+        let back = ProjectFile::from_text(&project.to_text()).expect("it can be read");
+
+        assert_eq!(back.canvas, project.canvas);
+        assert!(!back.predates_canvas());
+    }
+
+    #[test]
+    fn a_project_from_before_sizes_says_so_and_has_none() {
+        let text = r#"{"version": 2, "name": "old", "media": [], "tracks": []}"#;
+
+        let file = ProjectFile::from_text(text).expect("it can be read");
+
+        assert!(file.predates_canvas());
+        assert_eq!(file.canvas, Canvas::default());
     }
 
     #[test]

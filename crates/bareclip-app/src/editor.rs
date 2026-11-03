@@ -12,6 +12,7 @@ use std::{
 };
 
 use bareclip_core::{
+    canvas::{Canvas, ORIGINAL_NAME, RATIOS},
     history::History,
     project::{self, ProjectFile, write_atomic},
     splice::{CutMode, FrameIndex},
@@ -21,7 +22,7 @@ use bareclip_core::{
 };
 use bareclip_export::{
     FullPlan, LAYERED_REASON, LayeredClip, LayeredRequest, LayeredStretch, ProjectReport, Route,
-    export_layered, export_project, full_output_path, route_for,
+    export_layered, export_project, full_output_path, route_for, size_problem,
 };
 use bareclip_media::{
     DecodeStep, ExportPart, ExportRequest, MediaError, MediaInfo, PreviewFrame, SoundShape,
@@ -285,6 +286,8 @@ struct Snapshot {
     tracks: Tracks,
     /// Videos removed from the panel. They stay loaded so undo can restore them.
     hidden: Vec<MediaId>,
+    /// The finished video's size.
+    canvas: Canvas,
 }
 
 /// A trim in progress: where the clip's edge and the playhead were when the drag started.
@@ -450,6 +453,7 @@ impl Editor {
             project: Snapshot {
                 tracks: Tracks::default(),
                 hidden: Vec::new(),
+                canvas: Canvas::default(),
             },
             history: History::default(),
             preview: Preview::new(use_sound, Arc::new(move || repaint.request_repaint())),
@@ -537,7 +541,9 @@ impl Editor {
                 (entry.id, absolute)
             })
             .collect();
-        ProjectFile::capture(&self.project_name, media, &self.project.tracks)
+        let mut file = ProjectFile::capture(&self.project_name, media, &self.project.tracks);
+        file.canvas = self.project.canvas;
+        file
     }
 
     fn has_unsaved_changes(&self) -> bool {
@@ -586,6 +592,7 @@ impl Editor {
         self.project = Snapshot {
             tracks: Tracks::default(),
             hidden: Vec::new(),
+            canvas: Canvas::default(),
         };
         self.history = History::default();
         self.selected = None;
@@ -762,6 +769,12 @@ impl Editor {
             })
             .collect();
         self.project.tracks = Tracks::restore(&fitted, |id| new_ids.get(&id).copied());
+        self.project.canvas = file.canvas.checked();
+        if file.predates_canvas() {
+            // These were sized by their largest video, and shouldn't change just by being opened.
+            self.project.canvas.original = self.project.tracks.canvas(&|id| self.video_size(id));
+        }
+        self.settle_canvas();
         self.project_name = file.name;
         self.project_path = path;
         self.media_panel_open = true;
@@ -1128,6 +1141,7 @@ impl Editor {
         };
         self.record();
         self.selected = Some(self.project.tracks.push(id, range));
+        self.settle_canvas();
         self.after_clip_added();
     }
 
@@ -1145,6 +1159,8 @@ impl Editor {
         self.record();
         for (id, range) in ranges {
             self.selected = Some(self.project.tracks.push(id, range));
+            self.settle_canvas();
+            self.settle_canvas();
         }
         self.after_clip_added();
     }
@@ -1181,6 +1197,7 @@ impl Editor {
         };
         self.record();
         self.selected = Some(self.project.tracks.place(id, range, time, target));
+        self.settle_canvas();
         self.after_clip_added();
     }
 
@@ -1225,6 +1242,7 @@ impl Editor {
 
     /// Tidies up after clips changed, so nothing points at a clip that has gone.
     fn after_timeline_change(&mut self) {
+        self.settle_canvas();
         if let Some(selected) = self.selected
             && self.project.tracks.clip(selected).is_none()
         {
@@ -1429,6 +1447,7 @@ impl Editor {
         }
         self.poll_strip_readers(ctx);
 
+        self.settle_canvas();
         let canvas = self.final_canvas();
         let layered = self.layer_display.is_some() && self.takes_layers();
         let Self {
@@ -1620,7 +1639,22 @@ impl Editor {
 
     /// The size of the finished video.
     fn final_canvas(&self) -> Option<(u32, u32)> {
-        self.project.tracks.canvas(&|id| self.video_size(id))
+        (!self.project.tracks.is_empty()).then(|| self.project.canvas.size())
+    }
+
+    /// Lets the first video set the project's size, and an empty timeline forget it.
+    fn settle_canvas(&mut self) {
+        let mut canvas = self.project.canvas;
+        canvas.settle(&self.project.tracks, &|id| self.video_size(id));
+        self.project.canvas = canvas;
+    }
+
+    /// Changes the project's shape, as one step to undo. `None` is the first video's own.
+    fn choose_ratio(&mut self, ratio: Option<(u32, u32)>) {
+        if self.project.canvas.ratio != ratio {
+            self.record();
+            self.project.canvas.ratio = ratio;
+        }
     }
 
     /// Whether this project needs several pictures drawn together, rather than one at a time.
@@ -1688,10 +1722,15 @@ impl Editor {
         if self.takes_layers() {
             return Route::Full(LAYERED_REASON.to_owned());
         }
-        route_for(
-            &self.videos_on_timeline(),
-            !self.project.tracks.gaps().is_empty(),
-        )
+        let videos = self.videos_on_timeline();
+        let route = route_for(&videos, !self.project.tracks.gaps().is_empty());
+        if route != Route::Fast {
+            return route;
+        }
+        let misfit = self
+            .final_canvas()
+            .and_then(|canvas| videos.iter().find_map(|video| size_problem(canvas, video)));
+        misfit.map_or(Route::Fast, Route::Full)
     }
 
     /// The shape and size of the finished video, which the preview shows too.
@@ -1742,10 +1781,11 @@ impl Editor {
             return;
         };
         // Worked out here because the project may change while the export runs.
-        let layered = self.takes_layers().then(|| LayeredRequest {
+        let layered = matches!(self.export_route(), Route::Full(_)).then(|| LayeredRequest {
             output: output.clone(),
             stretches: self.layered_stretches(),
             sound: parts.clone(),
+            canvas: self.final_canvas(),
         });
         let request = ExportRequest {
             output: output.clone(),
@@ -2388,6 +2428,38 @@ impl Editor {
         }
     }
 
+    /// The shape of the finished video. It sits in the top row rather than coming and going with
+    /// the selection, so it is always there to be found.
+    fn size_picker(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        let name = format!("Size: {}", self.project.canvas.name());
+        let (width, height) = self.project.canvas.size();
+        let button = ui
+            .add(ActionButton::new(palette, Kind::Ghost, &name).icon(icons::RATIO))
+            .on_hover_text(format!(
+                "The shape of the finished video, now {width} x {height}"
+            ));
+        egui::Popup::menu(&button).show(|ui| {
+            let has_video = !self.project.tracks.is_empty();
+            if has_video
+                && ui
+                    .add(MenuItem::choice(
+                        palette,
+                        ORIGINAL_NAME,
+                        self.project.canvas.is_chosen(None),
+                    ))
+                    .clicked()
+            {
+                self.choose_ratio(None);
+            }
+            for (ratio, name) in RATIOS {
+                let chosen = self.project.canvas.is_chosen(Some(ratio));
+                if ui.add(MenuItem::choice(palette, name, chosen)).clicked() {
+                    self.choose_ratio(Some(ratio));
+                }
+            }
+        });
+    }
+
     /// The top of the card: undo and redo, anything that needs saying, and Export.
     fn card_top_row(&mut self, ui: &mut egui::Ui, palette: &Palette) {
         let frame = Frame::new()
@@ -2434,6 +2506,8 @@ impl Editor {
                     {
                         self.redo();
                     }
+                    ui.add_space(8.0);
+                    self.size_picker(ui, palette);
                     if let Some(notice) = self.notice.clone() {
                         ui.add_space(8.0);
                         components::symbol(ui, &icons::CIRCLE_ALERT, 16.0, palette.danger);
@@ -3123,6 +3197,7 @@ impl Editor {
                     ui.painter()
                         .rect_filled(fitted(size, rect), 0.0, Color32::BLACK);
                 }
+                self.stage_controls(ui, rect, palette);
                 return;
             }
             let layers = self.takes_layers();
@@ -3159,9 +3234,18 @@ impl Editor {
                 return;
             }
             if !self.project.tracks.is_empty() {
+                self.stage_controls(ui, rect, palette);
                 return;
             }
 
+            // The shape of what will be made, so a ratio picked now shows what it does.
+            let (width, height) = self.project.canvas.size();
+            ui.painter().rect_stroke(
+                fitted(vec2(width as f32, height as f32), rect),
+                0.0,
+                Stroke::new(1.0, palette.border),
+                egui::StrokeKind::Inside,
+            );
             let ctx = ui.ctx().clone();
             let logo = self.logo(&ctx);
             let hint = if self.visible_media().next().is_none() {
@@ -3183,14 +3267,13 @@ impl Editor {
                     );
                 });
             });
+            self.stage_controls(ui, rect, palette);
         });
     }
 
     /// The handles and toolbar on the picture, and what they ask for.
     fn stage_controls(&mut self, ui: &mut egui::Ui, area: egui::Rect, palette: &Palette) {
-        let Some(canvas) = self.final_canvas() else {
-            return;
-        };
+        let canvas = self.project.canvas.size();
         let size = vec2(canvas.0 as f32, canvas.1 as f32);
         let position = last_moment_by(self.position(), self.project.tracks.duration());
         let showing = self
@@ -3319,7 +3402,7 @@ impl Editor {
         let gaps = self.project.tracks.gaps();
         let gap_length = Ticks(gaps.iter().map(|gap| gap.duration().0).sum());
         let route = self.export_route();
-        let full_plan = FullPlan::for_videos(&self.videos_on_timeline());
+        let full_plan = FullPlan::on_canvas(&self.videos_on_timeline(), self.project.canvas.size());
         let ready = self.export_parts().is_some();
         let summary = self.plan_description();
 
@@ -4870,6 +4953,7 @@ mod tests {
         );
         layered.seek(Ticks::from_seconds(1.0));
         wait_for_layers(&ctx, &mut layered);
+        layered.selected = None;
         camera.shoot(&ctx, &mut layered, moved(pos2(1100.0, 80.0)), "60-layers");
         layered.selected = Some(top);
         run_frame(&ctx, &mut layered, vec![]);
@@ -4918,6 +5002,34 @@ mod tests {
             "64-light-layers-off-the-edge",
         );
         ctx.set_theme(egui::Theme::Dark);
+
+        // The project's shape, on a tall canvas and with its menu open.
+        let mut tall = with_videos(&ctx, &[test_clip()]);
+        tall.use_gpu(LayerDisplay::new(
+            camera.device.clone(),
+            camera.queue.clone(),
+            camera.renderer.clone(),
+        ));
+        wait_for_layers(&ctx, &mut tall);
+        pick_size(&ctx, &mut tall, "9:16");
+        wait_for_layers(&ctx, &mut tall);
+        camera.shoot(
+            &ctx,
+            &mut tall,
+            moved(pos2(1100.0, 80.0)),
+            "65-tall-project",
+        );
+        let button = named_nodes(&ctx, &mut tall)
+            .into_iter()
+            .find(|(label, ..)| label.starts_with("Size:"))
+            .expect("the Size button is there")
+            .1;
+        click(&ctx, &mut tall, button.center());
+        wait_for_layers(&ctx, &mut tall);
+        camera.shoot(&ctx, &mut tall, moved(button.center()), "66-size-menu");
+        let mut empty_shape = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut empty_shape, vec![]);
+        camera.shoot(&ctx, &mut empty_shape, vec![], "67-empty-project-shape");
         KEPT_TEXTURES.with_borrow_mut(|kept| *kept = None);
     }
 
@@ -9399,7 +9511,7 @@ mod tests {
     }
 
     #[test]
-    fn videos_of_different_sizes_export_together_at_the_largest_size() {
+    fn videos_of_different_sizes_export_together_at_the_first_videos_size() {
         let ctx = context();
         let mut editor = with_videos(&ctx, &[small_clip(), test_clip()]);
         let output =
@@ -9414,7 +9526,7 @@ mod tests {
         };
         assert!(matches!(report, ProjectReport::Full(_)), "{report:?}");
         let info = probe(&output).expect("the export can be read");
-        assert_eq!((info.video.width, info.video.height), (320, 180));
+        assert_eq!((info.video.width, info.video.height), (160, 90));
         assert_eq!(info.video.codec, "h264");
         assert!((info.duration.as_seconds() - 8.0).abs() < 0.1);
         let _ = std::fs::remove_file(&output);
@@ -9428,11 +9540,11 @@ mod tests {
     }
 
     #[test]
-    fn the_canvas_is_the_largest_video_on_the_timeline() {
+    fn the_canvas_is_the_first_video_on_the_timeline() {
         let ctx = context();
         let editor = with_videos(&ctx, &[small_clip(), test_clip()]);
 
-        assert_eq!(editor.canvas_size(), Some(vec2(320.0, 180.0)));
+        assert_eq!(editor.canvas_size(), Some(vec2(160.0, 90.0)));
     }
 
     #[test]
@@ -9944,5 +10056,246 @@ mod tests {
         assert_eq!(last_moment_by(Ticks(100), Ticks(100)), Ticks(99));
         assert_eq!(last_moment_by(Ticks(50), Ticks(100)), Ticks(50));
         assert_eq!(last_moment_by(Ticks(0), Ticks(0)), Ticks(0));
+    }
+
+    /// Picks a choice from the Size menu.
+    fn pick_size(ctx: &egui::Context, editor: &mut Editor, name: &str) {
+        let button = named_nodes(ctx, editor)
+            .into_iter()
+            .find(|(label, ..)| label.starts_with("Size:"))
+            .expect("the Size button is there")
+            .1;
+        click(ctx, editor, button.center());
+        run_frame(ctx, editor, vec![]);
+        click_named(ctx, editor, name);
+        run_frame(ctx, editor, vec![]);
+    }
+
+    fn size_button_says(ctx: &egui::Context, editor: &mut Editor) -> String {
+        named_nodes(ctx, editor)
+            .into_iter()
+            .find(|(label, ..)| label.starts_with("Size:"))
+            .expect("the Size button is there")
+            .0
+    }
+
+    #[test]
+    fn an_empty_project_is_16_by_9_and_says_so() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert_eq!(editor.project.canvas.size(), (1920, 1080));
+        assert_eq!(size_button_says(&ctx, &mut editor), "Size: 16:9");
+    }
+
+    #[test]
+    fn the_first_video_on_the_timeline_sets_the_exact_size() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[small_clip(), test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert_eq!(editor.final_canvas(), Some((160, 90)));
+        assert_eq!(size_button_says(&ctx, &mut editor), "Size: Original");
+    }
+
+    #[test]
+    fn a_video_only_in_the_panel_sets_nothing() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[small_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert_eq!(editor.project.canvas.size(), (1920, 1080));
+    }
+
+    #[test]
+    fn original_is_only_offered_once_there_is_a_video() {
+        let ctx = context();
+        let mut empty = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut empty, vec![]);
+        let button = named_nodes(&ctx, &mut empty)
+            .into_iter()
+            .find(|(label, ..)| label.starts_with("Size:"))
+            .expect("the Size button is there")
+            .1;
+        click(&ctx, &mut empty, button.center());
+        run_frame(&ctx, &mut empty, vec![]);
+        assert!(is_named(&ctx, &mut empty, "21:9"));
+        assert!(!is_named(&ctx, &mut empty, "Original"));
+    }
+
+    #[test]
+    fn picking_a_ratio_changes_the_size_and_one_undo_brings_it_back() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.final_canvas(), Some((320, 180)));
+
+        pick_size(&ctx, &mut editor, "9:16");
+
+        assert_eq!(editor.final_canvas(), Some((180, 320)));
+        assert_eq!(size_button_says(&ctx, &mut editor), "Size: 9:16");
+        editor.undo();
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.final_canvas(), Some((320, 180)));
+    }
+
+    #[test]
+    fn picking_original_goes_back_to_the_first_videos_size() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        pick_size(&ctx, &mut editor, "1:1");
+        assert_eq!(editor.final_canvas(), Some((180, 180)));
+
+        pick_size(&ctx, &mut editor, "Original");
+
+        assert_eq!(editor.final_canvas(), Some((320, 180)));
+    }
+
+    #[test]
+    fn a_ratio_picked_on_an_empty_project_stays_when_a_video_arrives() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        pick_size(&ctx, &mut editor, "9:16");
+
+        let id = editor.media[0].id;
+        editor.project.tracks.push(
+            id,
+            TimeRange {
+                start: Ticks(0),
+                end: Ticks::from_seconds(1.0),
+            },
+        );
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert_eq!(editor.project.canvas.name(), "9:16");
+        assert_eq!(editor.final_canvas(), Some((180, 320)));
+    }
+
+    #[test]
+    fn deleting_everything_goes_back_to_16_by_9_and_undo_brings_the_size_back() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[small_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        let clip = editor.project.tracks.played().clips()[0].id;
+
+        editor.selected = Some(clip);
+        editor.delete_selected();
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.project.canvas.size(), (1920, 1080));
+
+        editor.undo();
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.project.canvas.size(), (160, 90));
+    }
+
+    #[test]
+    fn a_project_of_the_first_videos_size_still_takes_the_fast_route() {
+        let ctx = context();
+        let editor = with_videos(&ctx, &[test_clip(), second_clip()]);
+
+        assert_eq!(editor.export_route(), Route::Fast);
+    }
+
+    #[test]
+    fn a_ratio_that_doesnt_fit_the_video_takes_the_full_route_and_says_why() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        pick_size(&ctx, &mut editor, "9:16");
+
+        let Route::Full(reason) = editor.export_route() else {
+            panic!("it should take the full route");
+        };
+        assert!(reason.contains("180 x 320"), "{reason}");
+    }
+
+    #[test]
+    fn picking_a_ratio_exports_at_that_size_through_the_real_editor() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        pick_size(&ctx, &mut editor, "1:1");
+        let output =
+            std::env::temp_dir().join(format!("bareclip-ui-square-{}.mp4", std::process::id()));
+        let _ = std::fs::remove_file(&output);
+
+        editor.start_export_to(&ctx, output.clone());
+        wait_for_export(&ctx, &mut editor);
+
+        let ExportState::Done { report, .. } = &editor.export_state else {
+            panic!("the export did not finish: {:?}", failure_of(&editor));
+        };
+        let ProjectReport::Full(report) = report else {
+            panic!("it took the fast route: {report:?}");
+        };
+        assert_eq!((report.width, report.height), (180, 180));
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn a_projects_size_comes_back_when_it_is_opened_again() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        pick_size(&ctx, &mut editor, "4:5");
+        let folder = project_folder("size");
+        let path = folder.join("size.bareclip");
+        assert!(editor.save_to(&path));
+
+        let mut reopened = Editor::new(&ctx, false);
+        reopened.open_project(&ctx, &path);
+        settle(&ctx, &mut reopened);
+        run_frame(&ctx, &mut reopened, vec![]);
+
+        assert_eq!(reopened.project.canvas.name(), "4:5");
+        assert_eq!(reopened.final_canvas(), editor.final_canvas());
+        assert!(!reopened.has_unsaved_changes());
+    }
+
+    #[test]
+    fn a_project_from_before_sizes_keeps_coming_out_at_its_largest_video() {
+        let ctx = context();
+        let folder = project_folder("old-size");
+        let path = folder.join("old.bareclip");
+        let saved = |media: u64| project::SavedClip {
+            media,
+            start: if media == 1 {
+                0
+            } else {
+                Ticks::from_seconds(1.0).0
+            },
+            source_start: 0,
+            source_end: Ticks::from_seconds(1.0).0,
+            placement: Placement::default(),
+        };
+        let mut file = ProjectFile {
+            version: 2,
+            name: "old".to_owned(),
+            media: vec![
+                project::SavedMedia {
+                    id: 1,
+                    path: small_clip().to_path_buf(),
+                },
+                project::SavedMedia {
+                    id: 2,
+                    path: test_clip().to_path_buf(),
+                },
+            ],
+            tracks: vec![vec![saved(1), saved(2)]],
+            canvas: Canvas::default(),
+        };
+        file.version = 2;
+        std::fs::write(&path, file.to_text()).expect("it can be written");
+
+        let mut editor = Editor::new(&ctx, false);
+        editor.open_project(&ctx, &path);
+        settle(&ctx, &mut editor);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert_eq!(editor.final_canvas(), Some((320, 180)));
+        assert!(!editor.has_unsaved_changes());
     }
 }

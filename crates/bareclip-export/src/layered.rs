@@ -57,6 +57,8 @@ pub struct LayeredRequest {
     pub stretches: Vec<LayeredStretch>,
     /// What the sound comes from: the top clip at each moment, as a fast export would see it.
     pub sound: Vec<ExportPart>,
+    /// The finished video's size, or the largest video's if the project hasn't chosen one.
+    pub canvas: Option<(u32, u32)>,
 }
 
 /// Which stretch a moment falls in. Rounding can put the very last frame just past the end, and
@@ -108,7 +110,10 @@ pub fn export_layered(
         .iter()
         .map(|info| (info.path.clone(), (info.video.width, info.video.height)))
         .collect();
-    let plan = FullPlan::for_videos(&videos);
+    let plan = match request.canvas {
+        Some(canvas) => FullPlan::on_canvas(&videos, canvas),
+        None => FullPlan::for_videos(&videos),
+    };
     let settings = &plan.settings;
     let canvas = (settings.width, settings.height);
     let rate = settings.frame_rate;
@@ -334,6 +339,7 @@ mod tests {
             output: PathBuf::from("out.mp4"),
             stretches: Vec::new(),
             sound: Vec::new(),
+            canvas: None,
         };
 
         assert!(matches!(

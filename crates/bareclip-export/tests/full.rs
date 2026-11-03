@@ -806,6 +806,7 @@ fn layered_request(
         output: output_path(name, "mp4"),
         stretches,
         sound,
+        canvas: None,
     }
 }
 
@@ -1150,9 +1151,63 @@ fn a_layered_export_over_one_of_its_videos_is_refused() {
             vec![whole(&red_clip(), 1, 0.0, 1.0, top_left_quarter())],
         )],
         sound: Vec::new(),
+        canvas: None,
     };
 
     let result = export_layered(&job, &AtomicBool::new(false), &|_| {});
 
     assert!(matches!(result, Err(MediaError::SameInputAndOutput)));
+}
+
+#[test]
+fn a_size_the_project_chose_is_what_comes_out_with_bars_around_the_picture() {
+    let mut job = layered_request(
+        "layer-chosen-size",
+        vec![stretch(
+            0.0,
+            1.0,
+            vec![whole(&red_clip(), 1, 0.0, 1.0, Placement::default())],
+        )],
+        Vec::new(),
+    );
+    job.canvas = Some((180, 320));
+
+    let report = run_layered(&job);
+
+    assert_eq!((report.width, report.height), (180, 320));
+    let mut reader = PictureReader::open(&job.output).expect("the export opens");
+    let picture = reader
+        .next_picture()
+        .expect("it decodes")
+        .expect("a picture");
+    let view = picture.view();
+    assert_eq!((view.width, view.height), (180, 320));
+    assert!(
+        is_red(colour_at(&view, 90, 160)),
+        "the picture is in the middle"
+    );
+    assert!(
+        brightness_at(&view, 90, 10) < 30,
+        "with a black bar above it"
+    );
+    assert!(brightness_at(&view, 90, 310) < 30, "and below it");
+}
+
+#[test]
+fn a_larger_video_is_scaled_down_to_a_smaller_project() {
+    let mut job = layered_request(
+        "layer-scaled-down",
+        vec![stretch(
+            0.0,
+            1.0,
+            vec![whole(&red_clip(), 1, 0.0, 1.0, Placement::default())],
+        )],
+        Vec::new(),
+    );
+    job.canvas = Some((160, 90));
+
+    let report = run_layered(&job);
+
+    assert_eq!((report.width, report.height), (160, 90));
+    assert!(report.composited_frames > 0, "fitting it takes the GPU");
 }
