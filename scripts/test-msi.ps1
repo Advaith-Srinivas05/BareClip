@@ -75,9 +75,14 @@ try {
         }
         Assert-That (-not $App.HasExited) 'the installed app starts'
         Assert-That ($Window -ne [IntPtr]::Zero) "the installed app shows its window after $($Clock.ElapsedMilliseconds) ms"
-        Start-Sleep -Seconds 1
-        $Window = [BareClipTest.Windows]::Find($App.Id, 'untitled - BareClip')
-        Assert-That ($Window -ne [IntPtr]::Zero) 'its title names the new project untitled'
+        # The title changes once the first frame has been drawn.
+        $Clock.Restart()
+        do {
+            $Named = [BareClipTest.Windows]::Find($App.Id, 'untitled - BareClip')
+            if ($Named -eq [IntPtr]::Zero) { Start-Sleep -Milliseconds 50 }
+        } while ($Named -eq [IntPtr]::Zero -and $Clock.Elapsed.TotalSeconds -lt 15)
+        Assert-That ($Named -ne [IntPtr]::Zero) "its title names the new project untitled after $($Clock.ElapsedMilliseconds) ms"
+        $Window = $Named
         [void][BareClipTest.Windows]::PostMessage($Window, $WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
         Assert-That ($App.WaitForExit(6000)) 'the installed app closes cleanly'
     }

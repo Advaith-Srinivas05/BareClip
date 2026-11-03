@@ -1,5 +1,6 @@
 # Checks installing for everyone on this PC: the shared folders and registry, upgrading in place
-# and uninstalling. Run scripts/build-msi.ps1 first, in a terminal opened as administrator.
+# and uninstalling. Run scripts/build-msi.ps1 first, on an administrator account. Each step shows
+# the installer's progress bar and asks for permission, unless Windows is set not to.
 $ErrorActionPreference = 'Stop'
 
 $Root = Split-Path -Parent $PSScriptRoot
@@ -10,10 +11,9 @@ $InstallDir = Join-Path $env:ProgramW6432 'BareClip'
 $StartMenu = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\BareClip.lnk'
 $Desktop = Join-Path $env:PUBLIC 'Desktop\BareClip.lnk'
 
-$IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $IsAdmin) { throw 'Run this in a terminal opened as administrator.' }
 if (Test-Path $InstallDir) { throw "$InstallDir already exists, so this test will not touch it." }
 if (Test-Path 'HKCU:\Software\BareClip') { throw 'BareClip is installed for this user, so this test will not touch it.' }
+if (Test-Path 'HKLM:\Software\BareClip') { throw 'BareClip is installed for everyone, so this test will not touch it.' }
 
 function Assert-That([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw "FAILED: $Message" }
@@ -40,7 +40,7 @@ foreach ($Version in '0.1.0', '0.1.1') {
 $Old = Join-Path $Work 'BareClip-0.1.0.msi'
 $New = Join-Path $Work 'BareClip-0.1.1.msi'
 
-$ExitCode = Invoke-Msi @('/i', "`"$Old`"", '/qn', '/l*v', "`"$Log`"", 'MSIINSTALLPERUSER=""')
+$ExitCode = Invoke-Msi @('/i', "`"$Old`"", '/qb', '/l*v', "`"$Log`"", 'MSIINSTALLPERUSER=""')
 Assert-That ($ExitCode -eq 0) "the older version installed for everyone (exit $ExitCode)"
 try {
     Assert-That (Test-Path (Join-Path $InstallDir 'bareclip.exe')) 'the app is in Program Files'
@@ -49,8 +49,8 @@ try {
     Assert-That (Test-Path 'HKLM:\Software\BareClip') 'its choices are in the machine registry'
     Assert-That (-not (Test-Path 'HKCU:\Software\BareClip')) 'and not in this user''s'
 
-    # Nothing here says everyone, so the upgrade has to work that out for itself.
-    $ExitCode = Invoke-Msi @('/i', "`"$New`"", '/qn', '/l*v', "`"$Log`"")
+    # With no pages to work it out on, an unattended upgrade has to be told it's for everyone.
+    $ExitCode = Invoke-Msi @('/i', "`"$New`"", '/qb', '/l*v', "`"$Log`"", 'MSIINSTALLPERUSER=""')
     Assert-That ($ExitCode -eq 0) "the newer version installed over it (exit $ExitCode)"
     $Installed = @(Get-Installed)
     Assert-That ($Installed.Count -eq 1) 'there is still only one copy'
@@ -60,7 +60,7 @@ try {
 }
 finally {
     foreach ($Product in Get-Installed) {
-        $ExitCode = Invoke-Msi @('/x', $Product.Code, '/qn', '/l*v', "`"$Log`"")
+        $ExitCode = Invoke-Msi @('/x', $Product.Code, '/qb', '/l*v', "`"$Log`"")
     }
 }
 Assert-That ($ExitCode -eq 0) "it uninstalled (exit $ExitCode)"
