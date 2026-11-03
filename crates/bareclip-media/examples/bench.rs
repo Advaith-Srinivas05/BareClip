@@ -33,9 +33,10 @@ fn run_export(
     let extension = input
         .extension()
         .map_or_else(|| "mp4".into(), |e| e.to_string_lossy().into_owned());
-    let output = PathBuf::from(format!(
-        "{}-{label}.{extension}",
-        input.with_extension("").display()
+    // Never beside the video, so measuring someone's recordings leaves their folder as it was.
+    let output = std::env::temp_dir().join(format!(
+        "bareclip-bench-{}-{label}.{extension}",
+        std::process::id()
     ));
     let _ = std::fs::remove_file(&output);
     let request = ExportRequest {
@@ -62,6 +63,7 @@ fn run_export(
         size as f64 / 1_048_576.0,
         output.display(),
     );
+    let _ = std::fs::remove_file(&output);
 }
 
 /// What it costs to read the pictures and sound shape clips show on the timeline.
