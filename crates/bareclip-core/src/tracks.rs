@@ -21,6 +21,15 @@ pub enum TrackTarget {
     New(usize),
 }
 
+/// Which way a clip can move among those it overlaps, as seen on the picture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrderMove {
+    Forward,
+    Backward,
+    ToFront,
+    ToBack,
+}
+
 /// A stretch of the timeline over which the same clips show. Dead space has none of these.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stretch {
@@ -183,6 +192,79 @@ impl Tracks {
         self.tracks[from].remove(id);
         self.tracks[index].land(clip, wanted);
         self.refresh();
+    }
+
+    /// The tracks, by position, with a clip overlapping this one in time.
+    fn overlapping_tracks(&self, clip: Clip) -> Vec<usize> {
+        self.tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, track)| {
+                track.clips().iter().any(|other| {
+                    other.id != clip.id && other.start < clip.end() && clip.start < other.end()
+                })
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Whether a clip is in front of or behind anything it could move past. Moving only makes a
+    /// difference among clips that overlap in time.
+    pub fn can_move_in_order(&self, id: ClipId, order: OrderMove) -> bool {
+        let (Some(clip), Some(own)) = (self.clip(id), self.track_of(id)) else {
+            return false;
+        };
+        let overlapping = self.overlapping_tracks(clip);
+        match order {
+            OrderMove::Forward | OrderMove::ToFront => overlapping.iter().any(|index| *index < own),
+            OrderMove::Backward | OrderMove::ToBack => overlapping.iter().any(|index| *index > own),
+        }
+    }
+
+    /// Moves a clip past those it overlaps, onto a track where it fits without moving in time.
+    /// It uses a track that has room if it can, and makes a new one if not. Returns whether it
+    /// moved.
+    pub fn move_in_order(&mut self, id: ClipId, order: OrderMove) -> bool {
+        if !self.can_move_in_order(id, order) {
+            return false;
+        }
+        let (Some(clip), Some(own)) = (self.clip(id), self.track_of(id)) else {
+            return false;
+        };
+        let overlapping = self.overlapping_tracks(clip);
+        let above = overlapping.iter().copied().filter(|index| *index < own);
+        let below = overlapping.iter().copied().filter(|index| *index > own);
+        let is_free = |index: usize| !overlapping.contains(&index) && index != own;
+        let target = match order {
+            OrderMove::Forward | OrderMove::ToFront => {
+                let past = if order == OrderMove::Forward {
+                    above.max()
+                } else {
+                    above.min()
+                };
+                let past = past.unwrap_or(own);
+                if past > 0 && is_free(past - 1) {
+                    TrackTarget::Existing(past - 1)
+                } else {
+                    TrackTarget::New(past)
+                }
+            }
+            OrderMove::Backward | OrderMove::ToBack => {
+                let past = if order == OrderMove::Backward {
+                    below.min()
+                } else {
+                    below.max()
+                };
+                let past = past.unwrap_or(own);
+                if past + 1 < self.tracks.len() && is_free(past + 1) {
+                    TrackTarget::Existing(past + 1)
+                } else {
+                    TrackTarget::New(past + 1)
+                }
+            }
+        };
+        self.move_clip(id, clip.start, target);
+        true
     }
 
     /// Lays a clip's picture out differently. Returns whether that changed anything.
@@ -1088,6 +1170,132 @@ mod tests {
         assert_eq!(
             tracks.next_change(Ticks(30), Ticks(20), WIDE, &all_wide),
             None
+        );
+    }
+
+    /// Three clips stacked and overlapping, from the top down.
+    fn three_stacked() -> (Tracks, [ClipId; 3]) {
+        let mut tracks = Tracks::default();
+        let bottom = tracks.place(VIDEO, range(0, 100), Ticks(0), TrackTarget::New(0));
+        let middle = tracks.place(VIDEO, range(0, 100), Ticks(0), TrackTarget::New(0));
+        let top = tracks.place(VIDEO, range(0, 100), Ticks(0), TrackTarget::New(0));
+        (tracks, [top, middle, bottom])
+    }
+
+    /// Which clip each track holds, from the top down.
+    fn order_of(tracks: &Tracks) -> Vec<ClipId> {
+        tracks
+            .tracks()
+            .iter()
+            .map(|track| track.clips()[0].id)
+            .collect()
+    }
+
+    #[test]
+    fn moving_forward_goes_past_one_clip() {
+        let (mut tracks, [top, middle, bottom]) = three_stacked();
+
+        assert!(tracks.move_in_order(bottom, OrderMove::Forward));
+
+        assert_eq!(order_of(&tracks), [top, bottom, middle]);
+    }
+
+    #[test]
+    fn moving_backward_goes_past_one_clip() {
+        let (mut tracks, [top, middle, bottom]) = three_stacked();
+
+        assert!(tracks.move_in_order(top, OrderMove::Backward));
+
+        assert_eq!(order_of(&tracks), [middle, top, bottom]);
+    }
+
+    #[test]
+    fn moving_to_the_front_goes_past_everything() {
+        let (mut tracks, [top, middle, bottom]) = three_stacked();
+
+        assert!(tracks.move_in_order(bottom, OrderMove::ToFront));
+
+        assert_eq!(order_of(&tracks), [bottom, top, middle]);
+    }
+
+    #[test]
+    fn moving_to_the_back_goes_past_everything() {
+        let (mut tracks, [top, middle, bottom]) = three_stacked();
+
+        assert!(tracks.move_in_order(top, OrderMove::ToBack));
+
+        assert_eq!(order_of(&tracks), [middle, bottom, top]);
+    }
+
+    #[test]
+    fn the_clip_on_top_cant_go_further_forward() {
+        let (mut tracks, [top, ..]) = three_stacked();
+
+        assert!(!tracks.can_move_in_order(top, OrderMove::Forward));
+        assert!(!tracks.can_move_in_order(top, OrderMove::ToFront));
+        assert!(!tracks.move_in_order(top, OrderMove::Forward));
+    }
+
+    #[test]
+    fn the_clip_at_the_bottom_cant_go_further_back() {
+        let (tracks, [.., bottom]) = three_stacked();
+
+        assert!(!tracks.can_move_in_order(bottom, OrderMove::Backward));
+        assert!(!tracks.can_move_in_order(bottom, OrderMove::ToBack));
+    }
+
+    #[test]
+    fn a_clip_overlapping_nothing_has_no_order_to_change() {
+        let mut tracks = Tracks::default();
+        tracks.place(VIDEO, range(0, 100), Ticks(0), TrackTarget::New(0));
+        let apart = tracks.place(VIDEO, range(0, 100), Ticks(500), TrackTarget::New(0));
+
+        assert!(!tracks.can_move_in_order(apart, OrderMove::Backward));
+        assert!(!tracks.can_move_in_order(apart, OrderMove::ToBack));
+    }
+
+    #[test]
+    fn moving_in_order_never_moves_a_clip_in_time_or_changes_its_neighbours() {
+        let mut tracks = Tracks::default();
+        let long = tracks.place(VIDEO, range(0, 1000), Ticks(0), TrackTarget::New(0));
+        let short = tracks.place(OTHER, range(0, 100), Ticks(300), TrackTarget::New(0));
+        // Above the short one, and later than it, so the track above has room for it to move to.
+        let later = tracks.place(OTHER, range(0, 100), Ticks(900), TrackTarget::Existing(0));
+
+        assert!(tracks.move_in_order(long, OrderMove::ToFront));
+
+        assert_eq!(tracks.clip(long).map(|clip| clip.start), Some(Ticks(0)));
+        assert_eq!(tracks.clip(short).map(|clip| clip.start), Some(Ticks(300)));
+        assert_eq!(tracks.clip(later).map(|clip| clip.start), Some(Ticks(900)));
+        assert_eq!(tracks.track_of(long), Some(0));
+    }
+
+    #[test]
+    fn a_track_with_room_is_used_rather_than_a_new_one() {
+        let mut tracks = Tracks::default();
+        let bottom = tracks.place(VIDEO, range(0, 100), Ticks(0), TrackTarget::New(0));
+        let middle = tracks.place(VIDEO, range(0, 100), Ticks(0), TrackTarget::New(0));
+        // The top track has nothing at this time, so there is room there.
+        tracks.place(VIDEO, range(0, 100), Ticks(500), TrackTarget::New(0));
+        assert_eq!(tracks.tracks().len(), 3);
+
+        assert!(tracks.move_in_order(bottom, OrderMove::Forward));
+
+        assert_eq!(tracks.track_of(bottom), Some(0));
+        assert_eq!(tracks.track_of(middle), Some(1));
+        assert_eq!(tracks.tracks().len(), 2, "its old track was left empty");
+    }
+
+    #[test]
+    fn moving_in_order_changes_which_clip_is_seen_on_top() {
+        let (mut tracks, [top, _, bottom]) = three_stacked();
+        assert_eq!(tracks.topmost_at(Ticks(5)).map(|clip| clip.id), Some(top));
+
+        tracks.move_in_order(bottom, OrderMove::ToFront);
+
+        assert_eq!(
+            tracks.topmost_at(Ticks(5)).map(|clip| clip.id),
+            Some(bottom)
         );
     }
 
