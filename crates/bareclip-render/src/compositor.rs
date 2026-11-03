@@ -119,6 +119,8 @@ pub struct Compositor {
     brightness_pipeline: wgpu::RenderPipeline,
     colour_pipeline: wgpu::RenderPipeline,
     display_pipeline: wgpu::RenderPipeline,
+    /// What the canvas starts as, wherever no layer covers it.
+    background: wgpu::Color,
     output_bind_group: wgpu::BindGroup,
     /// The finished canvas as the window shows it. Unused by exports.
     display: OutputPlane,
@@ -428,6 +430,7 @@ impl Compositor {
             brightness_pipeline,
             colour_pipeline,
             display_pipeline,
+            background: BLACK,
             output_bind_group,
             display,
             brightness,
@@ -601,8 +604,19 @@ impl Compositor {
         }
     }
 
-    /// Draws the layers on a black canvas, without bringing the result back. This is all a
-    /// preview needs, which is why the speed test measures it on its own.
+    /// What shows wherever no layer covers the canvas.
+    pub fn set_background(&mut self, colour: [u8; 3]) {
+        let part = |value: u8| f64::from(value) / 255.0;
+        self.background = wgpu::Color {
+            r: part(colour[0]),
+            g: part(colour[1]),
+            b: part(colour[2]),
+            a: 1.0,
+        };
+    }
+
+    /// Draws the layers on the canvas, without bringing the result back. This is all a preview
+    /// needs, which is why the speed test measures it on its own.
     pub fn draw(&mut self, layers: &[Layer]) -> Result<(), RenderError> {
         for (index, layer) in layers.iter().enumerate() {
             self.upload(index, layer);
@@ -616,7 +630,7 @@ impl Compositor {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(BLACK),
+                        load: wgpu::LoadOp::Clear(self.background),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -909,6 +923,56 @@ mod tests {
             }
         }
         picture
+    }
+
+    #[test]
+    fn the_background_shows_only_where_no_layer_covers_the_canvas() {
+        let Some(mut compositor) = compositor(64, 36) else {
+            return;
+        };
+        compositor.set_background([255, 0, 0]);
+        let blue = Flat::new(16, 18, BLUE_HD);
+        let layer = Layer {
+            picture: blue.view(),
+            rect: Rect {
+                x: 32.0,
+                y: 0.0,
+                width: 32.0,
+                height: 36.0,
+            },
+            opacity: 1.0,
+            look: PictureLook::PLAIN,
+        };
+
+        let drawn = compositor.render(&[layer]).expect("it draws");
+
+        assert_near(at(&drawn, 8, 18), RED_HD);
+        assert_near(at(&drawn, 56, 18), BLUE_HD);
+    }
+
+    #[test]
+    fn with_nothing_to_draw_the_whole_canvas_is_the_background() {
+        let Some(mut compositor) = compositor(64, 36) else {
+            return;
+        };
+        compositor.set_background([0, 0, 255]);
+
+        let drawn = compositor.render(&[]).expect("it draws");
+
+        assert_near(at(&drawn, 32, 18), BLUE_HD);
+    }
+
+    #[test]
+    fn the_window_shows_the_background_as_the_colour_it_was_given() {
+        let Some(mut compositor) = compositor(64, 36) else {
+            return;
+        };
+        compositor.set_background([255, 148, 34]);
+
+        compositor.draw_for_display(&[]).expect("it draws");
+        let pixels = compositor.read_display().expect("it reads back");
+
+        assert_eq!(&pixels[..4], &[255, 148, 34, 255]);
     }
 
     #[test]

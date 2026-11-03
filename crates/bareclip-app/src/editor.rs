@@ -12,7 +12,10 @@ use std::{
 };
 
 use bareclip_core::{
-    canvas::{Canvas, ORIGINAL_NAME, RATIOS},
+    canvas::{
+        BACKGROUND_SWATCHES, BLACK, Canvas, Colour, ORIGINAL_NAME, RATIOS, colour_from_hex,
+        colour_to_hex,
+    },
     history::History,
     project::{self, ProjectFile, write_atomic},
     splice::{CutMode, FrameIndex},
@@ -36,7 +39,8 @@ use eframe::egui::{
 
 use crate::{
     components::{
-        self, ActionButton, CheckBox, IconButton, Kind, MenuItem, NAME_BAR_PADDING, NameBar,
+        self, ActionButton, CheckBox, ColourSwatch, IconButton, Kind, MenuItem, NAME_BAR_PADDING,
+        NameBar,
     },
     fonts, icons,
     layers::{LayerDisplay, LayerPictures, Moment},
@@ -332,6 +336,8 @@ pub struct Editor {
     stage_state: StageState,
     /// The project from before a change on the stage began, until it becomes one undo step.
     stage_before: Option<Snapshot>,
+    /// A colour code partway through being typed.
+    background_text: Option<String>,
     selected: Option<ClipId>,
     /// A moment in the dead space that was clicked on.
     selected_gap: Option<Ticks>,
@@ -462,6 +468,7 @@ impl Editor {
             layer_display: None,
             stage_state: StageState::default(),
             stage_before: None,
+            background_text: None,
             selected: None,
             selected_gap: None,
             timeline_state: TimelineState::default(),
@@ -1499,7 +1506,10 @@ impl Editor {
             if let Some(problem) = layer_pictures.update(&stack, moment, top, &lookup, &notify) {
                 *notice = Some(problem);
             }
-            if let Err(error) = display.draw(layer_pictures, &stack, now, canvas, &size_of) {
+            let background = project.canvas.background;
+            if let Err(error) =
+                display.draw(layer_pictures, &stack, now, canvas, background, &size_of)
+            {
                 *notice = Some(error.to_string());
             }
         } else if let Some(frame) = frame {
@@ -1660,9 +1670,11 @@ impl Editor {
     /// Whether this project needs several pictures drawn together, rather than one at a time.
     fn takes_layers(&self) -> bool {
         self.final_canvas().is_some_and(|canvas| {
-            self.project
-                .tracks
-                .needs_layers(canvas, &|id| self.video_size(id))
+            let size_of = |id: MediaId| self.video_size(id);
+            let tracks = &self.project.tracks;
+            tracks.needs_layers(canvas, &size_of)
+                || (self.project.canvas.background != BLACK
+                    && tracks.shows_canvas(canvas, &size_of))
         })
     }
 
@@ -1786,6 +1798,7 @@ impl Editor {
             stretches: self.layered_stretches(),
             sound: parts.clone(),
             canvas: self.final_canvas(),
+            background: self.project.canvas.background,
         });
         let request = ExportRequest {
             output: output.clone(),
@@ -2460,6 +2473,97 @@ impl Editor {
         });
     }
 
+    /// Changes the background. A run of changes while a pointer is held is one step to undo.
+    fn change_background(&mut self, colour: Colour) {
+        if self.project.canvas.background != colour {
+            if self.stage_before.is_none() {
+                self.stage_before = Some(self.project.clone());
+            }
+            self.project.canvas.background = colour;
+        }
+    }
+
+    /// The colour behind the picture: a set of swatches and any colour you like. It only shows
+    /// where no picture covers the canvas, so it is out in the row with the project's size.
+    fn background_picker(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        let current = self.project.canvas.background;
+        let [red, green, blue] = current;
+        let shown = Color32::from_rgb(red, green, blue);
+        let button = ui
+            .add(IconButton::new(
+                palette,
+                Kind::Ghost,
+                icons::PAINT_BUCKET,
+                "Background colour",
+            ))
+            .on_hover_text("The colour behind the picture");
+        // A dot on the button says what it is set to without opening it.
+        ui.painter().circle(
+            button.rect.right_bottom() - vec2(7.0, 7.0),
+            4.0,
+            shown,
+            Stroke::new(1.0, palette.border_strong),
+        );
+        let mut picked = None;
+        egui::Popup::menu(&button)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                for row in BACKGROUND_SWATCHES.chunks(8) {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        for (colour, name) in row {
+                            let [red, green, blue] = *colour;
+                            let swatch = ColourSwatch::new(
+                                palette,
+                                Color32::from_rgb(red, green, blue),
+                                name,
+                                *colour == current,
+                            );
+                            if ui.add(swatch).clicked() {
+                                picked = Some(*colour);
+                            }
+                        }
+                    });
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Custom").size(13.0).color(palette.text_muted));
+                    let mut text = self
+                        .background_text
+                        .clone()
+                        .unwrap_or_else(|| colour_to_hex(current));
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut text)
+                            .desired_width(80.0)
+                            .char_limit(7),
+                    );
+                    field.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::Role::TextInput, true, "Colour code")
+                    });
+                    if field.changed() {
+                        if let Some(colour) = colour_from_hex(&text) {
+                            picked = Some(colour);
+                        }
+                        self.background_text = Some(text);
+                    } else if !field.has_focus() {
+                        self.background_text = None;
+                    }
+                });
+                let mut chosen = shown;
+                egui::color_picker::color_picker_color32(
+                    ui,
+                    &mut chosen,
+                    egui::color_picker::Alpha::Opaque,
+                );
+                if chosen != shown {
+                    picked = Some([chosen.r(), chosen.g(), chosen.b()]);
+                }
+            });
+        if let Some(colour) = picked {
+            self.change_background(colour);
+        }
+    }
+
     /// The top of the card: undo and redo, anything that needs saying, and Export.
     fn card_top_row(&mut self, ui: &mut egui::Ui, palette: &Palette) {
         let frame = Frame::new()
@@ -2508,6 +2612,7 @@ impl Editor {
                     }
                     ui.add_space(8.0);
                     self.size_picker(ui, palette);
+                    self.background_picker(ui, palette);
                     if let Some(notice) = self.notice.clone() {
                         ui.add_space(8.0);
                         components::symbol(ui, &icons::CIRCLE_ALERT, 16.0, palette.danger);
@@ -3194,8 +3299,12 @@ impl Editor {
             let canvas = self.canvas_size();
             if self.preview.in_gap(self.project.tracks.played()) {
                 if let Some(size) = canvas {
-                    ui.painter()
-                        .rect_filled(fitted(size, rect), 0.0, Color32::BLACK);
+                    let [red, green, blue] = self.project.canvas.background;
+                    ui.painter().rect_filled(
+                        fitted(size, rect),
+                        0.0,
+                        Color32::from_rgb(red, green, blue),
+                    );
                 }
                 self.stage_controls(ui, rect, palette);
                 return;
@@ -5023,6 +5132,25 @@ mod tests {
             &mut layered,
             moved(pos2(1100.0, 80.0)),
             "68-turned-and-flipped",
+        );
+
+        // A coloured background, around a resized clip and with its menu open.
+        layered.project.canvas.background = [255, 148, 34];
+        layered.project.tracks.remove(top_and_below(&layered).1);
+        wait_for_layers(&ctx, &mut layered);
+        camera.shoot(
+            &ctx,
+            &mut layered,
+            moved(pos2(1100.0, 80.0)),
+            "69-background",
+        );
+        click_named(&ctx, &mut layered, "Background colour");
+        wait_for_layers(&ctx, &mut layered);
+        camera.shoot(
+            &ctx,
+            &mut layered,
+            moved(pos2(1100.0, 80.0)),
+            "70-background-menu",
         );
 
         // The project's shape, on a tall canvas and with its menu open.
@@ -10413,5 +10541,156 @@ mod tests {
 
         assert!(placement_of(&editor, clip).is_default());
         assert_eq!(editor.export_route(), Route::Fast);
+    }
+
+    fn pick_background(ctx: &egui::Context, editor: &mut Editor, name: &str) {
+        click_named(ctx, editor, "Background colour");
+        for _ in 0..3 {
+            run_frame(ctx, editor, vec![]);
+        }
+        click_named(ctx, editor, name);
+        run_frame(ctx, editor, vec![]);
+    }
+
+    #[test]
+    fn a_new_project_has_a_black_background() {
+        let ctx = context();
+        let editor = Editor::new(&ctx, false);
+
+        assert_eq!(editor.project.canvas.background, BLACK);
+    }
+
+    #[test]
+    fn picking_a_swatch_sets_the_background_as_one_undo_step() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        pick_background(&ctx, &mut editor, "Orange");
+
+        assert_eq!(editor.project.canvas.background, [255, 148, 34]);
+        editor.undo();
+        assert_eq!(editor.project.canvas.background, BLACK);
+    }
+
+    #[test]
+    fn a_background_nothing_can_show_keeps_the_fast_route() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        pick_background(&ctx, &mut editor, "Orange");
+
+        assert_eq!(editor.export_route(), Route::Fast);
+    }
+
+    #[test]
+    fn a_background_showing_in_dead_space_takes_the_full_route() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip()]);
+        let id = editor.media[0].id;
+        editor.project.tracks.place(
+            id,
+            TimeRange {
+                start: Ticks(0),
+                end: Ticks::from_seconds(1.0),
+            },
+            Ticks::from_seconds(1.0),
+            TrackTarget::New(0),
+        );
+        run_frame(&ctx, &mut editor, vec![]);
+
+        pick_background(&ctx, &mut editor, "Red");
+
+        assert_eq!(
+            editor.export_route(),
+            Route::Full(LAYERED_REASON.to_owned())
+        );
+    }
+
+    #[test]
+    fn a_background_showing_around_a_resized_clip_exports_through_the_real_editor() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let clip = editor.project.tracks.played().clips()[0].id;
+        editor
+            .project
+            .tracks
+            .set_placement(clip, small_in_a_corner());
+        run_frame(&ctx, &mut editor, vec![]);
+        pick_background(&ctx, &mut editor, "Blue");
+        let output =
+            std::env::temp_dir().join(format!("bareclip-ui-background-{}.mp4", std::process::id()));
+        let _ = std::fs::remove_file(&output);
+
+        editor.start_export_to(&ctx, output.clone());
+        wait_for_export(&ctx, &mut editor);
+
+        let ExportState::Done { .. } = &editor.export_state else {
+            panic!("the export did not finish: {:?}", failure_of(&editor));
+        };
+        let mut reader = bareclip_media::PictureReader::open(&output).expect("it opens");
+        let picture = reader
+            .next_picture()
+            .expect("it decodes")
+            .expect("a picture");
+        let view = picture.view();
+        let far = (view.height as usize / 2 - 4) * view.uv_stride + view.width as usize / 2 - 4;
+        assert!(view.u[far] > 180, "the background shows: {}", view.u[far]);
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn a_background_comes_back_when_a_project_is_opened_again() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        pick_background(&ctx, &mut editor, "Navy");
+        let folder = project_folder("background");
+        let path = folder.join("background.bareclip");
+        assert!(editor.save_to(&path));
+
+        let mut reopened = Editor::new(&ctx, false);
+        reopened.open_project(&ctx, &path);
+        settle(&ctx, &mut reopened);
+        run_frame(&ctx, &mut reopened, vec![]);
+
+        assert_eq!(reopened.project.canvas.background, [0, 26, 122]);
+        assert!(!reopened.has_unsaved_changes());
+    }
+
+    #[test]
+    fn a_colour_code_sets_the_background_once_it_is_whole() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Background colour");
+        for _ in 0..3 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        let field = named_rect(&ctx, &mut editor, "Colour code");
+        click(&ctx, &mut editor, field.center());
+        run_frame(
+            &ctx,
+            &mut editor,
+            vec![egui::Event::Key {
+                key: Key::A,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::COMMAND,
+            }],
+        );
+
+        run_frame(&ctx, &mut editor, vec![egui::Event::Text("#12".to_owned())]);
+        assert_eq!(editor.project.canvas.background, BLACK, "not whole yet");
+
+        run_frame(
+            &ctx,
+            &mut editor,
+            vec![egui::Event::Text("3456".to_owned())],
+        );
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.project.canvas.background, [0x12, 0x34, 0x56]);
     }
 }

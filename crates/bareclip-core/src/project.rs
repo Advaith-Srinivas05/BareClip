@@ -283,6 +283,7 @@ mod tests {
         project.canvas = Canvas {
             original: Some((1920, 992)),
             ratio: Some((9, 16)),
+            background: [10, 20, 30],
         };
 
         let back = ProjectFile::from_text(&project.to_text()).expect("it can be read");

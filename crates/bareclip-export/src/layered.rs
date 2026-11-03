@@ -9,6 +9,7 @@ use std::{
 };
 
 use bareclip_core::{
+    canvas::{BLACK, Colour},
     picture::BlackPicture,
     placement::{Placement, WHOLE},
     time::Ticks,
@@ -59,6 +60,8 @@ pub struct LayeredRequest {
     pub sound: Vec<ExportPart>,
     /// The finished video's size, or the largest video's if the project hasn't chosen one.
     pub canvas: Option<(u32, u32)>,
+    /// What shows wherever no picture covers the canvas.
+    pub background: Colour,
 }
 
 /// Which stretch a moment falls in. Rounding can put the very last frame just past the end, and
@@ -72,6 +75,24 @@ fn stretch_at(stretches: &[LayeredStretch], time: Ticks) -> Option<usize> {
 
 fn render_error(error: impl std::fmt::Display) -> MediaError {
     MediaError::Render(error.to_string())
+}
+
+/// The GPU, opened the first time a frame needs it.
+fn opened<'a>(
+    compositor: &'a mut Option<Compositor>,
+    size: (u32, u32),
+    background: Colour,
+    report: &mut FullReport,
+) -> Result<&'a mut Compositor, MediaError> {
+    if compositor.is_none() {
+        let mut new = Compositor::new(size.0, size.1).map_err(render_error)?;
+        new.set_background(background);
+        report.gpu = Some(new.gpu_name().to_owned());
+        *compositor = Some(new);
+    }
+    compositor
+        .as_mut()
+        .ok_or_else(|| render_error("The GPU was not opened."))
 }
 
 /// Reads each different video that shows, in the order they first do.
@@ -134,7 +155,7 @@ pub fn export_layered(
     let mut sound: Option<ClipSound> = None;
     let mut current_sound = None;
     let mut current_stretch = None;
-    // Whether the last frame written was black, or else came from the current stretch.
+    // Whether the last frame written was dead space, or else came from the current stretch.
     let mut wrote_black = false;
     let mut wrote_anything = false;
     let mut report = FullReport {
@@ -231,21 +252,14 @@ pub fn export_layered(
                             })
                         })
                         .collect();
-                    if layers.is_empty() {
+                    if layers.is_empty() && request.background == BLACK {
                         writer.write_picture(&black.view())?;
                         report.black_frames += 1;
-                    } else if needs_compositor(&layers, canvas) {
-                        if compositor.is_none() {
-                            let opened = Compositor::new(settings.width, settings.height)
+                    } else if layers.is_empty() || needs_compositor(&layers, canvas) {
+                        let drawn =
+                            opened(&mut compositor, canvas, request.background, &mut report)?
+                                .render(&layers)
                                 .map_err(render_error)?;
-                            report.gpu = Some(opened.gpu_name().to_owned());
-                            compositor = Some(opened);
-                        }
-                        let drawn = compositor
-                            .as_mut()
-                            .ok_or_else(|| render_error("The GPU was not opened."))?
-                            .render(&layers)
-                            .map_err(render_error)?;
                         writer.write_picture(&drawn)?;
                         report.composited_frames += 1;
                     } else {
@@ -258,8 +272,13 @@ pub fn export_layered(
             None => {
                 if wrote_black {
                     writer.repeat_picture()?;
-                } else {
+                } else if request.background == BLACK {
                     writer.write_picture(&black.view())?;
+                } else {
+                    let drawn = opened(&mut compositor, canvas, request.background, &mut report)?
+                        .render(&[])
+                        .map_err(render_error)?;
+                    writer.write_picture(&drawn)?;
                 }
                 report.black_frames += 1;
                 wrote_black = true;
@@ -341,6 +360,7 @@ mod tests {
             stretches: Vec::new(),
             sound: Vec::new(),
             canvas: None,
+            background: BLACK,
         };
 
         assert!(matches!(
