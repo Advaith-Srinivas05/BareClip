@@ -1069,7 +1069,7 @@ fn write_audio_packet(
     Ok(())
 }
 
-fn temporary_path(output: &Path) -> PathBuf {
+pub(crate) fn temporary_path(output: &Path) -> PathBuf {
     let extension = output.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
     let stem = output
         .file_stem()
@@ -1270,7 +1270,7 @@ pub fn can_write_gaps(codec: &str) -> bool {
         .is_some_and(|found| !encoder_candidates(found.id()).is_empty())
 }
 
-fn same_file(a: &Path, b: &Path) -> bool {
+pub fn same_file(a: &Path, b: &Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,

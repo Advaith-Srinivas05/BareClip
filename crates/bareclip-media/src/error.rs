@@ -12,6 +12,7 @@ pub enum MediaError {
     SameInputAndOutput,
     CannotJoin(String),
     GapNeedsEncoder,
+    Render(String),
     Cancelled,
 }
 
@@ -30,6 +31,7 @@ impl fmt::Display for MediaError {
             Self::GapNeedsEncoder => f.write_str(
                 "Dead space can't be written for this video's format. Remove the gaps to export it.",
             ),
+            Self::Render(reason) => f.write_str(reason),
             Self::Cancelled => f.write_str("Export cancelled."),
         }
     }
