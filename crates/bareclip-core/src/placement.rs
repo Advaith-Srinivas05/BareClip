@@ -25,12 +25,16 @@ pub struct Rect {
     pub height: f32,
 }
 
+/// A picture an odd size short of an even canvas leaves less than this uncovered, and nobody
+/// could see what shows through.
+const COVERS_WITHIN: f32 = 1.5;
+
 impl Rect {
     fn covers(&self, canvas: (u32, u32)) -> bool {
-        self.x <= 0.0
-            && self.y <= 0.0
-            && self.x + self.width >= canvas.0 as f32
-            && self.y + self.height >= canvas.1 as f32
+        self.x <= COVERS_WITHIN
+            && self.y <= COVERS_WITHIN
+            && self.x + self.width >= canvas.0 as f32 - COVERS_WITHIN
+            && self.y + self.height >= canvas.1 as f32 - COVERS_WITHIN
     }
 }
 
@@ -195,7 +199,7 @@ mod tests {
         assert!(!faded.hides_below(CANVAS, CANVAS));
 
         let smaller = Placement {
-            scale: WHOLE - 1,
+            scale: WHOLE - WHOLE / 100,
             ..normal
         };
         assert!(!smaller.hides_below(CANVAS, CANVAS));
@@ -205,6 +209,11 @@ mod tests {
             ..normal
         };
         assert!(!moved.hides_below(CANVAS, CANVAS));
+    }
+
+    #[test]
+    fn a_picture_an_odd_size_short_of_an_even_canvas_still_hides_what_is_below() {
+        assert!(Placement::default().hides_below((853, 481), (854, 482)));
     }
 
     #[test]

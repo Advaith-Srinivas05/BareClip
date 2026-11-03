@@ -102,13 +102,18 @@ pub struct FullPlan {
 }
 
 impl FullPlan {
+    /// A plan at the largest video's size.
     pub fn for_videos(videos: &[MediaInfo]) -> Self {
         let sizes: Vec<(u32, u32)> = videos
             .iter()
             .map(|info| (info.video.width, info.video.height))
             .collect();
+        Self::on_canvas(videos, final_size(&sizes).unwrap_or((2, 2)))
+    }
+
+    /// A plan at a size the project has chosen.
+    pub fn on_canvas(videos: &[MediaInfo], (width, height): (u32, u32)) -> Self {
         let rates: Vec<f64> = videos.iter().map(|info| info.video.frame_rate).collect();
-        let (width, height) = final_size(&sizes).unwrap_or((2, 2));
 
         let track_count = videos
             .iter()
@@ -154,6 +159,22 @@ impl FullPlan {
         let (num, den) = self.settings.frame_rate;
         f64::from(num) / f64::from(den)
     }
+}
+
+/// Why a video that could otherwise be copied can't be, because the project is another size.
+pub fn size_problem(canvas: (u32, u32), video: &MediaInfo) -> Option<String> {
+    let size = (video.video.width, video.video.height);
+    if final_size(&[size]) == Some(canvas) {
+        return None;
+    }
+    let name = video.path.file_name().map_or_else(
+        || "A video".to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    Some(format!(
+        "{name} is {} x {} and the project is {} x {}, so it is fitted to the project.",
+        size.0, size.1, canvas.0, canvas.1
+    ))
 }
 
 #[cfg(test)]
