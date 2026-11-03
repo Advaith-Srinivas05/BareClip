@@ -20,6 +20,29 @@ function Assert-That([bool]$Condition, [string]$Message) {
     Write-Host "ok: $Message"
 }
 
+# Windows can report a hidden helper window as the app's main one, so this looks through them
+# all for the window with the app's title. The title is BareClip until a project name is added.
+Add-Type -Namespace BareClipTest -Name Windows -MemberDefinition @'
+public delegate bool Visit(IntPtr window, IntPtr unused);
+[DllImport("user32.dll")] public static extern bool EnumWindows(Visit visit, IntPtr unused);
+[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr window, System.Text.StringBuilder text, int size);
+[DllImport("user32.dll")] public static extern bool PostMessage(IntPtr window, uint message, IntPtr w, IntPtr l);
+public static IntPtr Find(uint process, string title) {
+    IntPtr found = IntPtr.Zero;
+    EnumWindows((window, unused) => {
+        uint owner;
+        GetWindowThreadProcessId(window, out owner);
+        var text = new System.Text.StringBuilder(256);
+        GetWindowText(window, text, 256);
+        if (owner == process && text.ToString() == title) { found = window; }
+        return true;
+    }, IntPtr.Zero);
+    return found;
+}
+'@
+$WM_CLOSE = 0x10
+
 function Invoke-Msi([string[]]$Arguments) {
     $Process = Start-Process msiexec.exe -ArgumentList $Arguments -Wait -PassThru
     return $Process.ExitCode
@@ -44,19 +67,24 @@ try {
     try {
         $App = Start-Process (Join-Path $InstallDir 'bareclip.exe') -PassThru
         $Clock = [Diagnostics.Stopwatch]::StartNew()
-        while ($Clock.ElapsedMilliseconds -lt 20000 -and -not $App.HasExited) {
-            $App.Refresh()
-            if ($App.MainWindowHandle -ne 0 -and $App.MainWindowTitle -eq 'BareClip') { break }
+        $Window = [IntPtr]::Zero
+        while ($Clock.ElapsedMilliseconds -lt 20000 -and -not $App.HasExited -and $Window -eq [IntPtr]::Zero) {
+            $Window = [BareClipTest.Windows]::Find($App.Id, 'BareClip')
+            if ($Window -eq [IntPtr]::Zero) { $Window = [BareClipTest.Windows]::Find($App.Id, 'untitled - BareClip') }
             Start-Sleep -Milliseconds 20
         }
         Assert-That (-not $App.HasExited) 'the installed app starts'
-        Assert-That ($App.MainWindowTitle -eq 'BareClip') "the installed app shows its window after $($Clock.ElapsedMilliseconds) ms"
+        Assert-That ($Window -ne [IntPtr]::Zero) "the installed app shows its window after $($Clock.ElapsedMilliseconds) ms"
         Start-Sleep -Seconds 1
-        [void]$App.CloseMainWindow()
+        $Window = [BareClipTest.Windows]::Find($App.Id, 'untitled - BareClip')
+        Assert-That ($Window -ne [IntPtr]::Zero) 'its title names the new project untitled'
+        [void][BareClipTest.Windows]::PostMessage($Window, $WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
         Assert-That ($App.WaitForExit(6000)) 'the installed app closes cleanly'
     }
     finally {
         $env:PATH = $SavedPath
+        # A failed check must not leave the app running while it is uninstalled.
+        if ($App -and -not $App.HasExited) { Stop-Process -Id $App.Id -Force }
     }
 }
 finally {
