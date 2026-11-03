@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::time::Ticks;
+use crate::{placement::Placement, time::Ticks};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimeRange {
@@ -37,6 +37,8 @@ pub struct Clip {
     /// When this clip starts on the timeline.
     pub start: Ticks,
     pub source: TimeRange,
+    /// How its picture is laid out. It belongs to the whole clip.
+    pub placement: Placement,
 }
 
 impl Clip {
@@ -140,14 +142,16 @@ impl Timeline {
 
     /// Puts saved clips back, each with a new id. Going through the usual rules means a
     /// file edited by hand can't produce an arrangement the editor couldn't.
-    pub(crate) fn restore(saved: impl IntoIterator<Item = (MediaId, Ticks, TimeRange)>) -> Self {
-        let mut clips: Vec<(MediaId, Ticks, TimeRange)> = saved
+    pub(crate) fn restore(
+        saved: impl IntoIterator<Item = (MediaId, Ticks, TimeRange, Placement)>,
+    ) -> Self {
+        let mut clips: Vec<(MediaId, Ticks, TimeRange, Placement)> = saved
             .into_iter()
-            .filter(|(_, _, source)| source.start < source.end)
+            .filter(|(_, _, source, _)| source.start < source.end)
             .collect();
-        clips.sort_by_key(|(_, start, _)| *start);
+        clips.sort_by_key(|(_, start, _, _)| *start);
         let mut timeline = Self::default();
-        for (media, start, source) in clips {
+        for (media, start, source, placement) in clips {
             let id = next_clip_id();
             let wanted = start.max(Ticks(0));
             // Past whatever is already there, since these arrive in order.
@@ -157,6 +161,7 @@ impl Timeline {
                 media,
                 start,
                 source,
+                placement: placement.clamped(),
             });
         }
         timeline
@@ -260,6 +265,7 @@ impl Timeline {
             media,
             start: self.duration(),
             source,
+            placement: Placement::default(),
         });
         id
     }
@@ -273,6 +279,7 @@ impl Timeline {
             media,
             start,
             source,
+            placement: Placement::default(),
         });
         id
     }
@@ -320,9 +327,21 @@ impl Timeline {
                     start: source_time,
                     end: clip.source.end,
                 },
+                placement: clip.placement,
             },
         );
         Some(second)
+    }
+
+    /// Lays a clip's picture out differently. Returns whether that changed anything.
+    pub(crate) fn set_placement(&mut self, id: ClipId, placement: Placement) -> bool {
+        let Some(index) = self.index_of(id) else {
+            return false;
+        };
+        let placement = placement.clamped();
+        let changed = self.clips[index].placement != placement;
+        self.clips[index].placement = placement;
+        changed
     }
 
     /// Removes a clip and leaves dead space where it was.

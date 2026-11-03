@@ -12,6 +12,8 @@ use crate::{color, scene::Layer};
 
 /// Wide enough that adding and removing see-through layers doesn't build up rounding errors.
 const CANVAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// What the window's renderer takes for a picture it didn't make itself.
+const DISPLAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const LAYER_UNIFORM_SIZE: u64 = 80;
 const BLACK: wgpu::Color = wgpu::Color {
     r: 0.0,
@@ -82,7 +84,9 @@ impl OutputPlane {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let row_bytes = (size.0 * pixel_bytes).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
@@ -114,7 +118,10 @@ pub struct Compositor {
     canvas_view: wgpu::TextureView,
     brightness_pipeline: wgpu::RenderPipeline,
     colour_pipeline: wgpu::RenderPipeline,
+    display_pipeline: wgpu::RenderPipeline,
     output_bind_group: wgpu::BindGroup,
+    /// The finished canvas as the window shows it. Unused by exports.
+    display: OutputPlane,
     brightness: OutputPlane,
     colour: OutputPlane,
     finished_y: Vec<u8>,
@@ -258,12 +265,33 @@ fn copy_rows(mapped: &[u8], row_bytes: usize, used_bytes: usize, into: &mut Vec<
 impl Compositor {
     /// Opens the GPU, ready to draw pictures of one size.
     pub fn new(width: u32, height: u32) -> Result<Self, RenderError> {
+        Self::on_gpu(gpu()?, width, height)
+    }
+
+    /// Draws on a GPU that is already open, such as the window's. That way what is drawn can be
+    /// shown without ever coming back through memory. Whoever opened it hears about its problems.
+    pub fn on_device(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, RenderError> {
+        let gpu = Gpu {
+            device,
+            queue,
+            name: "the window's GPU".to_owned(),
+            problem: Arc::new(Mutex::new(None)),
+        };
+        Self::on_gpu(gpu, width, height)
+    }
+
+    fn on_gpu(gpu: Gpu, width: u32, height: u32) -> Result<Self, RenderError> {
         let Gpu {
             device,
             queue,
             name: gpu_name,
             problem,
-        } = gpu()?;
+        } = gpu;
         let limit = device.limits().max_texture_dimension_2d;
         if width > limit || height > limit {
             return Err(RenderError::TooLarge {
@@ -333,6 +361,15 @@ impl Compositor {
             None,
         );
 
+        let display_pipeline = strip_pipeline(
+            &device,
+            &output_layout,
+            &output_shader,
+            "display_main",
+            DISPLAY_FORMAT,
+            None,
+        );
+
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("smooth"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -368,6 +405,7 @@ impl Compositor {
                 },
             ],
         });
+        let display = OutputPlane::new(&device, DISPLAY_FORMAT, (width, height), 4);
         let brightness =
             OutputPlane::new(&device, wgpu::TextureFormat::R8Unorm, (width, height), 1);
         let colour = OutputPlane::new(
@@ -389,7 +427,9 @@ impl Compositor {
             canvas_view,
             brightness_pipeline,
             colour_pipeline,
+            display_pipeline,
             output_bind_group,
+            display,
             brightness,
             colour,
             finished_y: Vec::new(),
@@ -566,6 +606,89 @@ impl Compositor {
         self.check_for_problem()
     }
 
+    /// Draws the layers and makes them ready to show in the window, through `display_view`.
+    pub fn draw_for_display(&mut self, layers: &[Layer]) -> Result<(), RenderError> {
+        self.draw(layers)?;
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("display"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.display.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.display_pipeline);
+            pass.set_bind_group(0, &self.output_bind_group, &[]);
+            pass.draw(0..4, 0..1);
+        }
+        self.queue.submit([encoder.finish()]);
+        self.check_for_problem()
+    }
+
+    /// What `draw_for_display` drew, for the window's renderer to show.
+    pub fn display_view(&self) -> &wgpu::TextureView {
+        &self.display.view
+    }
+
+    /// The size of the canvas.
+    pub fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
+    /// Brings back what `draw_for_display` drew as RGBA, so tests can see what the window shows.
+    pub fn read_display(&mut self) -> Result<Vec<u8>, RenderError> {
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            self.display.texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &self.display.readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.display.row_bytes),
+                    rows_per_image: None,
+                },
+            },
+            self.display.texture.size(),
+        );
+        self.queue.submit([encoder.finish()]);
+        let mapped = Arc::new(Mutex::new(None));
+        let noted = mapped.clone();
+        self.display
+            .readback
+            .map_async(wgpu::MapMode::Read, .., move |result| {
+                if let (Err(error), Ok(mut found)) = (result, noted.lock()) {
+                    *found = Some(error.to_string());
+                }
+            });
+        self.wait()?;
+        if let Some(problem) = mapped.lock().ok().and_then(|mut found| found.take()) {
+            return Err(RenderError::Gpu(problem));
+        }
+        let mut pixels = Vec::new();
+        {
+            let data = self
+                .display
+                .readback
+                .get_mapped_range(..)
+                .map_err(|error| RenderError::Gpu(error.to_string()))?;
+            copy_rows(
+                &data,
+                self.display.row_bytes as usize,
+                self.size.0 as usize * 4,
+                &mut pixels,
+            );
+        }
+        self.display.readback.unmap();
+        Ok(pixels)
+    }
+
     /// Waits until everything asked of the GPU so far is done.
     pub fn wait(&self) -> Result<(), RenderError> {
         self.device
@@ -740,6 +863,45 @@ mod tests {
                 opacity: 1.0,
             }
         }
+    }
+
+    #[test]
+    fn the_window_gets_the_same_layers_as_ordinary_colours() {
+        let Some(mut compositor) = compositor(64, 36) else {
+            return;
+        };
+        let red = Flat::new(64, 36, RED_HD);
+        let blue = Flat::new(16, 18, BLUE_HD);
+        let layers = [
+            red.filling((64, 36)),
+            Layer {
+                picture: blue.view(),
+                rect: Rect {
+                    x: 32.0,
+                    y: 0.0,
+                    width: 32.0,
+                    height: 36.0,
+                },
+                opacity: 1.0,
+            },
+        ];
+
+        compositor.draw_for_display(&layers).expect("it draws");
+        let pixels = compositor.read_display().expect("it reads back");
+
+        let at = |x: usize, y: usize| {
+            let start = (y * 64 + x) * 4;
+            (
+                pixels[start],
+                pixels[start + 1],
+                pixels[start + 2],
+                pixels[start + 3],
+            )
+        };
+        let (r, g, b, a) = at(8, 18);
+        assert!(r > 240 && g < 16 && b < 16 && a == 255, "{:?}", at(8, 18));
+        let (r, g, b, _) = at(56, 18);
+        assert!(r < 16 && g < 16 && b > 240, "{:?}", at(56, 18));
     }
 
     const RED_HD: (u8, u8, u8) = (63, 102, 240);

@@ -73,7 +73,7 @@ impl DecodedPicture {
 
 /// Which colour standard a video uses. Unlabelled video follows the usual convention for its
 /// resolution, which is what the preview does too.
-fn matrix_of(decoded: &frame::Video) -> ColorMatrix {
+pub(crate) fn matrix_of(decoded: &frame::Video) -> ColorMatrix {
     match decoded.color_space() {
         color::Space::BT470BG | color::Space::SMPTE170M => ColorMatrix::Bt601,
         color::Space::BT2020NCL | color::Space::BT2020CL => ColorMatrix::Bt2020,
@@ -83,11 +83,11 @@ fn matrix_of(decoded: &frame::Video) -> ColorMatrix {
     }
 }
 
-fn is_full_range(decoded: &frame::Video) -> bool {
+pub(crate) fn is_full_range(decoded: &frame::Video) -> bool {
     decoded.color_range() == color::Range::JPEG || decoded.format() == Pixel::YUVJ420P
 }
 
-fn coefficients_of(matrix: ColorMatrix) -> i32 {
+pub(crate) fn coefficients_of(matrix: ColorMatrix) -> i32 {
     match matrix {
         ColorMatrix::Bt601 => ffi::SWS_CS_ITU601,
         ColorMatrix::Bt709 => ffi::SWS_CS_ITU709,

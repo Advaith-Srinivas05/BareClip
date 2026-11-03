@@ -2,6 +2,7 @@
 //! picture and sound win, so the whole stack plays as one sequence of clips.
 
 use crate::{
+    placement::{Placement, final_size},
     project::SavedClip,
     time::Ticks,
     timeline::{Clip, ClipEdge, ClipId, MediaId, TimeRange, Timeline},
@@ -20,6 +21,15 @@ pub enum TrackTarget {
     New(usize),
 }
 
+/// A stretch of the timeline over which the same clips show. Dead space has none of these.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stretch {
+    pub start: Ticks,
+    pub end: Ticks,
+    /// What to draw, lowest first. The last one's sound is the one that plays.
+    pub stack: Vec<Clip>,
+}
+
 /// The project's tracks, highest first. A track with no clips on it disappears.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Tracks {
@@ -30,12 +40,16 @@ pub struct Tracks {
 impl Tracks {
     /// Puts saved tracks back. Clips of a video `media` doesn't recognise are left out.
     pub fn restore(saved: &[Vec<SavedClip>], media: impl Fn(u64) -> Option<MediaId>) -> Self {
-        let tracks =
-            saved.iter().map(|track| {
-                Timeline::restore(track.iter().filter_map(|clip| {
-                    Some((media(clip.media)?, Ticks(clip.start), clip.source()))
-                }))
-            });
+        let tracks = saved.iter().map(|track| {
+            Timeline::restore(track.iter().filter_map(|clip| {
+                Some((
+                    media(clip.media)?,
+                    Ticks(clip.start),
+                    clip.source(),
+                    clip.placement,
+                ))
+            }))
+        });
         let mut restored = Self {
             tracks: tracks.collect(),
             played: Timeline::default(),
@@ -169,6 +183,127 @@ impl Tracks {
         self.tracks[from].remove(id);
         self.tracks[index].land(clip, wanted);
         self.refresh();
+    }
+
+    /// Lays a clip's picture out differently. Returns whether that changed anything.
+    pub fn set_placement(&mut self, id: ClipId, placement: Placement) -> bool {
+        let Some(track) = self.track_of(id) else {
+            return false;
+        };
+        let changed = self.tracks[track].set_placement(id, placement);
+        self.refresh();
+        changed
+    }
+
+    /// What can be seen at a moment, lowest first. Anything completely hidden by what is above
+    /// it is left out, so nothing has to be decoded for it. A clip whose video has no known size
+    /// can't be drawn, so it hides nothing.
+    pub fn stack_at(
+        &self,
+        time: Ticks,
+        canvas: (u32, u32),
+        size_of: &dyn Fn(MediaId) -> Option<(u32, u32)>,
+    ) -> Vec<Clip> {
+        let mut stack = Vec::new();
+        for track in &self.tracks {
+            let found = track
+                .clips()
+                .iter()
+                .find(|clip| time >= clip.start && time < clip.end());
+            let Some(clip) = found else {
+                continue;
+            };
+            stack.push(*clip);
+            let hides = size_of(clip.media).is_some_and(|size| {
+                clip.placement
+                    .at(Ticks(time.0 - clip.start.0))
+                    .hides_below(size, canvas)
+            });
+            if hides {
+                break;
+            }
+        }
+        stack.reverse();
+        stack
+    }
+
+    /// Every stretch of the timeline with something showing, in order.
+    pub fn stretches(
+        &self,
+        canvas: (u32, u32),
+        size_of: &dyn Fn(MediaId) -> Option<(u32, u32)>,
+    ) -> Vec<Stretch> {
+        let mut moments: Vec<Ticks> = self
+            .tracks
+            .iter()
+            .flat_map(|track| track.clips())
+            .flat_map(|clip| [clip.start, clip.end()])
+            .collect();
+        moments.sort();
+        moments.dedup();
+
+        let mut stretches: Vec<Stretch> = Vec::new();
+        for pair in moments.windows(2) {
+            let stack = self.stack_at(pair[0], canvas, size_of);
+            if stack.is_empty() {
+                continue;
+            }
+            match stretches.last_mut() {
+                Some(last) if last.end == pair[0] && last.stack == stack => last.end = pair[1],
+                _ => stretches.push(Stretch {
+                    start: pair[0],
+                    end: pair[1],
+                    stack,
+                }),
+            }
+        }
+        stretches
+    }
+
+    /// The size of the finished video, which is the largest video that shows. What shows depends
+    /// on the size, because a picture only hides what is below it if it covers the canvas, so
+    /// this starts from what is on top and grows until nothing new appears.
+    pub fn canvas(&self, size_of: &dyn Fn(MediaId) -> Option<(u32, u32)>) -> Option<(u32, u32)> {
+        let on_top: Vec<(u32, u32)> = self
+            .played
+            .clips()
+            .iter()
+            .filter_map(|clip| size_of(clip.media))
+            .collect();
+        let mut canvas = final_size(&on_top)?;
+        // It only ever grows, so it can't change more times than there are clips.
+        let clips: usize = self.tracks.iter().map(|track| track.clips().len()).sum();
+        for _ in 0..=clips {
+            let showing: Vec<(u32, u32)> = self
+                .stretches(canvas, size_of)
+                .iter()
+                .flat_map(|stretch| &stretch.stack)
+                .filter_map(|clip| size_of(clip.media))
+                .collect();
+            let grown = final_size(&showing)?;
+            let area = |size: (u32, u32)| u64::from(size.0) * u64::from(size.1);
+            if area(grown) <= area(canvas) {
+                break;
+            }
+            canvas = grown;
+        }
+        Some(canvas)
+    }
+
+    /// Whether drawing this project takes layers: anywhere two pictures show at once, or one
+    /// picture isn't simply in its normal place.
+    pub fn needs_layers(
+        &self,
+        canvas: (u32, u32),
+        size_of: &dyn Fn(MediaId) -> Option<(u32, u32)>,
+    ) -> bool {
+        self.stretches(canvas, size_of).iter().any(|stretch| {
+            stretch.stack.len() > 1
+                || stretch
+                    .stack
+                    .iter()
+                    .any(|clip| !clip.placement.is_default())
+        })
     }
 
     /// Puts a copy of a clip straight after it on its own track.
@@ -348,8 +483,34 @@ fn merged(covered: Vec<TimeRange>, track: &Timeline) -> Vec<TimeRange> {
 mod tests {
     use super::*;
 
+    use crate::placement::WHOLE;
+
     const VIDEO: MediaId = MediaId(1);
     const OTHER: MediaId = MediaId(2);
+    const WIDE: (u32, u32) = (1920, 1080);
+
+    fn all_wide(_: MediaId) -> Option<(u32, u32)> {
+        Some(WIDE)
+    }
+
+    fn smaller() -> Placement {
+        Placement {
+            scale: WHOLE / 2,
+            ..Placement::default()
+        }
+    }
+
+    /// One clip on a track above another, both from 0 to 100.
+    fn two_tracks() -> (Tracks, ClipId, ClipId) {
+        let mut tracks = Tracks::default();
+        let below = tracks.place(VIDEO, range(0, 100), Ticks(0), TrackTarget::New(0));
+        let above = tracks.place(OTHER, range(0, 100), Ticks(0), TrackTarget::New(0));
+        (tracks, above, below)
+    }
+
+    fn ids(stack: &[Clip]) -> Vec<ClipId> {
+        stack.iter().map(|clip| clip.id).collect()
+    }
 
     fn range(start: i64, end: i64) -> TimeRange {
         TimeRange {
@@ -740,5 +901,183 @@ mod tests {
 
         assert_eq!(tracks.clips_using(VIDEO), 0);
         assert_eq!(tracks.tracks().len(), 1);
+    }
+
+    #[test]
+    fn a_full_picture_on_top_hides_what_is_below_it() {
+        let (tracks, above, _) = two_tracks();
+
+        assert_eq!(ids(&tracks.stack_at(Ticks(5), WIDE, &all_wide)), [above]);
+    }
+
+    #[test]
+    fn a_smaller_picture_on_top_shows_what_is_below_it_lowest_first() {
+        let (mut tracks, above, below) = two_tracks();
+        tracks.set_placement(above, smaller());
+
+        assert_eq!(
+            ids(&tracks.stack_at(Ticks(5), WIDE, &all_wide)),
+            [below, above]
+        );
+    }
+
+    #[test]
+    fn a_see_through_picture_on_top_shows_what_is_below_it() {
+        let (mut tracks, above, below) = two_tracks();
+        tracks.set_placement(
+            above,
+            Placement {
+                opacity: WHOLE / 2,
+                ..Placement::default()
+            },
+        );
+
+        assert_eq!(
+            ids(&tracks.stack_at(Ticks(5), WIDE, &all_wide)),
+            [below, above]
+        );
+    }
+
+    #[test]
+    fn bars_around_another_shape_show_the_track_below() {
+        let (tracks, above, below) = two_tracks();
+        let tall_on_top = |media: MediaId| Some(if media == OTHER { (1080, 1920) } else { WIDE });
+
+        assert_eq!(
+            ids(&tracks.stack_at(Ticks(5), WIDE, &tall_on_top)),
+            [below, above]
+        );
+    }
+
+    #[test]
+    fn a_full_picture_in_the_middle_hides_only_what_is_below_it() {
+        let mut tracks = Tracks::default();
+        tracks.place(VIDEO, range(0, 100), Ticks(0), TrackTarget::New(0));
+        let middle = tracks.place(VIDEO, range(0, 100), Ticks(0), TrackTarget::New(0));
+        let top = tracks.place(VIDEO, range(0, 100), Ticks(0), TrackTarget::New(0));
+        tracks.set_placement(top, smaller());
+
+        assert_eq!(
+            ids(&tracks.stack_at(Ticks(5), WIDE, &all_wide)),
+            [middle, top]
+        );
+    }
+
+    #[test]
+    fn dead_space_shows_nothing() {
+        let (tracks, ..) = two_tracks();
+
+        assert!(tracks.stack_at(Ticks(100), WIDE, &all_wide).is_empty());
+    }
+
+    #[test]
+    fn the_top_of_a_stack_is_the_clip_that_plays() {
+        let (mut tracks, above, _) = two_tracks();
+        tracks.set_placement(above, smaller());
+
+        let stack = tracks.stack_at(Ticks(5), WIDE, &all_wide);
+
+        assert_eq!(stack.last().map(|clip| clip.id), Some(above));
+        assert_eq!(tracks.played().clips()[0].id, above);
+    }
+
+    #[test]
+    fn stretches_change_where_what_shows_changes_and_skip_dead_space() {
+        let mut tracks = Tracks::default();
+        let long = tracks.place(VIDEO, range(0, 100), Ticks(0), TrackTarget::New(0));
+        let overlay = tracks.place(OTHER, range(0, 20), Ticks(40), TrackTarget::New(0));
+        tracks.set_placement(overlay, smaller());
+        let later = tracks.place(VIDEO, range(0, 10), Ticks(200), TrackTarget::Existing(1));
+
+        let stretches = tracks.stretches(WIDE, &all_wide);
+
+        let shape: Vec<(i64, i64, Vec<ClipId>)> = stretches
+            .iter()
+            .map(|stretch| (stretch.start.0, stretch.end.0, ids(&stretch.stack)))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                (0, 40, vec![long]),
+                (40, 60, vec![long, overlay]),
+                (60, 100, vec![long]),
+                (200, 210, vec![later]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_plain_project_needs_no_layers_even_with_overlapping_tracks() {
+        let (tracks, ..) = two_tracks();
+
+        assert!(!tracks.needs_layers(WIDE, &all_wide));
+    }
+
+    #[test]
+    fn a_resized_clip_that_shows_needs_layers() {
+        let mut tracks = Tracks::default();
+        let id = tracks.push(VIDEO, range(0, 100));
+        assert!(!tracks.needs_layers(WIDE, &all_wide));
+
+        tracks.set_placement(id, smaller());
+
+        assert!(tracks.needs_layers(WIDE, &all_wide));
+    }
+
+    #[test]
+    fn a_resized_clip_completely_hidden_needs_no_layers() {
+        let (mut tracks, _, below) = two_tracks();
+
+        tracks.set_placement(below, smaller());
+
+        assert!(!tracks.needs_layers(WIDE, &all_wide));
+    }
+
+    #[test]
+    fn the_canvas_is_the_largest_video_on_top() {
+        let (tracks, ..) = two_tracks();
+        let sizes = |media: MediaId| Some(if media == OTHER { WIDE } else { (3840, 2160) });
+
+        assert_eq!(tracks.canvas(&sizes), Some(WIDE), "the big one is hidden");
+    }
+
+    #[test]
+    fn a_larger_video_showing_under_a_smaller_one_sets_the_canvas() {
+        let (mut tracks, above, _) = two_tracks();
+        tracks.set_placement(above, smaller());
+        let sizes = |media: MediaId| Some(if media == OTHER { WIDE } else { (3840, 2160) });
+
+        assert_eq!(tracks.canvas(&sizes), Some((3840, 2160)));
+    }
+
+    #[test]
+    fn an_empty_project_has_no_canvas() {
+        assert_eq!(Tracks::default().canvas(&all_wide), None);
+    }
+
+    #[test]
+    fn splitting_duplicating_and_moving_keep_a_clips_layout() {
+        let mut tracks = Tracks::default();
+        let id = tracks.place(VIDEO, range(0, 100), Ticks(0), TrackTarget::New(0));
+        tracks.set_placement(id, smaller());
+
+        let second = tracks.split(id, Ticks(50)).expect("it splits");
+        let copy = tracks.duplicate(second).expect("it duplicates");
+        tracks.move_clip(second, Ticks(500), TrackTarget::New(0));
+        tracks.move_clip(copy, Ticks(900), TrackTarget::New(1));
+
+        for clip in [id, second, copy] {
+            assert_eq!(tracks.clip(clip).map(|c| c.placement), Some(smaller()));
+        }
+    }
+
+    #[test]
+    fn a_placement_change_says_whether_anything_changed() {
+        let mut tracks = Tracks::default();
+        let id = tracks.push(VIDEO, range(0, 100));
+
+        assert!(tracks.set_placement(id, smaller()));
+        assert!(!tracks.set_placement(id, smaller()));
+        assert!(!tracks.set_placement(ClipId(u64::MAX), smaller()));
     }
 }

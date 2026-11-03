@@ -2,6 +2,7 @@
 
 pub mod history;
 pub mod picture;
+pub mod placement;
 pub mod playback;
 pub mod project;
 pub mod splice;

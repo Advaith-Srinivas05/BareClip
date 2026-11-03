@@ -1,5 +1,6 @@
 //! Which way a project gets exported, and what a full export will produce.
 
+pub use bareclip_core::placement::final_size;
 use bareclip_media::{MediaInfo, SoundLabel, VideoSettings, can_write_gaps, join_problem};
 
 /// How an export will work.
@@ -29,6 +30,10 @@ fn rate_problem(first: &MediaInfo, other: &MediaInfo) -> Option<String> {
     Some(format!("{name} runs at {b:.0} fps instead of {a:.0} fps."))
 }
 
+/// Why a project with clips resized, moved or showing together can't be copied.
+pub const LAYERED_REASON: &str =
+    "Clips are resized, moved, see-through or showing together, so every frame is redrawn.";
+
 /// Picks the route: fast whenever that is possible, because nothing beats copying.
 pub fn route_for(videos: &[MediaInfo], has_gaps: bool) -> Route {
     let Some((first, others)) = videos.split_first() else {
@@ -47,20 +52,6 @@ pub fn route_for(videos: &[MediaInfo], has_gaps: bool) -> Route {
         ));
     }
     Route::Fast
-}
-
-/// The size of the finished video: the largest video's, so nothing loses detail. Encoders need
-/// even sizes, so an odd one rounds up.
-pub fn final_size(videos: &[(u32, u32)]) -> Option<(u32, u32)> {
-    let mut largest: Option<(u32, u32)> = None;
-    for &(width, height) in videos {
-        let area = u64::from(width) * u64::from(height);
-        let bigger = largest.is_none_or(|(w, h)| area > u64::from(w) * u64::from(h));
-        if bigger {
-            largest = Some((width, height));
-        }
-    }
-    largest.map(|(width, height)| (width.next_multiple_of(2), height.next_multiple_of(2)))
 }
 
 const USUAL_RATES: [(i32, i32); 16] = [

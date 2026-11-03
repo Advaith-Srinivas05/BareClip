@@ -12,8 +12,17 @@ use std::{
     },
 };
 
-use bareclip_core::{picture::Yuv420, splice::CutMode, timeline::TimeRange};
-use bareclip_export::{FullReport, ProjectReport, export_project};
+use bareclip_core::{
+    picture::Yuv420,
+    placement::{Placement, WHOLE},
+    splice::CutMode,
+    time::Ticks,
+    timeline::TimeRange,
+};
+use bareclip_export::{
+    FullReport, LayeredClip, LayeredRequest, LayeredStretch, ProjectReport, export_layered,
+    export_project,
+};
 use bareclip_media::{ExportPart, ExportRequest, MediaError, PictureReader, probe};
 use common::*;
 
@@ -756,4 +765,394 @@ fn the_length_never_drifts_from_the_timeline() {
     let info = probe(&job.output).expect("it can be read");
     let off = (info.duration.as_seconds() - 2.75).abs();
     assert!(off < 0.1, "{}", info.duration.as_seconds());
+}
+
+/// A flat colour for layers to be told apart by, labelled so it can skip the GPU alone.
+fn flat_clip(name: &str, colour: &str, size: (u32, u32), seconds: u32) -> PathBuf {
+    let video = format!(
+        "color=c={colour}:s={}x{}:r=30:d={seconds},format=yuv420p",
+        size.0, size.1
+    );
+    clip(name, &encoded(video, &[beeps(seconds)]))
+}
+
+fn red_clip() -> PathBuf {
+    flat_clip("layer-red.mp4", "red", (320, 180), 2)
+}
+
+fn blue_clip() -> PathBuf {
+    flat_clip("layer-blue.mp4", "blue", (320, 180), 2)
+}
+
+fn whole(input: &Path, key: u64, start: f64, length: f64, placement: Placement) -> LayeredClip {
+    LayeredClip {
+        key,
+        input: input.to_owned(),
+        start: seconds(start),
+        source: TimeRange {
+            start: Ticks(0),
+            end: seconds(length),
+        },
+        placement,
+    }
+}
+
+fn layered_request(
+    name: &str,
+    stretches: Vec<LayeredStretch>,
+    sound: Vec<ExportPart>,
+) -> LayeredRequest {
+    LayeredRequest {
+        output: output_path(name, "mp4"),
+        stretches,
+        sound,
+    }
+}
+
+fn stretch(start: f64, end: f64, stack: Vec<LayeredClip>) -> LayeredStretch {
+    LayeredStretch {
+        start: seconds(start),
+        end: seconds(end),
+        stack,
+    }
+}
+
+fn run_layered(request: &LayeredRequest) -> FullReport {
+    export_layered(request, &AtomicBool::new(false), &|_| {}).expect("the export succeeds")
+}
+
+fn colour_at(view: &Yuv420, x: usize, y: usize) -> (u8, u8) {
+    (
+        view.u[y / 2 * view.uv_stride + x / 2],
+        view.v[y / 2 * view.uv_stride + x / 2],
+    )
+}
+
+fn is_red(colour: (u8, u8)) -> bool {
+    colour.1 > 200 && colour.0 < 128
+}
+
+fn is_blue(colour: (u8, u8)) -> bool {
+    colour.0 > 200 && colour.1 < 128
+}
+
+/// Half the size, in the canvas's top left quarter.
+fn top_left_quarter() -> Placement {
+    Placement {
+        center_x: WHOLE / 4,
+        center_y: WHOLE / 4,
+        scale: WHOLE / 2,
+        opacity: WHOLE,
+    }
+}
+
+#[test]
+fn a_resized_clip_shows_the_one_below_around_it_on_every_frame() {
+    let job = layered_request(
+        "layer-two",
+        vec![stretch(
+            0.0,
+            2.0,
+            vec![
+                whole(&red_clip(), 1, 0.0, 2.0, Placement::default()),
+                whole(&blue_clip(), 2, 0.0, 2.0, top_left_quarter()),
+            ],
+        )],
+        vec![part(&blue_clip(), 0.0, 2.0, 0.0)],
+    );
+
+    let report = run_layered(&job);
+
+    assert_eq!((report.width, report.height), (320, 180));
+    assert_eq!(report.frames, 60);
+    assert!(report.gpu.is_some());
+    let mut reader = PictureReader::open(&job.output).expect("the export opens");
+    let mut count = 0;
+    while let Some(picture) = reader.next_picture().expect("it decodes") {
+        let view = picture.view();
+        assert!(is_blue(colour_at(&view, 80, 45)), "inside {count}");
+        assert!(is_red(colour_at(&view, 240, 45)), "right of it {count}");
+        assert!(is_red(colour_at(&view, 80, 135)), "below it {count}");
+        count += 1;
+    }
+    assert_eq!(count, 60);
+}
+
+#[test]
+fn a_clip_moved_partly_off_the_canvas_shows_only_what_is_on_it() {
+    let job = layered_request(
+        "layer-off",
+        vec![stretch(
+            0.0,
+            1.0,
+            vec![
+                whole(&red_clip(), 1, 0.0, 2.0, Placement::default()),
+                whole(
+                    &blue_clip(),
+                    2,
+                    0.0,
+                    2.0,
+                    Placement {
+                        center_x: 0,
+                        center_y: 0,
+                        ..top_left_quarter()
+                    },
+                ),
+            ],
+        )],
+        Vec::new(),
+    );
+
+    run_layered(&job);
+
+    let mut reader = PictureReader::open(&job.output).expect("the export opens");
+    let picture = reader
+        .next_picture()
+        .expect("it decodes")
+        .expect("a picture");
+    let view = picture.view();
+    assert!(is_blue(colour_at(&view, 40, 20)));
+    assert!(is_red(colour_at(&view, 120, 20)));
+    assert!(is_red(colour_at(&view, 40, 90)));
+}
+
+#[test]
+fn a_see_through_clip_mixes_with_the_one_below() {
+    let job = layered_request(
+        "layer-see-through",
+        vec![stretch(
+            0.0,
+            1.0,
+            vec![
+                whole(&red_clip(), 1, 0.0, 2.0, Placement::default()),
+                whole(
+                    &blue_clip(),
+                    2,
+                    0.0,
+                    2.0,
+                    Placement {
+                        opacity: WHOLE / 2,
+                        ..Placement::default()
+                    },
+                ),
+            ],
+        )],
+        Vec::new(),
+    );
+
+    run_layered(&job);
+
+    let mut reader = PictureReader::open(&job.output).expect("the export opens");
+    let picture = reader
+        .next_picture()
+        .expect("it decodes")
+        .expect("a picture");
+    let (u, v) = colour_at(&picture.view(), 160, 90);
+    assert!(!is_red((u, v)) && !is_blue((u, v)), "{u} {v}");
+    assert!(u > 150 && v > 150, "purple has both: {u} {v}");
+}
+
+#[test]
+fn an_overlay_comes_and_goes_on_the_exact_frame_and_footage_carries_on_under_it() {
+    let large = large_clip();
+    let job = layered_request(
+        "layer-comes-and-goes",
+        vec![
+            stretch(
+                0.0,
+                1.0,
+                vec![whole(&large, 1, 0.0, 3.0, Placement::default())],
+            ),
+            stretch(
+                1.0,
+                2.0,
+                vec![
+                    whole(&large, 1, 0.0, 3.0, Placement::default()),
+                    whole(
+                        &blue_clip(),
+                        2,
+                        1.0,
+                        1.0,
+                        Placement {
+                            center_x: WHOLE / 4,
+                            center_y: WHOLE / 8,
+                            scale: WHOLE / 4,
+                            opacity: WHOLE,
+                        },
+                    ),
+                ],
+            ),
+            stretch(
+                2.0,
+                3.0,
+                vec![whole(&large, 1, 0.0, 3.0, Placement::default())],
+            ),
+        ],
+        Vec::new(),
+    );
+
+    let report = run_layered(&job);
+
+    // The blocks spelling the frame number run along the middle, clear of the overlay.
+    let seen = pictures_of(&job.output);
+    let numbers: Vec<u32> = seen.iter().map(|picture| picture.number).collect();
+    assert_eq!(numbers, expected_run(0..90));
+    let mut reader = PictureReader::open(&job.output).expect("the export opens");
+    let mut frame = 0;
+    while let Some(picture) = reader.next_picture().expect("it decodes") {
+        let overlaid = is_blue(colour_at(&picture.view(), 80, 22));
+        assert_eq!(overlaid, (30..60).contains(&frame), "frame {frame}");
+        frame += 1;
+    }
+    // Only the frames with the overlay needed the GPU.
+    assert_eq!(report.composited_frames, 30);
+    assert_eq!(report.direct_frames, 60);
+}
+
+#[test]
+fn a_clip_alone_in_its_normal_place_never_opens_the_gpu() {
+    let job = layered_request(
+        "layer-plain",
+        vec![stretch(
+            0.0,
+            1.0,
+            vec![whole(&large_clip(), 1, 0.0, 1.0, Placement::default())],
+        )],
+        Vec::new(),
+    );
+
+    let report = run_layered(&job);
+
+    assert_eq!(report.gpu, None);
+    assert_eq!(report.composited_frames, 0);
+}
+
+#[test]
+fn frames_where_nothing_changes_are_repeated_rather_than_drawn() {
+    let job = layered_request(
+        "layer-repeats",
+        vec![stretch(
+            0.0,
+            1.0,
+            vec![
+                whole(&large_clip(), 1, 0.0, 1.0, Placement::default()),
+                whole(&blue_clip(), 2, 0.0, 1.0, top_left_quarter()),
+            ],
+        )],
+        Vec::new(),
+    );
+
+    let report = run_layered(&job);
+
+    // At twice the rate of what it shows, about half are just shown again.
+    assert_eq!(report.frames, 30);
+    assert_eq!(report.composited_frames + report.repeated_frames, 30);
+    assert!(report.composited_frames >= 29, "{report:?}");
+}
+
+#[test]
+fn dead_space_between_layers_is_black_and_keeps_its_length() {
+    let job = layered_request(
+        "layer-gap",
+        vec![
+            stretch(
+                0.0,
+                1.0,
+                vec![whole(&red_clip(), 1, 0.0, 1.0, top_left_quarter())],
+            ),
+            stretch(
+                2.0,
+                3.0,
+                vec![whole(&blue_clip(), 2, 2.0, 1.0, top_left_quarter())],
+            ),
+        ],
+        Vec::new(),
+    );
+
+    let report = run_layered(&job);
+
+    assert_eq!(report.frames, 90);
+    let seen = pictures_of(&job.output);
+    assert_eq!(seen.len(), 90);
+    assert!(seen[45].middle < 30, "{:?}", seen[45]);
+}
+
+#[test]
+fn a_larger_video_under_a_smaller_one_sets_the_size_and_nothing_is_cropped() {
+    let job = layered_request(
+        "layer-sizes",
+        vec![stretch(
+            0.0,
+            1.0,
+            vec![
+                whole(&large_clip(), 1, 0.0, 1.0, Placement::default()),
+                whole(&small_clip(), 2, 0.0, 1.0, top_left_quarter()),
+            ],
+        )],
+        Vec::new(),
+    );
+
+    let report = run_layered(&job);
+
+    assert_eq!((report.width, report.height), (320, 180));
+}
+
+#[test]
+fn sound_comes_from_the_top_clip_and_stays_in_sync_under_layers() {
+    let job = layered_request(
+        "layer-sync",
+        vec![stretch(
+            0.0,
+            2.0,
+            vec![
+                whole(&red_clip(), 1, 0.0, 2.0, Placement::default()),
+                whole(&large_clip(), 2, 0.0, 2.0, top_left_quarter()),
+            ],
+        )],
+        vec![part(&large_clip(), 0.0, 2.0, 0.0)],
+    );
+
+    run_layered(&job);
+
+    let sound = decode_audio(&job.output);
+    let starts = beep_times(&sound[0]);
+    assert_eq!(starts.len(), 2, "{starts:?}");
+    for (found, wanted) in starts.iter().zip([0.0, 1.0]) {
+        assert!((found - wanted).abs() < 0.05, "{starts:?}");
+    }
+}
+
+#[test]
+fn a_layered_export_can_be_cancelled_and_leaves_nothing_behind() {
+    let job = layered_request(
+        "layer-cancel",
+        vec![stretch(
+            0.0,
+            2.0,
+            vec![whole(&red_clip(), 1, 0.0, 2.0, top_left_quarter())],
+        )],
+        Vec::new(),
+    );
+
+    let result = export_layered(&job, &AtomicBool::new(true), &|_| {});
+
+    assert!(matches!(result, Err(MediaError::Cancelled)));
+    assert!(!job.output.exists());
+}
+
+#[test]
+fn a_layered_export_over_one_of_its_videos_is_refused() {
+    let job = LayeredRequest {
+        output: red_clip(),
+        stretches: vec![stretch(
+            0.0,
+            1.0,
+            vec![whole(&red_clip(), 1, 0.0, 1.0, top_left_quarter())],
+        )],
+        sound: Vec::new(),
+    };
+
+    let result = export_layered(&job, &AtomicBool::new(false), &|_| {});
+
+    assert!(matches!(result, Err(MediaError::SameInputAndOutput)));
 }

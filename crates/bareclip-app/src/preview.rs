@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use bareclip_core::{
     time::Ticks,
-    timeline::{ClipId, MediaId, Timeline},
+    timeline::{Clip, ClipId, MediaId, Timeline},
 };
 use bareclip_media::{MediaInfo, PreviewFrame};
 
@@ -27,6 +27,12 @@ pub struct Preview {
     /// When playback entered the dead space it is now passing through.
     gap_clock: Option<Instant>,
     use_sound: bool,
+    /// Whether pictures come out ready for the GPU compositor.
+    planes: bool,
+    /// The user moved the playhead, or started or stopped, since this was last asked about.
+    jumped: bool,
+    /// Which piece of the timeline the last picture came from.
+    last_picture_from: Option<Clip>,
     notify: Notify,
     error: Option<String>,
 }
@@ -40,6 +46,9 @@ impl Preview {
             position: Ticks(0),
             gap_clock: None,
             use_sound,
+            planes: false,
+            jumped: false,
+            last_picture_from: None,
             notify,
             error: None,
         }
@@ -101,7 +110,7 @@ impl Preview {
             self.slots.push(slot);
         } else {
             let info = lookup(media)?;
-            match Player::open(&info, self.use_sound, self.notify.clone()) {
+            match Player::open_as(&info, self.use_sound, self.planes, self.notify.clone()) {
                 Ok(player) => {
                     if self.slots.len() >= MAX_OPEN_PLAYERS {
                         self.slots.remove(0);
@@ -123,8 +132,52 @@ impl Preview {
         }
     }
 
+    /// Whether pictures are coming out ready for the GPU compositor.
+    pub fn planes(&self) -> bool {
+        self.planes
+    }
+
+    /// Switches between plain pictures and ones ready for the GPU compositor. Open players can't
+    /// change over, so they close, and playback picks up from the same place.
+    pub fn set_planes(
+        &mut self,
+        planes: bool,
+        timeline: &Timeline,
+        lookup: &dyn Fn(MediaId) -> Option<MediaInfo>,
+    ) {
+        if self.planes == planes {
+            return;
+        }
+        let position = self.position(timeline);
+        self.planes = planes;
+        self.slots.clear();
+        self.current = None;
+        self.seek(timeline, lookup, position);
+    }
+
+    /// Whether the playhead was moved by hand, or playback started or stopped, since the last time
+    /// this was asked. Moving on to the next clip by itself doesn't count.
+    pub fn take_jump(&mut self) -> bool {
+        std::mem::take(&mut self.jumped)
+    }
+
+    /// Which piece of the timeline the picture `update` last returned came from.
+    pub fn last_picture_from(&self) -> Option<Clip> {
+        self.last_picture_from
+    }
+
     /// Moves the playhead to a moment on the timeline.
     pub fn seek(
+        &mut self,
+        timeline: &Timeline,
+        lookup: &dyn Fn(MediaId) -> Option<MediaInfo>,
+        time: Ticks,
+    ) {
+        self.jumped = true;
+        self.go_to(timeline, lookup, time);
+    }
+
+    fn go_to(
         &mut self,
         timeline: &Timeline,
         lookup: &dyn Fn(MediaId) -> Option<MediaInfo>,
@@ -186,6 +239,7 @@ impl Preview {
         self.position = self.position(timeline);
         self.gap_clock = None;
         self.playing = false;
+        self.jumped = true;
         self.pause_all();
     }
 
@@ -212,10 +266,11 @@ impl Preview {
         let Some(index) = timeline.index_of(clip_id) else {
             // The clip was removed, so the playhead finds whatever is there now.
             let position = self.position;
-            self.seek(timeline, lookup, position);
+            self.go_to(timeline, lookup, position);
             return None;
         };
         let clip = timeline.clips()[index];
+        self.last_picture_from = Some(clip);
         let slot = self.slots.iter_mut().find(|slot| slot.media == media)?;
         let frame = slot.player.update();
         let source_position = slot.player.position();
@@ -225,7 +280,7 @@ impl Preview {
             self.position = self.position(timeline);
             if source_position >= clip.source.end || player_stopped {
                 match timeline.clips().get(index + 1) {
-                    Some(_) => self.seek(timeline, lookup, clip.end()),
+                    Some(_) => self.go_to(timeline, lookup, clip.end()),
                     None => {
                         self.position = timeline.duration();
                         self.playing = false;
@@ -248,7 +303,7 @@ impl Preview {
         let now = self.position(timeline);
         if timeline.locate(now).is_some() {
             let next = timeline.gap_at(self.position).map_or(now, |gap| gap.end);
-            self.seek(timeline, lookup, next);
+            self.go_to(timeline, lookup, next);
         }
     }
 }

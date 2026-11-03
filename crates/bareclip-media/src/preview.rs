@@ -2,10 +2,15 @@
 
 use std::path::Path;
 
-use bareclip_core::time::{Ticks, TimeBase};
+use bareclip_core::{
+    picture::{ColorFormat, Yuv420},
+    time::{Ticks, TimeBase},
+};
 use ffmpeg_next as ffmpeg;
 use ffmpeg_next::{
-    ChannelLayout, Packet, Rational, codec, color, decoder, ffi, format, frame,
+    ChannelLayout, Packet, Rational, codec, color, decoder, ffi, format,
+    format::Pixel,
+    frame,
     media::Type,
     software::{resampling, scaling},
     util::format::sample::{Sample, Type as SampleType},
@@ -13,6 +18,7 @@ use ffmpeg_next::{
 
 use crate::{
     error::MediaError,
+    full::{coefficients_of, is_full_range, matrix_of},
     probe::{discard_other_streams, to_time_base},
 };
 
@@ -55,6 +61,15 @@ pub fn fit_preview_size(width: u32, height: u32, max_width: u32, max_height: u32
 /// Sound always comes out as interleaved stereo.
 pub(crate) const PREVIEW_CHANNELS: usize = 2;
 
+/// A picture's stored values, tightly packed, for drawing with others on the GPU.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviewPlanes {
+    pub y: Vec<u8>,
+    pub u: Vec<u8>,
+    pub v: Vec<u8>,
+    pub color: ColorFormat,
+}
+
 /// One decoded picture, ready to draw.
 #[derive(Clone, Debug)]
 pub struct PreviewFrame {
@@ -62,7 +77,26 @@ pub struct PreviewFrame {
     pub time: Ticks,
     pub width: u32,
     pub height: u32,
+    /// Empty when the preview was asked for planes instead.
     pub rgba: Vec<u8>,
+    pub planes: Option<PreviewPlanes>,
+}
+
+impl PreviewFrame {
+    /// The picture as the GPU compositor takes it, if it was decoded that way.
+    pub fn view(&self) -> Option<Yuv420<'_>> {
+        let planes = self.planes.as_ref()?;
+        Some(Yuv420 {
+            width: self.width,
+            height: self.height,
+            y: &planes.y,
+            y_stride: self.width as usize,
+            u: &planes.u,
+            v: &planes.v,
+            uv_stride: self.width.div_ceil(2) as usize,
+            color: planes.color,
+        })
+    }
 }
 
 /// Whether a decoded frame was shown or passed over on the way to a target.
@@ -78,6 +112,8 @@ pub struct VideoPreview {
     video_index: usize,
     decoder: decoder::Video,
     scaler: Option<(scaling::Context, ffmpeg::format::Pixel, u32, u32)>,
+    /// Hands out planes rather than RGBA, for drawing on the GPU.
+    planes: bool,
     time_base: Rational,
     core_time_base: TimeBase,
     output_size: (u32, u32),
@@ -105,11 +141,19 @@ impl VideoPreview {
             video_index,
             decoder,
             scaler: None,
+            planes: false,
             time_base,
             core_time_base: to_time_base(time_base),
             output_size,
             sent_eof: false,
         })
+    }
+
+    /// Makes pictures come out as planes for the GPU rather than as RGBA. Skipping the colour
+    /// conversion is cheaper, and the GPU does it the same way for every layer.
+    pub fn with_planes(mut self) -> Self {
+        self.planes = true;
+        self
     }
 
     /// Moves to the keyframe at or before a display time.
@@ -153,7 +197,87 @@ impl VideoPreview {
         }
     }
 
+    /// Scales a picture into tightly packed planes, keeping its stored values as they are.
+    fn convert_to_planes(
+        &mut self,
+        decoded: &frame::Video,
+        pts: i64,
+    ) -> Result<PreviewFrame, MediaError> {
+        let (out_width, out_height) = self.output_size;
+        let matrix = matrix_of(decoded);
+        let full_range = is_full_range(decoded);
+        let needs_new = self
+            .scaler
+            .as_ref()
+            .is_none_or(|(_, format, width, height)| {
+                *format != decoded.format()
+                    || *width != decoded.width()
+                    || *height != decoded.height()
+            });
+        if needs_new {
+            let mut context = scaling::Context::get(
+                decoded.format(),
+                decoded.width(),
+                decoded.height(),
+                Pixel::YUV420P,
+                out_width,
+                out_height,
+                scaling::Flags::BILINEAR,
+            )?;
+            // SAFETY: the context is live, and these calls only read the constant coefficient
+            // tables and copy their values into it.
+            unsafe {
+                let table = ffi::sws_getCoefficients(coefficients_of(matrix));
+                let range = i32::from(full_range);
+                ffi::sws_setColorspaceDetails(
+                    context.as_mut_ptr(),
+                    table,
+                    range,
+                    table,
+                    range,
+                    0,
+                    1 << 16,
+                    1 << 16,
+                );
+            }
+            self.scaler = Some((context, decoded.format(), decoded.width(), decoded.height()));
+        }
+
+        let mut converted = frame::Video::empty();
+        if let Some((scaler, ..)) = self.scaler.as_mut() {
+            scaler.run(decoded, &mut converted)?;
+        }
+
+        let packed = |plane: usize, width: usize, height: usize| {
+            let stride = converted.stride(plane);
+            let data = converted.data(plane);
+            let mut values = Vec::with_capacity(width * height);
+            for row in 0..height {
+                values.extend_from_slice(&data[stride * row..stride * row + width]);
+            }
+            values
+        };
+        let (width, height) = (out_width as usize, out_height as usize);
+        let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
+        Ok(PreviewFrame {
+            pts,
+            time: Ticks::from_pts(pts, self.core_time_base),
+            width: out_width,
+            height: out_height,
+            rgba: Vec::new(),
+            planes: Some(PreviewPlanes {
+                y: packed(0, width, height),
+                u: packed(1, chroma_width, chroma_height),
+                v: packed(2, chroma_width, chroma_height),
+                color: ColorFormat { matrix, full_range },
+            }),
+        })
+    }
+
     fn convert(&mut self, decoded: &frame::Video, pts: i64) -> Result<PreviewFrame, MediaError> {
+        if self.planes {
+            return self.convert_to_planes(decoded, pts);
+        }
         let (out_width, out_height) = self.output_size;
         let needs_new = self
             .scaler
@@ -196,6 +320,7 @@ impl VideoPreview {
             width: out_width,
             height: out_height,
             rgba,
+            planes: None,
         })
     }
 }

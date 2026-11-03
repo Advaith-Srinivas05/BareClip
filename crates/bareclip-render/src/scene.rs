@@ -1,15 +1,7 @@
 //! What goes on a canvas, and whether that takes the GPU at all.
 
 use bareclip_core::picture::{ColorFormat, Yuv420};
-
-/// A place on the canvas, in pixels.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Rect {
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
-}
+pub use bareclip_core::placement::{Rect, fit_inside};
 
 /// One picture on the canvas. Later layers are drawn over earlier ones.
 #[derive(Clone, Copy, Debug)]
@@ -18,21 +10,6 @@ pub struct Layer<'a> {
     pub rect: Rect,
     /// 0 is invisible, and 1 hides what is underneath.
     pub opacity: f32,
-}
-
-/// The largest place a picture fits on the canvas without losing any of it, in the middle.
-/// Whatever it doesn't cover is left as bars.
-pub fn fit_inside(picture: (u32, u32), canvas: (u32, u32)) -> Rect {
-    let (width, height) = (picture.0.max(1) as f32, picture.1.max(1) as f32);
-    let (canvas_width, canvas_height) = (canvas.0 as f32, canvas.1 as f32);
-    let scale = (canvas_width / width).min(canvas_height / height);
-    let (shown_width, shown_height) = (width * scale, height * scale);
-    Rect {
-        x: (canvas_width - shown_width) / 2.0,
-        y: (canvas_height - shown_height) / 2.0,
-        width: shown_width,
-        height: shown_height,
-    }
 }
 
 /// Whether these layers take the GPU. A single picture that already fills the canvas exactly,

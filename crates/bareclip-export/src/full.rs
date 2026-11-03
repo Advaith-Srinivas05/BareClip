@@ -30,19 +30,19 @@ use crate::{
 /// Pictures decoded ahead of the one being drawn.
 const PICTURES_AHEAD: usize = 6;
 /// How far ahead of the picture the sound is kept, so the file stays well interleaved.
-const SOUND_LEAD_SECONDS: f64 = 1.0;
-const PROGRESS_EVERY: u64 = 16;
+pub(crate) const SOUND_LEAD_SECONDS: f64 = 1.0;
+pub(crate) const PROGRESS_EVERY: u64 = 16;
 
 /// A stretch of the finished video that shows one part.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Span {
-    start: Ticks,
-    end: Ticks,
-    source: TimeRange,
+pub(crate) struct Span {
+    pub(crate) start: Ticks,
+    pub(crate) end: Ticks,
+    pub(crate) source: TimeRange,
 }
 
 /// Where each part falls in the finished video, leaving room for dead space.
-fn spans_of(parts: &[ExportPart]) -> Vec<Span> {
+pub(crate) fn spans_of(parts: &[ExportPart]) -> Vec<Span> {
     let mut cursor = Ticks(0);
     parts
         .iter()
@@ -60,14 +60,14 @@ fn spans_of(parts: &[ExportPart]) -> Vec<Span> {
 }
 
 /// When a frame of the finished video appears. Exact, so that long videos never drift.
-fn frame_time(number: u64, rate: (i32, i32)) -> Ticks {
+pub(crate) fn frame_time(number: u64, rate: (i32, i32)) -> Ticks {
     let ticks =
         i128::from(number) * i128::from(TICKS_PER_SECOND) * i128::from(rate.1) / i128::from(rate.0);
     Ticks(ticks as i64)
 }
 
 /// How many frames fill a length of time.
-fn frame_count(length: Ticks, rate: (i32, i32)) -> u64 {
+pub(crate) fn frame_count(length: Ticks, rate: (i32, i32)) -> u64 {
     let denominator = i128::from(TICKS_PER_SECOND) * i128::from(rate.1);
     let frames = (i128::from(length.0) * i128::from(rate.0) + denominator / 2) / denominator;
     frames as u64
@@ -75,7 +75,7 @@ fn frame_count(length: Ticks, rate: (i32, i32)) -> u64 {
 
 /// Which part a moment falls in, if it isn't dead space. Rounding can put the very last frame
 /// just past the end, and that one still belongs to the last part.
-fn span_at(spans: &[Span], time: Ticks) -> Option<usize> {
+pub(crate) fn span_at(spans: &[Span], time: Ticks) -> Option<usize> {
     match spans.iter().position(|span| time < span.end) {
         Some(index) => (time >= spans[index].start).then_some(index),
         None => spans.len().checked_sub(1),
@@ -86,19 +86,19 @@ fn span_at(spans: &[Span], time: Ticks) -> Option<usize> {
 /// picture nearest its own time, rather than the latest so far: recordings round their times,
 /// and a picture landing a hair late would otherwise be skipped while the last one repeats.
 /// Nothing from past the end of the part ever shows, because that footage was cut away.
-fn pick_pictures_before(wanted: Ticks, half_frame: Ticks, span: Span) -> Ticks {
+pub(crate) fn pick_pictures_before(wanted: Ticks, half_frame: Ticks, span: Span) -> Ticks {
     Ticks(wanted.0 + half_frame.0).min(span.source.end)
 }
 
 /// Decodes a part on its own thread, so the decoder and the encoder can both run at full speed.
-struct PictureFeed {
+pub(crate) struct PictureFeed {
     pictures: Receiver<Result<DecodedPicture, MediaError>>,
-    shown: Option<DecodedPicture>,
+    pub(crate) shown: Option<DecodedPicture>,
     coming: Option<DecodedPicture>,
 }
 
 impl PictureFeed {
-    fn start(path: PathBuf, source: TimeRange) -> Result<Self, MediaError> {
+    pub(crate) fn start(path: PathBuf, source: TimeRange) -> Result<Self, MediaError> {
         let (sender, pictures) = mpsc::sync_channel(PICTURES_AHEAD);
         thread::Builder::new()
             .name("bareclip-export-decode".to_owned())
@@ -146,7 +146,7 @@ impl PictureFeed {
 
     /// Moves on to the last picture before a time in the video. Returns whether that is a
     /// different picture to the one before.
-    fn advance_to(&mut self, before: Ticks) -> Result<bool, MediaError> {
+    pub(crate) fn advance_to(&mut self, before: Ticks) -> Result<bool, MediaError> {
         if self.shown.is_none() && self.coming.is_none() {
             self.coming = self.next()?;
         }
