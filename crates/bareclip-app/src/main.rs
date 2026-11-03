@@ -23,6 +23,7 @@ fn main() -> eframe::Result {
         .with_title("BareClip")
         .with_inner_size([1280.0, 800.0])
         .with_min_inner_size([960.0, 600.0])
+        .with_decorations(false)
         .with_drag_and_drop(true);
     if let Ok(icon) = eframe::icon_data::from_png_bytes(WINDOW_ICON) {
         viewport = viewport.with_icon(icon);

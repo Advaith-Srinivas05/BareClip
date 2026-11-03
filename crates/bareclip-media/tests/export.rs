@@ -7,8 +7,13 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use bareclip_core::{splice::CutMode, time::Ticks};
-use bareclip_media::{ExportRequest, MediaError, export, probe};
+use bareclip_core::{
+    splice::CutMode,
+    time::Ticks,
+    timeline::MediaId,
+    tracks::{TrackTarget, Tracks},
+};
+use bareclip_media::{ExportPart, ExportRequest, MediaError, export, probe};
 use common::*;
 
 fn expected(frames: std::ops::Range<u32>) -> Vec<u32> {
@@ -905,4 +910,102 @@ fn nvenc_hevc_with_b_frames_in_mp4() {
 #[ignore = "needs an NVIDIA GPU"]
 fn nvenc_hevc_with_b_frames_in_mkv() {
     nvenc_case("hevc_nvenc", "mkv");
+}
+
+/// The parts a stack of tracks exports as, all from one video.
+fn parts_of_tracks(input: &Path, tracks: &Tracks) -> Vec<ExportPart> {
+    let played = tracks.played();
+    let mut previous_end = Ticks(0);
+    played
+        .clips()
+        .iter()
+        .map(|clip| {
+            let gap_before = Ticks(clip.start.0 - previous_end.0);
+            previous_end = clip.end();
+            let mut part = parts_of(input, vec![clip.source]).remove(0);
+            part.gap_before = gap_before;
+            part
+        })
+        .collect()
+}
+
+#[test]
+fn a_clip_on_a_higher_track_replaces_the_frames_it_covers() {
+    let input = h264_mp4();
+    let output = output_path("tracks-covered", "mp4");
+    let video = MediaId(1);
+    let mut tracks = Tracks::default();
+    // Frames 0 to 90 below, with frames 150 to 180 on top from one second in.
+    tracks.place(video, range(0.0, 3.0), seconds(0.0), TrackTarget::New(0));
+    tracks.place(video, range(5.0, 6.0), seconds(1.0), TrackTarget::New(0));
+
+    run_parts(
+        &output,
+        parts_of_tracks(&input, &tracks),
+        CutMode::FrameExact,
+    );
+
+    let mut wanted = expected(0..30);
+    wanted.extend(150..180);
+    wanted.extend(60..90);
+    assert_eq!(numbers(&decode_video(&output)), wanted);
+}
+
+#[test]
+fn a_clip_that_is_completely_covered_is_not_exported() {
+    let input = h264_mp4();
+    let output = output_path("tracks-hidden", "mp4");
+    let video = MediaId(1);
+    let mut tracks = Tracks::default();
+    tracks.place(video, range(5.0, 6.0), seconds(0.5), TrackTarget::New(0));
+    tracks.place(video, range(0.0, 3.0), seconds(0.0), TrackTarget::New(0));
+
+    run_parts(
+        &output,
+        parts_of_tracks(&input, &tracks),
+        CutMode::FrameExact,
+    );
+
+    assert_eq!(numbers(&decode_video(&output)), expected(0..90));
+}
+
+#[test]
+fn dead_space_with_nothing_on_any_track_exports_as_black_at_its_length() {
+    let input = h264_mp4();
+    let output = output_path("tracks-gap", "mp4");
+    let video = MediaId(1);
+    let mut tracks = Tracks::default();
+    tracks.place(video, range(0.0, 1.0), seconds(0.0), TrackTarget::New(0));
+    tracks.place(video, range(2.0, 3.0), seconds(2.0), TrackTarget::New(0));
+
+    let report = run_parts(
+        &output,
+        parts_of_tracks(&input, &tracks),
+        CutMode::FrameExact,
+    );
+
+    assert_eq!(report.black_frames, 30);
+    assert_eq!(decode_video(&output).len(), 90);
+}
+
+#[test]
+fn sound_follows_the_top_clip_across_tracks() {
+    let input = h264_mp4();
+    let output = output_path("tracks-sound", "mp4");
+    let video = MediaId(1);
+    let mut tracks = Tracks::default();
+    tracks.place(video, range(0.0, 3.0), seconds(0.0), TrackTarget::New(0));
+    tracks.place(video, range(5.0, 6.0), seconds(1.0), TrackTarget::New(0));
+
+    run_parts(
+        &output,
+        parts_of_tracks(&input, &tracks),
+        CutMode::FrameExact,
+    );
+
+    let picture = decode_video(&output).len() as f64 / 30.0;
+    for track in decode_audio(&output) {
+        let sound = track.samples.len() as f64 / f64::from(track.rate);
+        assert!((sound - picture).abs() < 0.05, "{sound} and {picture}");
+    }
 }

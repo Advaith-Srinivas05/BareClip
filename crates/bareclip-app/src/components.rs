@@ -29,8 +29,11 @@ const CARD_PADDING: f32 = 12.0;
 const CARD_ICON_SIZE: f32 = 18.0;
 const CARD_ICON_GAP: f32 = 10.0;
 const PROGRESS_HEIGHT: f32 = 8.0;
-const DIVIDER_HEIGHT: f32 = 20.0;
-const DIVIDER_ROOM: f32 = 13.0;
+const RAIL_TAB_HEIGHT: f32 = 58.0;
+const CHECK_BOX_SIZE: f32 = 20.0;
+const MENU_ITEM_HEIGHT: f32 = 30.0;
+const MENU_WIDTH: f32 = 210.0;
+const MENU_ITEM_PADDING: f32 = 8.0;
 
 /// How much attention a button asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -357,20 +360,249 @@ impl Widget for IconButton<'_> {
     }
 }
 
+/// A box that can be ticked. It shows a number instead of a tick when given one, for
+/// choices where the order they were picked in matters.
+pub struct CheckBox<'a> {
+    palette: &'a Palette,
+    checked: bool,
+    name: &'a str,
+    number: Option<usize>,
+    hidden: bool,
+}
+
+impl<'a> CheckBox<'a> {
+    pub fn new(palette: &'a Palette, checked: bool, name: &'a str) -> Self {
+        Self {
+            palette,
+            checked,
+            name,
+            number: None,
+            hidden: false,
+        }
+    }
+
+    pub fn number(mut self, number: Option<usize>) -> Self {
+        self.number = number;
+        self
+    }
+
+    /// Draws nothing unless focused, while the box can still be clicked.
+    pub fn hidden(mut self, hidden: bool) -> Self {
+        self.hidden = hidden;
+        self
+    }
+
+    /// Places the box at the top left of `area`, without taking up room in the layout.
+    pub fn show_in_corner(self, ui: &mut Ui, id: egui::Id, area: Rect, margin: f32) -> Response {
+        let rect = Rect::from_min_size(
+            area.min + vec2(margin, margin),
+            vec2(CHECK_BOX_SIZE, CHECK_BOX_SIZE),
+        );
+        let response = ui.interact(rect, id, Sense::click());
+        self.finish(ui, rect, response)
+    }
+
+    fn finish(self, ui: &Ui, rect: Rect, response: Response) -> Response {
+        let (checked, name) = (self.checked, self.name);
+        let enabled = response.enabled();
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, checked, name)
+        });
+        if (self.hidden && !response.has_focus()) || !ui.is_rect_visible(rect) {
+            return response;
+        }
+        let palette = self.palette;
+        let look = if checked {
+            Look {
+                fill: palette.accent,
+                stroke: Stroke::NONE,
+                content: palette.accent_text,
+            }
+        } else {
+            Look {
+                fill: palette.raised,
+                stroke: Stroke::new(
+                    1.0,
+                    if response.hovered() {
+                        palette.text_muted
+                    } else {
+                        palette.border_strong
+                    },
+                ),
+                content: palette.text,
+            }
+        };
+        paint_box(ui, rect, 4.0, &look, &response, palette);
+        if checked {
+            match self.number {
+                Some(number) => {
+                    ui.painter().text(
+                        rect.center(),
+                        Align2::CENTER_CENTER,
+                        number.to_string(),
+                        fonts::strong(12.0),
+                        look.content,
+                    );
+                }
+                None => icons::paint(
+                    ui.painter(),
+                    icons::square_at(rect.center(), 14.0),
+                    &icons::CHECK,
+                    look.content,
+                ),
+            }
+        }
+        response
+    }
+}
+
+impl Widget for CheckBox<'_> {
+    fn ui(self, ui: &mut Ui) -> Response {
+        let size = vec2(CHECK_BOX_SIZE, CHECK_BOX_SIZE);
+        let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+        self.finish(ui, rect, response)
+    }
+}
+
+/// One line of a menu, with its symbol, its name and any shortcut.
+pub struct MenuItem<'a> {
+    palette: &'a Palette,
+    icon: Option<Icon>,
+    label: &'a str,
+    shortcut: &'a str,
+}
+
+impl<'a> MenuItem<'a> {
+    pub fn new(palette: &'a Palette, icon: Icon, label: &'a str, shortcut: &'a str) -> Self {
+        Self {
+            palette,
+            icon: Some(icon),
+            label,
+            shortcut,
+        }
+    }
+
+    /// One choice among several, ticked if it is the current one.
+    pub fn choice(palette: &'a Palette, label: &'a str, chosen: bool) -> Self {
+        Self {
+            palette,
+            icon: chosen.then_some(icons::CHECK),
+            label,
+            shortcut: "",
+        }
+    }
+}
+
+impl Widget for MenuItem<'_> {
+    fn ui(self, ui: &mut Ui) -> Response {
+        let size = vec2(MENU_WIDTH, MENU_ITEM_HEIGHT);
+        let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+        let enabled = response.enabled();
+        let label = self.label;
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::MenuItem, enabled, label));
+        if ui.is_rect_visible(rect) {
+            let palette = self.palette;
+            let look = look(palette, Kind::Ghost, state_of(&response));
+            paint_box(ui, rect, f32::from(RADIUS), &look, &response, palette);
+            let icon_size = 16.0;
+            let left = rect.left() + MENU_ITEM_PADDING;
+            if let Some(icon) = &self.icon {
+                icons::paint(
+                    ui.painter(),
+                    icons::square_at(pos2(left + icon_size / 2.0, rect.center().y), icon_size),
+                    icon,
+                    look.content,
+                );
+            }
+            let font = FontId::new(13.0, FontFamily::Proportional);
+            ui.painter().text(
+                pos2(left + icon_size + ICON_GAP + 2.0, rect.center().y),
+                Align2::LEFT_CENTER,
+                label,
+                font,
+                look.content,
+            );
+            let shortcut = if enabled {
+                palette.text_muted
+            } else {
+                look.content
+            };
+            ui.painter().text(
+                pos2(rect.right() - MENU_ITEM_PADDING, rect.center().y),
+                Align2::RIGHT_CENTER,
+                self.shortcut,
+                FontId::new(12.0, FontFamily::Proportional),
+                shortcut,
+            );
+        }
+        response
+    }
+}
+
+/// A tab on the tool rail, with its symbol above its name.
+pub fn rail_tab(
+    ui: &mut Ui,
+    palette: &Palette,
+    icon: &Icon,
+    label: &str,
+    selected: bool,
+) -> Response {
+    let size = vec2(ui.available_width(), RAIL_TAB_HEIGHT);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, label));
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let state = state_of(&response);
+    let fill = match state {
+        State::Pressed => palette.text.gamma_multiply(GHOST_PRESSED),
+        State::Hover if !selected => palette.text.gamma_multiply(GHOST_HOVER),
+        _ if selected => palette.raised,
+        _ => Color32::TRANSPARENT,
+    };
+    let (symbol_color, text_color) = if selected {
+        (palette.accent, palette.text)
+    } else if state == State::Rest {
+        (palette.text_muted, palette.text_muted)
+    } else {
+        (palette.text, palette.text)
+    };
+    let look = Look {
+        fill,
+        stroke: Stroke::NONE,
+        content: text_color,
+    };
+    paint_box(ui, rect, f32::from(RADIUS), &look, &response, palette);
+    if selected {
+        ui.painter().rect_filled(
+            Rect::from_min_size(
+                rect.left_top() + vec2(0.0, 12.0),
+                vec2(3.0, rect.height() - 24.0),
+            ),
+            1.0,
+            palette.accent,
+        );
+    }
+    icons::paint(
+        ui.painter(),
+        icons::square_at(rect.center() - vec2(0.0, 9.0), 20.0),
+        icon,
+        symbol_color,
+    );
+    ui.painter().text(
+        rect.center() + vec2(0.0, 14.0),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::new(11.0, FontFamily::Proportional),
+        text_color,
+    );
+    response
+}
+
 /// A symbol that sits among text and does nothing.
 pub fn symbol(ui: &mut Ui, icon: &Icon, size: f32, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
     icons::paint(ui.painter(), rect, icon, color);
-}
-
-/// A thin upright line between groups of controls in a toolbar.
-pub fn divider(ui: &mut Ui, palette: &Palette) {
-    let (rect, _) = ui.allocate_exact_size(vec2(DIVIDER_ROOM, DIVIDER_HEIGHT), Sense::hover());
-    ui.painter().vline(
-        rect.center().x,
-        rect.y_range(),
-        Stroke::new(1.0, palette.border),
-    );
 }
 
 /// The title of a dialog, with a symbol saying what kind of dialog it is.
@@ -533,6 +765,72 @@ mod tests {
             button: egui::PointerButton::Primary,
             pressed,
             modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn a_rail_tab_reads_clearly_at_rest() {
+        for palette in [DARK, LIGHT] {
+            assert!(contrast(palette.text_muted, palette.bg_app) >= TEXT_MINIMUM);
+            assert!(contrast(palette.text, palette.raised) >= TEXT_MINIMUM);
+        }
+    }
+
+    #[test]
+    fn a_check_box_keeps_its_tick_readable() {
+        for palette in [DARK, LIGHT] {
+            assert!(contrast(palette.accent_text, palette.accent) >= TEXT_MINIMUM);
+        }
+    }
+
+    #[test]
+    fn a_shortcut_in_a_menu_is_readable() {
+        for palette in [DARK, LIGHT] {
+            assert!(contrast(palette.text_muted, palette.raised) >= TEXT_MINIMUM);
+        }
+    }
+
+    #[test]
+    fn a_check_box_a_rail_tab_and_a_menu_item_can_all_be_clicked() {
+        assert!(clicked(|ui| ui.add(CheckBox::new(&DARK, false, "Pick"))));
+        assert!(clicked(|ui| rail_tab(
+            ui,
+            &DARK,
+            &icons::FILM,
+            "Tool",
+            true
+        )));
+        assert!(clicked(|ui| ui.add(MenuItem::new(
+            &DARK,
+            icons::SCISSORS,
+            "Split",
+            "S"
+        ))));
+    }
+
+    #[test]
+    fn a_check_box_tells_screen_readers_whether_it_is_ticked() {
+        for checked in [false, true] {
+            let ctx = context();
+            ctx.enable_accesskit();
+            let output = run_ui(&ctx, egui::RawInput::default(), |ui| {
+                ui.add(CheckBox::new(&DARK, checked, "Pick"));
+            });
+            let update = output
+                .platform_output
+                .accesskit_update
+                .expect("the tree is reported");
+            let node = update
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some("Pick"))
+                .expect("the box is named");
+            let expected = if checked {
+                accesskit::Toggled::True
+            } else {
+                accesskit::Toggled::False
+            };
+            assert_eq!(node.1.toggled(), Some(expected));
         }
     }
 

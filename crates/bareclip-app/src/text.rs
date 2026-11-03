@@ -1,6 +1,9 @@
 //! Wording shown to the user.
 
-use std::path::{Path, PathBuf};
+use std::{
+    cmp::Ordering,
+    path::{Path, PathBuf},
+};
 
 use bareclip_core::{splice::CutMode, time::Ticks};
 use bareclip_media::{AudioInfo, ExportReport, MediaInfo};
@@ -122,6 +125,29 @@ pub fn remove_warning(name: &str, clips: usize) -> String {
     }
 }
 
+/// The warning shown before several videos and their clips leave the project.
+pub fn remove_many_warning(videos: usize, clips: usize) -> String {
+    match clips {
+        1 => {
+            format!("These {videos} videos have 1 clip on the timeline, which will be removed too.")
+        }
+        count => format!(
+            "These {videos} videos have {count} clips on the timeline, which will be removed too."
+        ),
+    }
+}
+
+/// The warning shown before exporting a timeline with dead space on it.
+pub fn gap_warning(gaps: usize, total: Ticks) -> String {
+    let length = clip_length(total);
+    match gaps {
+        1 => format!("1 gap of {length} will export as black picture and silence."),
+        count => {
+            format!("{count} gaps, {length} in total, will export as black picture and silence.")
+        }
+    }
+}
+
 pub fn encoder_name(encoder: &str) -> &str {
     match encoder {
         name if name.ends_with("_nvenc") => "your NVIDIA GPU",
@@ -162,10 +188,110 @@ pub fn export_summary(report: &ExportReport) -> Vec<String> {
     lines
 }
 
+/// Orders names the way File Explorer does: ignoring case, with runs of digits compared
+/// as numbers, so "clip 2" comes before "clip 10".
+pub fn natural_order(a: &str, b: &str) -> Ordering {
+    let mut left = a.chars().peekable();
+    let mut right = b.chars().peekable();
+    loop {
+        match (left.peek().copied(), right.peek().copied()) {
+            (None, None) => return a.cmp(b),
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(l), Some(r)) if l.is_ascii_digit() && r.is_ascii_digit() => {
+                let order = compare_digit_runs(&digit_run(&mut left), &digit_run(&mut right));
+                if order != Ordering::Equal {
+                    return order;
+                }
+            }
+            (Some(l), Some(r)) => {
+                let order = l.to_lowercase().cmp(r.to_lowercase());
+                if order != Ordering::Equal {
+                    return order;
+                }
+                left.next();
+                right.next();
+            }
+        }
+    }
+}
+
+fn digit_run(chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
+    let mut run = String::new();
+    while let Some(digit) = chars.next_if(char::is_ascii_digit) {
+        run.push(digit);
+    }
+    run
+}
+
+/// Compares digits by value without parsing them, so any length of number works.
+fn compare_digit_runs(a: &str, b: &str) -> Ordering {
+    let (a, b) = (a.trim_start_matches('0'), b.trim_start_matches('0'));
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_sort_the_way_file_explorer_sorts_them() {
+        let mut names = [
+            "clip 10.mp4",
+            "Clip 2.mp4",
+            "clip 1.mp4",
+            "another.mp4",
+            "clip.mp4",
+        ];
+
+        names.sort_by(|a, b| natural_order(a, b));
+
+        assert_eq!(
+            names,
+            [
+                "another.mp4",
+                "clip 1.mp4",
+                "Clip 2.mp4",
+                "clip 10.mp4",
+                "clip.mp4"
+            ]
+        );
+    }
+
+    #[test]
+    fn numbers_compare_by_value_at_any_length() {
+        assert_eq!(natural_order("a007", "a7b"), Ordering::Less);
+        assert_eq!(
+            natural_order("a99999999999999999999999", "a100000000000000000000000"),
+            Ordering::Less
+        );
+        assert_eq!(natural_order("same", "same"), Ordering::Equal);
+    }
     use std::time::Duration;
+
+    #[test]
+    fn the_warning_for_several_videos_counts_their_clips() {
+        assert_eq!(
+            remove_many_warning(2, 1),
+            "These 2 videos have 1 clip on the timeline, which will be removed too."
+        );
+        assert_eq!(
+            remove_many_warning(3, 5),
+            "These 3 videos have 5 clips on the timeline, which will be removed too."
+        );
+    }
+
+    #[test]
+    fn the_gap_warning_says_how_much_dead_space_there_is() {
+        assert_eq!(
+            gap_warning(1, Ticks::from_seconds(2.5)),
+            "1 gap of 2.50 s will export as black picture and silence."
+        );
+        assert_eq!(
+            gap_warning(3, Ticks::from_seconds(10.0)),
+            "3 gaps, 10.00 s in total, will export as black picture and silence."
+        );
+    }
 
     fn report() -> ExportReport {
         ExportReport {

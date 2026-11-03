@@ -208,7 +208,7 @@ def build_theme_preview(theme):
         b += rect(16, y, 76, 50, f"url(#scene-{theme})", 3)
         b += text(102, y + 21, name, name_fill, 12, 500) + text(102, y + 39, length, meta_fill, 12)
 
-    # Stage. It stays dark in both themes so footage is judged against the same surround.
+    # Stage. This picture of the interface predates the surround following the theme.
     stage_w = width - left - right
     stage_h = bottom - top
     b += rect(left, top, stage_w, stage_h, t["stage"])
