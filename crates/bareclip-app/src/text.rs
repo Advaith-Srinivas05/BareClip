@@ -5,21 +5,66 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use bareclip_core::{splice::CutMode, time::Ticks};
+use bareclip_core::{project, splice::CutMode, time::Ticks};
 use bareclip_export::{FullPlan, FullReport, ProjectReport};
 use bareclip_media::{AudioInfo, ExportReport, MediaInfo};
 
-/// The file a video's export is saved as unless the user picks another name.
-pub fn default_output_path(input: &Path) -> PathBuf {
-    let stem = input
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("video");
-    let extension = input
+pub const VIDEO_EXTENSIONS: [&str; 6] = ["mp4", "mkv", "mov", "webm", "avi", "ts"];
+
+/// A project's name as Windows will accept it for a file.
+pub fn safe_file_name(name: &str) -> String {
+    let replaced: String = name
+        .chars()
+        .map(|c| {
+            if c.is_control() || "<>:\"/\\|?*".contains(c) {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let cleaned = replaced.trim().trim_end_matches(['.', ' ']);
+    if cleaned.is_empty() {
+        return project::DEFAULT_NAME.to_owned();
+    }
+    // These stand for devices on Windows, even with a type after them.
+    let stem = cleaned.split('.').next().unwrap_or(cleaned).trim_end();
+    let reserved = ["CON", "PRN", "AUX", "NUL"]
+        .iter()
+        .any(|device| stem.eq_ignore_ascii_case(device))
+        || ["COM", "LPT"].iter().any(|device| {
+            stem.len() == 4
+                && stem.is_char_boundary(3)
+                && stem[..3].eq_ignore_ascii_case(device)
+                && matches!(stem.as_bytes()[3], b'1'..=b'9')
+        });
+    if reserved {
+        format!("{cleaned} video")
+    } else {
+        cleaned.to_owned()
+    }
+}
+
+/// The file an export is saved as unless the user picks another: named after the project,
+/// beside the first video and of the same type. A video type typed into the name isn't doubled.
+pub fn default_output_path(project_name: &str, first_video: &Path) -> PathBuf {
+    let name = safe_file_name(project_name);
+    let typed = name.rsplit_once('.').filter(|(_, typed)| {
+        VIDEO_EXTENSIONS
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(typed))
+    });
+    let stem = typed.map_or(name.as_str(), |(stem, _)| stem);
+    let stem = if stem.trim().is_empty() {
+        project::DEFAULT_NAME
+    } else {
+        stem
+    };
+    let extension = first_video
         .extension()
         .and_then(|extension| extension.to_str())
         .unwrap_or("mp4");
-    input.with_file_name(format!("{stem}-trimmed.{extension}"))
+    first_video.with_file_name(format!("{stem}.{extension}"))
 }
 
 pub fn file_size(bytes: u64) -> String {
@@ -443,18 +488,79 @@ mod tests {
     }
 
     #[test]
-    fn the_export_name_stays_beside_the_original_with_its_type() {
+    fn the_export_takes_the_project_name_beside_the_first_video_with_its_type() {
         assert_eq!(
-            default_output_path(Path::new("C:/videos/match.mkv")),
-            Path::new("C:/videos/match-trimmed.mkv")
+            default_output_path("untitled", Path::new("C:/videos/match.mkv")),
+            Path::new("C:/videos/untitled.mkv")
+        );
+        assert_eq!(
+            default_output_path("Final round", Path::new("C:/videos/match.mp4")),
+            Path::new("C:/videos/Final round.mp4")
         );
     }
 
     #[test]
-    fn a_file_without_a_type_becomes_mp4() {
+    fn a_first_video_without_a_type_exports_as_mp4() {
         assert_eq!(
-            default_output_path(Path::new("C:/videos/match")),
-            Path::new("C:/videos/match-trimmed.mp4")
+            default_output_path("untitled", Path::new("C:/videos/match")),
+            Path::new("C:/videos/untitled.mp4")
+        );
+    }
+
+    #[test]
+    fn a_video_type_typed_into_the_name_is_not_doubled() {
+        let first = Path::new("C:/videos/match.mkv");
+        assert_eq!(
+            default_output_path("clip.mkv", first),
+            Path::new("C:/videos/clip.mkv")
+        );
+        assert_eq!(
+            default_output_path("clip.MP4", first),
+            Path::new("C:/videos/clip.mkv")
+        );
+        assert_eq!(
+            default_output_path(".mp4", first),
+            Path::new("C:/videos/untitled.mkv")
+        );
+    }
+
+    #[test]
+    fn dots_that_are_part_of_the_name_stay() {
+        assert_eq!(
+            default_output_path("v1.2 final", Path::new("C:/videos/match.mp4")),
+            Path::new("C:/videos/v1.2 final.mp4")
+        );
+    }
+
+    #[test]
+    fn characters_windows_refuses_are_replaced() {
+        assert_eq!(safe_file_name("a/b:c*d?"), "a-b-c-d-");
+        assert_eq!(safe_file_name("line\nbreak"), "line-break");
+        assert_eq!(safe_file_name("  spaced  "), "spaced");
+        assert_eq!(safe_file_name("ends with dots..."), "ends with dots");
+    }
+
+    #[test]
+    fn a_name_with_nothing_usable_falls_back_to_the_default() {
+        assert_eq!(safe_file_name("..."), project::DEFAULT_NAME);
+        assert_eq!(safe_file_name("   "), project::DEFAULT_NAME);
+    }
+
+    #[test]
+    fn names_of_windows_devices_are_kept_from_being_devices() {
+        for device in ["CON", "nul", "Com1", "LPT9", "aux.final"] {
+            assert_eq!(safe_file_name(device), format!("{device} video"));
+        }
+        for fine in ["console", "com0", "com10", "lpt", "nullable", "c\u{f6}n1"] {
+            assert_eq!(safe_file_name(fine), fine);
+        }
+    }
+
+    #[test]
+    fn non_english_names_are_kept() {
+        assert_eq!(
+            safe_file_name("\u{c95}\u{ca8}\u{ccd}\u{ca8}\u{ca1} \u{52d5}\u{753b}"),
+            "\u{c95}\u{ca8}\u{ccd}\u{ca8}\u{ca1} \u{52d5}\u{753b}"
         );
     }
 

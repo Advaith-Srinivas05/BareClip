@@ -18,7 +18,7 @@ use crate::{
 pub const EXTENSION: &str = "bareclip";
 /// Goes up whenever the format changes in a way older versions can't read.
 const CURRENT_VERSION: u32 = 1;
-pub const DEFAULT_NAME: &str = "Untitled project";
+pub const DEFAULT_NAME: &str = "untitled";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedMedia {
