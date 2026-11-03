@@ -108,6 +108,7 @@ fn layers_of(pictures: &[DecodedPicture]) -> Vec<Layer<'_>> {
             picture: picture.view(),
             rect,
             opacity: 1.0,
+            look: bareclip_render::PictureLook::PLAIN,
         })
         .collect()
 }
@@ -196,6 +197,7 @@ fn scaled_export(source: &Path, frames: u32, output: &Path) -> f64 {
             picture: picture.view(),
             rect: fit_inside(picture.size(), (WIDTH, HEIGHT)),
             opacity: 1.0,
+            look: bareclip_render::PictureLook::PLAIN,
         };
         let drawn = compositor.render(&[layer]).expect("it draws");
         writer.write_picture(&drawn).expect("it encodes");

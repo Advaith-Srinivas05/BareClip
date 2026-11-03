@@ -227,6 +227,7 @@ pub fn export_layered(
                                 picture: picture.view(),
                                 rect: placement.rect(size, canvas),
                                 opacity: placement.opacity as f32 / WHOLE as f32,
+                                look: placement.look(),
                             })
                         })
                         .collect();

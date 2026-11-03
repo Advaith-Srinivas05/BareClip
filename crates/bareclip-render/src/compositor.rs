@@ -14,7 +14,7 @@ use crate::{color, scene::Layer};
 const CANVAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// What the window's renderer takes for a picture it didn't make itself.
 const DISPLAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
-const LAYER_UNIFORM_SIZE: u64 = 80;
+const LAYER_UNIFORM_SIZE: u64 = 112;
 const BLACK: wgpu::Color = wgpu::Color {
     r: 0.0,
     g: 0.0,
@@ -542,11 +542,37 @@ impl Compositor {
         let (width, height) = (self.size.0 as f32, self.size.1 as f32);
         let rect = layer.rect;
         let rows = color::to_rgb(picture.color);
-        let uniform: [f32; 20] = [
-            rect.x / width * 2.0 - 1.0,
-            1.0 - rect.y / height * 2.0,
-            (rect.x + rect.width) / width * 2.0 - 1.0,
-            1.0 - (rect.y + rect.height) / height * 2.0,
+        let radians = layer.look.degrees.to_radians();
+        // A flip just reads the picture from the other side.
+        let (from_x, to_x) = if layer.look.flip_x {
+            (1.0, 0.0)
+        } else {
+            (0.0, 1.0)
+        };
+        let (from_y, to_y) = if layer.look.flip_y {
+            (1.0, 0.0)
+        } else {
+            (0.0, 1.0)
+        };
+        // Edges only need softening where they don't line up with the pixels.
+        let soft_edges = if layer.look.degrees % 90.0 == 0.0 {
+            0.0
+        } else {
+            1.0
+        };
+        let uniform: [f32; 28] = [
+            rect.x + rect.width / 2.0,
+            rect.y + rect.height / 2.0,
+            rect.width / 2.0,
+            rect.height / 2.0,
+            radians.cos(),
+            radians.sin(),
+            width,
+            height,
+            from_x,
+            from_y,
+            to_x,
+            to_y,
             rows[0][0],
             rows[0][1],
             rows[0][2],
@@ -560,7 +586,7 @@ impl Compositor {
             rows[2][2],
             rows[2][3],
             layer.opacity,
-            0.0,
+            soft_edges,
             0.0,
             0.0,
         ];
@@ -817,7 +843,7 @@ impl fmt::Debug for Compositor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scene::{Rect, fit_inside};
+    use crate::scene::{PictureLook, Rect, fit_inside};
     use bareclip_core::picture::ColorMatrix;
 
     /// Stored values for a flat colour, with the planes the size a picture needs.
@@ -861,8 +887,139 @@ mod tests {
                 picture: self.view(),
                 rect: fit_inside((self.width, self.height), canvas),
                 opacity: 1.0,
+                look: PictureLook::PLAIN,
             }
         }
+    }
+
+    /// Red on the left half and blue on the right, or the other way up if told to.
+    fn half_and_half(width: u32, height: u32) -> Flat {
+        let mut picture = Flat::new(width, height, RED_HD);
+        let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
+        for y in 0..height {
+            for x in width / 2..width {
+                picture.y[(y * width + x) as usize] = BLUE_HD.0;
+            }
+        }
+        for y in 0..chroma_height {
+            for x in chroma_width / 2..chroma_width {
+                let at = (y * chroma_width + x) as usize;
+                picture.u[at] = BLUE_HD.1;
+                picture.v[at] = BLUE_HD.2;
+            }
+        }
+        picture
+    }
+
+    #[test]
+    fn a_picture_flipped_left_to_right_has_its_sides_swapped() {
+        let Some(mut compositor) = compositor(64, 36) else {
+            return;
+        };
+        let picture = half_and_half(64, 36);
+        let mut layer = picture.filling((64, 36));
+        layer.look.flip_x = true;
+
+        let drawn = compositor.render(&[layer]).expect("it draws");
+
+        assert_near(at(&drawn, 8, 18), BLUE_HD);
+        assert_near(at(&drawn, 56, 18), RED_HD);
+    }
+
+    #[test]
+    fn a_picture_flipped_top_to_bottom_keeps_its_sides() {
+        let Some(mut compositor) = compositor(64, 36) else {
+            return;
+        };
+        let picture = half_and_half(64, 36);
+        let mut layer = picture.filling((64, 36));
+        layer.look.flip_y = true;
+
+        let drawn = compositor.render(&[layer]).expect("it draws");
+
+        assert_near(at(&drawn, 8, 18), RED_HD);
+        assert_near(at(&drawn, 56, 18), BLUE_HD);
+    }
+
+    #[test]
+    fn a_picture_turned_a_quarter_clockwise_has_its_left_at_the_top() {
+        let Some(mut compositor) = compositor(64, 64) else {
+            return;
+        };
+        let picture = half_and_half(64, 64);
+        let mut layer = picture.filling((64, 64));
+        layer.look.degrees = 90.0;
+
+        let drawn = compositor.render(&[layer]).expect("it draws");
+
+        assert_near(at(&drawn, 32, 8), RED_HD);
+        assert_near(at(&drawn, 32, 56), BLUE_HD);
+    }
+
+    #[test]
+    fn a_picture_turned_a_half_turn_has_its_sides_swapped() {
+        let Some(mut compositor) = compositor(64, 36) else {
+            return;
+        };
+        let picture = half_and_half(64, 36);
+        let mut layer = picture.filling((64, 36));
+        layer.look.degrees = 180.0;
+
+        let drawn = compositor.render(&[layer]).expect("it draws");
+
+        assert_near(at(&drawn, 8, 18), BLUE_HD);
+        assert_near(at(&drawn, 56, 18), RED_HD);
+    }
+
+    #[test]
+    fn a_picture_turned_part_way_keeps_its_shape_on_a_wide_canvas() {
+        // Turning in the canvas's pixels rather than its shares is what keeps corners square.
+        let Some(mut compositor) = compositor(128, 64) else {
+            return;
+        };
+        let picture = Flat::new(32, 32, RED_HD);
+        let mut layer = picture.filling((128, 64));
+        layer.rect = Rect {
+            x: 48.0,
+            y: 16.0,
+            width: 32.0,
+            height: 32.0,
+        };
+        layer.look.degrees = 45.0;
+
+        let drawn = compositor.render(&[layer]).expect("it draws");
+
+        // A square on its point reaches further straight out than diagonally.
+        assert_near(at(&drawn, 64, 32), RED_HD);
+        assert_near(at(&drawn, 80, 32), RED_HD);
+        assert_near(at(&drawn, 64, 16), RED_HD);
+        assert_near(at(&drawn, 82, 14), (16, 128, 128));
+    }
+
+    #[test]
+    fn a_turned_pictures_edges_are_softened() {
+        let Some(mut compositor) = compositor(128, 128) else {
+            return;
+        };
+        let picture = Flat::new(32, 32, (235, 128, 128));
+        let mut layer = picture.filling((128, 128));
+        layer.rect = Rect {
+            x: 32.0,
+            y: 32.0,
+            width: 64.0,
+            height: 64.0,
+        };
+        layer.look.degrees = 30.0;
+
+        let drawn = compositor.render(&[layer]).expect("it draws");
+
+        let in_between = drawn
+            .y
+            .chunks(drawn.y_stride)
+            .flatten()
+            .filter(|value| **value > 40 && **value < 210)
+            .count();
+        assert!(in_between > 30, "only {in_between} pixels are in between");
     }
 
     #[test]
@@ -883,6 +1040,7 @@ mod tests {
                     height: 36.0,
                 },
                 opacity: 1.0,
+                look: PictureLook::PLAIN,
             },
         ];
 
@@ -1052,6 +1210,7 @@ mod tests {
                 height: 18.0,
             },
             opacity: 1.0,
+            look: PictureLook::PLAIN,
         };
 
         let result = compositor
@@ -1080,6 +1239,7 @@ mod tests {
                     height: 18.0,
                 },
                 opacity: 1.0,
+                look: PictureLook::PLAIN,
             }
         }
         let layers = [
@@ -1170,6 +1330,7 @@ mod tests {
             picture,
             rect: fit_inside((64, 36), (64, 36)),
             opacity: 1.0,
+            look: PictureLook::PLAIN,
         };
 
         let result = compositor.render(&[layer]).expect("it draws");
