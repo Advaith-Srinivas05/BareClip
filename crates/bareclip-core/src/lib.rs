@@ -5,3 +5,4 @@ pub mod playback;
 pub mod splice;
 pub mod time;
 pub mod timeline;
+pub mod tracks;

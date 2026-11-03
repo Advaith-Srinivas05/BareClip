@@ -138,6 +138,26 @@ impl Timeline {
             .find(|gap| time >= gap.start && time < gap.end)
     }
 
+    /// Clips already in order and not overlapping, such as what a stack of tracks plays.
+    pub(crate) fn from_ordered(clips: Vec<Clip>) -> Self {
+        Self { clips }
+    }
+
+    /// Moves every clip starting at or after a moment back by a stretch of time.
+    pub(crate) fn shift_from(&mut self, time: Ticks, by: Ticks) {
+        for clip in &mut self.clips {
+            if clip.start >= time {
+                clip.start = Ticks(clip.start.0 - by.0);
+            }
+        }
+    }
+
+    /// Puts an existing clip as close as it can get to a moment.
+    pub(crate) fn land(&mut self, mut clip: Clip, wanted: Ticks) {
+        clip.start = self.landing(None, wanted, clip.duration());
+        self.settle(clip);
+    }
+
     /// Closes the dead space around a moment by moving every later clip back.
     pub fn remove_gap(&mut self, time: Ticks) -> bool {
         let Some(gap) = self.gap_at(time) else {
@@ -149,6 +169,20 @@ impl Timeline {
             }
         }
         true
+    }
+
+    /// Closes all the dead space, so the clips play straight after one another.
+    pub fn remove_all_gaps(&mut self) -> bool {
+        let mut free = Ticks(0);
+        let mut changed = false;
+        for clip in &mut self.clips {
+            if clip.start != free {
+                clip.start = free;
+                changed = true;
+            }
+            free = clip.end();
+        }
+        changed
     }
 
     /// Where something of a given length ends up if dropped at a moment. If its front
@@ -217,6 +251,18 @@ impl Timeline {
             source,
         });
         id
+    }
+
+    /// Puts a copy of a clip straight after it, moving later clips along if they need room.
+    pub fn duplicate(&mut self, id: ClipId) -> Option<ClipId> {
+        let clip = self.clip(id)?;
+        let copy = next_clip_id();
+        self.settle(Clip {
+            id: copy,
+            start: clip.end(),
+            ..clip
+        });
+        Some(copy)
     }
 
     /// Moves a clip as close as it can get to a moment.
@@ -352,6 +398,69 @@ mod tests {
         for pair in timeline.clips().windows(2) {
             assert!(pair[0].end() <= pair[1].start, "{pair:?}");
         }
+    }
+
+    #[test]
+    fn removing_all_gaps_closes_every_one_and_keeps_the_order() {
+        let (mut timeline, ids) = three_clips();
+        timeline.move_clip(ids[2], Ticks(100));
+        timeline.move_clip(ids[1], Ticks(50));
+        timeline.move_clip(ids[0], Ticks(5));
+        assert_eq!(timeline.gaps().len(), 3);
+
+        assert!(timeline.remove_all_gaps());
+
+        assert!(timeline.gaps().is_empty());
+        assert_eq!(order(&timeline), ids);
+        assert_eq!(starts(&timeline), [0, 10, 30]);
+    }
+
+    #[test]
+    fn removing_all_gaps_with_none_changes_nothing() {
+        let (mut timeline, _) = three_clips();
+
+        assert!(!timeline.remove_all_gaps());
+        assert_eq!(starts(&timeline), [0, 10, 30]);
+    }
+
+    #[test]
+    fn a_duplicate_lands_straight_after_its_clip_with_the_same_footage() {
+        let (mut timeline, ids) = three_clips();
+
+        let copy = timeline.duplicate(ids[0]).expect("the clip exists");
+
+        assert_eq!(order(&timeline), [ids[0], copy, ids[1], ids[2]]);
+        assert_eq!(starts(&timeline), [0, 10, 20, 40]);
+        let (original, duplicate) = (
+            timeline.clip(ids[0]).expect("the clip stays"),
+            timeline.clip(copy).expect("the copy is there"),
+        );
+        assert_eq!(duplicate.media, original.media);
+        assert_eq!(duplicate.source, original.source);
+        assert_no_overlaps(&timeline);
+    }
+
+    #[test]
+    fn a_duplicate_uses_up_dead_space_before_moving_anything() {
+        let (mut timeline, ids) = three_clips();
+        timeline.move_clip(ids[1], Ticks(50));
+        let before = timeline.clip(ids[1]).expect("the clip exists").start;
+
+        timeline.duplicate(ids[0]);
+
+        assert_eq!(
+            timeline.clip(ids[1]).expect("the clip exists").start,
+            before
+        );
+        assert_no_overlaps(&timeline);
+    }
+
+    #[test]
+    fn a_clip_that_is_gone_cannot_be_duplicated() {
+        let (mut timeline, ids) = three_clips();
+        timeline.remove(ids[0]);
+
+        assert_eq!(timeline.duplicate(ids[0]), None);
     }
 
     #[test]

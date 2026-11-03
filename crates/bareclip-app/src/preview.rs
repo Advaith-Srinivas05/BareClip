@@ -255,7 +255,10 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use bareclip_core::timeline::TimeRange;
+    use bareclip_core::{
+        timeline::TimeRange,
+        tracks::{TrackTarget, Tracks},
+    };
     use bareclip_media::probe;
 
     fn make_clip(name: &str, first_number: u32) -> PathBuf {
@@ -350,6 +353,55 @@ mod tests {
         timeline.push(MediaId(1), range(1.0, 1.5));
         timeline.push(MediaId(2), range(0.5, 1.0));
         timeline
+    }
+
+    /// A clip of the first video, with half a second of the second one on a track above.
+    fn covered_tracks() -> Tracks {
+        let mut tracks = Tracks::default();
+        tracks.place(
+            MediaId(1),
+            range(1.0, 2.0),
+            seconds(0.0),
+            TrackTarget::New(0),
+        );
+        tracks.place(
+            MediaId(2),
+            range(0.5, 1.0),
+            seconds(0.25),
+            TrackTarget::New(0),
+        );
+        tracks
+    }
+
+    #[test]
+    fn a_higher_track_shows_over_a_lower_one_and_the_lower_one_carries_on_after_it() {
+        let tracks = covered_tracks();
+        let played = tracks.played();
+        let mut preview = Preview::new(false, no_notify());
+
+        preview.seek(played, &lookup, seconds(0.1));
+        wait_for_frame(&mut preview, played, 33);
+
+        // 0.1 s into the upper clip, which starts half a second into its video.
+        preview.seek(played, &lookup, seconds(0.35));
+        wait_for_frame(&mut preview, played, 1018);
+
+        // 0.8 s into the lower clip, not 0.3 s: the time under the upper clip still passed.
+        preview.seek(played, &lookup, seconds(0.8));
+        wait_for_frame(&mut preview, played, 54);
+    }
+
+    #[test]
+    fn playback_runs_from_a_lower_track_to_a_higher_one_and_back() {
+        let tracks = covered_tracks();
+        let played = tracks.played();
+        assert_eq!(played.clips().len(), 3);
+        let mut preview = Preview::new(false, no_notify());
+
+        preview.play(played, &lookup);
+
+        wait_for_frame(&mut preview, played, 1016);
+        wait_for_frame(&mut preview, played, 54);
     }
 
     #[test]

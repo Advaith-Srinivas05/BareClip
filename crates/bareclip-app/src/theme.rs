@@ -97,6 +97,9 @@ const THEME_CHOICES: [(ThemePreference, Icon, &str); 3] = [
     (ThemePreference::Dark, icons::MOON, "Dark"),
 ];
 
+/// How long panels take to slide and menus to fade, kept short so nothing feels slow.
+const ANIMATION_SECONDS: f32 = 0.15;
+
 /// The colours of the theme currently showing.
 pub fn palette(ctx: &egui::Context) -> &'static Palette {
     match ctx.theme() {
@@ -109,6 +112,7 @@ pub fn palette(ctx: &egui::Context) -> &'static Palette {
 pub fn install(ctx: &egui::Context) {
     ctx.set_visuals_of(Theme::Dark, visuals(&DARK, Theme::Dark));
     ctx.set_visuals_of(Theme::Light, visuals(&LIGHT, Theme::Light));
+    ctx.all_styles_mut(|style| style.animation_time = ANIMATION_SECONDS);
 }
 
 /// The symbol for the theme choice in use.
@@ -466,5 +470,6 @@ pub mod tests {
         assert_eq!(ctx.global_style().visuals.panel_fill, DARK.surface);
         ctx.set_theme(Theme::Light);
         assert_eq!(ctx.global_style().visuals.panel_fill, LIGHT.surface);
+        assert_eq!(ctx.global_style().animation_time, ANIMATION_SECONDS);
     }
 }
