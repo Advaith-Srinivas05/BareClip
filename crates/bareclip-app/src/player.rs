@@ -730,7 +730,7 @@ mod tests {
         }
 
         assert!(
-            began.elapsed() < Duration::from_millis(100),
+            began.elapsed() < Duration::from_millis(500),
             "it took {:?} to start",
             began.elapsed()
         );

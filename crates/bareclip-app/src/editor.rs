@@ -1466,6 +1466,7 @@ impl Editor {
             timeline_state,
             layer_pictures,
             layer_display,
+            stage_state,
             ..
         } = self;
         let lookup = |id: MediaId| media_info(media, id);
@@ -1488,7 +1489,15 @@ impl Editor {
                 preview.position(project.tracks.played()),
                 project.tracks.duration(),
             );
-            let stack = project.tracks.stack_at(now, canvas, &size_of);
+            let mut stack = project.tracks.stack_at(now, canvas, &size_of);
+            // The clip being cropped shows whole, with what would be cut dimmed on top.
+            if let Some(clip) = stage_state
+                .cropping()
+                .and_then(|id| stack.iter_mut().find(|clip| clip.id == id))
+                && let Some(size) = size_of(clip.media)
+            {
+                clip.placement = clip.placement.uncropped(size, canvas);
+            }
             let moment = Moment {
                 now,
                 playing: preview.is_playing(),
@@ -5152,6 +5161,36 @@ mod tests {
         // A coloured background, around a resized clip and with its menu open.
         layered.project.canvas.background = [255, 148, 34];
         layered.project.tracks.remove(top_and_below(&layered).1);
+        // Cropping, with the part being cut dimmed.
+        layered.project.tracks.set_placement(
+            top,
+            Placement {
+                center_x: WHOLE / 2,
+                center_y: WHOLE / 2,
+                scale: WHOLE * 7 / 10,
+                crop_left: WHOLE / 5,
+                crop_bottom: WHOLE * 3 / 10,
+                ..Placement::default()
+            },
+        );
+        layered.selected = Some(top);
+        wait_for_layers(&ctx, &mut layered);
+        camera.shoot(&ctx, &mut layered, moved(pos2(1100.0, 80.0)), "72-cropped");
+        click_named(&ctx, &mut layered, "Crop");
+        wait_for_layers(&ctx, &mut layered);
+        camera.shoot(&ctx, &mut layered, moved(pos2(1100.0, 80.0)), "73-cropping");
+        click_named(&ctx, &mut layered, "Finish cropping");
+        layered.project.tracks.set_placement(
+            top,
+            Placement {
+                center_x: WHOLE * 2 / 5,
+                center_y: WHOLE / 2,
+                scale: WHOLE / 2,
+                rotation: 30_000,
+                flip_x: true,
+                ..Placement::default()
+            },
+        );
         wait_for_layers(&ctx, &mut layered);
         camera.shoot(
             &ctx,
@@ -10823,5 +10862,182 @@ mod tests {
             Route::Fast,
             "still one picture at a time"
         );
+    }
+
+    #[test]
+    fn cropping_cuts_a_side_away_and_leaves_the_rest_where_it_was_as_one_undo_step() {
+        let ctx = context();
+        let mut editor = stacked_clips(&ctx);
+        let (top, _) = top_and_below(&editor);
+        editor
+            .project
+            .tracks
+            .set_placement(top, small_in_a_corner());
+        editor.selected = Some(top);
+        run_frame(&ctx, &mut editor, vec![]);
+        let before = editor.project.clone();
+
+        click_named(&ctx, &mut editor, "Crop");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.stage_state.cropping(), Some(top));
+
+        // It spans 0.1 to 0.5 across, so its left edge in the middle of its height is at (0.1, 0.3).
+        let from = on_canvas(&editor, 0.1, 0.3);
+        let to = on_canvas(&editor, 0.2, 0.3);
+        begin_drag(&ctx, &mut editor, from, to);
+        end_drag(&ctx, &mut editor, to);
+
+        let cropped = placement_of(&editor, top);
+        assert!(
+            (cropped.crop_left - WHOLE / 4).abs() < WHOLE / 50,
+            "{cropped:?}"
+        );
+        assert_eq!(cropped.crop_right, 0);
+        assert_eq!(
+            cropped.scale,
+            small_in_a_corner().scale,
+            "it doesn't resize"
+        );
+        let whole = cropped.uncropped((320, 180), (320, 180));
+        assert!(
+            (whole.center_x - 300_000).abs() < 100,
+            "the rest stays: {whole:?}"
+        );
+
+        editor.undo();
+        assert_eq!(editor.project, before);
+    }
+
+    #[test]
+    fn a_drag_while_cropping_never_moves_or_resizes_the_clip() {
+        let ctx = context();
+        let mut editor = stacked_clips(&ctx);
+        let (top, _) = top_and_below(&editor);
+        editor
+            .project
+            .tracks
+            .set_placement(top, small_in_a_corner());
+        editor.selected = Some(top);
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Crop");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let from = on_canvas(&editor, 0.3, 0.3);
+        let to = on_canvas(&editor, 0.4, 0.4);
+        begin_drag(&ctx, &mut editor, from, to);
+        end_drag(&ctx, &mut editor, to);
+
+        assert_eq!(placement_of(&editor, top), small_in_a_corner());
+    }
+
+    #[test]
+    fn finishing_clicking_away_or_deselecting_all_end_cropping() {
+        let ctx = context();
+        let mut editor = stacked_clips(&ctx);
+        let (top, _) = top_and_below(&editor);
+        editor
+            .project
+            .tracks
+            .set_placement(top, small_in_a_corner());
+        editor.selected = Some(top);
+        run_frame(&ctx, &mut editor, vec![]);
+        let begin = |ctx: &egui::Context, editor: &mut Editor| {
+            click_named(ctx, editor, "Crop");
+            run_frame(ctx, editor, vec![]);
+            assert_eq!(editor.stage_state.cropping(), Some(top));
+        };
+
+        begin(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Finish cropping");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.stage_state.cropping(), None);
+
+        begin(&ctx, &mut editor);
+        let away = on_canvas(&editor, 0.9, 0.9);
+        click(&ctx, &mut editor, away);
+        assert_eq!(editor.stage_state.cropping(), None);
+        assert_eq!(editor.selected, Some(top), "it stays selected");
+
+        begin(&ctx, &mut editor);
+        editor.selected = None;
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.stage_state.cropping(), None);
+    }
+
+    #[test]
+    fn reset_crop_puts_back_what_was_cut_with_the_rest_still_in_place() {
+        let ctx = context();
+        let mut editor = stacked_clips(&ctx);
+        let (top, _) = top_and_below(&editor);
+        let start = small_in_a_corner();
+        let cropped = start.cropped_to(
+            bareclip_core::placement::CropSides {
+                left: 0.25,
+                ..Default::default()
+            },
+            (320, 180),
+            (320, 180),
+        );
+        editor.project.tracks.set_placement(top, cropped);
+        editor.selected = Some(top);
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Crop");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        click_named(&ctx, &mut editor, "Reset crop");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let back = placement_of(&editor, top);
+        assert!(!back.is_cropped());
+        assert!((back.center_x - start.center_x).abs() <= 2, "{back:?}");
+    }
+
+    #[test]
+    fn a_cropped_clip_takes_the_full_route() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let clip = editor.project.tracks.played().clips()[0].id;
+        assert_eq!(editor.export_route(), Route::Fast);
+
+        editor.project.tracks.set_placement(
+            clip,
+            Placement {
+                crop_left: WHOLE / 10,
+                ..Placement::default()
+            },
+        );
+
+        assert_eq!(
+            editor.export_route(),
+            Route::Full(LAYERED_REASON.to_owned())
+        );
+    }
+
+    #[test]
+    fn a_crop_turn_and_flip_come_back_when_a_project_is_opened_again() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let clip = editor.project.tracks.played().clips()[0].id;
+        let placement = Placement {
+            rotation: 33_000,
+            flip_y: true,
+            crop_bottom: WHOLE / 5,
+            ..small_in_a_corner()
+        };
+        editor.project.tracks.set_placement(clip, placement);
+        let folder = project_folder("look");
+        let path = folder.join("look.bareclip");
+        assert!(editor.save_to(&path));
+
+        let mut reopened = Editor::new(&ctx, false);
+        reopened.open_project(&ctx, &path);
+        settle(&ctx, &mut reopened);
+        run_frame(&ctx, &mut reopened, vec![]);
+
+        assert_eq!(
+            reopened.project.tracks.tracks()[0].clips()[0].placement,
+            placement
+        );
+        assert!(!reopened.has_unsaved_changes());
     }
 }

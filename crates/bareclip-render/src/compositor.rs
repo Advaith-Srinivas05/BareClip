@@ -546,16 +546,17 @@ impl Compositor {
         let rect = layer.rect;
         let rows = color::to_rgb(picture.color);
         let radians = layer.look.degrees.to_radians();
-        // A flip just reads the picture from the other side.
+        // Cropping reads only part of the picture, and a flip reads it from the other side.
+        let [left, top, right, bottom] = layer.look.source;
         let (from_x, to_x) = if layer.look.flip_x {
-            (1.0, 0.0)
+            (right, left)
         } else {
-            (0.0, 1.0)
+            (left, right)
         };
         let (from_y, to_y) = if layer.look.flip_y {
-            (1.0, 0.0)
+            (bottom, top)
         } else {
-            (0.0, 1.0)
+            (top, bottom)
         };
         // Edges only need softening where they don't line up with the pixels.
         let soft_edges = if layer.look.degrees % 90.0 == 0.0 {
@@ -973,6 +974,39 @@ mod tests {
         let pixels = compositor.read_display().expect("it reads back");
 
         assert_eq!(&pixels[..4], &[255, 148, 34, 255]);
+    }
+
+    #[test]
+    fn a_crop_shows_only_the_part_kept_stretched_over_the_place() {
+        let Some(mut compositor) = compositor(64, 36) else {
+            return;
+        };
+        let picture = half_and_half(64, 36);
+        let mut layer = picture.filling((64, 36));
+        // Only the right half, which is all blue, across the whole place.
+        layer.look.source = [0.5, 0.0, 1.0, 1.0];
+
+        let drawn = compositor.render(&[layer]).expect("it draws");
+
+        assert_near(at(&drawn, 8, 18), BLUE_HD);
+        assert_near(at(&drawn, 56, 18), BLUE_HD);
+    }
+
+    #[test]
+    fn a_crop_and_a_flip_together_read_the_kept_part_backwards() {
+        let Some(mut compositor) = compositor(64, 36) else {
+            return;
+        };
+        let picture = half_and_half(64, 36);
+        let mut layer = picture.filling((64, 36));
+        // The middle half, so red then blue, but flipped so blue comes first.
+        layer.look.source = [0.25, 0.0, 0.75, 1.0];
+        layer.look.flip_x = true;
+
+        let drawn = compositor.render(&[layer]).expect("it draws");
+
+        assert_near(at(&drawn, 8, 18), BLUE_HD);
+        assert_near(at(&drawn, 56, 18), RED_HD);
     }
 
     #[test]

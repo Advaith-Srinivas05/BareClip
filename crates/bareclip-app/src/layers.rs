@@ -625,6 +625,10 @@ mod tests {
                 center_y: WHOLE * 4 / 10,
                 scale: WHOLE / 2,
                 opacity: WHOLE * 3 / 4,
+                rotation: 20_000,
+                flip_x: true,
+                crop_left: WHOLE / 10,
+                crop_bottom: WHOLE / 5,
                 ..Placement::default()
             },
         );
@@ -714,6 +718,10 @@ mod tests {
                 center_y: WHOLE * 6 / 10,
                 scale: WHOLE / 2,
                 opacity: WHOLE * 3 / 4,
+                rotation: 20_000,
+                flip_x: true,
+                crop_left: WHOLE / 10,
+                crop_bottom: WHOLE / 5,
                 ..Placement::default()
             },
         );

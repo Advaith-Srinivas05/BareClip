@@ -18,6 +18,8 @@ const QUARTER_TURN: i32 = FULL_TURN / 4;
 /// How far a scale can be from a picture's best fit and still count as being at it, so that turning
 /// a picture back round finds its way home exactly.
 const CLOSE_TO_FIT: f64 = 0.002;
+/// The least of a picture that cropping leaves, each way.
+const SMALLEST_KEPT_BY_CROP: i32 = WHOLE / 20;
 /// How big a picture-in-picture is, compared with its normal size.
 const PICTURE_IN_PICTURE_SCALE: i32 = WHOLE * 3 / 10;
 /// How far a picture-in-picture sits from the canvas's edges, as a share of its shorter side.
@@ -91,6 +93,22 @@ pub struct Placement {
     pub rotation: i32,
     pub flip_x: bool,
     pub flip_y: bool,
+    /// How much is cut from each side of the source picture, as parts of its width or height.
+    /// These go by the source, not by how it looks once flipped.
+    pub crop_left: i32,
+    pub crop_top: i32,
+    pub crop_right: i32,
+    pub crop_bottom: i32,
+}
+
+/// How much is cut from each side of a picture as it looks on screen, once flipped but not
+/// turned, as shares of the whole picture.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CropSides {
+    pub left: f64,
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
 }
 
 /// A corner of the canvas.
@@ -118,6 +136,8 @@ pub struct PictureLook {
     pub degrees: f32,
     pub flip_x: bool,
     pub flip_y: bool,
+    /// The part of the source picture that shows: left, top, right and bottom, from 0 to 1.
+    pub source: [f32; 4],
 }
 
 impl PictureLook {
@@ -125,6 +145,7 @@ impl PictureLook {
         degrees: 0.0,
         flip_x: false,
         flip_y: false,
+        source: [0.0, 0.0, 1.0, 1.0],
     };
 
     pub fn is_plain(&self) -> bool {
@@ -142,6 +163,10 @@ impl Default for Placement {
             rotation: 0,
             flip_x: false,
             flip_y: false,
+            crop_left: 0,
+            crop_top: 0,
+            crop_right: 0,
+            crop_bottom: 0,
         }
     }
 }
@@ -159,7 +184,112 @@ impl Placement {
             scale: self.scale.clamp(SMALLEST_SCALE, LARGEST_SCALE),
             opacity: self.opacity.clamp(0, WHOLE),
             rotation: self.rotation.rem_euclid(FULL_TURN),
+            crop_left: self.crop_left.clamp(0, WHOLE - SMALLEST_KEPT_BY_CROP),
+            crop_right: self
+                .crop_right
+                .clamp(0, (WHOLE - SMALLEST_KEPT_BY_CROP - self.crop_left).max(0)),
+            crop_top: self.crop_top.clamp(0, WHOLE - SMALLEST_KEPT_BY_CROP),
+            crop_bottom: self
+                .crop_bottom
+                .clamp(0, (WHOLE - SMALLEST_KEPT_BY_CROP - self.crop_top).max(0)),
             ..self
+        }
+    }
+
+    /// Whether any of the picture has been cut away.
+    pub fn is_cropped(self) -> bool {
+        self.crop_left != 0 || self.crop_top != 0 || self.crop_right != 0 || self.crop_bottom != 0
+    }
+
+    /// How much of the picture's width and height is left after cropping.
+    fn kept(self) -> (f64, f64) {
+        let whole = f64::from(WHOLE);
+        (
+            1.0 - f64::from(self.crop_left + self.crop_right) / whole,
+            1.0 - f64::from(self.crop_top + self.crop_bottom) / whole,
+        )
+    }
+
+    /// How much is cut from each side, as the picture looks on screen.
+    pub fn crop_sides(self) -> CropSides {
+        let share = |value: i32| f64::from(value) / f64::from(WHOLE);
+        let (left, right) = if self.flip_x {
+            (self.crop_right, self.crop_left)
+        } else {
+            (self.crop_left, self.crop_right)
+        };
+        let (top, bottom) = if self.flip_y {
+            (self.crop_bottom, self.crop_top)
+        } else {
+            (self.crop_top, self.crop_bottom)
+        };
+        CropSides {
+            left: share(left),
+            top: share(top),
+            right: share(right),
+            bottom: share(bottom),
+        }
+    }
+
+    /// How far the part that is kept sits from the middle of the whole picture, in pixels on the
+    /// canvas, after turning.
+    fn kept_offset(self, picture: (u32, u32), canvas: (u32, u32)) -> (f64, f64) {
+        let fitted = fit_inside(picture, canvas);
+        let scale = f64::from(self.scale) / f64::from(WHOLE);
+        let sides = self.crop_sides();
+        let across = (sides.left - sides.right) / 2.0 * f64::from(fitted.width) * scale;
+        let down = (sides.top - sides.bottom) / 2.0 * f64::from(fitted.height) * scale;
+        let radians = self.degrees().to_radians();
+        (
+            across * radians.cos() - down * radians.sin(),
+            across * radians.sin() + down * radians.cos(),
+        )
+    }
+
+    /// The same picture with nothing cut away, with what was kept staying exactly where it is.
+    pub fn uncropped(self, picture: (u32, u32), canvas: (u32, u32)) -> Self {
+        let (across, down) = self.kept_offset(picture, canvas);
+        let whole = f64::from(WHOLE);
+        Self {
+            center_x: self.center_x - (across / f64::from(canvas.0) * whole).round() as i32,
+            center_y: self.center_y - (down / f64::from(canvas.1) * whole).round() as i32,
+            crop_left: 0,
+            crop_top: 0,
+            crop_right: 0,
+            crop_bottom: 0,
+            ..self
+        }
+    }
+
+    /// The same picture cropped differently, with what stays staying exactly where it is. Cropping
+    /// never makes the rest of the picture move or grow.
+    pub fn cropped_to(self, sides: CropSides, picture: (u32, u32), canvas: (u32, u32)) -> Self {
+        let full = self.uncropped(picture, canvas);
+        let whole = f64::from(WHOLE);
+        let part = |share: f64| (share.clamp(0.0, 1.0) * whole).round() as i32;
+        let (crop_left, crop_right) = if self.flip_x {
+            (part(sides.right), part(sides.left))
+        } else {
+            (part(sides.left), part(sides.right))
+        };
+        let (crop_top, crop_bottom) = if self.flip_y {
+            (part(sides.bottom), part(sides.top))
+        } else {
+            (part(sides.top), part(sides.bottom))
+        };
+        let cropped = Self {
+            crop_left,
+            crop_top,
+            crop_right,
+            crop_bottom,
+            ..full
+        }
+        .clamped();
+        let (across, down) = cropped.kept_offset(picture, canvas);
+        Self {
+            center_x: full.center_x + (across / f64::from(canvas.0) * whole).round() as i32,
+            center_y: full.center_y + (down / f64::from(canvas.1) * whole).round() as i32,
+            ..cropped
         }
     }
 
@@ -174,13 +304,21 @@ impl Placement {
             degrees: self.degrees() as f32,
             flip_x: self.flip_x,
             flip_y: self.flip_y,
+            source: [
+                self.crop_left as f32 / WHOLE as f32,
+                self.crop_top as f32 / WHOLE as f32,
+                1.0 - self.crop_right as f32 / WHOLE as f32,
+                1.0 - self.crop_bottom as f32 / WHOLE as f32,
+            ],
         }
     }
 
     /// The scale at which a picture just fits the canvas when turned this far by quarter turns.
-    fn fit_scale(picture: (u32, u32), canvas: (u32, u32), rotation: i32) -> f64 {
+    fn fit_scale(picture: (u32, u32), canvas: (u32, u32), rotation: i32, kept: (f64, f64)) -> f64 {
         let fitted = fit_inside(picture, canvas);
-        let (width, height) = (f64::from(fitted.width), f64::from(fitted.height));
+        let (kept_width, kept_height) = kept;
+        let width = f64::from(fitted.width) * kept_width;
+        let height = f64::from(fitted.height) * kept_height;
         let (across, down) = if rotation % (QUARTER_TURN * 2) == 0 {
             (width, height)
         } else {
@@ -195,9 +333,10 @@ impl Placement {
         let rotation = (self.rotation / QUARTER_TURN + 1) * QUARTER_TURN % FULL_TURN;
         let scale_now = f64::from(self.scale) / f64::from(WHOLE);
         let was_fitting = self.rotation % QUARTER_TURN == 0
-            && (scale_now - Self::fit_scale(picture, canvas, self.rotation)).abs() <= CLOSE_TO_FIT;
+            && (scale_now - Self::fit_scale(picture, canvas, self.rotation, self.kept())).abs()
+                <= CLOSE_TO_FIT;
         let scale = if was_fitting {
-            let fit = Self::fit_scale(picture, canvas, rotation);
+            let fit = Self::fit_scale(picture, canvas, rotation, self.kept());
             ((fit * f64::from(WHOLE)).round() as i32).clamp(SMALLEST_SCALE, LARGEST_SCALE)
         } else {
             self.scale
@@ -261,12 +400,17 @@ impl Placement {
     /// Where a picture of this size goes on a canvas.
     pub fn rect(self, picture: (u32, u32), canvas: (u32, u32)) -> Rect {
         let fitted = fit_inside(picture, canvas);
-        if self.center_x == WHOLE / 2 && self.center_y == WHOLE / 2 && self.scale == WHOLE {
+        if self.center_x == WHOLE / 2
+            && self.center_y == WHOLE / 2
+            && self.scale == WHOLE
+            && !self.is_cropped()
+        {
             return fitted;
         }
         let part = |value: i32| f64::from(value) / f64::from(WHOLE);
-        let width = f64::from(fitted.width) * part(self.scale);
-        let height = f64::from(fitted.height) * part(self.scale);
+        let (kept_width, kept_height) = self.kept();
+        let width = f64::from(fitted.width) * part(self.scale) * kept_width;
+        let height = f64::from(fitted.height) * part(self.scale) * kept_height;
         Rect {
             x: (part(self.center_x) * f64::from(canvas.0) - width / 2.0) as f32,
             y: (part(self.center_y) * f64::from(canvas.1) - height / 2.0) as f32,
@@ -509,6 +653,218 @@ mod tests {
 
         assert_eq!(placed.opacity, WHOLE / 2);
         assert!(placed.flip_x);
+    }
+
+    /// Half the size somewhere away from the middle, so anything that moves shows up.
+    fn off_centre() -> Placement {
+        Placement {
+            center_x: 400_000,
+            center_y: 300_000,
+            scale: WHOLE / 2,
+            ..Placement::default()
+        }
+    }
+
+    /// Where a corner of the whole picture is on the canvas, given which way it lies.
+    fn full_corner(placement: Placement, across: f64, down: f64) -> (f64, f64) {
+        let full = placement.uncropped(CANVAS, CANVAS);
+        let rect = full.rect(CANVAS, CANVAS);
+        let (half_w, half_h) = (f64::from(rect.width) / 2.0, f64::from(rect.height) / 2.0);
+        let (x, y) = (f64::from(rect.x) + half_w, f64::from(rect.y) + half_h);
+        let radians = full.degrees().to_radians();
+        let (reach_x, reach_y) = (across * half_w, down * half_h);
+        (
+            x + reach_x * radians.cos() - reach_y * radians.sin(),
+            y + reach_x * radians.sin() + reach_y * radians.cos(),
+        )
+    }
+
+    #[track_caller]
+    fn assert_close(found: (f64, f64), wanted: (f64, f64)) {
+        assert!(
+            (found.0 - wanted.0).abs() < 0.1 && (found.1 - wanted.1).abs() < 0.1,
+            "{found:?} is not {wanted:?}"
+        );
+    }
+
+    #[test]
+    fn a_cropped_picture_is_only_as_big_as_what_is_kept() {
+        let cropped = Placement {
+            crop_left: WHOLE / 4,
+            crop_bottom: WHOLE / 2,
+            ..Placement::default()
+        };
+
+        let rect = cropped.rect(CANVAS, CANVAS);
+
+        assert_eq!(rect.width, 1440.0);
+        assert_eq!(rect.height, 540.0);
+    }
+
+    #[test]
+    fn cropping_leaves_what_is_kept_exactly_where_it_was() {
+        let start = off_centre();
+        let before = start.rect(CANVAS, CANVAS);
+
+        let cropped = start.cropped_to(
+            CropSides {
+                left: 0.25,
+                ..CropSides::default()
+            },
+            CANVAS,
+            CANVAS,
+        );
+
+        let after = cropped.rect(CANVAS, CANVAS);
+        // Half size is 960 wide, so a quarter of it cut from the left moves that edge in by 240.
+        assert!((after.x - before.x - 240.0).abs() < 0.1, "{after:?}");
+        assert!((after.width - 720.0).abs() < 0.1, "{after:?}");
+        assert!((after.x + after.width - before.x - before.width).abs() < 0.1);
+        assert_eq!(after.y, before.y);
+    }
+
+    #[test]
+    fn the_whole_picture_stays_put_however_it_is_cropped() {
+        for start in [
+            off_centre(),
+            Placement {
+                rotation: 30_000,
+                ..off_centre()
+            },
+            Placement {
+                rotation: 90_000,
+                flip_x: true,
+                ..off_centre()
+            },
+            Placement {
+                rotation: 250_000,
+                flip_x: true,
+                flip_y: true,
+                ..off_centre()
+            },
+        ] {
+            let sides = CropSides {
+                left: 0.1,
+                top: 0.2,
+                right: 0.3,
+                bottom: 0.05,
+            };
+
+            let cropped = start.cropped_to(sides, CANVAS, CANVAS);
+
+            assert_close(
+                full_corner(cropped, -1.0, -1.0),
+                full_corner(start, -1.0, -1.0),
+            );
+            assert_close(full_corner(cropped, 1.0, 1.0), full_corner(start, 1.0, 1.0));
+            assert_eq!(cropped.scale, start.scale, "cropping doesn't resize");
+        }
+    }
+
+    #[test]
+    fn uncropping_after_cropping_comes_back_where_it_began() {
+        let start = Placement {
+            rotation: 45_000,
+            ..off_centre()
+        };
+
+        let back = start
+            .cropped_to(
+                CropSides {
+                    left: 0.3,
+                    bottom: 0.2,
+                    ..CropSides::default()
+                },
+                CANVAS,
+                CANVAS,
+            )
+            .uncropped(CANVAS, CANVAS);
+
+        assert!((back.center_x - start.center_x).abs() <= 2, "{back:?}");
+        assert!((back.center_y - start.center_y).abs() <= 2, "{back:?}");
+        assert!(!back.is_cropped());
+    }
+
+    #[test]
+    fn a_flipped_pictures_crop_goes_by_what_is_seen() {
+        let flipped = Placement {
+            flip_x: true,
+            flip_y: true,
+            ..Placement::default()
+        };
+
+        let cropped = flipped.cropped_to(
+            CropSides {
+                left: 0.25,
+                top: 0.1,
+                ..CropSides::default()
+            },
+            CANVAS,
+            CANVAS,
+        );
+
+        assert_eq!(cropped.crop_right, WHOLE / 4, "seen on the left");
+        assert_eq!(cropped.crop_left, 0);
+        assert_eq!(cropped.crop_bottom, WHOLE / 10, "seen on the top");
+        assert_eq!(cropped.crop_sides().left, 0.25);
+        assert_eq!(cropped.crop_sides().top, 0.1);
+    }
+
+    #[test]
+    fn crop_shows_the_right_part_of_the_source() {
+        let cropped = Placement {
+            crop_left: WHOLE / 4,
+            crop_top: WHOLE / 2,
+            crop_right: WHOLE / 4,
+            ..Placement::default()
+        };
+
+        assert_eq!(cropped.look().source, [0.25, 0.5, 0.75, 1.0]);
+        assert!(Placement::default().look().is_plain());
+        assert!(!cropped.look().is_plain());
+    }
+
+    #[test]
+    fn a_crop_can_never_leave_nothing() {
+        let cut_away = Placement {
+            crop_left: WHOLE,
+            crop_right: WHOLE,
+            crop_top: WHOLE * 2,
+            crop_bottom: -5,
+            ..Placement::default()
+        }
+        .clamped();
+
+        assert_eq!(cut_away.crop_left, WHOLE - SMALLEST_KEPT_BY_CROP);
+        assert_eq!(cut_away.crop_right, 0);
+        assert_eq!(cut_away.crop_top, WHOLE - SMALLEST_KEPT_BY_CROP);
+        assert_eq!(cut_away.crop_bottom, 0);
+        let (width, height) = cut_away.kept();
+        assert!(width > 0.0 && height > 0.0);
+    }
+
+    #[test]
+    fn a_placement_from_before_cropping_reads_as_not_cropped() {
+        let text = r#"{"center_x":100,"center_y":200,"scale":300,"opacity":400,"rotation":500}"#;
+
+        let placement: Placement = serde_json::from_str(text).expect("it can be read");
+
+        assert!(!placement.is_cropped());
+        assert_eq!(placement.rotation, 500);
+    }
+
+    #[test]
+    fn a_cropped_picture_fitting_the_canvas_goes_on_fitting_it_when_turned() {
+        // What is kept is square, so it should stay the height of the canvas at every turn.
+        let square_part = Placement {
+            crop_left: 218_750,
+            crop_right: 218_750,
+            ..Placement::default()
+        };
+
+        let turned = square_part.turned_quarter(CANVAS, CANVAS);
+
+        assert!((turned.scale - WHOLE).abs() < 10, "{turned:?}");
     }
 
     #[test]
