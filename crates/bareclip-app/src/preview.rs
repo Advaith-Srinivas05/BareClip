@@ -144,17 +144,26 @@ impl Preview {
         };
 
         let media = location.clip.media;
-        if self.current.map(|(_, current)| current) != Some(media) {
+        let changed_video = self.current.map(|(_, current)| current) != Some(media);
+        if changed_video {
             self.pause_all();
         }
         self.current = Some((location.clip.id, media));
         let keep_playing = self.playing;
         if let Some(player) = self.player_for(media, lookup) {
+            if changed_video {
+                player.forget_pictures();
+            }
             player.seek(location.source_time);
             if keep_playing && !player.is_playing() {
                 player.play();
             }
         }
+    }
+
+    #[cfg(test)]
+    pub fn seeks_sent(&self) -> u64 {
+        self.slots.iter().map(|slot| slot.player.seeks_sent()).sum()
     }
 
     pub fn play(&mut self, timeline: &Timeline, lookup: &dyn Fn(MediaId) -> Option<MediaInfo>) {
@@ -550,6 +559,30 @@ mod tests {
         timeline.push(MediaId(1), range(1.0, 1.3));
         timeline.place(MediaId(2), range(0.5, 0.8), seconds(0.8));
         timeline
+    }
+
+    #[test]
+    fn coming_back_to_a_video_shows_nothing_left_over_from_before() {
+        let timeline = two_clip_timeline();
+        let mut preview = Preview::new(false, no_notify());
+        preview.seek(&timeline, &lookup, seconds(0.1));
+        // The first video's picture arrives while the second is being shown, so nobody takes it.
+        preview.seek(&timeline, &lookup, seconds(0.6));
+        thread::sleep(Duration::from_millis(300));
+
+        preview.seek(&timeline, &lookup, seconds(0.2));
+
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            if let Some(frame) = preview.update(&timeline, &lookup) {
+                assert_ne!(number_of(&frame), 33, "the picture from the first seek");
+                if number_of(&frame) == 36 {
+                    return;
+                }
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        panic!("the picture never arrived");
     }
 
     #[test]

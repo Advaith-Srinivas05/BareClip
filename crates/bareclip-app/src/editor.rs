@@ -36,7 +36,9 @@ use crate::{
     storage::{self, ExportCuts, Recovery, RecoveryRecord, Settings},
     text,
     theme::{self, Palette},
-    timeline::{self, ClipFace, ClipView, MediaDrag, MenuAction, TimelineState, TimelineView},
+    timeline::{
+        self, ClipFace, ClipView, MediaDrag, MenuAction, TimelineDrag, TimelineState, TimelineView,
+    },
 };
 
 const VIDEO_EXTENSIONS: [&str; 6] = ["mp4", "mkv", "mov", "webm", "avi", "ts"];
@@ -338,6 +340,9 @@ pub struct Editor {
     /// Where settings and recovery copies live. Without it, the app keeps nothing.
     app_folder: Option<PathBuf>,
     recovery: Option<Recovery>,
+    seek_bar_held: bool,
+    /// Playback was paused for the playhead being moved by hand, and carries on afterwards.
+    resume_after_scrub: bool,
     last_autosaved: Option<ProjectFile>,
     last_autosave_at: Instant,
     /// When the project first differed from what its file holds.
@@ -455,6 +460,8 @@ impl Editor {
             settings_open: false,
             app_folder: None,
             recovery: None,
+            seek_bar_held: false,
+            resume_after_scrub: false,
             last_autosaved: None,
             last_autosave_at: Instant::now(),
             unsaved_since: None,
@@ -966,6 +973,21 @@ impl Editor {
         preview.seek(project.tracks.played(), &|id| media_info(media, id), time);
         if self.project.tracks.is_empty() {
             self.picture = None;
+        }
+    }
+
+    /// Playback waits while the playhead is moved by hand, so the picture can follow the
+    /// pointer, and carries on from wherever it lands.
+    fn hold_playback_while_scrubbing(&mut self) {
+        let scrubbing = self.timeline_state.drag == TimelineDrag::Scrub || self.seek_bar_held;
+        if scrubbing && self.preview.is_playing() {
+            self.preview.pause(self.project.tracks.played());
+            self.resume_after_scrub = true;
+        } else if !scrubbing && std::mem::take(&mut self.resume_after_scrub) {
+            let at_the_end = self.position() >= self.project.tracks.duration();
+            if !at_the_end && !self.preview.is_playing() {
+                self.toggle_playback();
+            }
         }
     }
 
@@ -1781,8 +1803,10 @@ impl Editor {
         self.media_panel(ui, palette);
         // The video and the timeline share one card, from here down to the stage.
         self.card_top_row(ui, palette);
+        self.seek_bar_held = false;
         self.timeline_panel(ui, palette);
         self.stage(ui, palette);
+        self.hold_playback_while_scrubbing();
         self.remove_dialog(&ctx, palette);
         self.export_dialog(&ctx, palette);
         self.settings_dialog(&ctx, palette);
@@ -2645,9 +2669,14 @@ impl Editor {
                     let room = ui.available_width() - WINDOW_BUTTON_SIZE - CONTROL_SPACING - 8.0;
                     let position = self.position();
                     let total = self.project.tracks.duration();
-                    if let Some(time) =
-                        timeline::seek_bar(ui, palette, room.max(40.0), position, total)
-                    {
+                    if let Some(time) = timeline::seek_bar(
+                        ui,
+                        palette,
+                        room.max(40.0),
+                        position,
+                        total,
+                        &mut self.seek_bar_held,
+                    ) {
                         self.seek(time);
                     }
                     ui.add_space(8.0);
@@ -5987,28 +6016,168 @@ mod tests {
         let _ = std::fs::remove_file(&output);
     }
 
+    /// Rests the pointer somewhere, and gives the frame after it a chance to react.
+    fn hover_readout_at(ctx: &egui::Context, editor: &mut Editor, at: egui::Pos2) -> Option<Ticks> {
+        run_frame(ctx, editor, moved(at));
+        run_frame(ctx, editor, vec![]);
+        editor.timeline_state.hover_readout
+    }
+
     #[test]
-    fn hovering_anywhere_on_the_timeline_shows_the_time_there() {
+    fn hovering_the_empty_timeline_shows_the_time_there() {
         let ctx = context();
         let mut editor = with_videos(&ctx, &[test_clip()]);
         let scale = editor.timeline_state.scale;
         let track = editor.timeline_state.track;
 
-        // On a clip, on the ruler, and on the empty timeline after the video.
-        for (time, y) in [
-            (1.5, track.center().y),
-            (2.5, track.top() - 12.0),
-            (4.8, track.center().y),
-        ] {
+        // On the ruler, even above a clip, and on the empty timeline after the video.
+        for (time, y) in [(2.5, track.top() - 12.0), (4.8, track.center().y)] {
             let at = pos2(scale.x_of(Ticks::from_seconds(time)), y);
-            run_frame(&ctx, &mut editor, vec![egui::Event::PointerMoved(at)]);
-            let shown = editor.timeline_state.hover_time.expect("a time is shown");
+            let shown = hover_readout_at(&ctx, &mut editor, at).expect("a time is shown");
             assert!((shown.as_seconds() - time).abs() < 0.02, "{shown:?}");
         }
 
         let away = pos2(track.center().x, 100.0);
-        run_frame(&ctx, &mut editor, vec![egui::Event::PointerMoved(away)]);
-        assert_eq!(editor.timeline_state.hover_time, None);
+        assert_eq!(hover_readout_at(&ctx, &mut editor, away), None);
+    }
+
+    #[test]
+    fn the_hover_time_stays_away_from_clips() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let scale = editor.timeline_state.scale;
+        let y = editor.timeline_state.track.center().y;
+
+        // The middle of a clip, and its trim handle.
+        for time in [1.5, 4.0] {
+            let at = pos2(scale.x_of(Ticks::from_seconds(time)), y);
+            assert_eq!(hover_readout_at(&ctx, &mut editor, at), None, "at {time}");
+        }
+    }
+
+    #[test]
+    fn the_hover_time_stays_away_from_the_playhead() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        editor.seek(Ticks::from_seconds(2.0));
+        run_frame(&ctx, &mut editor, vec![]);
+        let scale = editor.timeline_state.scale;
+        let track = editor.timeline_state.track;
+        let x = scale.x_of(Ticks::from_seconds(2.0));
+        let ruler_y = track.top() - 12.0;
+
+        assert_eq!(hover_readout_at(&ctx, &mut editor, pos2(x, ruler_y)), None);
+        let beside = pos2(x + 30.0, ruler_y);
+        assert!(hover_readout_at(&ctx, &mut editor, beside).is_some());
+    }
+
+    #[test]
+    fn the_hover_time_stays_away_from_a_gaps_button_but_shows_on_the_gap() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip(), second_clip()]);
+        let second = editor.project.tracks.played().clips()[1];
+        let total = editor.project.tracks.duration();
+        let moved_to = Ticks(total.0 + Ticks::from_seconds(4.0).0);
+        editor
+            .project
+            .tracks
+            .move_clip(second.id, moved_to, TrackTarget::Existing(0));
+        run_frame(&ctx, &mut editor, vec![]);
+        editor.timeline_state.fit(editor.project.tracks.duration());
+        run_frame(&ctx, &mut editor, vec![]);
+        let gap = editor.project.tracks.gaps()[0];
+        let scale = editor.timeline_state.scale;
+        let track = editor.timeline_state.track;
+        let middle = scale.x_of(Ticks((gap.start.0 + gap.end.0) / 2));
+
+        let on_gap = pos2(middle - 60.0, track.center().y);
+        assert!(hover_readout_at(&ctx, &mut editor, on_gap).is_some());
+
+        let on_button = pos2(middle, track.center().y);
+        assert_eq!(hover_readout_at(&ctx, &mut editor, on_button), None);
+    }
+
+    #[test]
+    fn dragging_the_playhead_seeks_as_it_moves_and_not_while_it_rests() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let scale = editor.timeline_state.scale;
+        let ruler_y = editor.timeline_state.track.top() - 12.0;
+        let x_of = |seconds| scale.x_of(Ticks::from_seconds(seconds));
+        let before = editor.preview.seeks_sent();
+
+        begin_drag(
+            &ctx,
+            &mut editor,
+            pos2(x_of(1.0), ruler_y),
+            pos2(x_of(3.0), ruler_y),
+        );
+        let after_moving = editor.preview.seeks_sent();
+        assert!(after_moving > before);
+
+        for _ in 0..10 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        assert_eq!(editor.preview.seeks_sent(), after_moving);
+
+        end_drag(&ctx, &mut editor, pos2(x_of(3.0), ruler_y));
+    }
+
+    #[test]
+    fn moving_the_playhead_pauses_playback_until_it_is_let_go() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let scale = editor.timeline_state.scale;
+        let ruler_y = editor.timeline_state.track.top() - 12.0;
+        let (from, to) = (
+            pos2(scale.x_of(Ticks::from_seconds(1.0)), ruler_y),
+            pos2(scale.x_of(Ticks::from_seconds(3.0)), ruler_y),
+        );
+        editor.toggle_playback();
+
+        begin_drag(&ctx, &mut editor, from, to);
+        assert!(!editor.preview.is_playing());
+
+        end_drag(&ctx, &mut editor, to);
+        assert!(editor.preview.is_playing());
+        assert!(!editor.resume_after_scrub);
+    }
+
+    #[test]
+    fn a_paused_video_stays_paused_after_moving_the_playhead() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let scale = editor.timeline_state.scale;
+        let ruler_y = editor.timeline_state.track.top() - 12.0;
+        let (from, to) = (
+            pos2(scale.x_of(Ticks::from_seconds(1.0)), ruler_y),
+            pos2(scale.x_of(Ticks::from_seconds(3.0)), ruler_y),
+        );
+
+        begin_drag(&ctx, &mut editor, from, to);
+        end_drag(&ctx, &mut editor, to);
+
+        assert!(!editor.preview.is_playing());
+    }
+
+    #[test]
+    fn letting_go_at_the_very_end_does_not_start_over() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let scale = editor.timeline_state.scale;
+        let ruler_y = editor.timeline_state.track.top() - 12.0;
+        let total = editor.project.tracks.duration();
+        let (from, to) = (
+            pos2(scale.x_of(Ticks::from_seconds(1.0)), ruler_y),
+            pos2(scale.x_of(total) + 30.0, ruler_y),
+        );
+        editor.toggle_playback();
+
+        begin_drag(&ctx, &mut editor, from, to);
+        end_drag(&ctx, &mut editor, to);
+
+        assert!(!editor.preview.is_playing());
+        assert_eq!(editor.position(), total);
     }
 
     #[test]
