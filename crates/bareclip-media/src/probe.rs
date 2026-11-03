@@ -85,7 +85,7 @@ pub fn join_problem(first: &MediaInfo, other: &MediaInfo) -> Option<String> {
         return None;
     };
     Some(format!(
-        "{} {reason}, so it can't be exported together with {} yet.",
+        "{} {reason}, so it can't be copied together with {}.",
         name(other),
         name(first)
     ))

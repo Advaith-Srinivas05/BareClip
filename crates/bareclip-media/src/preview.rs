@@ -16,7 +16,7 @@ use crate::{
     probe::{discard_other_streams, to_time_base},
 };
 
-fn threaded_context(
+pub(crate) fn threaded_context(
     parameters: codec::Parameters,
 ) -> Result<codec::context::Context, ffmpeg::Error> {
     let mut context = codec::context::Context::from_parameters(parameters)?;
@@ -27,7 +27,10 @@ fn threaded_context(
     Ok(context)
 }
 
-fn seek_to_seconds(input: &mut format::context::Input, seconds: f64) -> Result<(), ffmpeg::Error> {
+pub(crate) fn seek_to_seconds(
+    input: &mut format::context::Input,
+    seconds: f64,
+) -> Result<(), ffmpeg::Error> {
     let target = (seconds * f64::from(ffi::AV_TIME_BASE)) as i64;
     if target <= 0 {
         input.seek(0, ..0)
