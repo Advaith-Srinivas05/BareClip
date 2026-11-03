@@ -1,6 +1,7 @@
 //! Decides how a project gets exported, and does the export that redraws every frame.
 
 mod full;
+mod layered;
 mod plan;
 mod sink;
 mod sound;
@@ -9,7 +10,8 @@ use std::{path::Path, sync::atomic::AtomicBool, time::Duration};
 
 use bareclip_media::{ExportReport, ExportRequest, MediaError, MediaInfo, export, probe};
 
-pub use plan::{FullPlan, Route, final_size, frame_rate_for, route_for};
+pub use layered::{LayeredClip, LayeredRequest, LayeredStretch, export_layered};
+pub use plan::{FullPlan, LAYERED_REASON, Route, final_size, frame_rate_for, route_for};
 pub use sink::VideoSink;
 
 /// What an export that redrew every frame did.

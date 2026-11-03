@@ -20,7 +20,8 @@ use bareclip_core::{
     tracks::{TrackTarget, Tracks},
 };
 use bareclip_export::{
-    FullPlan, ProjectReport, Route, export_project, final_size, full_output_path, route_for,
+    FullPlan, LAYERED_REASON, LayeredClip, LayeredRequest, LayeredStretch, ProjectReport, Route,
+    export_layered, export_project, full_output_path, route_for,
 };
 use bareclip_media::{
     DecodeStep, ExportPart, ExportRequest, MediaError, MediaInfo, PreviewFrame, SoundShape,
@@ -37,7 +38,9 @@ use crate::{
         self, ActionButton, CheckBox, IconButton, Kind, MenuItem, NAME_BAR_PADDING, NameBar,
     },
     fonts, icons,
+    layers::{LayerDisplay, LayerPictures, Moment},
     preview::Preview,
+    stage::{self, StageClip, StageState, StageView},
     storage::{self, ExportCuts, Recovery, RecoveryRecord, Settings},
     text,
     theme::{self, Palette},
@@ -319,6 +322,13 @@ pub struct Editor {
     history: History<Snapshot>,
     preview: Preview,
     picture: Option<TextureHandle>,
+    /// What each clip under the top one is showing, when several show at once.
+    layer_pictures: LayerPictures,
+    /// Where layers get drawn. Without it, only the top clip shows.
+    layer_display: Option<LayerDisplay>,
+    stage_state: StageState,
+    /// The project from before a change on the stage began, until it becomes one undo step.
+    stage_before: Option<Snapshot>,
     selected: Option<ClipId>,
     /// A moment in the dead space that was clicked on.
     selected_gap: Option<Ticks>,
@@ -444,6 +454,10 @@ impl Editor {
             history: History::default(),
             preview: Preview::new(use_sound, Arc::new(move || repaint.request_repaint())),
             picture: None,
+            layer_pictures: LayerPictures::default(),
+            layer_display: None,
+            stage_state: StageState::default(),
+            stage_before: None,
             selected: None,
             selected_gap: None,
             timeline_state: TimelineState::default(),
@@ -1415,6 +1429,8 @@ impl Editor {
         }
         self.poll_strip_readers(ctx);
 
+        let canvas = self.final_canvas();
+        let layered = self.layer_display.is_some() && self.takes_layers();
         let Self {
             preview,
             project,
@@ -1422,10 +1438,46 @@ impl Editor {
             picture,
             notice,
             timeline_state,
+            layer_pictures,
+            layer_display,
             ..
         } = self;
-        let frame = preview.update(project.tracks.played(), &|id| media_info(media, id));
-        if let Some(frame) = frame {
+        let lookup = |id: MediaId| media_info(media, id);
+        if preview.planes() != layered {
+            preview.set_planes(layered, project.tracks.played(), &lookup);
+            *layer_pictures = LayerPictures::default();
+            if let Some(display) = layer_display {
+                display.forget();
+            }
+        }
+        let frame = preview.update(project.tracks.played(), &lookup);
+        if let (true, Some(canvas), Some(display)) = (layered, canvas, layer_display.as_mut()) {
+            let size_of = |id: MediaId| {
+                media
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .map(|entry| (entry.info.video.width, entry.info.video.height))
+            };
+            let now = last_moment_by(
+                preview.position(project.tracks.played()),
+                project.tracks.duration(),
+            );
+            let stack = project.tracks.stack_at(now, canvas, &size_of);
+            let moment = Moment {
+                now,
+                playing: preview.is_playing(),
+                jumped: preview.take_jump(),
+            };
+            let top = frame.zip(preview.last_picture_from());
+            let repaint = ctx.clone();
+            let notify: crate::player::Notify = Arc::new(move || repaint.request_repaint());
+            if let Some(problem) = layer_pictures.update(&stack, moment, top, &lookup, &notify) {
+                *notice = Some(problem);
+            }
+            if let Err(error) = display.draw(layer_pictures, &stack, now, canvas, &size_of) {
+                *notice = Some(error.to_string());
+            }
+        } else if let Some(frame) = frame {
             let image = egui::ColorImage::from_rgba_unmultiplied(
                 [frame.width as usize, frame.height as usize],
                 &frame.rgba,
@@ -1554,11 +1606,67 @@ impl Editor {
             .collect()
     }
 
+    /// A video's full size, once it has been read.
+    fn video_size(&self, id: MediaId) -> Option<(u32, u32)> {
+        self.entry(id)
+            .map(|entry| (entry.info.video.width, entry.info.video.height))
+    }
+
+    /// The size of the finished video.
+    fn final_canvas(&self) -> Option<(u32, u32)> {
+        self.project.tracks.canvas(&|id| self.video_size(id))
+    }
+
+    /// Whether this project needs several pictures drawn together, rather than one at a time.
+    fn takes_layers(&self) -> bool {
+        self.final_canvas().is_some_and(|canvas| {
+            self.project
+                .tracks
+                .needs_layers(canvas, &|id| self.video_size(id))
+        })
+    }
+
+    /// The whole project as an export that draws layers.
+    fn layered_stretches(&self) -> Vec<LayeredStretch> {
+        let Some(canvas) = self.final_canvas() else {
+            return Vec::new();
+        };
+        self.project
+            .tracks
+            .stretches(canvas, &|id| self.video_size(id))
+            .into_iter()
+            .map(|stretch| LayeredStretch {
+                start: stretch.start,
+                end: stretch.end,
+                stack: stretch
+                    .stack
+                    .iter()
+                    .filter_map(|clip| {
+                        Some(LayeredClip {
+                            key: clip.id.0,
+                            input: self.entry(clip.media)?.info.path.clone(),
+                            start: clip.start,
+                            source: clip.source,
+                            placement: clip.placement,
+                        })
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
     /// Each different video that shows on the timeline, in the order they first show.
     fn videos_on_timeline(&self) -> Vec<MediaInfo> {
         let mut seen = Vec::new();
         let mut videos = Vec::new();
-        for clip in self.project.tracks.played().clips() {
+        let Some(canvas) = self.final_canvas() else {
+            return videos;
+        };
+        let stretches = self
+            .project
+            .tracks
+            .stretches(canvas, &|id| self.video_size(id));
+        for clip in stretches.iter().flat_map(|stretch| &stretch.stack) {
             if !seen.contains(&clip.media) {
                 seen.push(clip.media);
                 if let Some(entry) = self.entry(clip.media) {
@@ -1571,6 +1679,9 @@ impl Editor {
 
     /// How the timeline would be exported as it is now.
     fn export_route(&self) -> Route {
+        if self.takes_layers() {
+            return Route::Full(LAYERED_REASON.to_owned());
+        }
         route_for(
             &self.videos_on_timeline(),
             !self.project.tracks.gaps().is_empty(),
@@ -1579,16 +1690,8 @@ impl Editor {
 
     /// The shape and size of the finished video, which the preview shows too.
     fn canvas_size(&self) -> Option<egui::Vec2> {
-        let sizes: Vec<(u32, u32)> = self
-            .project
-            .tracks
-            .played()
-            .clips()
-            .iter()
-            .filter_map(|clip| self.entry(clip.media))
-            .map(|entry| (entry.info.video.width, entry.info.video.height))
-            .collect();
-        final_size(&sizes).map(|(width, height)| vec2(width as f32, height as f32))
+        self.final_canvas()
+            .map(|(width, height)| vec2(width as f32, height as f32))
     }
 
     /// The file the export dialog starts on, or nothing if no video is on the timeline.
@@ -1632,6 +1735,12 @@ impl Editor {
         let Some(parts) = self.export_parts() else {
             return;
         };
+        // Worked out here because the project may change while the export runs.
+        let layered = self.takes_layers().then(|| LayeredRequest {
+            output: output.clone(),
+            stretches: self.layered_stretches(),
+            sound: parts.clone(),
+        });
         let request = ExportRequest {
             output: output.clone(),
             parts,
@@ -1644,9 +1753,15 @@ impl Editor {
         let worker_cancel = cancel.clone();
         let repaint = ctx.clone();
         thread::spawn(move || {
-            let outcome = export_project(&request, &worker_cancel, &|fraction| {
+            let progress = |fraction: f32| {
                 worker_progress.store(fraction.to_bits(), Ordering::Relaxed);
-            });
+            };
+            let outcome = match &layered {
+                Some(layered) => {
+                    export_layered(layered, &worker_cancel, &progress).map(ProjectReport::Full)
+                }
+                None => export_project(&request, &worker_cancel, &progress),
+            };
             let _ = sender.send(outcome);
             repaint.request_repaint();
         });
@@ -1802,6 +1917,11 @@ impl Editor {
         let logo = ctx.load_texture("strip-logo", image, TextureOptions::LINEAR);
         self.strip_logo = Some((dark, factor, logo.clone()));
         Some(logo)
+    }
+
+    /// Gives the editor a GPU to draw layers on.
+    pub fn use_gpu(&mut self, display: LayerDisplay) {
+        self.layer_display = Some(display);
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui) {
@@ -2999,6 +3119,22 @@ impl Editor {
                 }
                 return;
             }
+            let layers = self.takes_layers();
+            let layered_picture = self
+                .layer_display
+                .as_ref()
+                .filter(|_| layers)
+                .and_then(LayerDisplay::picture);
+            if let (Some(texture), Some(size)) = (layered_picture, canvas) {
+                ui.painter().image(
+                    texture,
+                    fitted(size, rect),
+                    egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+                self.stage_controls(ui, rect, palette);
+                return;
+            }
             if let Some(picture) = &self.picture {
                 let size = picture.size_vec2();
                 // A video of another shape gets black bars here, as it does in the export.
@@ -3013,6 +3149,7 @@ impl Editor {
                     egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
                     Color32::WHITE,
                 );
+                self.stage_controls(ui, rect, palette);
                 return;
             }
             if !self.project.tracks.is_empty() {
@@ -3041,6 +3178,73 @@ impl Editor {
                 });
             });
         });
+    }
+
+    /// The handles and toolbar on the picture, and what they ask for.
+    fn stage_controls(&mut self, ui: &mut egui::Ui, area: egui::Rect, palette: &Palette) {
+        let Some(canvas) = self.final_canvas() else {
+            return;
+        };
+        let size = vec2(canvas.0 as f32, canvas.1 as f32);
+        let position = last_moment_by(self.position(), self.project.tracks.duration());
+        let showing = self
+            .project
+            .tracks
+            .stack_at(position, canvas, &|id| self.video_size(id));
+        // Lowest first, including a clip so hidden it doesn't show, so that selecting one on the
+        // timeline still gives it handles.
+        let clips: Vec<StageClip> = self
+            .project
+            .tracks
+            .tracks()
+            .iter()
+            .rev()
+            .filter_map(|track| {
+                track
+                    .clips()
+                    .iter()
+                    .find(|clip| position >= clip.start && position < clip.end())
+            })
+            .filter_map(|clip| {
+                Some(StageClip {
+                    id: clip.id,
+                    placement: clip.placement,
+                    size: self.video_size(clip.media)?,
+                    visible: showing.iter().any(|shown| shown.id == clip.id),
+                })
+            })
+            .collect();
+        let view = StageView {
+            frame: fitted(size, area),
+            area,
+            canvas,
+            clips: &clips,
+            selected: self.selected,
+            row_above_is_free: self.notice.is_none(),
+        };
+        let events = stage::show(ui, palette, &mut self.stage_state, &view);
+        let pointer_down = ui.input(|input| input.pointer.any_down());
+        self.apply_stage_events(events, pointer_down);
+    }
+
+    /// A change stays one undo step for as long as a pointer is held down, however it began.
+    fn apply_stage_events(&mut self, events: stage::StageEvents, pointer_down: bool) {
+        if let Some(selection) = events.select {
+            self.selected = selection;
+            self.selected_gap = None;
+        }
+        if let Some((id, placement)) = events.place {
+            let before = self.project.clone();
+            if self.project.tracks.set_placement(id, placement) && self.stage_before.is_none() {
+                self.stage_before = Some(before);
+            }
+        }
+        if !pointer_down
+            && let Some(before) = self.stage_before.take()
+            && before != self.project
+        {
+            self.history.record(before);
+        }
     }
 
     /// The shape of the picture, even before any frame of it has been shown.
@@ -3304,6 +3508,12 @@ impl Editor {
 }
 
 /// The largest place something of this size fits inside a rectangle, in the middle.
+/// A moment that still shows something: the playhead stops at the very end of the project, where
+/// nothing is left, but its last picture stays up.
+fn last_moment_by(time: Ticks, end: Ticks) -> Ticks {
+    Ticks(time.0.min(end.0 - 1).max(0))
+}
+
 fn fitted(size: egui::Vec2, within: egui::Rect) -> egui::Rect {
     let scale = (within.width() / size.x).min(within.height() / size.y);
     egui::Rect::from_center_size(within.center(), size * scale)
@@ -3786,6 +3996,7 @@ fn show_in_folder(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bareclip_core::placement::{Placement, WHOLE};
     use eframe::{egui_wgpu, wgpu};
     use std::{process::Command, sync::OnceLock, time::Instant};
 
@@ -3905,7 +4116,7 @@ mod tests {
     struct Camera {
         device: wgpu::Device,
         queue: wgpu::Queue,
-        renderer: egui_wgpu::Renderer,
+        renderer: Arc<egui::mutex::RwLock<egui_wgpu::Renderer>>,
         folder: PathBuf,
     }
 
@@ -3934,7 +4145,11 @@ mod tests {
             .expect("a GPU is available");
             let (device, queue) = block_on(adapter.request_device(&Default::default()))
                 .expect("the GPU can be opened");
-            let renderer = egui_wgpu::Renderer::new(&device, CAMERA_FORMAT, Default::default());
+            let renderer = Arc::new(egui::mutex::RwLock::new(egui_wgpu::Renderer::new(
+                &device,
+                CAMERA_FORMAT,
+                Default::default(),
+            )));
             KEPT_TEXTURES.with_borrow_mut(|kept| *kept = Some(Vec::new()));
             Self {
                 device,
@@ -3959,6 +4174,7 @@ mod tests {
                 for (id, images) in &delta.set {
                     for image in images {
                         self.renderer
+                            .write()
                             .update_texture(&self.device, &self.queue, *id, image);
                     }
                 }
@@ -3994,7 +4210,7 @@ mod tests {
             });
 
             let mut encoder = self.device.create_command_encoder(&Default::default());
-            let extra = self.renderer.update_buffers(
+            let extra = self.renderer.write().update_buffers(
                 &self.device,
                 &self.queue,
                 &mut encoder,
@@ -4016,7 +4232,7 @@ mod tests {
                         ..Default::default()
                     })
                     .forget_lifetime();
-                self.renderer.render(&mut pass, &jobs, &screen);
+                self.renderer.read().render(&mut pass, &jobs, &screen);
             }
             encoder.copy_texture_to_buffer(
                 target.as_image_copy(),
@@ -4054,7 +4270,7 @@ mod tests {
             drop(data);
             for delta in &mut textures {
                 for id in &delta.free {
-                    self.renderer.free_texture(id);
+                    self.renderer.write().free_texture(id);
                 }
                 delta.clear();
             }
@@ -4628,6 +4844,74 @@ mod tests {
         offered.settings_open = true;
         settled(&mut offered);
         camera.shoot(&ctx, &mut offered, moved(pos2(640.0, 300.0)), "49-settings");
+
+        // Layers, drawn by the real compositor and shown by the real renderer.
+        let mut layered = stacked_clips(&ctx);
+        layered.use_gpu(LayerDisplay::new(
+            camera.device.clone(),
+            camera.queue.clone(),
+            camera.renderer.clone(),
+        ));
+        let (top, _) = top_and_below(&layered);
+        layered.project.tracks.set_placement(
+            top,
+            Placement {
+                center_x: WHOLE * 3 / 10,
+                center_y: WHOLE * 3 / 10,
+                scale: WHOLE * 2 / 5,
+                ..Placement::default()
+            },
+        );
+        layered.seek(Ticks::from_seconds(1.0));
+        wait_for_layers(&ctx, &mut layered);
+        camera.shoot(&ctx, &mut layered, moved(pos2(1100.0, 80.0)), "60-layers");
+        layered.selected = Some(top);
+        run_frame(&ctx, &mut layered, vec![]);
+        camera.shoot(
+            &ctx,
+            &mut layered,
+            moved(pos2(1100.0, 80.0)),
+            "61-layers-selected",
+        );
+        let frame = layered.stage_state.frame.expect("the stage was drawn");
+        let on_clip = frame.left_top() + frame.size() * 0.3;
+        begin_drag(&ctx, &mut layered, on_clip, frame.center());
+        camera.shoot(&ctx, &mut layered, vec![], "62-layers-snapped-to-centre");
+        end_drag(&ctx, &mut layered, frame.center());
+        layered.project.tracks.set_placement(
+            top,
+            Placement {
+                center_x: WHOLE / 2,
+                center_y: WHOLE / 2,
+                scale: WHOLE,
+                opacity: WHOLE / 2,
+            },
+        );
+        wait_for_layers(&ctx, &mut layered);
+        camera.shoot(
+            &ctx,
+            &mut layered,
+            moved(pos2(1100.0, 80.0)),
+            "63-layers-see-through",
+        );
+        ctx.set_theme(egui::Theme::Light);
+        layered.project.tracks.set_placement(
+            top,
+            Placement {
+                center_x: WHOLE,
+                center_y: WHOLE / 8,
+                scale: WHOLE / 2,
+                opacity: WHOLE,
+            },
+        );
+        wait_for_layers(&ctx, &mut layered);
+        camera.shoot(
+            &ctx,
+            &mut layered,
+            moved(pos2(1100.0, 80.0)),
+            "64-light-layers-off-the-edge",
+        );
+        ctx.set_theme(egui::Theme::Dark);
         KEPT_TEXTURES.with_borrow_mut(|kept| *kept = None);
     }
 
@@ -9239,5 +9523,420 @@ mod tests {
                 .len(),
             before
         );
+    }
+
+    /// Two videos of the same size on two tracks, both from the start, with the first on top.
+    fn stacked_clips(ctx: &egui::Context) -> Editor {
+        let mut editor = in_panel_only(ctx, &[test_clip(), second_clip()]);
+        let ids: Vec<MediaId> = editor.media.iter().map(|entry| entry.id).collect();
+        let source = TimeRange {
+            start: Ticks(0),
+            end: Ticks::from_seconds(3.0),
+        };
+        for id in ids.iter().rev() {
+            editor
+                .project
+                .tracks
+                .place(*id, source, Ticks(0), TrackTarget::New(0));
+        }
+        editor.seek(Ticks::from_seconds(1.0));
+        wait_for_stage(ctx, &mut editor);
+        editor
+    }
+
+    /// The top clip and the one under it.
+    fn top_and_below(editor: &Editor) -> (ClipId, ClipId) {
+        let tracks = editor.project.tracks.tracks();
+        (tracks[0].clips()[0].id, tracks[1].clips()[0].id)
+    }
+
+    fn placement_of(editor: &Editor, id: ClipId) -> Placement {
+        editor.project.tracks.clip(id).expect("the clip").placement
+    }
+
+    /// Runs frames until the picture and the controls on it are up.
+    fn wait_for_stage(ctx: &egui::Context, editor: &mut Editor) {
+        let started = Instant::now();
+        while editor.stage_state.frame.is_none() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the picture never came"
+            );
+            run_frame(ctx, editor, vec![]);
+            thread::sleep(Duration::from_millis(5));
+        }
+        run_frame(ctx, editor, vec![]);
+    }
+
+    /// Runs frames until the layers have been drawn and have settled.
+    fn wait_for_layers(ctx: &egui::Context, editor: &mut Editor) {
+        for _ in 0..60 {
+            run_frame(ctx, editor, vec![]);
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn stage_frame(editor: &Editor) -> egui::Rect {
+        editor.stage_state.frame.expect("the stage was drawn")
+    }
+
+    /// A place on the canvas, in shares of it.
+    fn on_canvas(editor: &Editor, x: f32, y: f32) -> egui::Pos2 {
+        let frame = stage_frame(editor);
+        frame.left_top() + vec2(frame.width() * x, frame.height() * y)
+    }
+
+    /// Half the size, away from every line it could snap to.
+    fn small_in_a_corner() -> Placement {
+        Placement {
+            center_x: WHOLE * 3 / 10,
+            center_y: WHOLE * 3 / 10,
+            scale: WHOLE * 2 / 5,
+            ..Placement::default()
+        }
+    }
+
+    #[test]
+    fn clicking_the_picture_selects_the_clip_on_top_there() {
+        let ctx = context();
+        let mut editor = stacked_clips(&ctx);
+        let (top, below) = top_and_below(&editor);
+        editor
+            .project
+            .tracks
+            .set_placement(top, small_in_a_corner());
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let on_top = on_canvas(&editor, 0.3, 0.3);
+        click(&ctx, &mut editor, on_top);
+        assert_eq!(editor.selected, Some(top));
+
+        let on_below = on_canvas(&editor, 0.8, 0.8);
+        click(&ctx, &mut editor, on_below);
+        assert_eq!(editor.selected, Some(below));
+    }
+
+    #[test]
+    fn clicking_where_no_clip_is_drawn_clears_the_selection() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let clip = editor.project.tracks.played().clips()[0].id;
+        editor
+            .project
+            .tracks
+            .set_placement(clip, small_in_a_corner());
+        editor.selected = Some(clip);
+        wait_for_stage(&ctx, &mut editor);
+
+        let empty = on_canvas(&editor, 0.9, 0.9);
+        click(&ctx, &mut editor, empty);
+
+        assert_eq!(editor.selected, None);
+    }
+
+    #[test]
+    fn a_clip_completely_hidden_cant_be_clicked_on_the_picture() {
+        let ctx = context();
+        let mut editor = stacked_clips(&ctx);
+        let (top, _) = top_and_below(&editor);
+
+        let middle = on_canvas(&editor, 0.5, 0.5);
+        click(&ctx, &mut editor, middle);
+
+        assert_eq!(editor.selected, Some(top));
+    }
+
+    #[test]
+    fn dragging_a_clip_moves_it_as_one_undo_step() {
+        let ctx = context();
+        let mut editor = stacked_clips(&ctx);
+        let (top, _) = top_and_below(&editor);
+        editor
+            .project
+            .tracks
+            .set_placement(top, small_in_a_corner());
+        run_frame(&ctx, &mut editor, vec![]);
+        let before = editor.project.clone();
+
+        let from = on_canvas(&editor, 0.3, 0.3);
+        let to = on_canvas(&editor, 0.37, 0.43);
+        begin_drag(&ctx, &mut editor, from, to);
+        end_drag(&ctx, &mut editor, to);
+
+        let placement = placement_of(&editor, top);
+        assert!(
+            (placement.center_x - 370_000).abs() < 3_000,
+            "{placement:?}"
+        );
+        assert!(
+            (placement.center_y - 430_000).abs() < 3_000,
+            "{placement:?}"
+        );
+        assert_eq!(placement.scale, WHOLE * 2 / 5);
+        assert_eq!(editor.selected, Some(top), "dragging selects it too");
+
+        editor.undo();
+        assert_eq!(editor.project, before, "one undo undoes the whole drag");
+        editor.redo();
+        assert_eq!(placement_of(&editor, top), placement);
+    }
+
+    #[test]
+    fn a_click_with_no_movement_changes_nothing_to_undo() {
+        let ctx = context();
+        let mut editor = stacked_clips(&ctx);
+        let can_undo_before = editor.history.can_undo();
+
+        let middle = on_canvas(&editor, 0.5, 0.5);
+        click(&ctx, &mut editor, middle);
+
+        assert_eq!(editor.history.can_undo(), can_undo_before);
+    }
+
+    #[test]
+    fn dragging_a_corner_resizes_with_the_opposite_corner_still() {
+        let ctx = context();
+        let mut editor = stacked_clips(&ctx);
+        let (top, _) = top_and_below(&editor);
+        editor
+            .project
+            .tracks
+            .set_placement(top, small_in_a_corner());
+        editor.selected = Some(top);
+        run_frame(&ctx, &mut editor, vec![]);
+        let before = editor.project.clone();
+
+        // It spans 0.1 to 0.5 each way, and its bottom right corner goes out to 0.7.
+        let from = on_canvas(&editor, 0.5, 0.5);
+        let to = on_canvas(&editor, 0.67, 0.67);
+        begin_drag(&ctx, &mut editor, from, to);
+        end_drag(&ctx, &mut editor, to);
+
+        let placement = placement_of(&editor, top);
+        let (scale, x, y) = (placement.scale, placement.center_x, placement.center_y);
+        assert!((scale - 570_000).abs() < 8_000, "{placement:?}");
+        let half = scale / 2;
+        assert!(
+            (x - half - 100_000).abs() < 2_000,
+            "left stays: {placement:?}"
+        );
+        assert!(
+            (y - half - 100_000).abs() < 2_000,
+            "top stays: {placement:?}"
+        );
+
+        editor.undo();
+        assert_eq!(editor.project, before);
+    }
+
+    #[test]
+    fn a_drag_close_to_the_middle_snaps_there_and_shows_a_line_until_it_ends() {
+        let ctx = context();
+        let mut editor = stacked_clips(&ctx);
+        let (top, _) = top_and_below(&editor);
+        editor
+            .project
+            .tracks
+            .set_placement(top, small_in_a_corner());
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let from = on_canvas(&editor, 0.3, 0.3);
+        let to = on_canvas(&editor, 0.501, 0.3);
+        begin_drag(&ctx, &mut editor, from, to);
+
+        assert_eq!(placement_of(&editor, top).center_x, WHOLE / 2);
+        assert!(editor.stage_state.has_guides());
+        end_drag(&ctx, &mut editor, to);
+        assert!(!editor.stage_state.has_guides());
+    }
+
+    #[test]
+    fn the_toolbar_only_shows_for_a_selected_clip() {
+        let ctx = context();
+        let mut editor = stacked_clips(&ctx);
+        editor.selected = None;
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(!is_named(&ctx, &mut editor, "Reset size and place"));
+
+        let (top, _) = top_and_below(&editor);
+        editor.selected = Some(top);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(is_named(&ctx, &mut editor, "Reset size and place"));
+        assert!(is_named(&ctx, &mut editor, "Opacity"));
+    }
+
+    #[test]
+    fn reset_puts_a_clip_back_as_one_undo_step() {
+        let ctx = context();
+        let mut editor = stacked_clips(&ctx);
+        let (top, _) = top_and_below(&editor);
+        editor
+            .project
+            .tracks
+            .set_placement(top, small_in_a_corner());
+        editor.selected = Some(top);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        click_named(&ctx, &mut editor, "Reset size and place");
+
+        assert!(placement_of(&editor, top).is_default());
+        editor.undo();
+        assert_eq!(placement_of(&editor, top), small_in_a_corner());
+    }
+
+    #[test]
+    fn the_opacity_slider_changes_only_how_see_through_a_clip_is() {
+        let ctx = context();
+        let mut editor = stacked_clips(&ctx);
+        let (top, _) = top_and_below(&editor);
+        editor
+            .project
+            .tracks
+            .set_placement(top, small_in_a_corner());
+        editor.selected = Some(top);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        click_named(&ctx, &mut editor, "Opacity");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let placement = placement_of(&editor, top);
+        assert!(
+            (placement.opacity - WHOLE / 2).abs() < WHOLE / 10,
+            "{placement:?}"
+        );
+        assert_eq!(placement.scale, small_in_a_corner().scale);
+
+        editor.undo();
+        assert_eq!(placement_of(&editor, top).opacity, WHOLE);
+    }
+
+    #[test]
+    fn pressing_and_dragging_the_opacity_slider_is_one_undo_step() {
+        let ctx = context();
+        let mut editor = stacked_clips(&ctx);
+        let (top, _) = top_and_below(&editor);
+        editor
+            .project
+            .tracks
+            .set_placement(top, small_in_a_corner());
+        editor.selected = Some(top);
+        run_frame(&ctx, &mut editor, vec![]);
+        let before = editor.project.clone();
+
+        let slider = named_rect(&ctx, &mut editor, "Opacity");
+        let from = slider.center();
+        let to = pos2(slider.left() + 4.0, from.y);
+        begin_drag(&ctx, &mut editor, from, to);
+        end_drag(&ctx, &mut editor, to);
+
+        assert!(placement_of(&editor, top).opacity < WHOLE / 5);
+        editor.undo();
+        assert_eq!(editor.project, before);
+    }
+
+    #[test]
+    fn the_arrow_keys_still_move_the_playhead_after_using_the_slider() {
+        let ctx = context();
+        let mut editor = stacked_clips(&ctx);
+        let (top, _) = top_and_below(&editor);
+        editor.selected = Some(top);
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Opacity");
+        run_frame(&ctx, &mut editor, vec![]);
+        let opacity = placement_of(&editor, top).opacity;
+        let position = editor.position();
+
+        run_frame(
+            &ctx,
+            &mut editor,
+            key_event(Key::ArrowLeft, Modifiers::SHIFT),
+        );
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert!(editor.position() < position);
+        assert_eq!(placement_of(&editor, top).opacity, opacity);
+    }
+
+    #[test]
+    fn a_resized_clip_takes_the_full_route_and_says_why_and_reset_brings_the_fast_one_back() {
+        let ctx = context();
+        let mut editor = stacked_clips(&ctx);
+        let (top, _) = top_and_below(&editor);
+        assert_eq!(editor.export_route(), Route::Fast);
+
+        editor
+            .project
+            .tracks
+            .set_placement(top, small_in_a_corner());
+
+        assert_eq!(
+            editor.export_route(),
+            Route::Full(LAYERED_REASON.to_owned())
+        );
+        assert_eq!(editor.videos_on_timeline().len(), 2);
+
+        editor
+            .project
+            .tracks
+            .set_placement(top, Placement::default());
+
+        assert_eq!(editor.export_route(), Route::Fast);
+        assert_eq!(editor.videos_on_timeline().len(), 1, "the other is hidden");
+    }
+
+    #[test]
+    fn a_resized_clip_exports_through_the_real_editor() {
+        let ctx = context();
+        let mut editor = stacked_clips(&ctx);
+        let (top, _) = top_and_below(&editor);
+        editor
+            .project
+            .tracks
+            .set_placement(top, small_in_a_corner());
+        let output =
+            std::env::temp_dir().join(format!("bareclip-ui-layers-{}.mp4", std::process::id()));
+        let _ = std::fs::remove_file(&output);
+
+        editor.start_export_to(&ctx, output.clone());
+        wait_for_export(&ctx, &mut editor);
+
+        let ExportState::Done { report, .. } = &editor.export_state else {
+            panic!("the export did not finish: {:?}", failure_of(&editor));
+        };
+        let ProjectReport::Full(report) = report else {
+            panic!("it took the fast route: {report:?}");
+        };
+        assert!(report.gpu.is_some(), "{report:?}");
+        assert!(report.composited_frames > 0);
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn a_layout_is_saved_and_comes_back_with_the_project() {
+        let ctx = context();
+        let mut editor = stacked_clips(&ctx);
+        let (top, _) = top_and_below(&editor);
+        editor
+            .project
+            .tracks
+            .set_placement(top, small_in_a_corner());
+        let folder = project_folder("layout");
+        let path = folder.join("layout.bareclip");
+
+        assert!(editor.save_to(&path));
+        let mut reopened = Editor::new(&ctx, false);
+        reopened.open_project(&ctx, &path);
+        settle(&ctx, &mut reopened);
+        run_frame(&ctx, &mut reopened, vec![]);
+
+        let clip = reopened.project.tracks.tracks()[0].clips()[0];
+        assert_eq!(clip.placement, small_in_a_corner());
+    }
+
+    #[test]
+    fn the_picture_stays_up_at_the_very_end_of_a_project() {
+        assert_eq!(last_moment_by(Ticks(100), Ticks(100)), Ticks(99));
+        assert_eq!(last_moment_by(Ticks(50), Ticks(100)), Ticks(50));
+        assert_eq!(last_moment_by(Ticks(0), Ticks(0)), Ticks(0));
     }
 }

@@ -18,6 +18,13 @@ fn vertex_main(@builtin(vertex_index) index: u32) -> Corner {
     return corner;
 }
 
+// The canvas as ordinary 8-bit colours, for showing in the window.
+@fragment
+fn display_main(corner: Corner) -> @location(0) vec4<f32> {
+    let colour = textureSample(canvas, smooth_sampler, corner.spot).rgb;
+    return vec4<f32>(colour, 1.0);
+}
+
 @fragment
 fn brightness_main(corner: Corner) -> @location(0) vec4<f32> {
     let colour = textureSample(canvas, smooth_sampler, corner.spot).rgb;

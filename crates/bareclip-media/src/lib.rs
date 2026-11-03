@@ -18,7 +18,8 @@ pub use full::{
     VideoWriter,
 };
 pub use preview::{
-    AudioChunk, AudioPreview, AudioStep, DecodeStep, PreviewFrame, VideoPreview, fit_preview_size,
+    AudioChunk, AudioPreview, AudioStep, DecodeStep, PreviewFrame, PreviewPlanes, VideoPreview,
+    fit_preview_size,
 };
 pub use probe::{AudioInfo, MediaInfo, VideoInfo, join_problem, probe, scan_frames};
 pub use strip::{SoundShape, StripPicture, picture_spacing, read_sound_shape, read_strip_pictures};

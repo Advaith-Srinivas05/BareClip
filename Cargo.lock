@@ -409,6 +409,7 @@ dependencies = [
  "bareclip-core",
  "bareclip-export",
  "bareclip-media",
+ "bareclip-render",
  "eframe",
  "rfd",
  "serde",

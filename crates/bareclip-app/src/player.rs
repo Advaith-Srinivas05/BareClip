@@ -24,8 +24,8 @@ use bareclip_media::{
 
 /// Preview pictures are reduced to this size, which is enough for the stage and
 /// keeps each frame cheap to convert and upload.
-const PREVIEW_WIDTH: u32 = 1280;
-const PREVIEW_HEIGHT: u32 = 720;
+pub const PREVIEW_WIDTH: u32 = 1280;
+pub const PREVIEW_HEIGHT: u32 = 720;
 /// Decoded frames waiting between the decoder and the screen.
 const FRAME_CHANNEL: usize = 6;
 const QUEUE_LIMIT: usize = 6;
@@ -86,11 +86,13 @@ fn deliver(
 
 fn video_worker(
     path: &Path,
+    planes: bool,
     commands: &Receiver<VideoCommand>,
     events: &SyncSender<VideoEvent>,
     notify: &Notify,
 ) {
     let mut preview = match VideoPreview::open(path, PREVIEW_WIDTH, PREVIEW_HEIGHT) {
+        Ok(preview) if planes => preview.with_planes(),
         Ok(preview) => preview,
         Err(error) => {
             let _ = events.send(VideoEvent::Error(error.to_string()));
@@ -393,14 +395,33 @@ pub struct Player {
 
 impl Player {
     /// Opens a video for playback. `use_sound` can be off where no sound is wanted.
+    #[cfg(test)]
     pub fn open(info: &MediaInfo, use_sound: bool, notify: Notify) -> Result<Self, String> {
+        Self::open_as(info, use_sound, false, notify)
+    }
+
+    /// Opens a video, with `planes` asking for pictures the GPU compositor can draw.
+    pub fn open_as(
+        info: &MediaInfo,
+        use_sound: bool,
+        planes: bool,
+        notify: Notify,
+    ) -> Result<Self, String> {
         let path = info.path.clone();
         let (commands, command_receiver) = mpsc::channel();
         let (event_sender, events) = mpsc::sync_channel(FRAME_CHANNEL);
         let worker_path = path.clone();
         let worker = thread::Builder::new()
             .name("bareclip-video".to_owned())
-            .spawn(move || video_worker(&worker_path, &command_receiver, &event_sender, &notify))
+            .spawn(move || {
+                video_worker(
+                    &worker_path,
+                    planes,
+                    &command_receiver,
+                    &event_sender,
+                    &notify,
+                );
+            })
             .map_err(|error| format!("The video decoder could not start: {error}"))?;
 
         let wanted_sound = use_sound && !info.audio.is_empty();
@@ -544,6 +565,16 @@ impl Player {
 
     /// Takes in decoded frames and returns the picture to show now, if it changed.
     pub fn update(&mut self) -> Option<PreviewFrame> {
+        self.update_on(None)
+    }
+
+    /// The same, for a player following another clock, which has reached `now` in this video.
+    /// It has no sound to wait for, and it doesn't stop by itself.
+    pub fn update_following(&mut self, now: Ticks) -> Option<PreviewFrame> {
+        self.update_on(Some(now))
+    }
+
+    fn update_on(&mut self, following: Option<Ticks>) -> Option<PreviewFrame> {
         let mut newest_paused = None;
         while self.state == PlayState::Paused || self.queue.len() < QUEUE_LIMIT {
             let Ok(event) = self.events.try_recv() else {
@@ -579,7 +610,9 @@ impl Player {
 
         if self.state == PlayState::Starting
             && self.exact_frame_ready
-            && (self.sound_is_ready() || self.start_requested.elapsed() >= START_TIMEOUT)
+            && (following.is_some()
+                || self.sound_is_ready()
+                || self.start_requested.elapsed() >= START_TIMEOUT)
         {
             self.state = PlayState::Playing;
             match &self.audio {
@@ -590,6 +623,10 @@ impl Player {
 
         if self.state != PlayState::Playing {
             return newest_paused;
+        }
+
+        if let Some(now) = following {
+            return self.queue.take_due(now);
         }
 
         let now = self.position();

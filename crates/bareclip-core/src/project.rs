@@ -10,6 +10,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    placement::Placement,
     time::Ticks,
     timeline::{MediaId, TimeRange},
     tracks::Tracks,
@@ -17,7 +18,7 @@ use crate::{
 
 pub const EXTENSION: &str = "bareclip";
 /// Goes up whenever the format changes in a way older versions can't read.
-const CURRENT_VERSION: u32 = 1;
+const CURRENT_VERSION: u32 = 2;
 pub const DEFAULT_NAME: &str = "untitled";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +34,10 @@ pub struct SavedClip {
     pub start: i64,
     pub source_start: i64,
     pub source_end: i64,
+    /// Left out for a clip that hasn't been moved or resized. Files from before layers have
+    /// none, which means the same thing.
+    #[serde(default, skip_serializing_if = "Placement::is_default")]
+    pub placement: Placement,
 }
 
 impl SavedClip {
@@ -107,6 +112,7 @@ impl ProjectFile {
                             start: clip.start.0,
                             source_start: clip.source.start.0,
                             source_end: clip.source.end.0,
+                            placement: clip.placement,
                         })
                         .collect()
                 })
@@ -245,6 +251,7 @@ mod tests {
             start,
             source_start: 0,
             source_end,
+            placement: Placement::default(),
         };
         // Out of order, overlapping, empty and starting before zero.
         let tracks = vec![vec![clip(50, 100), clip(0, 100), clip(5, 0), clip(-20, 10)]];
@@ -260,12 +267,73 @@ mod tests {
     }
 
     #[test]
+    fn a_project_from_before_layers_still_opens_with_nothing_moved() {
+        let text = r#"{
+            "version": 1,
+            "name": "old",
+            "media": [{"id": 1, "path": "a.mp4"}],
+            "tracks": [[{"media": 1, "start": 0, "source_start": 0, "source_end": 100}]]
+        }"#;
+
+        let file = ProjectFile::from_text(text).expect("it can be read");
+        let tracks = Tracks::restore(&file.tracks, |id| Some(MediaId(id)));
+
+        assert!(tracks.tracks()[0].clips()[0].placement.is_default());
+    }
+
+    #[test]
+    fn a_layout_survives_being_written_and_read_back() {
+        let mut tracks = stacked();
+        let id = tracks.tracks()[0].clips()[0].id;
+        let placement = Placement {
+            center_x: 250_000,
+            center_y: 750_000,
+            scale: 400_000,
+            opacity: 600_000,
+        };
+        tracks.set_placement(id, placement);
+        let file = ProjectFile::capture("x", Vec::new(), &tracks);
+
+        let back = ProjectFile::from_text(&file.to_text()).expect("it can be read");
+        let restored = Tracks::restore(&back.tracks, |id| Some(MediaId(id)));
+
+        assert_eq!(restored.tracks()[0].clips()[0].placement, placement);
+    }
+
+    #[test]
+    fn a_clip_that_was_not_moved_writes_nothing_about_its_layout() {
+        assert!(!file().to_text().contains("placement"));
+    }
+
+    #[test]
+    fn a_hand_edited_layout_comes_back_in_range() {
+        let clip = SavedClip {
+            media: 1,
+            start: 0,
+            source_start: 0,
+            source_end: 100,
+            placement: Placement {
+                scale: 0,
+                opacity: -5,
+                ..Placement::default()
+            },
+        };
+
+        let tracks = Tracks::restore(&[vec![clip]], |id| Some(MediaId(id)));
+
+        let placement = tracks.tracks()[0].clips()[0].placement;
+        assert!(placement.scale > 0);
+        assert_eq!(placement.opacity, 0);
+    }
+
+    #[test]
     fn a_clip_is_cut_down_to_fit_a_shorter_video_or_dropped_if_nothing_is_left() {
         let clip = SavedClip {
             media: 1,
             start: 0,
             source_start: 100,
             source_end: 300,
+            placement: Placement::default(),
         };
 
         assert_eq!(clip.fitted_to(Ticks(500)), Some(clip));
