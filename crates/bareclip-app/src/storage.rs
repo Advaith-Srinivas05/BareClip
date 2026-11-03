@@ -19,12 +19,6 @@ const SETTINGS_FILE: &str = "settings.json";
 const RECOVERY_FOLDER: &str = "recovery";
 const RECOVERY_EXTENSION: &str = "recovery";
 const LOCK_EXTENSION: &str = "lock";
-pub const AUTOSAVE_CHOICES: [(u32, &str); 4] = [
-    (5, "5 seconds"),
-    (15, "15 seconds"),
-    (30, "30 seconds"),
-    (60, "1 minute"),
-];
 
 /// Where the app keeps its files, or `None` if Windows doesn't say.
 pub fn app_folder() -> Option<PathBuf> {
@@ -81,7 +75,8 @@ impl From<ExportCuts> for CutMode {
 #[serde(default)]
 pub struct Settings {
     pub theme: ThemeSetting,
-    pub autosave_seconds: u32,
+    /// Whether edits go to the project's own file without being asked.
+    pub auto_save: bool,
     pub export_cuts: ExportCuts,
     pub thumbnails: bool,
     pub waveforms: bool,
@@ -91,7 +86,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: ThemeSetting::System,
-            autosave_seconds: AUTOSAVE_CHOICES[0].0,
+            auto_save: false,
             export_cuts: ExportCuts::FrameExact,
             thumbnails: true,
             waveforms: true,
@@ -303,7 +298,7 @@ mod tests {
         let folder = temporary_folder("settings-saved");
         let settings = Settings {
             theme: ThemeSetting::Light,
-            autosave_seconds: 30,
+            auto_save: true,
             export_cuts: ExportCuts::Fastest,
             thumbnails: false,
             waveforms: false,
@@ -330,10 +325,23 @@ mod tests {
         let settings = Settings::load(&folder);
 
         assert_eq!(settings.theme, ThemeSetting::Dark);
-        assert_eq!(
-            settings.autosave_seconds,
-            Settings::default().autosave_seconds
-        );
+        assert!(!settings.auto_save);
+    }
+
+    #[test]
+    fn settings_from_when_autosave_had_an_interval_still_load() {
+        let folder = temporary_folder("settings-old");
+        fs::write(
+            folder.join(SETTINGS_FILE),
+            r#"{"theme":"light","autosave_seconds":30,"waveforms":false}"#,
+        )
+        .expect("it can be written");
+
+        let settings = Settings::load(&folder);
+
+        assert_eq!(settings.theme, ThemeSetting::Light);
+        assert!(!settings.waveforms);
+        assert!(!settings.auto_save);
     }
 
     #[test]

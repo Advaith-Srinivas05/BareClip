@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc::{self, Receiver},
     },
-    thread,
+    thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -49,6 +49,11 @@ const SMALL_LOGO_LIGHT: &[u8] =
 /// How far the arrow keys and the buttons beside play move the playhead.
 const SKIP_SECONDS: f64 = 5.0;
 const BACKGROUND_TICK: Duration = Duration::from_millis(50);
+/// How often recovery copies are written, and how long a change waits before Auto Save writes
+/// it to the project's file.
+const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(5);
+const AUTO_SAVE_HELD: &str =
+    "Auto Save is paused because parts of this project couldn't be opened. Save it to resume.";
 const MIN_CLIP_SECONDS: f64 = 0.05;
 const THUMBNAIL_WIDTH: u32 = 160;
 const THUMBNAIL_HEIGHT: u32 = 90;
@@ -335,6 +340,15 @@ pub struct Editor {
     recovery: Option<Recovery>,
     last_autosaved: Option<ProjectFile>,
     last_autosave_at: Instant,
+    /// When the project first differed from what its file holds.
+    unsaved_since: Option<Instant>,
+    /// Auto Save's write to the project's file, while it is under way.
+    auto_save_write: Option<AutoSaveWrite>,
+    /// What Auto Save last failed to write, so it only tries again once something changes.
+    auto_save_failed: Option<ProjectFile>,
+    /// Parts of the file couldn't be opened, so writing now would drop them from it. Auto Save
+    /// waits until the user saves on purpose.
+    auto_save_held: bool,
     /// Recovery copies from runs that never closed properly, waiting to be offered.
     recovery_offers: Vec<PathBuf>,
     /// Videos ticked in the panel, in the order they were ticked.
@@ -364,6 +378,12 @@ enum LeaveFor {
     OpenPicked,
     Open(PathBuf),
     CloseWindow,
+}
+
+/// Auto Save writing the project to its file on another thread.
+struct AutoSaveWrite {
+    file: ProjectFile,
+    worker: JoinHandle<std::io::Result<()>>,
 }
 
 /// A project that can't finish opening until the user deals with videos that have moved.
@@ -437,6 +457,10 @@ impl Editor {
             recovery: None,
             last_autosaved: None,
             last_autosave_at: Instant::now(),
+            unsaved_since: None,
+            auto_save_write: None,
+            auto_save_failed: None,
+            auto_save_held: false,
             recovery_offers: Vec::new(),
             selected_media: Vec::new(),
             media_panel_open: true,
@@ -497,6 +521,7 @@ impl Editor {
 
     /// Does something that would replace the project, asking first if that would lose work.
     fn leave_project(&mut self, ctx: &egui::Context, reason: LeaveFor) {
+        self.flush_auto_save();
         if self.has_unsaved_changes() {
             self.leave_for = Some(reason);
         } else {
@@ -530,6 +555,7 @@ impl Editor {
 
     /// Clears everything down to an empty project.
     fn start_new_project(&mut self) {
+        self.wait_for_auto_save();
         self.preview.pause(self.project.tracks.played());
         self.media.clear();
         self.project = Snapshot {
@@ -554,6 +580,9 @@ impl Editor {
         self.project_path = None;
         self.baseline = self.current_file();
         self.last_autosaved = None;
+        self.unsaved_since = None;
+        self.auto_save_failed = None;
+        self.auto_save_held = false;
         if let Some(recovery) = &mut self.recovery {
             recovery.clear();
         }
@@ -579,6 +608,7 @@ impl Editor {
     }
 
     fn save_to(&mut self, path: &Path) -> bool {
+        self.wait_for_auto_save();
         let mut path = path.to_owned();
         if path.extension().is_none_or(|e| e != project::EXTENSION) {
             let mut named = path.into_os_string();
@@ -598,6 +628,9 @@ impl Editor {
                 self.baseline = file;
                 self.project_path = Some(path);
                 self.last_autosaved = None;
+                self.unsaved_since = None;
+                self.auto_save_failed = None;
+                self.auto_save_held = false;
                 self.notice = None;
                 if let Some(recovery) = &mut self.recovery {
                     recovery.clear();
@@ -703,6 +736,13 @@ impl Editor {
         self.project_name = file.name;
         self.project_path = path;
         self.media_panel_open = true;
+        self.auto_save_held = unreadable;
+        if unreadable && self.settings.auto_save {
+            self.notice = Some(match self.notice.take() {
+                Some(problem) => format!("{problem} {AUTO_SAVE_HELD}"),
+                None => AUTO_SAVE_HELD.to_owned(),
+            });
+        }
         // Work brought back from a crash, or missing parts of the file, is not what is on
         // disk, so it counts as unsaved until the user saves it.
         if restored_from.is_some() || unreadable {
@@ -728,16 +768,23 @@ impl Editor {
         }
     }
 
-    /// Writes a recovery copy if there are changes it doesn't have yet, no more often than
-    /// the user's setting. The first change after a quiet spell is written straight away.
+    /// Keeps unsaved work safe: Auto Save takes it to the project's file if that is on and the
+    /// project has one, and a recovery copy holds it until then. The first change after a quiet
+    /// spell goes to the copy straight away, and waits a while before touching the file, so a
+    /// mistake can be undone before it gets there.
     fn autosave(&mut self, ctx: &egui::Context) {
-        if self.recovery.is_none() {
+        self.collect_auto_save(ctx);
+        if self.recovery.is_none() && !self.settings.auto_save {
             return;
         }
         let file = self.current_file();
         let unsaved = file != self.baseline;
+        if unsaved {
+            self.auto_save_to_file(ctx, &file);
+        } else {
+            self.unsaved_since = None;
+        }
         let saved_path = self.project_path.clone();
-        let wait = Duration::from_secs(u64::from(self.settings.autosave_seconds));
         let since = self.last_autosave_at.elapsed();
         let Some(recovery) = &mut self.recovery else {
             return;
@@ -754,8 +801,8 @@ impl Editor {
         if recovery.is_busy() || self.last_autosaved.as_ref() == Some(&file) {
             return;
         }
-        if since < wait {
-            ctx.request_repaint_after(wait - since);
+        if since < AUTOSAVE_INTERVAL {
+            ctx.request_repaint_after(AUTOSAVE_INTERVAL - since);
             return;
         }
         recovery.write(&RecoveryRecord {
@@ -766,11 +813,101 @@ impl Editor {
         self.last_autosave_at = Instant::now();
     }
 
+    /// The file Auto Save would write to right now, if it would.
+    fn auto_save_path(&self) -> Option<&Path> {
+        if self.settings.auto_save && !self.auto_save_held {
+            self.project_path.as_deref()
+        } else {
+            None
+        }
+    }
+
+    /// Starts writing the project to its file on another thread once a change has waited long
+    /// enough, so a slow drive can't hold up the interface.
+    fn auto_save_to_file(&mut self, ctx: &egui::Context, file: &ProjectFile) {
+        let unsaved_for = self
+            .unsaved_since
+            .get_or_insert_with(Instant::now)
+            .elapsed();
+        let Some(path) = self.auto_save_path().map(Path::to_owned) else {
+            return;
+        };
+        if self.auto_save_write.is_some() || self.auto_save_failed.as_ref() == Some(file) {
+            return;
+        }
+        if unsaved_for < AUTOSAVE_INTERVAL {
+            ctx.request_repaint_after(AUTOSAVE_INTERVAL - unsaved_for);
+            return;
+        }
+        let text = file.to_text();
+        self.auto_save_write = Some(AutoSaveWrite {
+            file: file.clone(),
+            worker: thread::spawn(move || write_atomic(&path, text.as_bytes())),
+        });
+    }
+
+    /// Takes in the result of Auto Save's write if it has finished.
+    fn collect_auto_save(&mut self, ctx: &egui::Context) {
+        if self
+            .auto_save_write
+            .as_ref()
+            .is_some_and(|write| !write.worker.is_finished())
+        {
+            ctx.request_repaint_after(BACKGROUND_TICK);
+        } else {
+            self.wait_for_auto_save();
+        }
+    }
+
+    /// Lets Auto Save's write finish, which has to happen before anything else writes the file
+    /// or the project is replaced.
+    fn wait_for_auto_save(&mut self) {
+        let Some(write) = self.auto_save_write.take() else {
+            return;
+        };
+        self.unsaved_since = None;
+        match write.worker.join() {
+            Ok(Ok(())) => {
+                self.baseline = write.file;
+                self.auto_save_failed = None;
+            }
+            Ok(Err(error)) => {
+                self.notice = Some(format!("Auto Save could not write the project. {error}"));
+                self.auto_save_failed = Some(write.file);
+            }
+            Err(_) => {
+                self.notice = Some("Auto Save stopped unexpectedly.".to_owned());
+                self.auto_save_failed = Some(write.file);
+            }
+        }
+    }
+
+    /// With Auto Save on, leaving a project saves what hasn't reached the file yet instead of
+    /// asking about it. If that fails, the work still counts as unsaved.
+    fn flush_auto_save(&mut self) {
+        self.wait_for_auto_save();
+        if let Some(path) = self.auto_save_path().map(Path::to_owned)
+            && self.has_unsaved_changes()
+        {
+            self.save_to(&path);
+        }
+    }
+
+    fn toggle_auto_save(&mut self) {
+        self.settings.auto_save = !self.settings.auto_save;
+        self.auto_save_failed = None;
+        if self.settings.auto_save && self.auto_save_held {
+            self.notice = Some(AUTO_SAVE_HELD.to_owned());
+        }
+        self.save_settings();
+    }
+
     /// The window's close button, Alt+F4 and the like all arrive here.
     fn handle_close_request(&mut self, ctx: &egui::Context) {
         if self.closing {
             return;
         }
+        self.flush_auto_save();
         if self.has_unsaved_changes() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.leave_for = Some(LeaveFor::CloseWindow);
@@ -1803,6 +1940,11 @@ impl Editor {
             {
                 self.save_as();
             }
+            ui.separator();
+            let auto_save = MenuItem::choice(palette, "Auto Save", self.settings.auto_save);
+            if ui.add(auto_save).clicked() {
+                self.toggle_auto_save();
+            }
         });
     }
 
@@ -1837,27 +1979,6 @@ impl Editor {
                     self.settings.theme = theme;
                     changed = true;
                 }
-                ui.add_space(SETTINGS_ROW_GAP);
-
-                ui.label(RichText::new("Autosave").font(fonts::strong(13.0)));
-                ui.colored_label(
-                    palette.text_muted,
-                    "How often a recovery copy of unsaved work is written.",
-                );
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = CONTROL_SPACING;
-                    for (seconds, name) in storage::AUTOSAVE_CHOICES {
-                        let chosen = self.settings.autosave_seconds == seconds;
-                        let button = ActionButton::new(palette, Kind::Ghost, name)
-                            .small()
-                            .selected(chosen);
-                        if ui.add(button).clicked() && !chosen {
-                            self.settings.autosave_seconds = seconds;
-                            changed = true;
-                        }
-                    }
-                });
                 ui.add_space(SETTINGS_ROW_GAP);
 
                 ui.label(RichText::new("Export cuts").font(fonts::strong(13.0)));
@@ -7669,7 +7790,13 @@ mod tests {
         let mut editor = in_panel_only(&ctx, &[]);
         click_named(&ctx, &mut editor, "Project menu");
 
-        for name in ["New project", "Open project", "Save", "Save as"] {
+        for name in [
+            "New project",
+            "Open project",
+            "Save",
+            "Save as",
+            "Auto Save",
+        ] {
             assert!(menu_item(&ctx, &mut editor, name).is_some(), "{name}");
         }
     }
@@ -8141,7 +8268,6 @@ mod tests {
         let_dialog_open(&ctx, &mut editor);
         click_named(&ctx, &mut editor, "Light");
         run_frame(&ctx, &mut editor, vec![]);
-        click_named(&ctx, &mut editor, "30 seconds");
         click_named(&ctx, &mut editor, "Fastest");
         assert_eq!(editor.mode, CutMode::Keyframe);
         click_named(&ctx, &mut editor, "Done");
@@ -8150,7 +8276,6 @@ mod tests {
 
         let next = with_storage(&ctx, &folder);
 
-        assert_eq!(next.settings.autosave_seconds, 30);
         assert_eq!(next.mode, CutMode::Keyframe);
         assert_eq!(
             ctx.options(|options| options.theme_preference),
@@ -8160,22 +8285,265 @@ mod tests {
     }
 
     #[test]
-    fn the_autosave_setting_changes_how_long_it_waits() {
+    fn recovery_copies_are_written_every_five_seconds() {
         let ctx = context();
-        let folder = project_folder("interval-setting");
+        let folder = project_folder("interval-fixed");
         let mut editor = with_storage(&ctx, &folder);
-        editor.settings.autosave_seconds = 60;
         editor.import(&ctx, &[test_clip().to_path_buf()]);
         settle(&ctx, &mut editor);
 
-        editor.last_autosave_at = Instant::now() - Duration::from_secs(30);
+        editor.last_autosave_at = Instant::now() - Duration::from_secs(4);
         run_frame(&ctx, &mut editor, vec![]);
         assert!(editor.last_autosaved.is_none());
 
-        editor.last_autosave_at = Instant::now() - Duration::from_secs(61);
+        editor.last_autosave_at = Instant::now() - Duration::from_millis(5100);
         run_frame(&ctx, &mut editor, vec![]);
         assert!(editor.last_autosaved.is_some());
         editor.recovery.as_mut().expect("it is on").wait();
+    }
+
+    #[test]
+    fn settings_no_longer_ask_how_often_to_autosave() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[]);
+
+        click_named(&ctx, &mut editor, "Settings");
+        let_dialog_open(&ctx, &mut editor);
+
+        assert!(is_named(&ctx, &mut editor, "Fastest"));
+        assert!(!is_named(&ctx, &mut editor, "5 seconds"));
+    }
+
+    /// A saved project with one clip on the timeline, and a second clip added since the save.
+    fn with_a_change_since_saving(ctx: &egui::Context, name: &str) -> (Editor, PathBuf) {
+        let mut editor = with_videos(ctx, &[test_clip()]);
+        let path = project_folder(name).join("a.bareclip");
+        assert!(editor.save_to(&path));
+        let id = editor.media[0].id;
+        editor.add_to_timeline(id);
+        assert!(editor.has_unsaved_changes());
+        (editor, path)
+    }
+
+    /// Makes Auto Save's wait over, runs a frame and lets its write finish.
+    fn auto_save_now(ctx: &egui::Context, editor: &mut Editor) {
+        editor.unsaved_since = Some(Instant::now() - Duration::from_secs(3600));
+        run_frame(ctx, editor, vec![]);
+        editor.wait_for_auto_save();
+    }
+
+    fn clips_in(path: &Path) -> usize {
+        let file = ProjectFile::read(path).expect("the file can be read");
+        file.tracks.iter().map(Vec::len).sum()
+    }
+
+    #[test]
+    fn auto_save_starts_off_and_the_menu_turns_it_on_for_the_next_run_too() {
+        let ctx = context();
+        let folder = project_folder("auto-save-menu");
+        let mut editor = with_storage(&ctx, &folder);
+        assert!(!editor.settings.auto_save);
+
+        click_named(&ctx, &mut editor, "Project menu");
+        click_menu_item(&ctx, &mut editor, "Auto Save");
+        assert!(editor.settings.auto_save);
+
+        assert!(with_storage(&ctx, &folder).settings.auto_save);
+    }
+
+    #[test]
+    fn with_auto_save_off_only_saving_changes_the_file() {
+        let ctx = context();
+        let (mut editor, path) = with_a_change_since_saving(&ctx, "auto-save-off");
+
+        auto_save_now(&ctx, &mut editor);
+
+        assert_eq!(clips_in(&path), 1);
+        assert!(editor.has_unsaved_changes());
+    }
+
+    #[test]
+    fn with_auto_save_on_a_change_reaches_the_file_after_five_seconds() {
+        let ctx = context();
+        let (mut editor, path) = with_a_change_since_saving(&ctx, "auto-save-on");
+        editor.settings.auto_save = true;
+
+        run_frame(&ctx, &mut editor, vec![]);
+        editor.unsaved_since = Some(Instant::now() - Duration::from_secs(4));
+        run_frame(&ctx, &mut editor, vec![]);
+        editor.wait_for_auto_save();
+        assert_eq!(clips_in(&path), 1, "too soon");
+
+        auto_save_now(&ctx, &mut editor);
+
+        assert_eq!(clips_in(&path), 2);
+        assert!(!editor.has_unsaved_changes());
+    }
+
+    #[test]
+    fn auto_save_writes_a_later_change_too() {
+        let ctx = context();
+        let (mut editor, path) = with_a_change_since_saving(&ctx, "auto-save-later");
+        editor.settings.auto_save = true;
+        auto_save_now(&ctx, &mut editor);
+
+        let id = editor.media[0].id;
+        editor.add_to_timeline(id);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.unsaved_since.is_some(), "it waits again");
+        assert_eq!(clips_in(&path), 2);
+
+        auto_save_now(&ctx, &mut editor);
+        assert_eq!(clips_in(&path), 3);
+    }
+
+    #[test]
+    fn auto_save_leaves_a_project_with_no_file_unsaved_and_recoverable() {
+        let ctx = context();
+        let folder = project_folder("auto-save-unnamed");
+        let mut editor = with_storage(&ctx, &folder);
+        editor.settings.auto_save = true;
+        editor.import(&ctx, &[test_clip().to_path_buf()]);
+        settle(&ctx, &mut editor);
+
+        auto_save_now(&ctx, &mut editor);
+        autosave_now(&ctx, &mut editor);
+
+        assert!(editor.project_path.is_none());
+        assert!(editor.has_unsaved_changes());
+        crash(editor);
+        assert_eq!(storage::orphaned_recoveries(&folder).len(), 1);
+    }
+
+    #[test]
+    fn writing_the_file_removes_the_recovery_copy() {
+        let ctx = context();
+        let folder = project_folder("auto-save-clears");
+        let path = folder.join("a.bareclip");
+        let mut editor = with_storage(&ctx, &folder);
+        editor.import(&ctx, &[test_clip().to_path_buf()]);
+        settle(&ctx, &mut editor);
+        assert!(editor.save_to(&path));
+        editor.settings.auto_save = true;
+        let id = editor.media[0].id;
+        editor.add_to_timeline(id);
+        autosave_now(&ctx, &mut editor);
+        assert!(editor.last_autosaved.is_some(), "the copy goes first");
+
+        auto_save_now(&ctx, &mut editor);
+        run_frame(&ctx, &mut editor, vec![]);
+        crash(editor);
+
+        assert_eq!(clips_in(&path), 1);
+        assert!(storage::orphaned_recoveries(&folder).is_empty());
+    }
+
+    #[test]
+    fn with_auto_save_on_leaving_saves_instead_of_asking() {
+        let ctx = context();
+        let (mut editor, path) = with_a_change_since_saving(&ctx, "auto-save-leave");
+        editor.settings.auto_save = true;
+
+        run_frame(&ctx, &mut editor, key_event(Key::N, Modifiers::COMMAND));
+
+        assert!(editor.leave_for.is_none());
+        assert_eq!(clips_in(&path), 2);
+        assert!(editor.project.tracks.is_empty());
+    }
+
+    #[test]
+    fn with_auto_save_on_closing_saves_instead_of_asking() {
+        let ctx = context();
+        let (mut editor, path) = with_a_change_since_saving(&ctx, "auto-save-close");
+        editor.settings.auto_save = true;
+
+        editor.handle_close_request(&ctx);
+
+        assert!(editor.leave_for.is_none());
+        assert_eq!(clips_in(&path), 2);
+    }
+
+    #[test]
+    fn with_auto_save_on_a_project_with_no_file_still_asks_before_closing() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        editor.settings.auto_save = true;
+
+        editor.handle_close_request(&ctx);
+
+        assert_eq!(editor.leave_for, Some(LeaveFor::CloseWindow));
+    }
+
+    #[test]
+    fn saving_by_hand_during_an_auto_save_keeps_the_newest_work() {
+        let ctx = context();
+        let (mut editor, path) = with_a_change_since_saving(&ctx, "auto-save-race");
+        editor.settings.auto_save = true;
+        editor.unsaved_since = Some(Instant::now() - Duration::from_secs(3600));
+        run_frame(&ctx, &mut editor, vec![]);
+        let id = editor.media[0].id;
+        editor.add_to_timeline(id);
+
+        assert!(editor.save_to(&path));
+
+        assert!(editor.auto_save_write.is_none());
+        assert_eq!(clips_in(&path), 3);
+        assert!(!editor.has_unsaved_changes());
+    }
+
+    #[test]
+    fn a_failed_auto_save_reports_once_keeps_the_work_unsaved_and_tries_again_after_a_change() {
+        let ctx = context();
+        let (mut editor, path) = with_a_change_since_saving(&ctx, "auto-save-fails");
+        editor.settings.auto_save = true;
+        // A folder where the temporary file has to go makes the write fail.
+        let blocker = path.with_file_name("a.bareclip.tmp");
+        std::fs::create_dir(&blocker).expect("the folder can be created");
+
+        auto_save_now(&ctx, &mut editor);
+        assert!(editor.has_unsaved_changes());
+        assert!(editor.notice.take().is_some());
+
+        auto_save_now(&ctx, &mut editor);
+        assert!(editor.notice.is_none(), "the same work isn't tried again");
+
+        std::fs::remove_dir(&blocker).expect("the folder can be removed");
+        let id = editor.media[0].id;
+        editor.add_to_timeline(id);
+        auto_save_now(&ctx, &mut editor);
+        assert_eq!(clips_in(&path), 3);
+        assert!(!editor.has_unsaved_changes());
+    }
+
+    #[test]
+    fn auto_save_never_cuts_a_missing_video_out_of_the_file() {
+        let ctx = context();
+        let (project, video) = project_with_movable_video(&ctx, "auto-save-missing");
+        once_free(|| std::fs::remove_file(&video));
+        let mut editor = Editor::new(&ctx, false);
+        editor.settings.auto_save = true;
+        run_frame(&ctx, &mut editor, vec![]);
+        editor.open_project(&ctx, &project);
+        let_dialog_open(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Open without them");
+        settle(&ctx, &mut editor);
+        assert!(editor.has_unsaved_changes());
+        assert!(
+            editor
+                .notice
+                .as_deref()
+                .is_some_and(|n| n.contains("Auto Save"))
+        );
+
+        auto_save_now(&ctx, &mut editor);
+        editor.handle_close_request(&ctx);
+
+        assert_eq!(clips_in(&project), 1);
+        assert_eq!(editor.leave_for, Some(LeaveFor::CloseWindow));
+
+        editor.leave_for = None;
+        assert!(editor.save_to(&project));
+        assert!(!editor.auto_save_held, "saving on purpose lifts the hold");
     }
 
     #[test]
