@@ -63,4 +63,31 @@ finally {
 Assert-That ($ExitCode -eq 0) "it uninstalled (exit $ExitCode)"
 Assert-That (@(Get-Installed).Count -eq 0) 'nothing is left installed'
 Assert-That (-not (Test-Path (Join-Path $InstallDir 'bareclip.exe'))) 'the app is gone'
+
+# An upgrade stays in the chosen folder and keeps the shortcut choices, without being told.
+$Parent = Join-Path $env:TEMP "bareclip upgrade $PID"
+$Desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'BareClip.lnk'
+$StartMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\BareClip.lnk'
+New-Item -ItemType Directory -Force $Parent | Out-Null
+$ExitCode = Invoke-Msi @('/i', "`"$Old`"", '/qn', '/l*v', "`"$Log`"", "INSTALLPARENT=`"$Parent\`"", 'ADD_DESKTOP=""')
+Assert-That ($ExitCode -eq 0) "the older version installed in a chosen folder (exit $ExitCode)"
+try {
+    $ExitCode = Invoke-Msi @('/i', "`"$New`"", '/qn', '/l*v', "`"$Log`"")
+    Assert-That ($ExitCode -eq 0) "the newer version installed over it (exit $ExitCode)"
+    $Installed = @(Get-Installed)
+    Assert-That ($Installed.Count -eq 1 -and $Installed[0].Version -like '0.1.1*') 'there is one copy, and it is the newer one'
+    Assert-That (Test-Path (Join-Path $Parent 'BareClip\bareclip.exe')) 'it stayed in the chosen folder'
+    Assert-That (-not (Test-Path $InstallDir)) 'nothing went to the usual folder'
+    Assert-That (Test-Path $StartMenu) 'the Start menu shortcut stayed'
+    Assert-That (-not (Test-Path $Desktop)) 'the declined desktop shortcut did not come back'
+}
+finally {
+    foreach ($Product in Get-Installed) {
+        $ExitCode = Invoke-Msi @('/x', $Product.Code, '/qn', '/l*v', "`"$Log`"")
+    }
+}
+Assert-That ($ExitCode -eq 0) "it uninstalled (exit $ExitCode)"
+Assert-That (-not (Test-Path (Join-Path $Parent 'BareClip'))) 'the BareClip folder is gone'
+Assert-That (-not (Test-Path 'HKCU:\Software\BareClip')) 'the registry entries are gone'
+Remove-Item -Recurse -Force $Parent
 Write-Host 'The upgrade test passed.'
