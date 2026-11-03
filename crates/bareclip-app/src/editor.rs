@@ -4048,6 +4048,40 @@ mod tests {
         vec![egui::Event::PointerMoved(at)]
     }
 
+    /// Pictures of a mixed project: its export window, and black bars in the preview.
+    #[test]
+    #[ignore = "needs a GPU, and writes pictures to look at"]
+    fn draw_the_mixed_project_screens() {
+        let folder = std::env::var_os("BARECLIP_SCREENS").map_or_else(
+            || std::env::temp_dir().join("bareclip-screens"),
+            PathBuf::from,
+        );
+        let ctx = context();
+        let mut camera = Camera::new(folder);
+        let tall = make_clip("editor-tall", "180x320");
+        let mut editor = with_videos(&ctx, &[test_clip(), &tall]);
+        editor.media_panel_open = false;
+        let_panel_finish(&ctx, &mut editor);
+
+        editor.seek(Ticks::from_seconds(1.0));
+        for _ in 0..30 {
+            run_frame(&ctx, &mut editor, vec![]);
+            thread::sleep(Duration::from_millis(10));
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "mixed-1-same-shape");
+
+        editor.seek(Ticks::from_seconds(5.0));
+        for _ in 0..30 {
+            run_frame(&ctx, &mut editor, vec![]);
+            thread::sleep(Duration::from_millis(10));
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "mixed-2-black-bars");
+
+        editor.export_state = ExportState::Choosing;
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "mixed-3-export");
+    }
+
     /// Saves pictures of the screen to look at, in the folder named by `BARECLIP_SCREENS`.
     /// Needs a GPU, and a person or tool to judge the results.
     #[test]
