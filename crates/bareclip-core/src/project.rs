@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     canvas::Canvas,
     placement::Placement,
-    sound::{ClipSound, RowSound},
+    sound::ClipSound,
     speed::Speed,
     time::Ticks,
     timeline::{MediaId, TimeRange, Timeline},
@@ -69,6 +69,14 @@ impl SavedClip {
     }
 }
 
+/// What an older file says about a whole row. Solo is gone, so a file with it on opens with
+/// everything heard.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct OldRowSound {
+    pub muted: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectFile {
     pub version: u32,
@@ -79,9 +87,10 @@ pub struct ProjectFile {
     /// The rows of sound below those, from the top down.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audio_tracks: Vec<Vec<SavedClip>>,
-    /// How each row sounds, picture rows first. Left out if none are muted or on solo.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub row_sound: Vec<RowSound>,
+    /// How older files said each row sounded, picture rows first. Only ever read, because rows
+    /// no longer have sound settings of their own. Use `muted_rows`.
+    #[serde(default, skip_serializing)]
+    pub row_sound: Vec<OldRowSound>,
     #[serde(default)]
     pub canvas: Canvas,
 }
@@ -123,13 +132,14 @@ impl ProjectFile {
                 .collect(),
             tracks: saved_rows(tracks.picture_tracks()),
             audio_tracks: saved_rows(tracks.audio_tracks()),
-            row_sound: if tracks.row_sounds().iter().all(RowSound::is_default) {
-                Vec::new()
-            } else {
-                tracks.row_sounds().to_vec()
-            },
+            row_sound: Vec::new(),
             canvas: Canvas::default(),
         }
+    }
+
+    /// Which rows this file muted as a whole, if it is old enough to have done that.
+    pub fn muted_rows(&self) -> Vec<bool> {
+        self.row_sound.iter().map(|row| row.muted).collect()
     }
 
     /// Whether this file was saved before projects kept their own size.
@@ -366,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn sound_rows_clip_sound_and_row_sound_all_come_back() {
+    fn sound_rows_and_clip_sound_all_come_back() {
         let mut tracks = Tracks::default();
         let video = tracks.push(VIDEO, range(0, 100));
         tracks.set_clip_sound(
@@ -379,28 +389,18 @@ mod tests {
             },
         );
         let detached = tracks.detach_sound(video, 1)[0];
-        tracks.set_row_sound(
-            1,
-            RowSound {
-                muted: false,
-                solo: true,
-            },
-        );
         let file = ProjectFile::capture("x", Vec::new(), &tracks);
 
         let back = ProjectFile::from_text(&file.to_text()).expect("it can be read");
-        let restored =
-            Tracks::restore_with_sound(&back.tracks, &back.audio_tracks, &back.row_sound, |id| {
-                Some(MediaId(id))
-            });
+        let restored = Tracks::restore_with_sound(
+            &back.tracks,
+            &back.audio_tracks,
+            &back.muted_rows(),
+            |id| Some(MediaId(id)),
+        );
 
         assert_eq!(restored.picture_rows(), 1);
         assert_eq!(restored.audio_tracks().len(), 1);
-        let row = RowSound {
-            muted: false,
-            solo: true,
-        };
-        assert_eq!(restored.row_sounds(), [RowSound::default(), row]);
         let saved = restored.tracks()[1].clips()[0].sound;
         assert_eq!(saved, tracks.clip(detached).expect("it is there").sound);
         assert_eq!(saved.only_track, Some(0));
@@ -413,14 +413,39 @@ mod tests {
             "tracks":[[{"media":1,"start":0,"source_start":0,"source_end":100}]]}"#;
 
         let file = ProjectFile::from_text(text).expect("it can be read");
-        let tracks =
-            Tracks::restore_with_sound(&file.tracks, &file.audio_tracks, &file.row_sound, |id| {
-                Some(MediaId(id))
-            });
+        let tracks = Tracks::restore_with_sound(
+            &file.tracks,
+            &file.audio_tracks,
+            &file.muted_rows(),
+            |id| Some(MediaId(id)),
+        );
 
         assert!(tracks.audio_tracks().is_empty());
         assert!(tracks.tracks()[0].clips()[0].sound.is_default());
-        assert_eq!(tracks.row_sounds(), [RowSound::default()]);
+    }
+
+    #[test]
+    fn a_row_an_older_file_muted_comes_back_as_muted_clips_and_solo_is_forgotten() {
+        let text = r#"{"version":5,"name":"old","media":[{"id":1,"path":"a.mp4"}],
+            "tracks":[
+                [{"media":1,"start":0,"source_start":0,"source_end":100}],
+                [{"media":1,"start":0,"source_start":0,"source_end":100}]
+            ],
+            "row_sound":[{"muted":true,"solo":false},{"muted":false,"solo":true}]}"#;
+
+        let file = ProjectFile::from_text(text).expect("it can be read");
+        let tracks = Tracks::restore_with_sound(
+            &file.tracks,
+            &file.audio_tracks,
+            &file.muted_rows(),
+            |id| Some(MediaId(id)),
+        );
+
+        assert!(tracks.tracks()[0].clips()[0].sound.muted);
+        assert!(!tracks.tracks()[1].clips()[0].sound.muted);
+        assert_eq!(tracks.sound_spans(&|_| true).len(), 1);
+        let saved_again = ProjectFile::capture("old", Vec::new(), &tracks).to_text();
+        assert!(!saved_again.contains("row_sound"));
     }
 
     #[test]

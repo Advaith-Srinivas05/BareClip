@@ -1,7 +1,6 @@
 //! Converts between timeline time and screen position, and draws the timeline.
 
 use bareclip_core::{
-    sound::RowSound,
     speed::Speed,
     time::{Ticks, format_timecode},
     timeline::{ClipEdge, ClipId, MediaId, TimeRange},
@@ -9,15 +8,16 @@ use bareclip_core::{
 };
 use bareclip_media::SoundShape;
 use eframe::egui::{
-    self, Align2, Color32, CursorIcon, FontId, Galley, Mesh, Pos2, Rect, Sense, Shape, Stroke,
-    TextureHandle, UiBuilder, Vec2, pos2, vec2,
+    self, Align, Align2, Color32, CursorIcon, FontId, Galley, Layout, Mesh, Popup,
+    PopupCloseBehavior, PopupKind, Pos2, Rect, RectAlign, Sense, Shape, Stroke, TextureHandle,
+    UiBuilder, Vec2, pos2, vec2,
 };
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     components::{ActionButton, IconButton, Kind, MenuItem},
     icons::{self, Icon},
-    text,
+    stage, text,
     theme::Palette,
 };
 
@@ -86,19 +86,30 @@ const PLAYHEAD_LINE_REACH: f32 = 4.0;
 const GAP_HIGHLIGHT: f32 = 0.07;
 /// The selected clip's stretch of the ruler is tinted more than the rest of the project.
 const PROJECT_TINT: f32 = 0.18;
-const SELECTED_TINT: f32 = 0.42;
-const TRIM_TAG_GAP: f32 = 2.0;
+const SELECTED_TINT: f32 = 0.3;
 /// The time above the playhead while it is dragged sits this far over the ruler.
 const BUBBLE_ROOM: f32 = 24.0;
 const ZOOM_CARD_RADIUS: f32 = 8.0;
 const SNAP_LINE_WIDTH: f32 = 1.5;
 const HATCH_SPACING: f32 = 8.0;
+/// The space between a trim's time and the clip, when the clip is too short to hold it.
+const TRIM_TAG_GAP: f32 = 4.0;
+/// How strongly the outline of a quiet label on the ruler shows.
+const RULER_TAG_EDGE: f32 = 0.45;
 const NEW_TRACK_HINT: &str = "Drag a clip here for a new track";
 const ADD_AUDIO_HINT: &str = "Add audio";
-/// The narrow column left of the rows that holds their mute and solo buttons.
-const ROW_HEADER_WIDTH: f32 = 34.0;
-const ROW_BUTTON_SIZE: f32 = 24.0;
-const ROW_BUTTON_ICON: f32 = 14.0;
+/// Room left of the rows, so the playhead's head isn't cut off at the very start.
+const TRACKS_LEFT: f32 = 10.0;
+/// How long the pointer rests on a video before its name shows, and how it arrives.
+const NAME_HOVER_SECONDS: f64 = 1.0;
+const NAME_FADE_SECONDS: f32 = 0.15;
+const NAME_RISE: f32 = 3.0;
+/// How much of a clip has to show for a name that stays on it, or for its speed.
+const KEPT_NAME_MIN_WIDTH: f32 = 60.0;
+const SPEED_TAG_MIN_WIDTH: f32 = 44.0;
+const FLYOUT_GAP: f32 = 4.0;
+/// How far a menu's frame reaches past what is in it.
+const MENU_FRAME_ROOM: f32 = 8.0;
 /// A clip this narrow has no room for its speaker.
 const SPEAKER_MIN_WIDTH: f32 = 72.0;
 const SPEAKER_SIZE: f32 = 22.0;
@@ -179,6 +190,8 @@ pub struct ClipView {
     pub muted: bool,
     /// Whether it is on a row of sound, with no picture.
     pub sound_only: bool,
+    /// Whether the settings ask for this clip's sound to be drawn on it.
+    pub shows_waveform: bool,
     /// Whether it shows an image.
     pub is_still: bool,
     pub speed: Speed,
@@ -266,13 +279,24 @@ pub struct TrackLayout {
 }
 
 impl TrackLayout {
-    /// How tall the tracks and their dashed lanes are together.
+    /// The dashed lanes only show on a single track. From two tracks on they are clutter,
+    /// and a drag still makes a new track above, between or below, lighting up where.
+    pub fn has_lanes(count: usize) -> bool {
+        count == 1
+    }
+
+    /// How tall the tracks and any dashed lanes are together.
     fn content_height(count: usize) -> f32 {
         if count == 0 {
             return 0.0;
         }
         let gaps = count as f32 + 1.0;
-        (NEW_LANE_HEIGHT * 2.0) + (TRACK_HEIGHT * count as f32) + (TRACK_GAP * gaps)
+        let lanes = if Self::has_lanes(count) {
+            NEW_LANE_HEIGHT * 2.0
+        } else {
+            0.0
+        };
+        lanes + (TRACK_HEIGHT * count as f32) + (TRACK_GAP * gaps)
     }
 
     /// How far the tracks can scroll. Nothing scrolls while they all fit.
@@ -288,7 +312,12 @@ impl TrackLayout {
         } else {
             self.area.top() - self.scroll
         };
-        content_top + NEW_LANE_HEIGHT + TRACK_GAP
+        let lane = if Self::has_lanes(self.count) {
+            NEW_LANE_HEIGHT
+        } else {
+            0.0
+        };
+        content_top + lane + TRACK_GAP
     }
 
     pub fn track(&self, index: usize) -> Rect {
@@ -299,6 +328,7 @@ impl TrackLayout {
         )
     }
 
+    /// Where the lane above is, or where one lights up during a drag once lanes are hidden.
     pub fn new_lane_above(&self) -> Rect {
         let top = self.first_top() - TRACK_GAP - NEW_LANE_HEIGHT;
         Rect::from_min_size(
@@ -307,6 +337,7 @@ impl TrackLayout {
         )
     }
 
+    /// Where the lane below is, or where one lights up during a drag once lanes are hidden.
     pub fn new_lane_below(&self) -> Rect {
         let top = self.first_top() + self.count as f32 * (TRACK_HEIGHT + TRACK_GAP);
         Rect::from_min_size(
@@ -466,8 +497,26 @@ pub enum MenuAction {
     Split,
     Duplicate(ClipId),
     Delete(ClipId),
+    ToggleMute(ClipId),
+    Detach(ClipId),
     RemoveGap(Ticks),
     RemoveAllGaps,
+}
+
+/// The part of the clip's menu that opens beside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuFlyout {
+    Speed,
+    Audio,
+}
+
+/// What is open beside the clip's menu.
+#[derive(Clone, Copy, Debug, Default)]
+struct MenuFlyouts {
+    open: Option<MenuFlyout>,
+    rect: Option<Rect>,
+    /// The pointer is on its way across other lines to what is open, so they don't take over.
+    heading_there: bool,
 }
 
 /// The timeline's view, kept between frames.
@@ -487,6 +536,7 @@ pub struct TimelineState {
     /// area while there are none.
     pub track: Rect,
     pub layout: TrackLayout,
+    pub ruler: Rect,
     pub scale: TimeScale,
     pub scrollbar: Rect,
     pub zoom_buttons: [Rect; 3],
@@ -494,6 +544,8 @@ pub struct TimelineState {
     pub hover_time: Option<Ticks>,
     /// The time shown under the pointer, which is only over empty parts of the timeline.
     pub hover_readout: Option<Ticks>,
+    /// Where the clip being trimmed starts and ends, and which end has hold of the pointer.
+    pub trim_readout: Option<(Ticks, Ticks, ClipEdge)>,
     /// Where the playhead was last sent during this drag.
     scrubbed_to: Option<Ticks>,
     pub menu_target: Option<MenuTarget>,
@@ -501,7 +553,11 @@ pub struct TimelineState {
     pub hovered_clip: Option<ClipId>,
     pub hovered_gap: Option<TimeRange>,
     pub snap_line: Option<Ticks>,
-    pub trim_readout: Option<(Ticks, Ticks)>,
+    /// The clip the pointer has rested on, and when it arrived.
+    name_hover: Option<(ClipId, f64)>,
+    /// The clip whose name the pointer has rested on for long enough to show.
+    pub named_clip: Option<ClipId>,
+    menu_flyouts: MenuFlyouts,
     /// How far the pointer was from the clip's edge when a trim began.
     trim_grab: Ticks,
     /// What a trimmed edge really lined up with in the last frame, which a target the
@@ -520,6 +576,7 @@ impl Default for TimelineState {
             frozen_total: None,
             track_scroll: 0.0,
             track: Rect::NOTHING,
+            ruler: Rect::NOTHING,
             layout: TrackLayout {
                 area: Rect::NOTHING,
                 count: 0,
@@ -535,12 +592,15 @@ impl Default for TimelineState {
             zoom_buttons: [Rect::NOTHING; 3],
             hover_time: None,
             hover_readout: None,
+            trim_readout: None,
             scrubbed_to: None,
             menu_target: None,
             hovered_clip: None,
             hovered_gap: None,
             snap_line: None,
-            trim_readout: None,
+            name_hover: None,
+            named_clip: None,
+            menu_flyouts: MenuFlyouts::default(),
             trim_grab: Ticks(0),
             trim_aligned: None,
             playhead_bubble: false,
@@ -649,8 +709,6 @@ impl TimelineState {
 /// Changes the user made on the timeline this frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TimelineEvents {
-    /// A row's mute or solo was pressed.
-    pub row_sound: Option<(usize, RowSound)>,
     /// A clip's speaker was pressed.
     pub toggle_clip_mute: Option<ClipId>,
     /// The lane for adding audio was pressed.
@@ -669,6 +727,8 @@ pub struct TimelineEvents {
     pub move_clip: Option<(ClipId, Ticks, TrackTarget)>,
     pub drop_media: Option<(MediaId, Ticks, TrackTarget)>,
     pub menu: Option<MenuAction>,
+    /// The clip's menu changed its speed.
+    pub speed: Option<(ClipId, Speed)>,
     pub collapse: bool,
 }
 
@@ -796,17 +856,78 @@ fn draw_pill(painter: &egui::Painter, palette: &Palette, area: Rect, x: f32, tex
     paint_pill(painter, palette, rect, galley);
 }
 
-/// Where a trim's start and end times go: just outside each end of the clip, and always
-/// on the ruler.
+/// A label's fill, words and outline on the ruler. Most are quiet, sitting back on the tinted
+/// stretch of the selected clip. The end being dragged is lit, so it is the one the eye follows.
+fn ruler_tag_colours(palette: &Palette, lit: bool) -> (Color32, Color32, Stroke) {
+    if lit {
+        (palette.accent, palette.accent_text, Stroke::NONE)
+    } else {
+        (
+            palette.surface,
+            palette.text,
+            Stroke::new(1.0, palette.accent.gamma_multiply(RULER_TAG_EDGE)),
+        )
+    }
+}
+
+/// How large a label on the ruler is, and its words ready to draw.
+fn ruler_tag(
+    painter: &egui::Painter,
+    palette: &Palette,
+    text: String,
+    lit: bool,
+) -> (Arc<Galley>, Vec2) {
+    let (_, words, _) = ruler_tag_colours(palette, lit);
+    let galley = painter.layout_no_wrap(text, FontId::proportional(12.0), words);
+    let size = galley.size() + vec2(10.0, 3.0);
+    (galley, size)
+}
+
+fn paint_ruler_tag(
+    painter: &egui::Painter,
+    palette: &Palette,
+    rect: Rect,
+    galley: Arc<Galley>,
+    lit: bool,
+) {
+    let (fill, words, edge) = ruler_tag_colours(palette, lit);
+    painter.rect_filled(rect, 4.0, fill);
+    painter.rect_stroke(rect, 4.0, edge, egui::StrokeKind::Inside);
+    painter.galley(rect.min + vec2(5.0, 1.5), galley, words);
+}
+
+/// Where a trim's start and end times go: inside the clip's stretch of the ruler, one at each end,
+/// or just outside it when it is too short to hold both. Either way they stay on the ruler.
 fn trim_tag_rects(area: Rect, start_x: f32, end_x: f32, start: Vec2, end: Vec2) -> (Rect, Rect) {
-    let place = |wanted: f32, size: Vec2| {
-        let left = wanted.min(area.right() - size.x).max(area.left());
+    let fits = end_x - start_x >= start.x + end.x + TRIM_TAG_GAP;
+    let (start_left, end_left) = if fits {
+        (start_x, end_x - end.x)
+    } else {
+        (start_x - start.x - TRIM_TAG_GAP, end_x + TRIM_TAG_GAP)
+    };
+    let place = |left: f32, size: Vec2| {
+        let left = left.min(area.right() - size.x).max(area.left());
         Rect::from_min_size(pos2(left, area.center().y - size.y / 2.0), size)
     };
-    (
-        place(start_x - start.x - TRIM_TAG_GAP, start),
-        place(end_x + TRIM_TAG_GAP, end),
-    )
+    (place(start_left, start), place(end_left, end))
+}
+
+/// Where the time under the pointer shows, and what it says. It only runs along the project, so
+/// past the last clip it waits at the end. An empty timeline has none, and neither has a project
+/// scrolled right out of the view.
+fn hover_mark(scale: &TimeScale, total: Ticks, view: Rect, pointer_x: f32) -> Option<(f32, Ticks)> {
+    if total.0 <= 0 {
+        return None;
+    }
+    let (start, end) = (scale.x_of(Ticks(0)), scale.x_of(total));
+    let (x, time) = if pointer_x >= end {
+        (end, total)
+    } else if pointer_x <= start {
+        (start, Ticks(0))
+    } else {
+        (pointer_x, scale.time_at(pointer_x))
+    };
+    (x >= view.left() - 1.0 && x <= view.right() + 1.0).then_some((x, time))
 }
 
 /// How a clip is showing what can be done with it.
@@ -897,7 +1018,10 @@ fn draw_face(
             ));
         }
     }
-    let Some(sound) = face.sound.filter(|sound| !sound.peaks.is_empty()) else {
+    let Some(sound) = face
+        .sound
+        .filter(|sound| clip.shows_waveform && !sound.peaks.is_empty())
+    else {
         return;
     };
     let share = if clip.sound_only {
@@ -1019,45 +1143,154 @@ fn draw_clip(
     };
     painter.add(clip_shape(rect, Color32::TRANSPARENT, outline));
 
-    if rect.width() > 60.0 {
-        // On its own small backing, because it can be sitting on any picture.
-        let room = rect.shrink2(vec2(HANDLE_WIDTH + 4.0, 0.0));
-        let galley = painter.layout_no_wrap(
-            clip.label.clone(),
-            FontId::proportional(12.0),
+    // A long clip can start off to the left, so these stay with the part on show.
+    let shown = rect.intersect(painter.clip_rect());
+    draw_speed_tag(painter, palette, shown, clip);
+    if keeps_its_name(clip) && shown.width() > KEPT_NAME_MIN_WIDTH {
+        draw_clip_name(painter, palette, shown, shown.right() - HANDLE_WIDTH, clip);
+    }
+}
+
+/// A video can be told by its pictures, so its name waits for the pointer. Sound and images have
+/// less to go on, so theirs stays.
+fn keeps_its_name(clip: &ClipView) -> bool {
+    clip.sound_only || clip.is_still
+}
+
+/// What a clip says about its speed, which stays on show because nothing else gives it away.
+fn speed_tag_text(clip: &ClipView) -> Option<String> {
+    (!clip.speed.is_normal()).then(|| text::speed_name(clip.speed.as_factor()))
+}
+
+/// The speed tag's shape and text, at the start of the part of the clip on show.
+fn speed_tag(
+    painter: &egui::Painter,
+    palette: &Palette,
+    shown: Rect,
+    clip: &ClipView,
+) -> Option<(Rect, Arc<Galley>)> {
+    let name = speed_tag_text(clip).filter(|_| shown.width() >= SPEED_TAG_MIN_WIDTH)?;
+    let galley = painter.layout_no_wrap(name, FontId::proportional(11.0), palette.clip_video_text);
+    let tag = Rect::from_min_size(
+        pos2(
+            shown.left() + HANDLE_WIDTH + 4.0,
+            shown.top() + CLIP_LABEL_TOP,
+        ),
+        vec2(galley.size().x + 10.0, CLIP_LABEL_HEIGHT),
+    );
+    Some((tag, galley))
+}
+
+fn draw_speed_tag(painter: &egui::Painter, palette: &Palette, shown: Rect, clip: &ClipView) {
+    if let Some((tag, galley)) = speed_tag(painter, palette, shown, clip) {
+        let backing = palette.stage.gamma_multiply(CLIP_LABEL_BACKING);
+        painter.rect_filled(tag, 4.0, backing);
+        let top = tag.center().y - galley.size().y / 2.0;
+        painter.galley(pos2(tag.left() + 5.0, top), galley, palette.clip_video_text);
+    }
+}
+
+/// A clip's name on its own small backing, because it can be sitting on any picture. It starts
+/// after any speed tag and is cut short at `right`.
+fn draw_clip_name(
+    painter: &egui::Painter,
+    palette: &Palette,
+    shown: Rect,
+    right: f32,
+    clip: &ClipView,
+) {
+    let after_tag = speed_tag(painter, palette, shown, clip).map(|(tag, _)| tag.right() + 4.0);
+    let left = after_tag.unwrap_or(shown.left() + HANDLE_WIDTH + 4.0);
+    let galley = painter.layout_no_wrap(
+        clip.label.clone(),
+        FontId::proportional(12.0),
+        palette.clip_video_text,
+    );
+    let room = right - left;
+    let has_icon = room > CLIP_ICON_MIN_WIDTH;
+    let icon_room = if has_icon { CLIP_ICON_SIZE + 4.0 } else { 0.0 };
+    let width = (galley.size().x + icon_room + 12.0).min(room);
+    if width <= 0.0 {
+        return;
+    }
+    let label = Rect::from_min_size(
+        pos2(left, shown.top() + CLIP_LABEL_TOP),
+        vec2(width, CLIP_LABEL_HEIGHT),
+    );
+    let backing = palette.stage.gamma_multiply(CLIP_LABEL_BACKING);
+    let clipped = painter.with_clip_rect(label.intersect(painter.clip_rect()));
+    clipped.rect_filled(label, 4.0, backing);
+    let mut text_left = label.left() + 6.0;
+    if has_icon {
+        icons::paint(
+            &clipped,
+            icons::square_at(
+                pos2(text_left + CLIP_ICON_SIZE / 2.0, label.center().y),
+                CLIP_ICON_SIZE,
+            ),
+            if clip.sound_only {
+                &icons::MUSIC
+            } else if clip.is_still {
+                &icons::IMAGE
+            } else {
+                &icons::FILM
+            },
             palette.clip_video_text,
         );
-        let has_icon = rect.width() > CLIP_ICON_MIN_WIDTH;
-        let icon_room = if has_icon { CLIP_ICON_SIZE + 4.0 } else { 0.0 };
-        let width = (galley.size().x + icon_room + 12.0).min(room.width());
-        let label = Rect::from_min_size(
-            pos2(room.left(), rect.top() + CLIP_LABEL_TOP),
-            vec2(width, CLIP_LABEL_HEIGHT),
-        );
-        let backing = palette.stage.gamma_multiply(CLIP_LABEL_BACKING);
-        let clipped = painter.with_clip_rect(label.intersect(painter.clip_rect()));
-        clipped.rect_filled(label, 4.0, backing);
-        let mut left = label.left() + 6.0;
-        if has_icon {
-            icons::paint(
-                &clipped,
-                icons::square_at(
-                    pos2(left + CLIP_ICON_SIZE / 2.0, label.center().y),
-                    CLIP_ICON_SIZE,
-                ),
-                if clip.sound_only {
-                    &icons::MUSIC
-                } else if clip.is_still {
-                    &icons::IMAGE
-                } else {
-                    &icons::FILM
-                },
-                palette.clip_video_text,
-            );
-            left += icon_room;
+        text_left += icon_room;
+    }
+    let top = label.center().y - galley.size().y / 2.0;
+    clipped.galley(pos2(text_left, top), galley, palette.clip_video_text);
+}
+
+/// Keeps track of how long the pointer has rested on a clip, and shows the name when it has
+/// rested for long enough. A wait asks for one more frame at the moment it ends, so nothing
+/// repaints in between and an idle window stays idle.
+fn follow_name_hover(ui: &egui::Ui, state: &mut TimelineState) {
+    let now = ui.input(|input| input.time);
+    state.name_hover = state.hovered_clip.map(|id| match state.name_hover {
+        Some((was, since)) if was == id => (id, since),
+        _ => (id, now),
+    });
+    state.named_clip = state.name_hover.and_then(|(id, since)| {
+        let left = NAME_HOVER_SECONDS - (now - since);
+        if left > 0.0 {
+            ui.ctx().request_repaint_after_secs(left as f32);
+            None
+        } else {
+            Some(id)
         }
-        let top = label.center().y - galley.size().y / 2.0;
-        clipped.galley(pos2(left, top), galley, palette.clip_video_text);
+    });
+}
+
+/// The names the pointer has brought up, over every clip so that a narrow clip's can spill past
+/// it. Each fades in and out, and rises a little as it arrives.
+fn draw_hovered_names(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    palette: &Palette,
+    state: &TimelineState,
+    clips: &[ClipView],
+    (layout, scale): (&TrackLayout, &TimeScale),
+) {
+    for clip in clips {
+        let opacity = ui.ctx().animate_bool_with_time(
+            ui.scope_id().with(("clip-name", clip.id.0)),
+            state.named_clip == Some(clip.id),
+            NAME_FADE_SECONDS,
+        );
+        if opacity <= 0.0 {
+            continue;
+        }
+        let shape = clip_rect(scale, layout.track(clip.track), clip.start, clip.end);
+        let shown = shape.intersect(layout.area);
+        if !shown.is_positive() {
+            continue;
+        }
+        let mut fading = painter.clone();
+        fading.multiply_opacity(opacity);
+        let risen = shown.translate(vec2(0.0, (1.0 - opacity) * NAME_RISE));
+        draw_clip_name(&fading, palette, risen, layout.area.right(), clip);
     }
 }
 
@@ -1082,7 +1315,8 @@ fn dashed_outline(painter: &egui::Painter, rect: Rect, stroke: Stroke) {
 }
 
 /// A dashed lane that says a clip can be dropped here to make a new track. It only ever
-/// offers what works, so it names text and audio once those tracks exist.
+/// offers what works, so it names text and audio once those tracks exist. These only show on a
+/// single track, as [`TrackLayout::has_lanes`] says.
 fn draw_new_track_lane(painter: &egui::Painter, palette: &Palette, lane: Rect, hint: &str) {
     dashed_outline(painter, lane, Stroke::new(1.0, palette.border_strong));
     let left = lane.left() + 10.0;
@@ -1116,11 +1350,15 @@ fn draw_drop(
         dashed_outline(painter, lane, Stroke::new(1.5, palette.accent));
         lane
     };
+    // A lane with no room left to show, because the tracks fill the view, gets a line instead.
+    let fits = |lane: Rect| layout.area.contains_rect(lane);
     let row = match target {
         TrackTarget::Existing(index) => layout.track(index),
         TrackTarget::New(_) if layout.count == 0 => layout.area,
-        TrackTarget::New(0) => light_up(layout.new_lane_above()),
-        TrackTarget::New(index) if index >= layout.count => light_up(layout.new_lane_below()),
+        TrackTarget::New(0) if fits(layout.new_lane_above()) => light_up(layout.new_lane_above()),
+        TrackTarget::New(index) if index >= layout.count && fits(layout.new_lane_below()) => {
+            light_up(layout.new_lane_below())
+        }
         TrackTarget::New(index) => {
             let middle = pos2(
                 layout.area.center().x,
@@ -1170,69 +1408,165 @@ fn zoom_button(
         .on_hover_text(hint)
 }
 
-/// The menu that opens on a clip or a gap, reporting what was picked from it.
+/// A line of the clip's menu that opens more beside it, on being pointed at or pressed. Returns
+/// where the part beside it is on screen, while it is open.
+fn flyout_item(
+    ui: &mut egui::Ui,
+    (palette, icon, name): (&Palette, Icon, &str),
+    which: MenuFlyout,
+    flyouts: &mut MenuFlyouts,
+    content: impl FnOnce(&mut egui::Ui),
+) -> Option<Rect> {
+    let item = ui.add(MenuItem::opens_more(palette, icon, name));
+    if (item.hovered() && !flyouts.heading_there) || item.clicked() {
+        flyouts.open = Some(which);
+    }
+    let shown = Popup::from_response(&item)
+        .kind(PopupKind::Menu)
+        .open(flyouts.open == Some(which))
+        .align(RectAlign::RIGHT_START)
+        .layout(Layout::top_down_justified(Align::Min))
+        .style(egui::containers::menu::menu_style)
+        .gap(FLYOUT_GAP)
+        // The menu it belongs to looks after what a click does, because it can see both.
+        .close_behavior(PopupCloseBehavior::IgnoreClicks)
+        .show(content)?;
+    Some(shown.response.rect)
+}
+
+/// Speed and sound for the clip the menu is on, which only offers what the clip can do: an image
+/// has no speed, and a clip with no sound has none to change.
+fn clip_flyouts(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    clip: &ClipView,
+    flyouts: &mut MenuFlyouts,
+    events: &mut (Option<(ClipId, Speed)>, Option<MenuAction>),
+) -> Option<Rect> {
+    let mut beside = None;
+    if !clip.is_still {
+        let selected = stage::SelectedSpeed {
+            id: clip.id,
+            speed: clip.speed,
+            has_sound: clip.has_sound,
+        };
+        beside = beside.or(flyout_item(
+            ui,
+            (palette, icons::GAUGE, "Speed"),
+            MenuFlyout::Speed,
+            flyouts,
+            |ui| stage::speed_menu(ui, palette, &selected, &mut events.0),
+        ));
+    }
+    if clip.has_sound {
+        beside = beside.or(flyout_item(
+            ui,
+            (palette, icons::VOLUME_2, "Audio"),
+            MenuFlyout::Audio,
+            flyouts,
+            |ui| {
+                let (icon, name) = if clip.muted {
+                    (icons::VOLUME_2, "Unmute")
+                } else {
+                    (icons::VOLUME_X, "Mute")
+                };
+                if ui.add(MenuItem::new(palette, icon, name, "")).clicked() {
+                    events.1 = Some(MenuAction::ToggleMute(clip.id));
+                }
+                if !clip.sound_only
+                    && !clip.muted
+                    && ui
+                        .add(MenuItem::new(palette, icons::UNLINK, "Detach sound", ""))
+                        .on_hover_text("Puts this clip's sound on rows of its own, so it can be moved and changed by itself")
+                        .clicked()
+                {
+                    events.1 = Some(MenuAction::Detach(clip.id));
+                }
+            },
+        ));
+    }
+    beside
+}
+
+/// The menu that opens on a clip or a gap, reporting what was picked from it. Also returns where
+/// any part open beside it is on screen.
 fn timeline_menu(
     ui: &mut egui::Ui,
     palette: &Palette,
     view: &TimelineView,
     target: MenuTarget,
-) -> Option<MenuAction> {
+    (flyouts, speed): (&mut MenuFlyouts, &mut Option<(ClipId, Speed)>),
+) -> (Option<MenuAction>, Option<Rect>) {
     let mut action = None;
+    let mut beside = None;
+    flyouts.heading_there = flyouts
+        .rect
+        .is_some_and(|rect| ui.input(|input| input.pointer.is_moving_towards_rect(&rect)));
+    if flyouts.heading_there {
+        // Stopping counts as no longer heading there, and stopping sends no event of its own.
+        ui.ctx().request_repaint();
+    }
+    // Moving on to another line closes what is open beside the menu. A drag on a slider there
+    // counts as no line being pointed at, wherever it wanders.
+    let plain_line = |response: egui::Response, flyouts: &mut MenuFlyouts| {
+        if response.hovered() && !flyouts.heading_there {
+            flyouts.open = None;
+        }
+        response.clicked()
+    };
     match target {
         MenuTarget::Clip(id) => {
             let under_playhead = view
                 .tracks
                 .clip(id)
                 .is_some_and(|clip| view.position >= clip.start && view.position < clip.end());
-            if ui
+            let split = ui
                 .add_enabled(
                     under_playhead,
                     MenuItem::new(palette, icons::SCISSORS, "Split", "S"),
                 )
-                .on_disabled_hover_text("Move the playhead inside this clip to split it")
-                .clicked()
-            {
+                .on_disabled_hover_text("Move the playhead inside this clip to split it");
+            if plain_line(split, flyouts) {
                 action = Some(MenuAction::Split);
             }
-            if ui
-                .add(MenuItem::new(
-                    palette,
-                    icons::COPY_PLUS,
-                    "Duplicate",
-                    "Ctrl+D",
-                ))
-                .clicked()
-            {
+            let duplicate = ui.add(MenuItem::new(
+                palette,
+                icons::COPY_PLUS,
+                "Duplicate",
+                "Ctrl+D",
+            ));
+            if plain_line(duplicate, flyouts) {
                 action = Some(MenuAction::Duplicate(id));
             }
-            if ui
-                .add(MenuItem::new(palette, icons::TRASH_2, "Delete", "Del"))
-                .clicked()
-            {
+            let delete = ui.add(MenuItem::new(palette, icons::TRASH_2, "Delete", "Del"));
+            if plain_line(delete, flyouts) {
                 action = Some(MenuAction::Delete(id));
+            }
+            if let Some(clip) = view.clips.iter().find(|clip| clip.id == id) {
+                let mut picked = (None, None);
+                beside = clip_flyouts(ui, palette, clip, flyouts, &mut picked);
+                *speed = picked.0;
+                action = action.or(picked.1);
             }
         }
         MenuTarget::Gap(time) => {
-            if ui
-                .add(MenuItem::new(palette, icons::X, "Remove gap", "Del"))
-                .clicked()
-            {
+            let remove = ui.add(MenuItem::new(palette, icons::X, "Remove gap", "Del"));
+            if plain_line(remove, flyouts) {
                 action = Some(MenuAction::RemoveGap(time));
             }
         }
     }
     ui.separator();
     let has_gaps = !view.tracks.gaps().is_empty();
-    if ui
-        .add_enabled(
-            has_gaps,
-            MenuItem::new(palette, icons::X, "Remove all gaps", ""),
-        )
-        .clicked()
-    {
+    let remove_all = ui.add_enabled(
+        has_gaps,
+        MenuItem::new(palette, icons::X, "Remove all gaps", ""),
+    );
+    if plain_line(remove_all, flyouts) {
         action = Some(MenuAction::RemoveAllGaps);
     }
-    action
+    flyouts.rect = beside;
+    (action, beside)
 }
 
 /// Draws the scrollbar, which shows how much of the whole timeline is in view.
@@ -1412,85 +1746,6 @@ fn bottom_strip(
     collapse
 }
 
-/// The mute and solo buttons beside each row.
-fn row_headers(
-    ui: &mut egui::Ui,
-    palette: &Palette,
-    view: &TimelineView,
-    layout: &TrackLayout,
-    rect: Rect,
-    events: &mut TimelineEvents,
-) {
-    for (row, sound) in view.tracks.row_sounds().iter().enumerate() {
-        let track = layout.track(row);
-        // Half a row showing has no room for two buttons, and they would land on what is above.
-        if track.top() < layout.area.top() || track.bottom() > layout.area.bottom() {
-            continue;
-        }
-        let x = rect.left() + (ROW_HEADER_WIDTH - ROW_BUTTON_SIZE) / 2.0 - 2.0;
-        let place =
-            |y: f32| Rect::from_min_size(pos2(x, y), vec2(ROW_BUTTON_SIZE, ROW_BUTTON_SIZE));
-        let number = row + 1;
-        let id = ui.scope_id().with(("row-sound", row));
-
-        let mute_name = if sound.muted {
-            format!("Unmute row {number}")
-        } else {
-            format!("Mute row {number}")
-        };
-        let (kind, icon) = if sound.muted {
-            (Kind::Chosen, icons::VOLUME_X)
-        } else {
-            (Kind::Ghost, icons::VOLUME_2)
-        };
-        let mute = IconButton::new(palette, kind, icon, &mute_name)
-            .size(ROW_BUTTON_SIZE, ROW_BUTTON_ICON)
-            .show_at(ui, id.with("mute"), place(track.top() + 3.0))
-            .on_hover_text(if sound.muted {
-                "Unmute this row"
-            } else {
-                "Mute this row"
-            });
-        if mute.clicked() {
-            events.row_sound = Some((
-                row,
-                RowSound {
-                    muted: !sound.muted,
-                    ..*sound
-                },
-            ));
-        }
-
-        let solo_name = if sound.solo {
-            format!("Stop solo on row {number}")
-        } else {
-            format!("Solo row {number}")
-        };
-        let kind = if sound.solo {
-            Kind::Chosen
-        } else {
-            Kind::Ghost
-        };
-        let solo = IconButton::new(palette, kind, icons::HEADPHONES, &solo_name)
-            .size(ROW_BUTTON_SIZE, ROW_BUTTON_ICON)
-            .show_at(
-                ui,
-                id.with("solo"),
-                place(track.bottom() - ROW_BUTTON_SIZE - 3.0),
-            )
-            .on_hover_text("Hear only this row, in the preview and the finished video");
-        if solo.clicked() {
-            events.row_sound = Some((
-                row,
-                RowSound {
-                    solo: !sound.solo,
-                    ..*sound
-                },
-            ));
-        }
-    }
-}
-
 /// The speaker on each clip with sound, which mutes it.
 fn speakers(
     ui: &mut egui::Ui,
@@ -1552,8 +1807,8 @@ pub fn timeline(
     let painter = ui.painter_at(rect);
     let mut events = TimelineEvents::default();
     let inset = 8.0;
-    let left = rect.left() + ROW_HEADER_WIDTH;
-    let track_width = (rect.width() - ROW_HEADER_WIDTH - inset).max(1.0);
+    let left = rect.left() + TRACKS_LEFT;
+    let track_width = (rect.width() - TRACKS_LEFT - inset).max(1.0);
 
     let view_total = state.frozen_total.unwrap_or(total);
     if state.scale.width > 0.0 && (state.scale.width - track_width).abs() > 0.01 {
@@ -1561,7 +1816,6 @@ pub fn timeline(
     }
     state.clamp_scroll(view_total);
     state.snap_line = None;
-    state.trim_readout = None;
 
     if state.drag != TimelineDrag::None
         && let Some(pointer) = response.interact_pointer_pos()
@@ -1597,6 +1851,7 @@ pub fn timeline(
         scroll: state.track_scroll,
     };
     state.layout = layout;
+    state.ruler = ruler;
     state.track = if track_count == 0 {
         area
     } else {
@@ -1648,6 +1903,7 @@ pub fn timeline(
     state.hovered_clip = hovered_part
         .filter(|_| state.drag == TimelineDrag::None)
         .map(|(clip, _)| clip.id);
+    follow_name_hover(ui, state);
     if matches!(hovered_part, Some((_, ClipPart::Handle(_))))
         || matches!(state.drag, TimelineDrag::Trim(..))
     {
@@ -1736,7 +1992,10 @@ pub fn timeline(
             }
             _ => {}
         }
-        if response.clicked() && track_count > 0 && layout.new_lane_below().contains(pointer) {
+        if response.clicked()
+            && TrackLayout::has_lanes(track_count)
+            && layout.new_lane_below().contains(pointer)
+        {
             events.add_audio = true;
         } else if response.clicked() {
             events.seek = Some(Ticks(time.0.clamp(0, total.0)));
@@ -1785,6 +2044,7 @@ pub fn timeline(
         } else {
             None
         };
+        state.menu_flyouts = MenuFlyouts::default();
     }
 
     // The ruler: the project's own length is tinted, and dead space within it hatched.
@@ -1852,7 +2112,7 @@ pub fn timeline(
             egui::StrokeKind::Inside,
         );
     }
-    if track_count > 0 {
+    if TrackLayout::has_lanes(track_count) {
         draw_new_track_lane(
             &area_painter,
             palette,
@@ -1905,7 +2165,7 @@ pub fn timeline(
             ),
         );
     }
-    row_headers(ui, palette, view, &layout, rect, &mut events);
+    draw_hovered_names(ui, &area_painter, palette, state, clips, (&layout, &scale));
     speakers(ui, palette, state, clips, &layout, &scale, &mut events);
     if let Some((_, start, end, target)) = move_landing {
         draw_drop(
@@ -2005,12 +2265,12 @@ pub fn timeline(
         }
     }
 
-    // While trimming, the ruler says where the clip now starts and ends.
+    // While trimming, the ruler also says where the clip now starts and ends.
     let trim_tags = match state.drag {
-        TimelineDrag::Trim(id, _) => clips.iter().find(|clip| clip.id == id).map(|clip| {
-            state.trim_readout = Some((clip.start, clip.end));
-            let (start, start_size) = pill_text(&painter, palette, format_timecode(clip.start));
-            let (end, end_size) = pill_text(&painter, palette, format_timecode(clip.end));
+        TimelineDrag::Trim(id, edge) => clips.iter().find(|clip| clip.id == id).map(|clip| {
+            let tag = |time, lit| ruler_tag(&painter, palette, text::nearest_second(time), lit);
+            let (start, start_size) = tag(clip.start, edge == ClipEdge::Start);
+            let (end, end_size) = tag(clip.end, edge == ClipEdge::End);
             let (start_rect, end_rect) = trim_tag_rects(
                 ruler,
                 scale.x_of(clip.start),
@@ -2018,11 +2278,14 @@ pub fn timeline(
                 start_size,
                 end_size,
             );
-            [(start_rect, start), (end_rect, end)]
+            state.trim_readout = Some((clip.start, clip.end, edge));
+            (start_rect, start, end_rect, end, edge)
         }),
         _ => None,
     };
-
+    if trim_tags.is_none() {
+        state.trim_readout = None;
+    }
     if let Some(selected) = view
         .selected
         .and_then(|id| clips.iter().find(|clip| clip.id == id))
@@ -2031,26 +2294,15 @@ pub fn timeline(
         let x = scale.x_of(middle);
         if x > rect.left() && x < rect.right() {
             let length = text::clip_length(Ticks(selected.end.0 - selected.start.0));
-            let pill = painter.layout_no_wrap(length, FontId::proportional(11.0), palette.text);
-            let size = pill.size() + vec2(10.0, 3.0);
+            let (pill, size) = ruler_tag(&painter, palette, length, false);
             let shape = Rect::from_center_size(pos2(x, ruler.center().y), size);
-            let crowded = trim_tags
-                .as_ref()
-                .is_some_and(|tags| tags.iter().any(|(tag, _)| tag.intersects(shape)));
+            let crowded = trim_tags.as_ref().is_some_and(|(start, _, end, ..)| {
+                start.intersects(shape) || end.intersects(shape)
+            });
             if !crowded {
-                painter.rect_filled(shape, 4.0, palette.raised);
-                painter.rect_stroke(
-                    shape,
-                    4.0,
-                    Stroke::new(1.0, palette.accent),
-                    egui::StrokeKind::Inside,
-                );
-                painter.galley(shape.min + vec2(5.0, 1.5), pill, palette.text);
+                paint_ruler_tag(&painter, palette, shape, pill, false);
             }
         }
-    }
-    for (rect, galley) in trim_tags.into_iter().flatten() {
-        paint_pill(&painter, palette, rect, galley);
     }
     if let Some(line) = state.snap_line {
         painter.line_segment(
@@ -2065,6 +2317,16 @@ pub fn timeline(
     let x = scale.x_of(view.position);
     if x >= area.left() - 1.0 && x <= area.right() + 1.0 {
         draw_playhead(&painter, palette, x, ruler.top() + 2.0, area.bottom() + 4.0);
+    }
+    // The end being dragged goes last, so it stays whole if the two ever meet.
+    if let Some((start_rect, start, end_rect, end, edge)) = trim_tags {
+        if edge == ClipEdge::Start {
+            paint_ruler_tag(&painter, palette, end_rect, end, false);
+            paint_ruler_tag(&painter, palette, start_rect, start, true);
+        } else {
+            paint_ruler_tag(&painter, palette, start_rect, start, false);
+            paint_ruler_tag(&painter, palette, end_rect, end, true);
+        }
     }
 
     // The time under the pointer goes on top of everything else, but only over empty parts
@@ -2085,14 +2347,15 @@ pub fn timeline(
     state.hover_readout = None;
     if state.drag == TimelineDrag::None
         && !on_something
-        && let (Some(hover), Some(time)) = (pointer_over, hover_time)
+        && let Some(hover) = pointer_over
+        && let Some((x, time)) = hover_mark(&scale, total, area, hover.x)
     {
         state.hover_readout = Some(time);
         painter.line_segment(
-            [pos2(hover.x, ruler.bottom()), pos2(hover.x, rect.bottom())],
+            [pos2(x, ruler.bottom()), pos2(x, rect.bottom())],
             Stroke::new(1.0, palette.text_muted),
         );
-        draw_pill(&painter, palette, ruler, hover.x, format_timecode(time));
+        draw_pill(&painter, palette, ruler, x, format_timecode(time));
     }
 
     // Moving the playhead by hand shows its time above it, leaving its head uncovered.
@@ -2112,11 +2375,35 @@ pub fn timeline(
     }
 
     if let Some(target) = state.menu_target {
-        response.context_menu(|ui| {
-            events.menu = timeline_menu(ui, palette, view, target);
-        });
+        let just_opened = response.secondary_clicked();
+        let flyouts = &mut state.menu_flyouts;
+        let speed = &mut events.speed;
+        let menu = &mut events.menu;
+        // The menu has to judge clicks itself. Left to the toolkit, a click beside it on the
+        // speed controls would count as outside it.
+        Popup::context_menu(&response)
+            .close_behavior(PopupCloseBehavior::IgnoreClicks)
+            .show(|ui| {
+                let (picked, beside) = timeline_menu(ui, palette, view, target, (flyouts, speed));
+                *menu = picked;
+                let frame = ui.min_rect().expand(MENU_FRAME_ROOM);
+                let clicked_at = ui.input(|input| {
+                    input
+                        .pointer
+                        .any_click()
+                        .then(|| input.pointer.interact_pos())
+                        .flatten()
+                });
+                let outside = clicked_at.is_some_and(|at| {
+                    !frame.contains(at) && !beside.is_some_and(|rect| rect.contains(at))
+                });
+                if picked.is_some() || (outside && !just_opened) {
+                    ui.close();
+                }
+            });
         if !response.context_menu_opened() {
             state.menu_target = None;
+            state.menu_flyouts = MenuFlyouts::default();
         }
     }
 
@@ -2216,6 +2503,7 @@ mod tests {
             has_sound: false,
             muted: false,
             sound_only: false,
+            shows_waveform: false,
             is_still: false,
             speed: Speed::default(),
             fade_in: Ticks(0),
@@ -2609,29 +2897,6 @@ mod tests {
     }
 
     #[test]
-    fn trim_times_sit_just_outside_the_clip() {
-        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 24.0));
-        let size = vec2(60.0, 19.0);
-
-        let (start, end) = trim_tag_rects(area, 300.0, 700.0, size, size);
-
-        assert_eq!(start.right(), 300.0 - TRIM_TAG_GAP);
-        assert_eq!(end.left(), 700.0 + TRIM_TAG_GAP);
-        assert!(!start.intersects(end));
-    }
-
-    #[test]
-    fn trim_times_stay_on_the_ruler_at_its_ends() {
-        let area = Rect::from_min_size(pos2(50.0, 0.0), vec2(1000.0, 24.0));
-        let size = vec2(60.0, 19.0);
-
-        let (start, end) = trim_tag_rects(area, 52.0, 1045.0, size, size);
-
-        assert_eq!(start.left(), area.left());
-        assert_eq!(end.right(), area.right());
-    }
-
-    #[test]
     fn a_wider_timeline_shows_more_time_at_the_same_zoom() {
         let total = seconds(100.0);
         let mut state = TimelineState::default();
@@ -2678,6 +2943,140 @@ mod tests {
     }
 
     #[test]
+    fn only_a_single_track_has_lanes() {
+        assert!(!TrackLayout::has_lanes(0));
+        assert!(TrackLayout::has_lanes(1));
+        assert!(!TrackLayout::has_lanes(2));
+        assert!(!TrackLayout::has_lanes(5));
+
+        // With no lanes in the way the tracks don't need room for them, and just fit.
+        let snug = TRACK_HEIGHT * 3.0 + TRACK_GAP * 4.0;
+        assert_eq!(TrackLayout::furthest_scroll(3, snug), 0.0);
+        let first = layout(3, snug).track(0).top();
+        assert!((first - (100.0 + TRACK_GAP)).abs() < 0.01, "{first}");
+    }
+
+    #[test]
+    fn dragging_past_either_end_of_several_tracks_still_means_a_new_track() {
+        let tracks = layout(3, 500.0);
+
+        assert_eq!(
+            tracks.target_at(tracks.track(0).top() - 1.0),
+            TrackTarget::New(0)
+        );
+        assert_eq!(
+            tracks.target_at(tracks.track(2).bottom() + 1.0),
+            TrackTarget::New(3)
+        );
+        // Even for a clip already on the top track, which needs the pointer clear of it.
+        assert_eq!(
+            tracks.move_target_at(tracks.track(0).top() - 1.0, 0),
+            TrackTarget::New(0)
+        );
+    }
+
+    #[test]
+    fn trim_times_sit_inside_the_ends_of_the_clips_stretch_of_the_ruler() {
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 24.0));
+        let size = vec2(40.0, 18.0);
+
+        let (start, end) = trim_tag_rects(area, 300.0, 700.0, size, size);
+
+        assert_eq!(start.left(), 300.0);
+        assert_eq!(end.right(), 700.0);
+        assert!((start.center().y - area.center().y).abs() < 0.01);
+    }
+
+    #[test]
+    fn trim_times_move_outside_a_clip_too_short_to_hold_them() {
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 24.0));
+        let size = vec2(40.0, 18.0);
+
+        let (start, end) = trim_tag_rects(area, 300.0, 340.0, size, size);
+
+        assert_eq!(start.right(), 300.0 - TRIM_TAG_GAP);
+        assert_eq!(end.left(), 340.0 + TRIM_TAG_GAP);
+        assert!(!start.intersects(end));
+    }
+
+    #[test]
+    fn trim_times_stay_on_the_ruler_at_its_ends() {
+        let area = Rect::from_min_size(pos2(50.0, 0.0), vec2(1000.0, 24.0));
+        let size = vec2(40.0, 18.0);
+
+        let (start, end) = trim_tag_rects(area, -200.0, 1500.0, size, size);
+
+        assert_eq!(start.left(), area.left());
+        assert_eq!(end.right(), area.right());
+    }
+
+    #[test]
+    fn labels_on_the_ruler_can_be_read_quiet_or_lit_in_both_themes() {
+        for palette in [&crate::theme::DARK, &crate::theme::LIGHT] {
+            for lit in [false, true] {
+                let (fill, words, _) = ruler_tag_colours(palette, lit);
+                assert!(
+                    crate::theme::tests::contrast(words, fill) >= 4.5,
+                    "lit: {lit}"
+                );
+            }
+            let (quiet, ..) = ruler_tag_colours(palette, false);
+            let (lit, ..) = ruler_tag_colours(palette, true);
+            assert_ne!(quiet, lit);
+        }
+    }
+
+    fn mark_scale() -> TimeScale {
+        TimeScale {
+            left: 100.0,
+            width: 800.0,
+            visible_start: Ticks(0),
+            visible: seconds(80.0),
+        }
+    }
+
+    #[test]
+    fn the_time_under_the_pointer_follows_it_along_the_project() {
+        let scale = mark_scale();
+        let view = Rect::from_min_size(pos2(100.0, 0.0), vec2(800.0, 100.0));
+        let x = scale.x_of(seconds(10.0));
+
+        let (at, time) = hover_mark(&scale, seconds(45.0), view, x).expect("it shows");
+
+        assert_eq!(at, x);
+        assert!((time.as_seconds() - 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn the_time_under_the_pointer_stops_at_the_end_of_the_last_clip() {
+        let scale = mark_scale();
+        let view = Rect::from_min_size(pos2(100.0, 0.0), vec2(800.0, 100.0));
+        let end = scale.x_of(seconds(45.0));
+
+        for pointer in [end, end + 1.0, 890.0] {
+            assert_eq!(
+                hover_mark(&scale, seconds(45.0), view, pointer),
+                Some((end, seconds(45.0)))
+            );
+        }
+    }
+
+    #[test]
+    fn the_time_under_the_pointer_has_nowhere_to_show_without_a_project() {
+        let scale = mark_scale();
+        let view = Rect::from_min_size(pos2(100.0, 0.0), vec2(800.0, 100.0));
+
+        assert_eq!(hover_mark(&scale, Ticks(0), view, 300.0), None);
+
+        // Scrolled so that the project's end is already off the left of the view.
+        let later = TimeScale {
+            visible_start: seconds(60.0),
+            ..scale
+        };
+        assert_eq!(hover_mark(&later, seconds(45.0), view, 300.0), None);
+    }
+
+    #[test]
     fn a_taller_timeline_shows_more_space_around_tracks_kept_in_the_middle() {
         let tall = layout(1, 700.0);
 
@@ -2689,12 +3088,11 @@ mod tests {
     }
 
     #[test]
-    fn the_new_track_lanes_sit_above_and_below_the_tracks() {
-        let tracks = layout(2, 400.0);
+    fn the_new_track_lanes_sit_above_and_below_the_track() {
+        let tracks = layout(1, 400.0);
 
         assert!(tracks.new_lane_above().bottom() < tracks.track(0).top());
-        assert!(tracks.track(0).bottom() < tracks.track(1).top());
-        assert!(tracks.track(1).bottom() < tracks.new_lane_below().top());
+        assert!(tracks.track(0).bottom() < tracks.new_lane_below().top());
     }
 
     #[test]

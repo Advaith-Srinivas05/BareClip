@@ -5,7 +5,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use bareclip_core::{project, splice::CutMode, time::Ticks};
+use bareclip_core::{
+    project,
+    splice::CutMode,
+    time::{Ticks, format_timecode},
+};
 use bareclip_export::{FullPlan, FullReport, ProjectReport};
 use bareclip_media::{AudioInfo, ExportReport, MediaInfo, Quality};
 
@@ -164,13 +168,37 @@ pub fn audio_track_summary(position: usize, track: &AudioInfo) -> String {
     format!("{name}: {}, {channels}", codec_name(&track.codec))
 }
 
-/// A clip's length while it is being adjusted, precise enough to see each change.
+/// A clip's length as the timeline shows it, such as `46s` or `1m 30s`. A tenth of a second only
+/// matters on something short.
 pub fn clip_length(time: Ticks) -> String {
-    if time.as_seconds() < 60.0 {
-        format!("{:.2} s", time.as_seconds().max(0.0))
-    } else {
-        short_duration(time)
+    let total = time.as_seconds().max(0.0);
+    if total < 9.95 {
+        return format!("{total:.1}s");
     }
+    let whole = total.round() as u64;
+    let (hours, minutes, seconds) = (whole / 3600, whole / 60 % 60, whole % 60);
+    if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// A video's whole length on its card, such as `0:08`, with hours only if it reaches one.
+pub fn whole_time(time: Ticks) -> String {
+    let timecode = format_timecode(time);
+    timecode
+        .split('.')
+        .next()
+        .map_or_else(String::new, str::to_owned)
+}
+
+/// A moment to the nearest second, for the labels on the ruler, so a clip starting at 0.97 s doesn't
+/// claim to start a whole second before it looks.
+pub fn nearest_second(time: Ticks) -> String {
+    whole_time(Ticks::from_seconds(time.as_seconds().round()))
 }
 
 /// What an export is about to do, in terms of what matters to the user.
@@ -463,11 +491,11 @@ mod tests {
     fn the_gap_warning_says_how_much_dead_space_there_is() {
         assert_eq!(
             gap_warning(1, Ticks::from_seconds(2.5)),
-            "1 gap of 2.50 s will export as black picture and silence."
+            "1 gap of 2.5s will export as black picture and silence."
         );
         assert_eq!(
             gap_warning(3, Ticks::from_seconds(10.0)),
-            "3 gaps, 10.00 s in total, will export as black picture and silence."
+            "3 gaps, 10s in total, will export as black picture and silence."
         );
     }
 
@@ -533,8 +561,21 @@ mod tests {
 
     #[test]
     fn clip_lengths_stay_precise_until_they_get_long() {
-        assert_eq!(clip_length(Ticks::from_seconds(5.9)), "5.90 s");
-        assert_eq!(clip_length(Ticks::from_seconds(84.0)), "1 min 24 s");
+        assert_eq!(clip_length(Ticks::from_seconds(3.38)), "3.4s");
+        assert_eq!(clip_length(Ticks::from_seconds(46.0)), "46s");
+        assert_eq!(clip_length(Ticks::from_seconds(90.0)), "1m 30s");
+        assert_eq!(clip_length(Ticks::from_seconds(3723.0)), "1h 2m 3s");
+    }
+
+    #[test]
+    fn a_cards_length_has_no_hours_until_it_reaches_one() {
+        assert_eq!(nearest_second(Ticks::from_seconds(0.97)), "0:01");
+        assert_eq!(nearest_second(Ticks::from_seconds(2.99)), "0:03");
+        assert_eq!(nearest_second(Ticks::from_seconds(8.4)), "0:08");
+        assert_eq!(nearest_second(Ticks::from_seconds(89.6)), "1:30");
+        assert_eq!(whole_time(Ticks::from_seconds(8.4)), "0:08");
+        assert_eq!(whole_time(Ticks::from_seconds(84.0)), "1:24");
+        assert_eq!(whole_time(Ticks::from_seconds(3723.0)), "1:02:03");
     }
 
     #[test]

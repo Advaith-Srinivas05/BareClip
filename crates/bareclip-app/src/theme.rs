@@ -91,6 +91,10 @@ pub const LIGHT: Palette = Palette {
     success: hex(0x47702F),
 };
 
+/// How wide each theme's button is, and all of them together with the spaces between.
+const THEME_BUTTON_WIDTH: f32 = 84.0;
+const THEME_BUTTON_GAP: f32 = 4.0;
+pub const THEME_PICKER_WIDTH: f32 = THEME_BUTTON_WIDTH * 3.0 + THEME_BUTTON_GAP * 2.0;
 const THEME_CHOICES: [(ThemePreference, Icon, &str); 3] = [
     (ThemePreference::System, icons::MONITOR, "System"),
     (ThemePreference::Light, icons::SUN, "Light"),
@@ -115,27 +119,20 @@ pub fn install(ctx: &egui::Context) {
     ctx.all_styles_mut(|style| style.animation_time = ANIMATION_SECONDS);
 }
 
-/// Shows the theme choices and returns where each button was placed.
-pub fn theme_picker(ui: &mut egui::Ui, palette: &Palette) -> Vec<(ThemePreference, egui::Rect)> {
+/// Shows the theme choices, side by side in a row the caller has laid out.
+pub fn theme_picker(ui: &mut egui::Ui, palette: &Palette) {
     let current = ui.ctx().options(|options| options.theme_preference);
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        THEME_CHOICES
-            .iter()
-            .map(|&(choice, icon, label)| {
-                let button = ActionButton::new(palette, Kind::Ghost, label)
-                    .icon(icon)
-                    .small()
-                    .selected(current == choice);
-                let response = ui.add(button);
-                if response.clicked() {
-                    ui.ctx().set_theme(choice);
-                }
-                (choice, response.rect)
-            })
-            .collect()
-    })
-    .inner
+    ui.spacing_mut().item_spacing.x = THEME_BUTTON_GAP;
+    for &(choice, icon, label) in &THEME_CHOICES {
+        let button = ActionButton::new(palette, Kind::Ghost, label)
+            .icon(icon)
+            .small()
+            .width(THEME_BUTTON_WIDTH)
+            .selected(current == choice);
+        if ui.add(button).clicked() {
+            ui.ctx().set_theme(choice);
+        }
+    }
 }
 
 const SHADOW_ALPHA: u8 = 70;
