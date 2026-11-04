@@ -7,7 +7,7 @@ use std::{
 
 use bareclip_core::{project, splice::CutMode, time::Ticks};
 use bareclip_export::{FullPlan, FullReport, ProjectReport};
-use bareclip_media::{AudioInfo, ExportReport, MediaInfo};
+use bareclip_media::{AudioInfo, ExportReport, MediaInfo, Quality};
 
 pub const VIDEO_EXTENSIONS: [&str; 6] = ["mp4", "mkv", "mov", "webm", "avi", "ts"];
 /// Sound with no picture.
@@ -214,11 +214,32 @@ pub fn encoder_name(encoder: &str) -> &str {
 pub fn full_export_plan(plan: &FullPlan) -> String {
     let settings = &plan.settings;
     format!(
-        "Every frame is redrawn and saved as an H.264 MP4 at {} x {} and {} fps. This takes longer than copying.",
+        "Every frame is redrawn and saved as an H.264 MP4 at {} x {} and {} fps. This takes longer than copying. {}",
         settings.width,
         settings.height,
         frame_rate(plan.frame_rate()),
+        quality_note(settings.quality),
     )
+}
+
+/// What a quality is called in the export window.
+pub fn quality_name(quality: Quality) -> &'static str {
+    match quality {
+        Quality::MatchSource => "Match source",
+        Quality::Balanced => "Balanced",
+        Quality::Smaller => "Smaller file",
+    }
+}
+
+/// What a quality will do, in a sentence.
+pub fn quality_note(quality: Quality) -> &'static str {
+    match quality {
+        Quality::MatchSource => {
+            "Looks the same as the source. The file can come out larger than it."
+        }
+        Quality::Balanced => "Hard to tell from the source, at about its size or smaller.",
+        Quality::Smaller => "About half the size of Balanced. The loss can show on some footage.",
+    }
 }
 
 /// A frame rate with no needless decimals, such as `60` or `59.94`.
@@ -263,6 +284,13 @@ pub fn export_summary(report: &ProjectReport) -> Vec<String> {
     match report {
         ProjectReport::Fast(report) => fast_export_summary(report),
         ProjectReport::Full(report) => full_export_summary(report),
+        ProjectReport::Sound(report) => vec![
+            format!("Finished in {}.", elapsed(report.elapsed.as_secs_f64())),
+            format!(
+                "{} of sound saved, with no picture.",
+                elapsed(report.length.as_seconds())
+            ),
+        ],
     }
 }
 

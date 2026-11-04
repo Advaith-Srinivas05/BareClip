@@ -12,10 +12,11 @@ use std::{path::Path, sync::atomic::AtomicBool, time::Duration};
 use bareclip_media::{ExportReport, ExportRequest, MediaError, MediaInfo, export, probe};
 
 pub use layered::{LayeredClip, LayeredRequest, LayeredStretch, export_layered};
-pub use mixed::{SoundPlan, export_with_new_sound};
+pub use mixed::{SoundPlan, SoundReport, export_sound_only, export_with_new_sound};
 pub use plan::{
-    FullPlan, LAYERED_REASON, Route, copying_suits, final_size, frame_rate_for, mixed_rates,
-    route_for, size_problem, sound_labels,
+    CHOICES_REASON, ExportChoices, ExportRate, ExportSize, FullPlan, LAYERED_REASON, Route, SIZES,
+    copying_suits, final_size, frame_rate_for, mixed_rates, rates_on_offer, route_for,
+    size_problem, size_with_shorter_side, sizes_on_offer, sound_labels,
 };
 pub use sink::VideoSink;
 
@@ -45,6 +46,8 @@ pub struct FullReport {
 pub enum ProjectReport {
     Fast(ExportReport),
     Full(FullReport),
+    /// Only the sound was saved.
+    Sound(SoundReport),
 }
 
 /// Reads each different video once, in the order they are first used.

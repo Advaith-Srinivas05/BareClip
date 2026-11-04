@@ -676,6 +676,8 @@ mod tests {
             sound: bareclip_export::SoundPlan::default(),
             canvas: None,
             background: [0, 0, 0],
+            quality: Default::default(),
+            rate: Default::default(),
         };
         bareclip_export::export_layered(
             &request,
@@ -1138,6 +1140,8 @@ mod tests {
             sound: bareclip_export::SoundPlan::as_recorded(&sound, &infos),
             canvas: None,
             background: [0, 0, 0],
+            quality: Default::default(),
+            rate: Default::default(),
         };
         let report = bareclip_export::export_layered(&request, &cancel, &|_| {})
             .expect("the export succeeds");

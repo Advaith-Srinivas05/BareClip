@@ -4,6 +4,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
 };
 
 use bareclip_audio::{Bus, MixSpan, TimelineMix};
@@ -143,6 +144,42 @@ fn write_sound_file(
         progress(written as f32 / total as f32);
     }
     file.finish()
+}
+
+/// What an export of only the sound did.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SoundReport {
+    pub length: Ticks,
+    pub elapsed: Duration,
+}
+
+/// Saves the project's sound as a file with no picture, from the start of the timeline to where
+/// the last sound ends.
+pub fn export_sound_only(
+    plan: &SoundPlan,
+    output: &Path,
+    cancel: &AtomicBool,
+    progress: &dyn Fn(f32),
+) -> Result<SoundReport, MediaError> {
+    bareclip_media::init()?;
+    let started = Instant::now();
+    let length = plan.end();
+    if plan.tracks.is_empty() || length.0 <= 0 {
+        return Err(MediaError::NothingToExport);
+    }
+    if plan.spans.iter().any(|span| same_file(&span.path, output)) {
+        return Err(MediaError::SameInputAndOutput);
+    }
+    // A file half written is no use to anyone, so it only gets its name once it is finished.
+    let working = working_file(output, "working.m4a");
+    let _cleanup = Cleanup(vec![working.clone()]);
+    write_sound_file(plan, &working, length, cancel, progress)?;
+    std::fs::rename(&working, output)?;
+    progress(1.0);
+    Ok(SoundReport {
+        length,
+        elapsed: started.elapsed(),
+    })
 }
 
 /// Copies the picture and adds newly worked out sound, which takes far less time than redrawing.

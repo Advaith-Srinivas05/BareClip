@@ -15,11 +15,11 @@ use bareclip_core::{
     time::Ticks,
     timeline::TimeRange,
 };
-use bareclip_media::{MediaError, MediaInfo, probe, same_file};
+use bareclip_media::{MediaError, MediaInfo, Quality, probe, same_file};
 use bareclip_render::{Compositor, Layer, needs_compositor};
 
 use crate::{
-    FullPlan, FullReport,
+    ExportRate, FullPlan, FullReport,
     full::{PictureFeed, Span, frame_count, frame_time, pick_pictures_before},
     mixed::{SoundFeed, SoundPlan},
     sink::VideoSink,
@@ -63,6 +63,8 @@ pub struct LayeredRequest {
     pub canvas: Option<(u32, u32)>,
     /// What shows wherever no picture covers the canvas.
     pub background: Colour,
+    pub quality: Quality,
+    pub rate: ExportRate,
 }
 
 /// Which stretch a moment falls in. Rounding can put the very last frame just past the end by
@@ -141,6 +143,7 @@ pub fn export_layered(
         Some(canvas) => FullPlan::on_canvas(&videos, canvas),
         None => FullPlan::for_videos(&videos),
     };
+    plan = plan.with_choices(request.quality, request.rate);
     plan.settings.sound_tracks = request.sound.tracks.clone();
     let settings = &plan.settings;
     let canvas = (settings.width, settings.height);
@@ -355,6 +358,8 @@ mod tests {
             sound: SoundPlan::default(),
             canvas: None,
             background: BLACK,
+            quality: Quality::default(),
+            rate: ExportRate::default(),
         };
 
         assert!(matches!(

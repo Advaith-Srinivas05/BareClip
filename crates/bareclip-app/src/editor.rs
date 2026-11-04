@@ -26,14 +26,15 @@ use bareclip_core::{
     tracks::{OrderMove, TrackTarget, Tracks},
 };
 use bareclip_export::{
-    FullPlan, LAYERED_REASON, LayeredClip, LayeredRequest, LayeredStretch, ProjectReport, Route,
-    SoundPlan, copying_suits, export_layered, export_with_new_sound, full_output_path, mixed_rates,
-    route_for, size_problem, sound_labels,
+    CHOICES_REASON, ExportChoices, ExportRate, ExportSize, FullPlan, LAYERED_REASON, LayeredClip,
+    LayeredRequest, LayeredStretch, ProjectReport, Route, SIZES, SoundPlan, copying_suits,
+    export_layered, export_sound_only, export_with_new_sound, full_output_path, mixed_rates,
+    rates_on_offer, route_for, size_problem, size_with_shorter_side, sizes_on_offer, sound_labels,
 };
 use bareclip_media::{
-    DecodeStep, ExportPart, ExportRequest, MediaError, MediaInfo, PreviewFrame, SoundLabel,
-    SoundShape, StripPicture, VideoPreview, can_write_gaps, export, picture_spacing, plan_export,
-    probe, read_sound_shape, read_strip_pictures, scan_frames,
+    DecodeStep, ExportPart, ExportRequest, MediaError, MediaInfo, PreviewFrame, Quality,
+    SoundLabel, SoundShape, StripPicture, VideoPreview, can_write_gaps, export, picture_spacing,
+    plan_export, probe, read_sound_shape, read_strip_pictures, scan_frames,
 };
 use eframe::egui::{
     self, Align, Color32, CornerRadius, FontFamily, FontId, Frame, Key, Layout, Margin, Modifiers,
@@ -134,6 +135,8 @@ const EMPTY_HINT_MAX_HEIGHT: f32 = 200.0;
 const DIALOG_RADIUS: u8 = 10;
 /// A dialog's own buttons are never narrower than this, so short names still feel solid.
 const DIALOG_BUTTON_WIDTH: f32 = 84.0;
+const EXPORT_DROPDOWN_WIDTH: f32 = 128.0;
+const MATCH_SOURCE: &str = "Match source";
 /// The playback buttons: four of 32, the play button, and the spaces between them.
 const TRANSPORT_WIDTH: f32 = 180.0;
 const CONTROL_SPACING: f32 = 4.0;
@@ -400,6 +403,10 @@ pub struct Editor {
     rate_pick: Option<RatePick>,
     /// Keep game, mic and music on tracks of their own in this export, rather than one mix.
     keep_sound_apart: bool,
+    /// Size, quality and frame rate of the finished video in this export.
+    export_choices: ExportChoices,
+    /// This export saves only the sound.
+    sound_only: bool,
     /// The lane for adding audio was pressed, so a file picker opens once this frame is drawn.
     add_audio_requested: bool,
     confirm_remove: Vec<MediaId>,
@@ -534,6 +541,8 @@ impl Editor {
             mode: CutMode::FrameExact,
             rate_pick: None,
             keep_sound_apart: false,
+            export_choices: ExportChoices::default(),
+            sound_only: false,
             add_audio_requested: false,
             confirm_remove: Vec::new(),
             project_name: project::DEFAULT_NAME.to_owned(),
@@ -1422,6 +1431,8 @@ impl Editor {
     fn open_export(&mut self) {
         self.rate_pick = None;
         self.keep_sound_apart = false;
+        self.export_choices = ExportChoices::default();
+        self.sound_only = false;
         self.export_state = if self.project.tracks.gaps().is_empty() {
             ExportState::Choosing
         } else {
@@ -1911,13 +1922,13 @@ impl Editor {
     /// What the finished video's sound comes from, and the tracks it goes on.
     fn sound_plan(&self) -> SoundPlan {
         let tracks = &self.project.tracks;
-        if self.sound_is_plain() {
+        if self.sound_is_plain() && !self.sound_only {
             return SoundPlan::as_recorded(
                 &self.export_parts().unwrap_or_default(),
                 &self.videos_on_timeline(),
             );
         }
-        let apart = self.keep_sound_apart && self.can_keep_sound_apart();
+        let apart = self.keep_sound_apart && self.can_keep_sound_apart() && !self.sound_only;
         let own = self.own_tracks_kept_apart();
         let spans: Vec<MixSpan> = tracks
             .sound_spans(&|id| self.has_sound(id))
@@ -1957,6 +1968,9 @@ impl Editor {
     /// Why joining these videos is a choice between copying and redrawing, if it is. Videos that
     /// have to be redrawn anyway have no choice to make.
     fn rate_choice(&self) -> Option<String> {
+        if self.export_choices.need_redrawing() {
+            return None;
+        }
         let videos = self.videos_on_timeline();
         (self.route_before_rates(&videos) == Route::Fast)
             .then(|| mixed_rates(&videos))
@@ -1994,10 +2008,39 @@ impl Editor {
         if route != Route::Fast {
             return route;
         }
+        if self.export_choices.need_redrawing() {
+            return Route::Full(CHOICES_REASON.to_owned());
+        }
         match self.rate_choice() {
             Some(reason) if self.current_rate_pick() == RatePick::Redraw => Route::Full(reason),
             _ => Route::Fast,
         }
+    }
+
+    /// The finished video's size, with the export window's choice applied.
+    fn export_size(&self) -> Option<(u32, u32)> {
+        let canvas = self.final_canvas()?;
+        Some(match self.export_choices.size {
+            ExportSize::MatchSource => canvas,
+            ExportSize::Shorter(shorter) => size_with_shorter_side(canvas, shorter),
+        })
+    }
+
+    /// The plan a redrawn export would follow, with the export window's choices applied.
+    fn export_plan(&self) -> FullPlan {
+        let (width, height) = self.export_size().unwrap_or(self.project.canvas.size());
+        FullPlan::on_canvas(&self.videos_on_timeline(), (width, height))
+            .with_choices(self.export_choices.quality, self.export_choices.rate)
+    }
+
+    /// Which sizes the export window offers.
+    fn export_sizes(&self) -> Vec<(u32, &'static str)> {
+        let pictures: Vec<(u32, u32)> = self
+            .videos_on_timeline()
+            .iter()
+            .map(|video| (video.video.width, video.video.height))
+            .collect();
+        sizes_on_offer(self.project.canvas.size(), &pictures)
     }
 
     /// The shape and size of the finished video, which the preview shows too.
@@ -2024,7 +2067,9 @@ impl Editor {
     /// The file the export dialog starts on, or nothing if nothing is on the timeline.
     fn suggested_output(&self) -> Option<PathBuf> {
         let suggested = self.suggested_fast_output()?;
-        Some(if matches!(self.export_route(), Route::Full(_)) {
+        Some(if self.sound_only {
+            suggested.with_extension("m4a")
+        } else if matches!(self.export_route(), Route::Full(_)) {
             full_output_path(&suggested)
         } else {
             suggested
@@ -2035,7 +2080,12 @@ impl Editor {
         let Some(suggested) = self.suggested_output() else {
             return;
         };
-        let mut dialog = rfd::FileDialog::new().set_title("Export video as");
+        let title = if self.sound_only {
+            "Export sound as"
+        } else {
+            "Export video as"
+        };
+        let mut dialog = rfd::FileDialog::new().set_title(title);
         if let Some(folder) = suggested.parent() {
             dialog = dialog.set_directory(folder);
         }
@@ -2044,7 +2094,9 @@ impl Editor {
         }
         if let Some(extension) = suggested.extension() {
             let extension = extension.to_string_lossy().into_owned();
-            dialog = dialog.add_filter(format!("{} video", extension.to_uppercase()), &[extension]);
+            let kind = if self.sound_only { "sound" } else { "video" };
+            dialog =
+                dialog.add_filter(format!("{} {kind}", extension.to_uppercase()), &[extension]);
         }
         if let Some(output) = dialog.save_file() {
             self.start_export_to(ctx, output);
@@ -2052,18 +2104,23 @@ impl Editor {
     }
 
     fn start_export_to(&mut self, ctx: &egui::Context, output: PathBuf) {
-        let Some(parts) = self.export_parts() else {
+        let parts = self.export_parts();
+        if parts.is_none() && !self.sound_only {
             return;
-        };
+        }
+        let parts = parts.unwrap_or_default();
         // Worked out here because the project may change while the export runs.
         let sound = self.sound_plan();
         let copy_sound = self.sound_is_plain();
+        let sound_only = self.sound_only;
         let layered = matches!(self.export_route(), Route::Full(_)).then(|| LayeredRequest {
             output: output.clone(),
             stretches: self.layered_stretches(),
             sound: sound.clone(),
-            canvas: self.final_canvas(),
+            canvas: self.export_size(),
             background: self.project.canvas.background,
+            quality: self.export_choices.quality,
+            rate: self.export_choices.rate,
         });
         let request = ExportRequest {
             output: output.clone(),
@@ -2082,6 +2139,10 @@ impl Editor {
             };
             // The route has already been chosen, including any pick between Copy and Redraw.
             let outcome = match &layered {
+                _ if sound_only => {
+                    export_sound_only(&sound, &request.output, &worker_cancel, &progress)
+                        .map(ProjectReport::Sound)
+                }
                 Some(layered) => {
                     export_layered(layered, &worker_cancel, &progress).map(ProjectReport::Full)
                 }
@@ -3890,8 +3951,11 @@ impl Editor {
         let gaps = self.project.tracks.gaps();
         let gap_length = Ticks(gaps.iter().map(|gap| gap.duration().0).sum());
         let route = self.export_route();
-        let full_plan = FullPlan::on_canvas(&self.videos_on_timeline(), self.project.canvas.size());
-        let ready = self.export_parts().is_some();
+        let full_plan = self.export_plan();
+        let ready = self.export_parts().is_some() || self.sound_only;
+        let sizes = self.export_sizes();
+        let rates = rates_on_offer(&self.videos_on_timeline());
+        let has_sound = !self.sound_spans_for_export().is_empty();
         let summary = self.plan_description();
         let rate_choice = self.rate_choice();
         let rate_pick = self.current_rate_pick();
@@ -3933,6 +3997,48 @@ impl Editor {
                 }
                 ExportState::Choosing => {
                     components::dialog_title(ui, &icons::UPLOAD, palette.accent, "Export");
+                    ui.add_space(14.0);
+                    if has_sound {
+                        ui.horizontal(|ui| {
+                            let video = ActionButton::new(palette, Kind::Ghost, "Video").icon(icons::FILM).selected(!self.sound_only);
+                            if ui.add(video).clicked() {
+                                self.sound_only = false;
+                            }
+                            let sound = ActionButton::new(palette, Kind::Ghost, "Sound only").icon(icons::AUDIO_LINES).selected(self.sound_only);
+                            if ui.add(sound).clicked() {
+                                self.sound_only = true;
+                            }
+                        });
+                        ui.add_space(14.0);
+                    }
+                    if self.sound_only {
+                        ui.label(RichText::new("Sound only").font(fonts::strong(13.0)));
+                        ui.add_space(4.0);
+                        ui.colored_label(
+                            palette.text_muted,
+                            "Everything that can be heard, mixed together and saved as an M4A file with no picture.",
+                        );
+                        if has_solo {
+                            ui.add_space(8.0);
+                            ui.colored_label(
+                                palette.danger,
+                                "A row is on Solo, so only its sound goes in the file.",
+                            );
+                        }
+                        ui.add_space(18.0);
+                        components::dialog_buttons(ui, |ui| {
+                            let start = ActionButton::new(palette, Kind::Primary, "Choose file and export")
+                                .icon(icons::UPLOAD);
+                            if ui.add_enabled(has_sound, start).clicked() {
+                                begin_export = true;
+                            }
+                            if ui.add(dialog_button(palette, "Cancel")).clicked() {
+                                next_state = Some(ExportState::Closed);
+                            }
+                        });
+                        return;
+                    }
+                    export_choice_row(ui, palette, &mut self.export_choices, &sizes, &rates);
                     ui.add_space(14.0);
                     if let Some(reason) = &rate_choice {
                         ui.label(
@@ -4160,6 +4266,11 @@ impl Editor {
         }
     }
 
+    /// What could be heard in an export, whichever way it goes.
+    fn sound_spans_for_export(&self) -> Vec<bareclip_core::tracks::SoundSpan> {
+        self.project.tracks.sound_spans(&|id| self.has_sound(id))
+    }
+
     fn plan_description(&self) -> Option<String> {
         let mut copied = 0;
         let mut encoded = 0;
@@ -4177,6 +4288,106 @@ impl Editor {
         }
         Some(text::plan_summary(copied, encoded))
     }
+}
+
+/// One of the export window's dropdowns: its name above a button showing the current choice.
+fn export_dropdown(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    title: &str,
+    current: &str,
+    choices: impl FnOnce(&mut egui::Ui),
+) {
+    ui.vertical(|ui| {
+        ui.set_width(EXPORT_DROPDOWN_WIDTH);
+        ui.colored_label(palette.text_muted, title);
+        ui.add_space(2.0);
+        let name = format!("{title}: {current}");
+        let button = ui.add(components::Dropdown::new(
+            palette,
+            &name,
+            current,
+            EXPORT_DROPDOWN_WIDTH,
+        ));
+        egui::Popup::menu(&button).show(choices);
+    });
+}
+
+/// The Resolution, Quality and Frame rate choices.
+fn export_choice_row(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    choices: &mut ExportChoices,
+    sizes: &[(u32, &'static str)],
+    rates: &[u32],
+) {
+    ui.horizontal_top(|ui| {
+        let size_name = match choices.size {
+            ExportSize::MatchSource => MATCH_SOURCE,
+            ExportSize::Shorter(shorter) => SIZES
+                .iter()
+                .find(|(side, _)| *side == shorter)
+                .map_or(MATCH_SOURCE, |(_, name)| *name),
+        };
+        export_dropdown(ui, palette, "Resolution", size_name, |ui| {
+            let chosen = choices.size == ExportSize::MatchSource;
+            if ui
+                .add(MenuItem::choice(palette, MATCH_SOURCE, chosen))
+                .clicked()
+            {
+                choices.size = ExportSize::MatchSource;
+            }
+            for (shorter, name) in sizes {
+                let chosen = choices.size == ExportSize::Shorter(*shorter);
+                if ui.add(MenuItem::choice(palette, name, chosen)).clicked() {
+                    choices.size = ExportSize::Shorter(*shorter);
+                }
+            }
+        });
+        export_dropdown(
+            ui,
+            palette,
+            "Quality",
+            text::quality_name(choices.quality),
+            |ui| {
+                for quality in Quality::ALL {
+                    let chosen = choices.quality == quality;
+                    if ui
+                        .add(MenuItem::choice(
+                            palette,
+                            text::quality_name(quality),
+                            chosen,
+                        ))
+                        .clicked()
+                    {
+                        choices.quality = quality;
+                    }
+                }
+            },
+        );
+        let rate_name = match choices.rate {
+            ExportRate::MatchSource => MATCH_SOURCE.to_owned(),
+            ExportRate::Fps(fps) => format!("{fps} fps"),
+        };
+        export_dropdown(ui, palette, "Frame rate", &rate_name, |ui| {
+            let chosen = choices.rate == ExportRate::MatchSource;
+            if ui
+                .add(MenuItem::choice(palette, MATCH_SOURCE, chosen))
+                .clicked()
+            {
+                choices.rate = ExportRate::MatchSource;
+            }
+            for fps in rates {
+                let chosen = choices.rate == ExportRate::Fps(*fps);
+                if ui
+                    .add(MenuItem::choice(palette, &format!("{fps} fps"), chosen))
+                    .clicked()
+                {
+                    choices.rate = ExportRate::Fps(*fps);
+                }
+            }
+        });
+    });
 }
 
 /// The largest place something of this size fits inside a rectangle, in the middle.
@@ -10616,6 +10827,145 @@ mod tests {
     }
 
     #[test]
+    fn choosing_anything_but_match_source_redraws_and_going_back_copies_again() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        assert_eq!(editor.export_route(), Route::Fast);
+
+        for choices in [
+            ExportChoices {
+                size: ExportSize::Shorter(480),
+                ..ExportChoices::default()
+            },
+            ExportChoices {
+                quality: Quality::Smaller,
+                ..ExportChoices::default()
+            },
+            ExportChoices {
+                rate: ExportRate::Fps(24),
+                ..ExportChoices::default()
+            },
+        ] {
+            editor.export_choices = choices;
+            assert_eq!(
+                editor.export_route(),
+                Route::Full(CHOICES_REASON.to_owned())
+            );
+        }
+
+        editor.export_choices = ExportChoices::default();
+        assert_eq!(editor.export_route(), Route::Fast);
+    }
+
+    #[test]
+    fn the_export_window_starts_on_match_source_every_time() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        editor.export_choices.quality = Quality::Smaller;
+        editor.sound_only = true;
+
+        editor.open_export();
+
+        assert_eq!(editor.export_choices, ExportChoices::default());
+        assert!(!editor.sound_only);
+    }
+
+    #[test]
+    fn a_chosen_resolution_sets_the_finished_size_without_changing_the_project() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        let canvas = editor.project.canvas.size();
+        editor.export_choices.size = ExportSize::Shorter(240);
+
+        let wanted = size_with_shorter_side(canvas, 240);
+        assert_eq!(editor.export_size(), Some(wanted));
+        assert_eq!(editor.export_plan().settings.width, wanted.0);
+        assert_eq!(editor.project.canvas.size(), canvas);
+    }
+
+    #[test]
+    fn a_redraw_for_a_chosen_quality_comes_out_with_what_was_chosen() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        let canvas = editor.project.canvas.size();
+        let wanted = size_with_shorter_side(canvas, canvas.0.min(canvas.1) / 2);
+        editor.export_choices = ExportChoices {
+            size: ExportSize::Shorter(canvas.0.min(canvas.1) / 2),
+            quality: Quality::Balanced,
+            rate: ExportRate::Fps(15),
+        };
+
+        let output = output_called("chosen-choices");
+        let report = exported_report(&ctx, &mut editor, &output);
+
+        assert!(matches!(report, ProjectReport::Full(_)), "{report:?}");
+        let info = probe(&output).expect("it can be read");
+        assert_eq!((info.video.width, info.video.height), wanted);
+        assert!((info.video.frame_rate - 15.0).abs() < 0.5);
+        assert!(!info.audio.is_empty(), "the sound comes along");
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn sound_only_saves_what_can_be_heard_as_one_mix() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound, song_file()]);
+        editor.keep_sound_apart = true;
+        editor.sound_only = true;
+        assert_eq!(editor.sound_plan().tracks.len(), 1);
+
+        let output = output_called("sound-only").with_extension("m4a");
+        let report = exported_report(&ctx, &mut editor, &output);
+
+        assert!(matches!(report, ProjectReport::Sound(_)), "{report:?}");
+        let info = probe(&output).expect("it can be read");
+        assert!(info.is_sound_only());
+        assert_eq!(info.audio.len(), 1);
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn sound_only_suggests_a_sound_file_named_after_the_project() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        editor.sound_only = true;
+
+        let suggested = editor
+            .suggested_output()
+            .expect("there is something to save");
+
+        assert_eq!(
+            suggested.extension().and_then(|ext| ext.to_str()),
+            Some("m4a")
+        );
+    }
+
+    #[test]
+    fn the_export_window_offers_each_choice_by_name() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        editor.open_export();
+        run_frame(&ctx, &mut editor, vec![]);
+
+        click_named(&ctx, &mut editor, "Quality: Match source");
+        let_dialog_open(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Smaller file");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.export_choices.quality, Quality::Smaller);
+
+        click_named(&ctx, &mut editor, "Sound only");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.sound_only);
+    }
+
+    #[test]
     fn the_export_window_only_offers_keeping_sound_apart_when_there_is_something_to_keep_apart() {
         let ctx = context();
         let sound = clip_with_sound();
@@ -10864,6 +11214,39 @@ mod tests {
     }
 
     /// Draws sound on the real screen, with no window. Run with
+    /// `$env:BARECLIP_SCREENS = '<folder>'; ./scripts/cargo.ps1 test -p bareclip-app draw_the_export_screens '--' --ignored`
+    #[test]
+    #[ignore = "needs a real GPU, and draws pictures to look at rather than checking anything"]
+    fn draw_the_export_screens() {
+        let folder = std::env::var_os("BARECLIP_SCREENS").map_or_else(
+            || std::env::temp_dir().join("bareclip-screens"),
+            PathBuf::from,
+        );
+        let ctx = context();
+        let mut camera = Camera::new(folder);
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        for _ in 0..30 {
+            run_frame(&ctx, &mut editor, vec![]);
+            thread::sleep(Duration::from_millis(10));
+        }
+        editor.open_export();
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "export-01-match-source");
+
+        click_named(&ctx, &mut editor, "Quality: Match source");
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "export-02-quality-menu");
+
+        click_named(&ctx, &mut editor, "Balanced");
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "export-03-balanced");
+
+        click_named(&ctx, &mut editor, "Sound only");
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "export-04-sound-only");
+    }
+
     /// `$env:BARECLIP_SCREENS = '<folder>'; ./scripts/cargo.ps1 test -p bareclip-app draw_the_sound_screens '--' --ignored`
     #[test]
     #[ignore = "needs a real GPU, and draws pictures to look at rather than checking anything"]
