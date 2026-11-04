@@ -47,14 +47,14 @@ pub fn format_timecode(time: Ticks) -> String {
     let negative = time.0 < 0;
     let hundredths = i128::from(time.0).abs() * 100 / i128::from(TICKS_PER_SECOND);
     let seconds = hundredths / 100;
-    format!(
-        "{}{:02}:{:02}:{:02}.{:02}",
-        if negative { "-" } else { "" },
-        seconds / 3600,
-        seconds / 60 % 60,
-        seconds % 60,
-        hundredths % 100
-    )
+    let sign = if negative { "-" } else { "" };
+    let (hours, minutes, rest) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    let fraction = hundredths % 100;
+    if hours > 0 {
+        format!("{sign}{hours}:{minutes:02}:{rest:02}.{fraction:02}")
+    } else {
+        format!("{sign}{minutes}:{rest:02}.{fraction:02}")
+    }
 }
 
 fn round_div(numerator: i128, denominator: i128) -> i128 {
@@ -82,19 +82,19 @@ mod tests {
 
     #[test]
     fn timecodes_show_each_unit() {
-        assert_eq!(format_timecode(Ticks(0)), "00:00:00.00");
-        assert_eq!(format_timecode(Ticks::from_seconds(84.18)), "00:01:24.18");
-        assert_eq!(format_timecode(Ticks::from_seconds(3723.5)), "01:02:03.50");
+        assert_eq!(format_timecode(Ticks(0)), "0:00.00");
+        assert_eq!(format_timecode(Ticks::from_seconds(84.18)), "1:24.18");
+        assert_eq!(format_timecode(Ticks::from_seconds(3723.5)), "1:02:03.50");
     }
 
     #[test]
     fn timecodes_round_down() {
-        assert_eq!(format_timecode(Ticks(TICKS_PER_SECOND - 1)), "00:00:00.99");
+        assert_eq!(format_timecode(Ticks(TICKS_PER_SECOND - 1)), "0:00.99");
     }
 
     #[test]
     fn timecodes_can_be_negative() {
-        assert_eq!(format_timecode(Ticks::from_seconds(-1.5)), "-00:00:01.50");
+        assert_eq!(format_timecode(Ticks::from_seconds(-1.5)), "-0:01.50");
     }
 
     #[test]

@@ -928,6 +928,7 @@ pub fn show(
 /// How wide the sound controls' popup is laid out, leaving room for labels and values.
 const SOUND_LABEL_WIDTH: f32 = 58.0;
 const SPEED_MENU_WIDTH: f32 = 250.0;
+const SPEED_BOX_WIDTH: f32 = 44.0;
 /// As far as the fade sliders go. Longer fades can be typed in, as in Clipchamp.
 const FADE_SLIDER_SECONDS: f64 = 2.0;
 
@@ -996,20 +997,84 @@ fn fade_row(
     changed
 }
 
-/// The speeds one press away.
-const SPEED_CHOICES: [f64; 7] = [0.25, 0.5, 1.0, 1.5, 2.0, 4.0, 8.0];
+/// The speeds one press away, in two rows of four.
+const SPEED_CHOICES: [f64; 8] = [0.25, 0.5, 1.0, 1.5, 2.0, 4.0, 8.0, 16.0];
+const SPEED_CHOICES_PER_ROW: usize = 4;
+const SPEED_CHOICE_GAP: f32 = 4.0;
+const SPEED_CHOICE_WIDTH: f32 = (SPEED_MENU_WIDTH - SPEED_CHOICE_GAP * 3.0) / 4.0;
 
-/// A speed from the slider, kept to two places, so that 1x can actually be reached.
-fn tidy_factor(factor: f64) -> f64 {
-    (factor * 100.0).round() / 100.0
+/// A speed from the slider, which moves in tenths. Finer ones can be typed.
+fn slider_factor(factor: f64) -> f64 {
+    ((factor * 10.0).round() / 10.0).clamp(slowest_factor(), fastest_factor())
+}
+
+fn slowest_factor() -> f64 {
+    f64::from(SLOWEST) / f64::from(NORMAL)
+}
+
+fn fastest_factor() -> f64 {
+    f64::from(FASTEST) / f64::from(NORMAL)
+}
+
+/// The speed someone typed, kept to two places and inside the limits. Either `1.5` or `1.5x` will
+/// do, and anything that isn't a speed gives `None`, leaving the clip as it was.
+fn typed_factor(typed: &str) -> Option<f64> {
+    let typed = typed.trim();
+    let number = typed.strip_suffix(['x', 'X']).unwrap_or(typed).trim_end();
+    let factor: f64 = number.parse().ok()?;
+    (factor.is_finite() && factor >= 0.0)
+        .then(|| ((factor * 100.0).round() / 100.0).clamp(slowest_factor(), fastest_factor()))
+}
+
+/// The box that shows the speed and can be typed over. Pressing it selects the lot, ready to type
+/// a new one, and it takes effect on Enter or on clicking away. Escape leaves things as they were.
+fn speed_box(ui: &mut egui::Ui, factor: f64) -> Option<f64> {
+    let id = ui.scope_id().with("speed-box");
+    let showing = text::speed_name(factor);
+    let mut typed = ui
+        .data(|data| data.get_temp::<String>(id))
+        .unwrap_or_else(|| showing.clone());
+    let mut output = egui::TextEdit::singleline(&mut typed)
+        .id(id)
+        .desired_width(SPEED_BOX_WIDTH)
+        .align(egui::Align2::CENTER_CENTER)
+        .show(ui);
+    let response = output
+        .response
+        .response
+        .clone()
+        .on_hover_text("Type any speed from 0.1 to 16");
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::Role::TextInput, response.enabled(), "Speed value")
+    });
+    if response.gained_focus() {
+        let everything = egui::text::CCursorRange::two(
+            egui::text::CCursor::new(0),
+            egui::text::CCursor::new(typed.chars().count()),
+        );
+        output.state.cursor.set_char_range(Some(everything));
+        output.state.store(ui.ctx(), id);
+    }
+    // A click away can close the menu around this box in the same frame, so it can't wait for
+    // the focus to be lost on the next one.
+    let finished = response.lost_focus() || (response.has_focus() && response.clicked_elsewhere());
+    let escaped = ui.input(|input| input.key_pressed(egui::Key::Escape));
+    if response.has_focus() && !finished {
+        ui.data_mut(|data| data.insert_temp(id, typed.clone()));
+    } else {
+        ui.data_mut(|data| data.remove::<String>(id));
+    }
+    (finished && !escaped)
+        .then(|| typed_factor(&typed))
+        .flatten()
 }
 
 /// How fast a clip plays, and whether its voice keeps its pitch.
-fn speed_menu(
+pub fn speed_menu(
     ui: &mut egui::Ui,
     palette: &Palette,
     selected: &SelectedSpeed,
-    events: &mut StageEvents,
+    change: &mut Option<(ClipId, Speed)>,
 ) {
     let speed = selected.speed;
     let factor = speed.as_factor();
@@ -1017,14 +1082,12 @@ fn speed_menu(
         sound_row_setup(ui, palette);
         sound_label(ui, palette, "Speed");
         // Even steps along the slider are even multiples, so 0.5x and 2x sit either side of 1x.
-        let (slowest, fastest) = (f64::from(SLOWEST), f64::from(FASTEST));
-        let normal = f64::from(NORMAL);
         let mut along = factor.log2();
         let slider = ui
             .add(
                 Slider::new(
                     &mut along,
-                    (slowest / normal).log2()..=(fastest / normal).log2(),
+                    slowest_factor().log2()..=fastest_factor().log2(),
                 )
                 .show_value(false)
                 .trailing_fill(true),
@@ -1032,37 +1095,33 @@ fn speed_menu(
             .on_hover_text("Slower or faster than it was recorded");
         slider.widget_info(|| egui::WidgetInfo::slider(slider.enabled(), factor, "Clip speed"));
         if slider.changed() {
-            events.speed = Some((selected.id, speed.with_factor(tidy_factor(along.exp2()))));
+            *change = Some((selected.id, speed.with_factor(slider_factor(along.exp2()))));
         }
         if slider.drag_stopped() || slider.clicked() {
             slider.surrender_focus();
         }
-        let mut typed_factor = factor;
-        let typed = ui.add(
-            egui::DragValue::new(&mut typed_factor)
-                .range((slowest / normal)..=(fastest / normal))
-                .speed(0.01)
-                .max_decimals(2)
-                .suffix("x"),
-        );
-        if typed.changed() {
-            events.speed = Some((selected.id, speed.with_factor(typed_factor)));
+        if let Some(typed) = speed_box(ui, factor) {
+            *change = Some((selected.id, speed.with_factor(typed)));
         }
     });
     ui.add_space(4.0);
-    ui.horizontal_wrapped(|ui| {
-        ui.set_max_width(SPEED_MENU_WIDTH);
-        for choice in SPEED_CHOICES {
-            let name = text::speed_name(choice);
-            let chosen = (factor - choice).abs() < 0.001;
-            let button = ActionButton::new(palette, Kind::Ghost, &name)
-                .small()
-                .selected(chosen);
-            if ui.add(button).clicked() {
-                events.speed = Some((selected.id, speed.with_factor(choice)));
+    ui.spacing_mut().item_spacing.y = SPEED_CHOICE_GAP;
+    for row in SPEED_CHOICES.chunks(SPEED_CHOICES_PER_ROW) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = SPEED_CHOICE_GAP;
+            for choice in row {
+                let name = text::speed_name(*choice);
+                let chosen = (factor - choice).abs() < 0.001;
+                let button = ActionButton::new(palette, Kind::Ghost, &name)
+                    .small()
+                    .width(SPEED_CHOICE_WIDTH)
+                    .selected(chosen);
+                if ui.add(button).clicked() {
+                    *change = Some((selected.id, speed.with_factor(*choice)));
+                }
             }
-        }
-    });
+        });
+    }
     if selected.has_sound {
         ui.separator();
         let keep = MenuItem::choice(palette, "Keep pitch", speed.keep_pitch);
@@ -1071,7 +1130,7 @@ fn speed_menu(
             .on_hover_text("Voices stay at their own pitch. Off, sound rises and falls with speed, like a tape")
             .clicked()
         {
-            events.speed = Some((
+            *change = Some((
                 selected.id,
                 Speed {
                     keep_pitch: !speed.keep_pitch,
@@ -1203,7 +1262,7 @@ fn sound_toolbar(
                     .on_hover_text("Slower or faster");
                 egui::Popup::menu(&button)
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                    .show(|ui| speed_menu(ui, palette, speed, events));
+                    .show(|ui| speed_menu(ui, palette, speed, &mut events.speed));
             }
         });
 }
@@ -1414,7 +1473,7 @@ fn toolbar(
                 let opened = button(ui, 4.0, icons::GAUGE, "Speed", "Slower or faster");
                 egui::Popup::menu(&opened)
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                    .show(|ui| speed_menu(ui, palette, speed, events));
+                    .show(|ui| speed_menu(ui, palette, speed, &mut events.speed));
             }
             if let Some(sound) = &sound {
                 let place = if speed.is_some() { 5.0 } else { 4.0 };
@@ -1571,6 +1630,35 @@ fn more_menu(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_slider_moves_in_tenths_and_stays_inside_the_limits() {
+        assert_eq!(slider_factor(1.34), 1.3);
+        assert_eq!(slider_factor(1.0001), 1.0);
+        assert_eq!(slider_factor(0.07), 0.1);
+        assert_eq!(slider_factor(15.98), 16.0);
+        for step in 1..=160 {
+            let wanted = f64::from(step) / 10.0;
+            assert_eq!(slider_factor(wanted), wanted);
+        }
+    }
+
+    #[test]
+    fn a_typed_speed_can_be_finer_than_the_slider_and_stays_inside_the_limits() {
+        assert_eq!(typed_factor("0.25"), Some(0.25));
+        assert_eq!(typed_factor(" 0.75x "), Some(0.75));
+        assert_eq!(typed_factor("2X"), Some(2.0));
+        assert_eq!(typed_factor("1.234"), Some(1.23));
+        assert_eq!(typed_factor("50"), Some(16.0));
+        assert_eq!(typed_factor("0.01"), Some(0.1));
+    }
+
+    #[test]
+    fn anything_typed_that_isnt_a_speed_changes_nothing() {
+        for typed in ["", "x", "fast", "-2", "1,5", "NaN", "inf"] {
+            assert_eq!(typed_factor(typed), None, "{typed}");
+        }
+    }
 
     const CANVAS: (u32, u32) = (1920, 1080);
     const WIDTH: f32 = 200.0;

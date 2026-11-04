@@ -20,6 +20,9 @@ const SMALL_BUTTON_HEIGHT: f32 = 26.0;
 const BUTTON_PADDING: f32 = 12.0;
 const SMALL_BUTTON_PADDING: f32 = 8.0;
 pub const NAME_BAR_PADDING: f32 = 8.0;
+pub const NAME_BAR_HEIGHT: f32 = 32.0;
+/// The same size as the app's name beside it.
+pub const NAME_BAR_TEXT: f32 = 15.0;
 const ICON_GAP: f32 = 6.0;
 const FOCUS_RING_GAP: f32 = 2.0;
 const DIALOG_BUTTON_SPACING: f32 = 8.0;
@@ -36,6 +39,22 @@ const CHECK_BOX_SIZE: f32 = 20.0;
 const MENU_ITEM_HEIGHT: f32 = 30.0;
 const MENU_WIDTH: f32 = 210.0;
 const MENU_ITEM_PADDING: f32 = 8.0;
+/// The room for the drawing of a shape on a line of a menu.
+const MENU_SHAPE_ROOM: egui::Vec2 = vec2(18.0, 16.0);
+/// How long the pointer rests on something before its note shows, and how the note arrives.
+const NOTE_REST_SECONDS: f64 = 0.5;
+const NOTE_FADE_SECONDS: f32 = 0.15;
+const NOTE_RISE: f32 = 3.0;
+/// How far a note sits from the line it explains, clear of the menu's frame.
+const NOTE_OFFSET: f32 = 14.0;
+const NOTE_PADDING: egui::Vec2 = vec2(8.0, 5.0);
+const SETTINGS_CARD_RADIUS: u8 = 8;
+const SETTINGS_ROW_PADDING: f32 = 12.0;
+const SETTINGS_ROW_HEIGHT: f32 = 44.0;
+const SETTINGS_ROW_WITH_DETAIL_HEIGHT: f32 = 54.0;
+const SWITCH_SIZE: egui::Vec2 = vec2(34.0, 18.0);
+const SWITCH_KNOB_RADIUS: f32 = 6.0;
+const SWITCH_SECONDS: f32 = 0.12;
 
 /// How much attention a button asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -282,6 +301,7 @@ pub struct IconButton<'a> {
     name: &'a str,
     size: f32,
     icon_size: f32,
+    icon_raise: f32,
     round: bool,
     solid: bool,
     hidden: bool,
@@ -296,6 +316,7 @@ impl<'a> IconButton<'a> {
             name,
             size: BUTTON_HEIGHT,
             icon_size: 16.0,
+            icon_raise: 0.0,
             round: false,
             solid: false,
             hidden: false,
@@ -305,6 +326,12 @@ impl<'a> IconButton<'a> {
     pub fn size(mut self, size: f32, icon_size: f32) -> Self {
         self.size = size;
         self.icon_size = icon_size;
+        self
+    }
+
+    /// Moves the symbol up from the middle, leaving room for something under it.
+    pub fn icon_raised(mut self, by: f32) -> Self {
+        self.icon_raise = by;
         self
     }
 
@@ -345,7 +372,8 @@ impl<'a> IconButton<'a> {
                 f32::from(RADIUS)
             };
             paint_box(ui, rect, radius, &look, &response, self.palette);
-            let square = icons::square_at(rect.center(), self.icon_size);
+            let middle = rect.center() - vec2(0.0, self.icon_raise);
+            let square = icons::square_at(middle, self.icon_size);
             if self.solid {
                 icons::paint_solid(ui.painter(), square, &self.icon, look.content);
             } else {
@@ -475,6 +503,9 @@ pub struct MenuItem<'a> {
     icon: Option<Icon>,
     label: &'a str,
     shortcut: &'a str,
+    opens_more: bool,
+    shape: Option<(u32, u32)>,
+    detail: &'a str,
 }
 
 impl<'a> MenuItem<'a> {
@@ -484,6 +515,17 @@ impl<'a> MenuItem<'a> {
             icon: Some(icon),
             label,
             shortcut,
+            opens_more: false,
+            shape: None,
+            detail: "",
+        }
+    }
+
+    /// A line that opens more beside the menu, marked with an arrow.
+    pub fn opens_more(palette: &'a Palette, icon: Icon, label: &'a str) -> Self {
+        Self {
+            opens_more: true,
+            ..Self::new(palette, icon, label, "")
         }
     }
 
@@ -494,8 +536,34 @@ impl<'a> MenuItem<'a> {
             icon: chosen.then_some(icons::CHECK),
             label,
             shortcut: "",
+            opens_more: false,
+            shape: None,
+            detail: "",
         }
     }
+
+    /// One shape among several: a drawing of it, its name and, more faintly, its numbers. It is
+    /// ticked and the drawing filled in if it is the current one.
+    pub fn shape_choice(
+        palette: &'a Palette,
+        shape: (u32, u32),
+        label: &'a str,
+        detail: &'a str,
+        chosen: bool,
+    ) -> Self {
+        Self {
+            shape: Some(shape),
+            detail,
+            ..Self::choice(palette, label, chosen)
+        }
+    }
+}
+
+/// How large a drawing of this shape is on a line of a menu.
+fn menu_shape_size((width, height): (u32, u32)) -> egui::Vec2 {
+    let (width, height) = (width.max(1) as f32, height.max(1) as f32);
+    let scale = (MENU_SHAPE_ROOM.x / width).min(MENU_SHAPE_ROOM.y / height);
+    vec2(width * scale, height * scale)
 }
 
 impl Widget for MenuItem<'_> {
@@ -504,7 +572,15 @@ impl Widget for MenuItem<'_> {
         let (rect, response) = ui.allocate_exact_size(size, Sense::click());
         let enabled = response.enabled();
         let label = self.label;
-        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::MenuItem, enabled, label));
+        let (detail, chosen) = (self.detail, self.icon.is_some());
+        response.widget_info(|| {
+            let name = if detail.is_empty() {
+                label.to_owned()
+            } else {
+                format!("{label} {detail}")
+            };
+            egui::WidgetInfo::labeled(egui::Role::MenuItem, enabled, name)
+        });
         if ui.is_rect_visible(rect) {
             let palette = self.palette;
             let look = look(palette, Kind::Ghost, state_of(&response));
@@ -520,11 +596,27 @@ impl Widget for MenuItem<'_> {
                 );
             }
             let font = FontId::new(13.0, FontFamily::Proportional);
-            ui.painter().text(
-                pos2(left + icon_size + ICON_GAP + 2.0, rect.center().y),
+            let mut text_left = left + icon_size + ICON_GAP + 2.0;
+            if let Some(shape) = self.shape {
+                let middle = pos2(text_left + MENU_SHAPE_ROOM.x / 2.0, rect.center().y);
+                let drawing = Rect::from_center_size(middle, menu_shape_size(shape));
+                if chosen {
+                    ui.painter().rect_filled(drawing, 2.0, look.content);
+                } else {
+                    ui.painter().rect_stroke(
+                        drawing,
+                        2.0,
+                        Stroke::new(1.3, look.content),
+                        StrokeKind::Inside,
+                    );
+                }
+                text_left += MENU_SHAPE_ROOM.x + ICON_GAP + 2.0;
+            }
+            let name = ui.painter().text(
+                pos2(text_left, rect.center().y),
                 Align2::LEFT_CENTER,
                 label,
-                font,
+                font.clone(),
                 look.content,
             );
             let shortcut = if enabled {
@@ -533,15 +625,235 @@ impl Widget for MenuItem<'_> {
                 look.content
             };
             ui.painter().text(
+                pos2(name.right() + 5.0, rect.center().y),
+                Align2::LEFT_CENTER,
+                detail,
+                font,
+                shortcut,
+            );
+            ui.painter().text(
                 pos2(rect.right() - MENU_ITEM_PADDING, rect.center().y),
                 Align2::RIGHT_CENTER,
                 self.shortcut,
                 FontId::new(12.0, FontFamily::Proportional),
                 shortcut,
             );
+            if self.opens_more {
+                let arrow_size = 14.0;
+                icons::paint(
+                    ui.painter(),
+                    icons::square_at(
+                        pos2(
+                            rect.right() - MENU_ITEM_PADDING - arrow_size / 2.0,
+                            rect.center().y,
+                        ),
+                        arrow_size,
+                    ),
+                    &icons::CHEVRON_RIGHT,
+                    look.content,
+                );
+            }
         }
         response
     }
+}
+
+/// Explains something once the pointer has rested on it, the way a clip's name arrives: a wait,
+/// then a fade and a small rise. It sits beside the thing, or on its other side if there is no
+/// room, and over everything else. The wait asks for a single frame when it ends.
+pub fn note_on_rest(ui: &Ui, palette: &Palette, response: &Response, note: &str) {
+    let id = response.id.with("rest-note");
+    let now = ui.input(|input| input.time);
+    let hovered = response.hovered();
+    let since = ui.data_mut(|data| {
+        if hovered {
+            *data.get_temp_mut_or(id, now)
+        } else {
+            data.remove::<f64>(id);
+            now
+        }
+    });
+    let left = NOTE_REST_SECONDS - (now - since);
+    if hovered && left > 0.0 {
+        ui.ctx().request_repaint_after_secs(left as f32);
+    }
+    let opacity =
+        ui.ctx()
+            .animate_bool_with_time(id.with("fade"), hovered && left <= 0.0, NOTE_FADE_SECONDS);
+    if opacity <= 0.0 {
+        return;
+    }
+    let mut painter = ui
+        .ctx()
+        .layer_painter(egui::LayerId::new(egui::Order::Tooltip, id));
+    painter.multiply_opacity(opacity);
+    let text = painter.layout_no_wrap(
+        note.to_owned(),
+        FontId::new(12.0, FontFamily::Proportional),
+        palette.text,
+    );
+    let size = text.size() + NOTE_PADDING * 2.0;
+    let row = response.rect;
+    let beside = row.right() + NOTE_OFFSET;
+    let left_edge = if beside + size.x > ui.ctx().content_rect().right() {
+        row.left() - NOTE_OFFSET - size.x
+    } else {
+        beside
+    };
+    let top = row.center().y - size.y / 2.0 + (1.0 - opacity) * NOTE_RISE;
+    let shape = Rect::from_min_size(pos2(left_edge, top), size);
+    painter.rect_filled(shape, f32::from(RADIUS), palette.raised);
+    painter.rect_stroke(
+        shape,
+        f32::from(RADIUS),
+        Stroke::new(1.0, palette.border_strong),
+        StrokeKind::Inside,
+    );
+    painter.galley(shape.min + NOTE_PADDING, text, palette.text);
+}
+
+/// A setting that is on or off: its name on the left and a switch on the right, with the whole
+/// line to press. Made to sit inside a [`settings_group`].
+pub struct SwitchRow<'a> {
+    palette: &'a Palette,
+    name: &'a str,
+    on: bool,
+}
+
+impl<'a> SwitchRow<'a> {
+    pub fn new(palette: &'a Palette, name: &'a str, on: bool) -> Self {
+        Self { palette, name, on }
+    }
+}
+
+impl Widget for SwitchRow<'_> {
+    fn ui(self, ui: &mut Ui) -> Response {
+        let size = vec2(ui.available_width(), SETTINGS_ROW_HEIGHT);
+        let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+        let (name, on) = (self.name, self.on);
+        let enabled = response.enabled();
+        response
+            .widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, on, name));
+        if !ui.is_rect_visible(rect) {
+            return response;
+        }
+        let palette = self.palette;
+        let row_look = look(palette, Kind::Ghost, state_of(&response));
+        paint_box(ui, rect.shrink(3.0), 5.0, &row_look, &response, palette);
+        ui.painter().text(
+            pos2(rect.left() + SETTINGS_ROW_PADDING, rect.center().y),
+            Align2::LEFT_CENTER,
+            name,
+            fonts::strong(13.0),
+            palette.text,
+        );
+        let along = ui
+            .ctx()
+            .animate_bool_with_time(response.id.with("switch"), on, SWITCH_SECONDS);
+        let track = Rect::from_center_size(
+            pos2(
+                rect.right() - SETTINGS_ROW_PADDING - SWITCH_SIZE.x / 2.0,
+                rect.center().y,
+            ),
+            SWITCH_SIZE,
+        );
+        let (track_fill, knob, edge) = switch_colours(palette, along);
+        let radius = SWITCH_SIZE.y / 2.0;
+        ui.painter().rect_filled(track, radius, track_fill);
+        ui.painter()
+            .rect_stroke(track, radius, Stroke::new(1.0, edge), StrokeKind::Inside);
+        let reach = SWITCH_SIZE.x / 2.0 - radius;
+        ui.painter().circle_filled(
+            track.center() + vec2(reach * (along * 2.0 - 1.0), 0.0),
+            SWITCH_KNOB_RADIUS,
+            knob,
+        );
+        response
+    }
+}
+
+/// A switch's track, knob and outline, on the way from off at 0 to on at 1.
+fn switch_colours(palette: &Palette, along: f32) -> (Color32, Color32, Color32) {
+    (
+        palette.surface.lerp_to_gamma(palette.accent, along),
+        palette.text_muted.lerp_to_gamma(palette.accent_text, along),
+        palette.border_strong.lerp_to_gamma(palette.accent, along),
+    )
+}
+
+/// A group of settings: a small heading over a card that holds its rows.
+pub fn settings_group(ui: &mut Ui, palette: &Palette, heading: &str, add: impl FnOnce(&mut Ui)) {
+    ui.label(
+        egui::RichText::new(heading.to_uppercase())
+            .font(fonts::strong(11.0))
+            .color(palette.text_muted),
+    );
+    ui.add_space(6.0);
+    egui::Frame::new()
+        .fill(palette.surface)
+        .stroke(Stroke::new(1.0, palette.border))
+        .corner_radius(CornerRadius::same(SETTINGS_CARD_RADIUS))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 0.0;
+            add(ui);
+        });
+}
+
+/// A line of a group of settings, with its name and any explanation on the left, and on the
+/// right a control exactly `control_width` wide.
+pub fn settings_row(
+    ui: &mut Ui,
+    palette: &Palette,
+    (name, detail): (&str, Option<&str>),
+    control_width: f32,
+    add_control: impl FnOnce(&mut Ui),
+) {
+    let height = if detail.is_some() {
+        SETTINGS_ROW_WITH_DETAIL_HEIGHT
+    } else {
+        SETTINGS_ROW_HEIGHT
+    };
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    let left = rect.left() + SETTINGS_ROW_PADDING;
+    let name_y = rect.center().y - if detail.is_some() { 9.0 } else { 0.0 };
+    ui.painter().text(
+        pos2(left, name_y),
+        Align2::LEFT_CENTER,
+        name,
+        fonts::strong(13.0),
+        palette.text,
+    );
+    if let Some(detail) = detail {
+        ui.painter().text(
+            pos2(left, rect.center().y + 9.0),
+            Align2::LEFT_CENTER,
+            detail,
+            FontId::new(12.0, FontFamily::Proportional),
+            palette.text_muted,
+        );
+    }
+    let right = rect.right() - SETTINGS_ROW_PADDING;
+    let place = Rect::from_min_max(
+        pos2(right - control_width, rect.top()),
+        pos2(right, rect.bottom()),
+    );
+    let mut control = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(place)
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    add_control(&mut control);
+}
+
+/// The line between two rows of a group of settings.
+pub fn settings_divider(ui: &mut Ui, palette: &Palette) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+    ui.painter().hline(
+        rect.x_range(),
+        rect.center().y,
+        Stroke::new(1.0, palette.border),
+    );
 }
 
 /// A round colour to pick, with a ring around the chosen one. It shows the colour itself, so it
@@ -605,7 +917,7 @@ impl<'a> NameBar<'a> {
 
 impl Widget for NameBar<'_> {
     fn ui(self, ui: &mut Ui) -> Response {
-        let size = vec2(self.width, SMALL_BUTTON_HEIGHT);
+        let size = vec2(self.width, NAME_BAR_HEIGHT);
         let (rect, response) = ui.allocate_exact_size(size, Sense::click());
         let enabled = response.enabled();
         let label = self.label;
@@ -626,7 +938,7 @@ impl Widget for NameBar<'_> {
             );
             let mut job = egui::text::LayoutJob::simple_singleline(
                 label.to_owned(),
-                FontId::new(12.0, FontFamily::Proportional),
+                FontId::new(NAME_BAR_TEXT, FontFamily::Proportional),
                 palette.text,
             );
             job.wrap.max_width = self.width - NAME_BAR_PADDING * 2.0;
@@ -1041,6 +1353,28 @@ mod tests {
                 Some((node.role(), node.label()?.to_owned(), node.is_disabled()))
             })
             .collect()
+    }
+
+    #[test]
+    fn a_switch_can_be_read_on_and_off_in_both_themes() {
+        const SHAPE_MINIMUM: f64 = 3.0;
+        for palette in [&DARK, &LIGHT] {
+            let (track, knob, _) = switch_colours(palette, 0.0);
+            assert!(contrast(knob, track) >= SHAPE_MINIMUM);
+            let (track, knob, _) = switch_colours(palette, 1.0);
+            assert!(contrast(knob, track) >= SHAPE_MINIMUM);
+            assert_eq!(track, palette.accent);
+        }
+    }
+
+    #[test]
+    fn a_drawn_shape_fits_its_room_and_keeps_its_proportions() {
+        for ratio in [(16, 9), (9, 16), (1, 1), (21, 9), (2, 3), (1920, 992)] {
+            let size = menu_shape_size(ratio);
+            assert!(size.x <= MENU_SHAPE_ROOM.x + 0.01 && size.y <= MENU_SHAPE_ROOM.y + 0.01);
+            let wanted = ratio.0 as f32 / ratio.1 as f32;
+            assert!((size.x / size.y - wanted).abs() < 0.01, "{ratio:?}");
+        }
     }
 
     #[test]

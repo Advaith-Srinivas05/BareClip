@@ -88,20 +88,6 @@ fn fade_curve(progress: f64) -> f32 {
     (progress.clamp(0.0, 1.0) * std::f64::consts::FRAC_PI_2).sin() as f32
 }
 
-/// How a whole row of the timeline sounds.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RowSound {
-    pub muted: bool,
-    pub solo: bool,
-}
-
-impl RowSound {
-    pub fn is_default(&self) -> bool {
-        *self == Self::default()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

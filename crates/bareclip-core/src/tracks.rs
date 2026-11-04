@@ -5,7 +5,7 @@
 use crate::{
     placement::{Placement, final_size},
     project::SavedClip,
-    sound::{ClipSound, RowSound},
+    sound::ClipSound,
     speed::Speed,
     time::Ticks,
     timeline::{Clip, ClipEdge, ClipId, MediaId, TimeRange, Timeline, next_clip_id},
@@ -91,8 +91,6 @@ pub struct Tracks {
     tracks: Vec<Timeline>,
     /// How many of the rows, from the top, hold pictures.
     picture_rows: usize,
-    /// One for each row, in the same order.
-    row_sounds: Vec<RowSound>,
     played: Timeline,
     played_videos: Timeline,
     /// Where nothing plays on any row.
@@ -105,36 +103,38 @@ impl Tracks {
         Self::restore_with_sound(saved, &[], &[], media)
     }
 
-    /// Puts saved rows back, picture rows and then sound rows.
+    /// Puts saved rows back, picture rows and then sound rows. `muted_rows` says which rows an
+    /// older file muted as a whole, and their clips come back muted, so they stay silent.
     pub fn restore_with_sound(
         pictures: &[Vec<SavedClip>],
         sounds: &[Vec<SavedClip>],
-        row_sounds: &[RowSound],
+        muted_rows: &[bool],
         media: impl Fn(u64) -> Option<MediaId>,
     ) -> Self {
         let tracks: Vec<Timeline> = pictures
             .iter()
             .chain(sounds)
-            .map(|track| {
+            .enumerate()
+            .map(|(row, track)| {
+                let row_muted = muted_rows.get(row).copied().unwrap_or(false);
                 Timeline::restore(track.iter().filter_map(|clip| {
                     Some((
                         media(clip.media)?,
                         Ticks(clip.start),
                         clip.source(),
                         clip.placement,
-                        clip.sound,
+                        ClipSound {
+                            muted: clip.sound.muted || row_muted,
+                            ..clip.sound
+                        },
                         clip.speed,
                     ))
                 }))
             })
             .collect();
-        let row_sounds = (0..tracks.len())
-            .map(|row| row_sounds.get(row).copied().unwrap_or_default())
-            .collect();
         let mut restored = Self {
             tracks,
             picture_rows: pictures.len(),
-            row_sounds,
             played: Timeline::default(),
             played_videos: Timeline::default(),
             gaps: Vec::new(),
@@ -176,27 +176,6 @@ impl Tracks {
     /// Whether a row only holds sound.
     pub fn is_sound_row(&self, row: usize) -> bool {
         row >= self.picture_rows
-    }
-
-    /// How each row sounds, in the same order as `tracks`.
-    pub fn row_sounds(&self) -> &[RowSound] {
-        &self.row_sounds
-    }
-
-    /// Changes how a row sounds. Returns whether that changed anything.
-    pub fn set_row_sound(&mut self, row: usize, sound: RowSound) -> bool {
-        match self.row_sounds.get_mut(row) {
-            Some(current) if *current != sound => {
-                *current = sound;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Whether any row is on solo, which leaves the others out of what is heard and exported.
-    pub fn has_solo(&self) -> bool {
-        self.row_sounds.iter().any(|row| row.solo)
     }
 
     /// What actually plays and exports: the visible stretch of every clip, in order.
@@ -448,16 +427,11 @@ impl Tracks {
             .any(|stretch| stretch.stack.iter().any(|clip| !clip.speed.is_normal()))
     }
 
-    /// Everything that can be heard, in order of time. Muted clips and rows are left out, and so
-    /// is every row but those on solo when any is. `has_sound` says which files have any.
+    /// Everything that can be heard, in order of time. Muted clips are left out. `has_sound` says
+    /// which files have any.
     pub fn sound_spans(&self, has_sound: &dyn Fn(MediaId) -> bool) -> Vec<SoundSpan> {
-        let solo = self.has_solo();
         let mut spans: Vec<SoundSpan> = Vec::new();
         for (row, track) in self.tracks.iter().enumerate() {
-            let row_sound = self.row_sounds[row];
-            if row_sound.muted || (solo && !row_sound.solo) {
-                continue;
-            }
             let sound_row = self.is_sound_row(row).then(|| row - self.picture_rows);
             let mut last: Option<SoundSpan> = None;
             for clip in track.clips() {
@@ -489,7 +463,7 @@ impl Tracks {
     /// Whether the sound is just what each video recorded, one at a time, with nothing to mix. Then
     /// it can be copied, every track of it.
     pub fn sound_is_plain(&self, has_sound: &dyn Fn(MediaId) -> bool) -> bool {
-        if !self.audio_tracks().is_empty() || self.row_sounds.iter().any(|row| !row.is_default()) {
+        if !self.audio_tracks().is_empty() {
             return false;
         }
         let mut heard: Vec<&Clip> = self
@@ -892,7 +866,6 @@ impl Tracks {
             TrackTarget::New(index) => index,
         };
         self.tracks.insert(new_at, Timeline::default());
-        self.row_sounds.insert(new_at, RowSound::default());
         if kind == RowKind::Picture {
             self.picture_rows += 1;
         }
@@ -900,18 +873,10 @@ impl Tracks {
     }
 
     fn refresh(&mut self) {
-        let mut row = 0;
-        let mut picture_rows = self.picture_rows;
-        let tracks = &self.tracks;
-        self.row_sounds.retain(|_| {
-            let keep = !tracks[row].is_empty();
-            if !keep && row < self.picture_rows {
-                picture_rows -= 1;
-            }
-            row += 1;
-            keep
-        });
-        self.picture_rows = picture_rows;
+        self.picture_rows = self.tracks[..self.picture_rows]
+            .iter()
+            .filter(|track| !track.is_empty())
+            .count();
         self.tracks.retain(|track| !track.is_empty());
         self.played = flatten(self.picture_tracks());
         self.played_videos = if self.has_stills() {
@@ -1193,26 +1158,18 @@ mod tests {
     }
 
     #[test]
-    fn row_sound_stays_with_its_row_as_others_come_and_go() {
+    fn emptied_rows_go_and_the_count_of_picture_rows_follows() {
         let mut tracks = Tracks::default();
         let lower = tracks.place(VIDEO, range(0, 100), Ticks(0), TrackTarget::New(0));
         let song = tracks.push_sound(SONG, range(0, 100));
-        let muted = RowSound {
-            muted: true,
-            solo: false,
-        };
-        assert!(tracks.set_row_sound(1, muted));
-        assert!(!tracks.set_row_sound(1, muted));
-
         let upper = tracks.place(OTHER, range(0, 100), Ticks(0), TrackTarget::New(0));
-        assert_eq!(tracks.row_sounds()[2], muted);
+        assert_eq!(tracks.picture_rows(), 2);
 
         tracks.remove(upper);
-        assert_eq!(tracks.row_sounds(), [RowSound::default(), muted]);
+        assert_eq!(tracks.picture_rows(), 1);
 
         tracks.remove(lower);
         assert_eq!(tracks.picture_rows(), 0);
-        assert_eq!(tracks.row_sounds(), [muted]);
         assert_eq!(tracks.track_of(song), Some(0));
     }
 
@@ -1233,7 +1190,7 @@ mod tests {
     }
 
     #[test]
-    fn a_muted_clip_or_row_isnt_heard() {
+    fn a_muted_clip_isnt_heard() {
         let (mut tracks, above, _) = two_tracks();
         tracks.set_clip_sound(
             above,
@@ -1243,43 +1200,6 @@ mod tests {
             },
         );
         assert_eq!(tracks.sound_spans(&with_sound).len(), 1);
-
-        tracks.set_row_sound(
-            1,
-            RowSound {
-                muted: true,
-                solo: false,
-            },
-        );
-        assert!(tracks.sound_spans(&with_sound).is_empty());
-    }
-
-    #[test]
-    fn solo_leaves_out_every_other_row_and_mute_beats_solo() {
-        let (mut tracks, _, _) = two_tracks();
-        tracks.push_sound(SONG, range(0, 100));
-        tracks.set_row_sound(
-            2,
-            RowSound {
-                muted: false,
-                solo: true,
-            },
-        );
-        assert!(tracks.has_solo());
-
-        let spans = tracks.sound_spans(&with_sound);
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].media, SONG);
-        assert_eq!(spans[0].sound_row, Some(0));
-
-        tracks.set_row_sound(
-            2,
-            RowSound {
-                muted: true,
-                solo: true,
-            },
-        );
-        assert!(tracks.sound_spans(&with_sound).is_empty());
     }
 
     #[test]
@@ -1468,7 +1388,7 @@ mod tests {
     }
 
     #[test]
-    fn sound_rows_overlaps_and_row_settings_all_stop_sound_being_plain() {
+    fn sound_rows_and_overlaps_stop_sound_being_plain() {
         let (overlapping, _, _) = two_tracks();
         assert!(!overlapping.sound_is_plain(&with_sound));
 
@@ -1476,17 +1396,6 @@ mod tests {
         with_music.push(VIDEO, range(0, 100));
         with_music.push_sound(SONG, range(0, 100));
         assert!(!with_music.sound_is_plain(&with_sound));
-
-        let mut muted_row = Tracks::default();
-        muted_row.push(VIDEO, range(0, 100));
-        muted_row.set_row_sound(
-            0,
-            RowSound {
-                muted: true,
-                solo: false,
-            },
-        );
-        assert!(!muted_row.sound_is_plain(&with_sound));
     }
 
     #[test]

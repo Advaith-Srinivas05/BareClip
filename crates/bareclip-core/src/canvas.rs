@@ -10,13 +10,14 @@ use crate::{placement::final_size, timeline::MediaId, tracks::Tracks};
 /// An empty project's size, and what a picked ratio is worked out from until a video arrives.
 pub const EMPTY_SIZE: (u32, u32) = (1920, 1080);
 /// The ratios on offer, and their names.
-pub const RATIOS: [((u32, u32), &str); 6] = [
+pub const RATIOS: [((u32, u32), &str); 7] = [
     ((16, 9), "16:9"),
     ((9, 16), "9:16"),
     ((1, 1), "1:1"),
-    ((4, 5), "4:5"),
     ((4, 3), "4:3"),
+    ((4, 5), "4:5"),
     ((21, 9), "21:9"),
+    ((2, 3), "2:3"),
 ];
 /// What the first video's own size is called in the picker.
 pub const ORIGINAL_NAME: &str = "Original";
@@ -334,6 +335,11 @@ mod tests {
 
         assert_eq!(size_for_ratio((16, 9), tall), (1920, 1080));
         assert_eq!(size_for_ratio((9, 16), tall), (1080, 1920));
+    }
+
+    #[test]
+    fn two_by_three_is_tall_and_keeps_the_longer_side() {
+        assert_eq!(size_for_ratio((2, 3), (1920, 1080)), (1280, 1920));
     }
 
     #[test]

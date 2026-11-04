@@ -14,8 +14,7 @@ use std::{
 use bareclip_audio::{Bus, MixSpan};
 use bareclip_core::{
     canvas::{
-        BACKGROUND_SWATCHES, BLACK, Canvas, Colour, ORIGINAL_NAME, RATIOS, colour_from_hex,
-        colour_to_hex,
+        BACKGROUND_SWATCHES, BLACK, Canvas, Colour, ORIGINAL_NAME, colour_from_hex, colour_to_hex,
     },
     history::History,
     picture::StillPicture,
@@ -46,7 +45,7 @@ use eframe::egui::{
 use crate::{
     components::{
         self, ActionButton, CheckBox, ColourSwatch, IconButton, Kind, MenuItem, NAME_BAR_PADDING,
-        NameBar,
+        NameBar, SwitchRow,
     },
     fonts, icons,
     layers::{LayerDisplay, LayerPictures, Moment},
@@ -87,7 +86,9 @@ const STRIP_UPLOADS_PER_FRAME: usize = 4;
 /// A reader holds this many pictures ready before it waits for the interface to catch up.
 const STRIP_CHANNEL: usize = 8;
 const RAIL_WIDTH: f32 = 78.0;
-const MEDIA_PANEL_WIDTH: f32 = 290.0;
+/// The panel's card comes out about 241 wide, which is Clipchamp's 301 pixels on the owner's 125%
+/// display, measured from their screenshot.
+const MEDIA_PANEL_WIDTH: f32 = 250.0;
 const MEDIA_PANEL_MIN_WIDTH: f32 = 240.0;
 const MEDIA_PANEL_MAX_WIDTH: f32 = 720.0;
 /// Each card is at least this wide, so a wider panel fits more of them across.
@@ -115,10 +116,76 @@ const PANEL_GAP: i8 = 8;
 const PANEL_RADIUS: u8 = 10;
 const STAGE_MARGIN: i8 = 8;
 /// The strip across the top of the window, standing in for the Windows title bar.
-const TITLE_STRIP_HEIGHT: f32 = 40.0;
+const TITLE_STRIP_HEIGHT: f32 = 48.0;
 const WINDOW_BUTTON_SIZE: f32 = 32.0;
 const PROJECT_NAME_WIDTH: f32 = 220.0;
 const SETTINGS_ROW_GAP: f32 = 14.0;
+/// The buttons that skip 5 seconds: an arrow arching over the number, each with room to be read.
+const SKIP_ARROW_SIZE: f32 = 22.0;
+const SKIP_ARROW_RAISE: f32 = 6.0;
+const SKIP_NUMBER_SIZE: f32 = 12.0;
+const SKIP_NUMBER_DROP: f32 = 7.0;
+const SETTINGS_WIDTH: f32 = 440.0;
+const SETTINGS_CHOICE_WIDTH: f32 = 96.0;
+
+/// A shape in the Size menu: what it is called, and what it is for, which shows when the pointer
+/// rests on it.
+struct SizeChoice {
+    ratio: (u32, u32),
+    name: &'static str,
+    numbers: &'static str,
+    note: &'static str,
+}
+
+/// The shapes in the Size menu, the commonly used ones first. A test holds these to `RATIOS`.
+const SIZE_GROUPS: [&[SizeChoice]; 2] = [
+    &[
+        SizeChoice {
+            ratio: (16, 9),
+            name: "Wide",
+            numbers: "16:9",
+            note: "YouTube and streaming sites",
+        },
+        SizeChoice {
+            ratio: (9, 16),
+            name: "Vertical",
+            numbers: "9:16",
+            note: "Instagram Reels and TikTok",
+        },
+        SizeChoice {
+            ratio: (1, 1),
+            name: "Square",
+            numbers: "1:1",
+            note: "Instagram posts",
+        },
+    ],
+    &[
+        SizeChoice {
+            ratio: (4, 3),
+            name: "Classic",
+            numbers: "4:3",
+            note: "Older TVs and slides",
+        },
+        SizeChoice {
+            ratio: (4, 5),
+            name: "Social",
+            numbers: "4:5",
+            note: "Instagram and Facebook feeds",
+        },
+        SizeChoice {
+            ratio: (21, 9),
+            name: "Cinema",
+            numbers: "21:9",
+            note: "Ultrawide, film look",
+        },
+        SizeChoice {
+            ratio: (2, 3),
+            name: "Portrait",
+            numbers: "2:3",
+            note: "Pinterest and tall photos",
+        },
+    ],
+];
 const STRIP_LOGO_HEIGHT: f32 = 22.0;
 /// How close to the window's edge the pointer has to be to resize it, and how far along
 /// from a corner still counts as that corner.
@@ -858,7 +925,7 @@ impl Editor {
         self.project.tracks = Tracks::restore_with_sound(
             &fitted(&file.tracks),
             &fitted(&file.audio_tracks),
-            &file.row_sound,
+            &file.muted_rows(),
             |id| new_ids.get(&id).copied(),
         );
         self.project.canvas = file.canvas.checked();
@@ -1210,9 +1277,9 @@ impl Editor {
             scan
         });
 
-        let want_pictures = self.settings.thumbnails && !sound_only;
-        let strip_reader = (!is_still && (want_pictures || self.settings.waveforms))
-            .then(|| start_strip_reader(ctx, &info, want_pictures, self.settings.waveforms));
+        let read_sound = self.settings.reads_sound_shape(sound_only);
+        let strip_reader = (!is_still && (!sound_only || read_sound))
+            .then(|| start_strip_reader(ctx, &info, true, read_sound));
         let id = MediaId(self.next_media);
         self.next_media += 1;
         Ok(MediaEntry {
@@ -1761,29 +1828,23 @@ impl Editor {
         }
     }
 
-    /// Brings what is being read for the clips into line with the settings. Turning something
-    /// off stops reading the file for it and forgets what was read.
+    /// Brings what is being read for the clips into line with the settings. Turning waveforms off
+    /// forgets what nothing needs any more. Pictures carry on from where they had got to, and are
+    /// always wanted.
     fn apply_strip_settings(&mut self, ctx: &egui::Context) {
-        let (thumbnails, waveforms) = (self.settings.thumbnails, self.settings.waveforms);
+        let settings = self.settings;
         for entry in &mut self.media {
             entry.strip_reader = None;
             // An image is its own picture, already in memory, with nothing to read.
             if entry.info.is_still() {
-                entry.strip_pictures = match (&entry.thumbnail, thumbnails) {
-                    (Some(thumbnail), true) => vec![(Ticks(0), thumbnail.clone())],
-                    _ => Vec::new(),
-                };
                 continue;
             }
-            if !thumbnails {
-                entry.strip_pictures.clear();
-                entry.strip_pictures_done = false;
-            }
-            if !waveforms {
+            let read_sound = settings.reads_sound_shape(entry.info.is_sound_only());
+            if !read_sound {
                 entry.sound_shape = None;
             }
-            let want_pictures = thumbnails && !entry.strip_pictures_done;
-            let want_sound = waveforms && entry.sound_shape.is_none();
+            let want_pictures = !entry.info.is_sound_only() && !entry.strip_pictures_done;
+            let want_sound = read_sound && entry.sound_shape.is_none();
             if want_pictures {
                 entry.strip_pictures.clear();
             }
@@ -2530,7 +2591,7 @@ impl Editor {
                     }
                     ui.label(
                         RichText::new("BareClip")
-                            .font(fonts::strong(15.0))
+                            .font(fonts::strong(components::NAME_BAR_TEXT))
                             .color(palette.accent),
                     );
                     ui.add_space(10.0);
@@ -2588,9 +2649,14 @@ impl Editor {
             let edit = ui.add(
                 egui::TextEdit::singleline(&mut typed)
                     .id(egui::Id::unique("project_name_edit"))
-                    .font(FontId::new(12.0, FontFamily::Proportional))
-                    .margin(Margin::symmetric(NAME_BAR_PADDING as i8, 5))
-                    .desired_width(PROJECT_NAME_WIDTH),
+                    .font(FontId::new(
+                        components::NAME_BAR_TEXT,
+                        FontFamily::Proportional,
+                    ))
+                    .margin(Margin::symmetric(NAME_BAR_PADDING as i8, 0))
+                    .min_size(vec2(PROJECT_NAME_WIDTH, components::NAME_BAR_HEIGHT))
+                    .align(egui::Align2::LEFT_CENTER)
+                    .desired_width(PROJECT_NAME_WIDTH - 2.0 * NAME_BAR_PADDING),
             );
             let cancelled = ui.input(|input| input.key_pressed(Key::Escape));
             if edit.lost_focus() {
@@ -2619,7 +2685,7 @@ impl Editor {
         let menu = ui
             .add(
                 IconButton::new(palette, Kind::Ghost, icons::CHEVRON_DOWN, "Project menu")
-                    .size(26.0, 14.0),
+                    .size(components::NAME_BAR_HEIGHT, 16.0),
             )
             .on_hover_text("Project");
         egui::Popup::menu(&menu).show(|ui| {
@@ -2673,13 +2739,21 @@ impl Editor {
         let modal = egui::Modal::new(egui::Id::unique("settings_dialog"))
             .frame(dialog_frame(ctx))
             .show(ctx, |ui| {
-                ui.set_width(440.0);
+                ui.set_width(SETTINGS_WIDTH);
                 components::dialog_title(ui, &icons::SETTINGS, palette.accent, "Settings");
                 ui.add_space(SETTINGS_ROW_GAP);
 
-                ui.label(RichText::new("Theme").font(fonts::strong(13.0)));
-                ui.add_space(4.0);
-                theme::theme_picker(ui, palette);
+                components::settings_group(ui, palette, "Appearance", |ui| {
+                    components::settings_row(
+                        ui,
+                        palette,
+                        ("Theme", None),
+                        theme::THEME_PICKER_WIDTH,
+                        |ui| {
+                            theme::theme_picker(ui, palette);
+                        },
+                    );
+                });
                 let theme = ui.ctx().options(|options| options.theme_preference).into();
                 if theme != self.settings.theme {
                     self.settings.theme = theme;
@@ -2687,52 +2761,50 @@ impl Editor {
                 }
                 ui.add_space(SETTINGS_ROW_GAP);
 
-                ui.label(RichText::new("Export cuts").font(fonts::strong(13.0)));
-                ui.colored_label(
-                    palette.text_muted,
-                    "Which choice the export dialog starts on.",
-                );
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = CONTROL_SPACING;
-                    for (cuts, name) in [
-                        (ExportCuts::FrameExact, "Frame-exact"),
-                        (ExportCuts::Fastest, "Fastest"),
-                    ] {
-                        let chosen = self.settings.export_cuts == cuts;
-                        let button = ActionButton::new(palette, Kind::Ghost, name)
-                            .small()
-                            .selected(chosen);
-                        if ui.add(button).clicked() && !chosen {
-                            self.settings.export_cuts = cuts;
-                            self.mode = cuts.into();
-                            changed = true;
-                        }
-                    }
+                components::settings_group(ui, palette, "Export", |ui| {
+                    components::settings_row(
+                        ui,
+                        palette,
+                        ("Export cuts", Some("Where the export window starts")),
+                        SETTINGS_CHOICE_WIDTH * 2.0 + CONTROL_SPACING,
+                        |ui| {
+                            ui.spacing_mut().item_spacing.x = CONTROL_SPACING;
+                            for (cuts, name) in [
+                                (ExportCuts::FrameExact, "Frame-exact"),
+                                (ExportCuts::Fastest, "Fastest"),
+                            ] {
+                                let chosen = self.settings.export_cuts == cuts;
+                                let button = ActionButton::new(palette, Kind::Ghost, name)
+                                    .small()
+                                    .width(SETTINGS_CHOICE_WIDTH)
+                                    .selected(chosen);
+                                if ui.add(button).clicked() && !chosen {
+                                    self.settings.export_cuts = cuts;
+                                    self.mode = cuts.into();
+                                    changed = true;
+                                }
+                            }
+                        },
+                    );
                 });
                 ui.add_space(SETTINGS_ROW_GAP);
 
-                ui.label(RichText::new("On clips").font(fonts::strong(13.0)));
-                ui.colored_label(
-                    palette.text_muted,
-                    "Reading these takes a little while in the background for each video.",
-                );
-                ui.add_space(6.0);
-                for (name, setting) in [
-                    ("Thumbnails on clips", &mut self.settings.thumbnails),
-                    ("Waveforms on clips", &mut self.settings.waveforms),
-                ] {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        if ui.add(CheckBox::new(palette, *setting, name)).clicked() {
-                            *setting = !*setting;
-                            strip_changed = true;
-                        }
-                        ui.label(name);
-                    });
-                    ui.add_space(2.0);
-                }
-                ui.add_space(18.0);
+                components::settings_group(ui, palette, "Waveforms", |ui| {
+                    let on_clips = self.settings.waveforms_on_clips;
+                    let row = SwitchRow::new(palette, "Waveforms on clips", on_clips);
+                    if ui.add(row).clicked() {
+                        self.settings.waveforms_on_clips = !on_clips;
+                        strip_changed = true;
+                    }
+                    components::settings_divider(ui, palette);
+                    let on_audio = self.settings.waveforms_on_audio;
+                    let row = SwitchRow::new(palette, "Waveforms on audio", on_audio);
+                    if ui.add(row).clicked() {
+                        self.settings.waveforms_on_audio = !on_audio;
+                        strip_changed = true;
+                    }
+                });
+                ui.add_space(20.0);
                 components::dialog_buttons(ui, |ui| {
                     close = ui.add(dialog_button(palette, "Done")).clicked();
                 });
@@ -2928,22 +3000,40 @@ impl Editor {
                 "The shape of the finished video, now {width} x {height}"
             ));
         egui::Popup::menu(&button).show(|ui| {
-            let has_video = self.project.canvas.original.is_some();
-            if has_video
-                && ui
-                    .add(MenuItem::choice(
-                        palette,
-                        ORIGINAL_NAME,
-                        self.project.canvas.is_chosen(None),
-                    ))
-                    .clicked()
-            {
-                self.choose_ratio(None);
+            if let Some(original) = self.project.canvas.original {
+                let chosen = self.project.canvas.is_chosen(None);
+                let row = ui.add(MenuItem::shape_choice(
+                    palette,
+                    original,
+                    ORIGINAL_NAME,
+                    "",
+                    chosen,
+                ));
+                let (width, height) = original;
+                let note = format!("Same as your first video, {width} x {height}");
+                components::note_on_rest(ui, palette, &row, &note);
+                if row.clicked() {
+                    self.choose_ratio(None);
+                }
+                ui.separator();
             }
-            for (ratio, name) in RATIOS {
-                let chosen = self.project.canvas.is_chosen(Some(ratio));
-                if ui.add(MenuItem::choice(palette, name, chosen)).clicked() {
-                    self.choose_ratio(Some(ratio));
+            for (index, group) in SIZE_GROUPS.iter().enumerate() {
+                if index > 0 {
+                    ui.separator();
+                }
+                for choice in *group {
+                    let chosen = self.project.canvas.is_chosen(Some(choice.ratio));
+                    let row = ui.add(MenuItem::shape_choice(
+                        palette,
+                        choice.ratio,
+                        choice.name,
+                        choice.numbers,
+                        chosen,
+                    ));
+                    components::note_on_rest(ui, palette, &row, choice.note);
+                    if row.clicked() {
+                        self.choose_ratio(Some(choice.ratio));
+                    }
                 }
             }
         });
@@ -3521,7 +3611,7 @@ impl Editor {
             ui,
             palette,
             has_clips,
-            icons::ROTATE_CCW,
+            icons::UNDO,
             "5 seconds back",
             "Back 5 seconds (Left arrow). One frame: Shift+Left",
         )
@@ -3549,7 +3639,7 @@ impl Editor {
             ui,
             palette,
             has_clips,
-            icons::ROTATE_CW,
+            icons::REDO,
             "5 seconds forward",
             "Forward 5 seconds (Right arrow). One frame: Shift+Right",
         )
@@ -3624,22 +3714,17 @@ impl Editor {
                 track,
                 start: clip.start,
                 end: clip.end(),
-                label: self.entry(clip.media).map_or_else(String::new, |entry| {
-                    if clip.speed.is_normal() {
-                        entry.name.clone()
-                    } else {
-                        format!(
-                            "{}, {}",
-                            text::speed_name(clip.speed.as_factor()),
-                            entry.name
-                        )
-                    }
-                }),
+                label: self
+                    .entry(clip.media)
+                    .map_or_else(String::new, |entry| entry.name.clone()),
                 media: clip.media,
                 source_start: clip.source.start,
                 has_sound: self.has_sound(clip.media),
                 muted: clip.sound.muted,
                 sound_only: self.project.tracks.is_sound_row(track),
+                shows_waveform: self
+                    .settings
+                    .shows_waveform(self.project.tracks.is_sound_row(track)),
                 is_still: clip.is_still(),
                 speed: clip.speed,
                 fade_in: clip.sound.fade_in_on(clip.duration()),
@@ -3666,19 +3751,12 @@ impl Editor {
             selected_gap: self.selected_gap,
         };
         let events = timeline::timeline(ui, palette, &mut self.timeline_state, &view);
-        self.apply_timeline_events(events);
+        let pointer_down = ui.input(|input| input.pointer.any_down());
+        self.apply_timeline_events(events, pointer_down);
     }
 
-    fn apply_timeline_events(&mut self, events: timeline::TimelineEvents) {
-        if let Some((row, sound)) = events.row_sound {
-            let before = self.project.clone();
-            if self.project.tracks.set_row_sound(row, sound) {
-                self.history.record(before);
-            }
-        }
-        if let Some(id) = events.toggle_clip_mute
-            && let Some(clip) = self.project.tracks.clip(id)
-        {
+    fn toggle_clip_mute(&mut self, id: ClipId) {
+        if let Some(clip) = self.project.tracks.clip(id) {
             self.record();
             let muted = !clip.sound.muted;
             self.project.tracks.set_clip_sound(
@@ -3688,6 +3766,20 @@ impl Editor {
                     ..clip.sound
                 },
             );
+        }
+    }
+
+    fn apply_timeline_events(&mut self, events: timeline::TimelineEvents, pointer_down: bool) {
+        if let Some(id) = events.toggle_clip_mute {
+            self.toggle_clip_mute(id);
+        }
+        // The clip's menu changes speed the same way the toolbar does, as one undo step.
+        if events.speed.is_some() {
+            let speed = stage::StageEvents {
+                speed: events.speed,
+                ..stage::StageEvents::default()
+            };
+            self.apply_stage_events(speed, pointer_down);
         }
         if events.add_audio {
             self.add_audio_requested = true;
@@ -3741,6 +3833,8 @@ impl Editor {
                 self.selected = Some(id);
                 self.delete_selected();
             }
+            Some(MenuAction::ToggleMute(id)) => self.toggle_clip_mute(id),
+            Some(MenuAction::Detach(id)) => self.detach_sound(id),
             Some(MenuAction::RemoveGap(time)) => self.remove_gap(time),
             Some(MenuAction::RemoveAllGaps) => self.remove_all_gaps(),
             None => {}
@@ -4128,7 +4222,6 @@ impl Editor {
         let rate_choice = self.rate_choice();
         let rate_pick = self.current_rate_pick();
         let can_keep_apart = self.can_keep_sound_apart();
-        let has_solo = self.project.tracks.has_solo();
         let plain_sound = self.sound_is_plain();
 
         egui::Modal::new(egui::Id::unique("export_dialog")).frame(dialog_frame(ctx)).show(ctx, |ui| {
@@ -4186,13 +4279,6 @@ impl Editor {
                             palette.text_muted,
                             "Everything that can be heard, mixed together and saved as an M4A file with no picture.",
                         );
-                        if has_solo {
-                            ui.add_space(8.0);
-                            ui.colored_label(
-                                palette.danger,
-                                "A row is on Solo, so only its sound goes in the file.",
-                            );
-                        }
                         ui.add_space(18.0);
                         components::dialog_buttons(ui, |ui| {
                             let start = ActionButton::new(palette, Kind::Primary, "Choose file and export")
@@ -4274,13 +4360,6 @@ impl Editor {
                             self.keep_sound_apart = true;
                         }
                         ui.add_space(14.0);
-                    }
-                    if has_solo {
-                        ui.colored_label(
-                            palette.danger,
-                            "A row is on Solo, so only its sound goes in the finished video.",
-                        );
-                        ui.add_space(10.0);
                     }
                     if let Route::Full(reason) = &route {
                         ui.label(RichText::new("Full export").font(fonts::strong(13.0)));
@@ -4700,19 +4779,20 @@ fn skip_button(
     name: &str,
     hint: &str,
 ) -> egui::Response {
-    let button = ui
-        .add_enabled(enabled, IconButton::new(palette, Kind::Ghost, icon, name))
-        .on_hover_text(hint);
+    let arrow = IconButton::new(palette, Kind::Ghost, icon, name)
+        .size(32.0, SKIP_ARROW_SIZE)
+        .icon_raised(SKIP_ARROW_RAISE);
+    let button = ui.add_enabled(enabled, arrow).on_hover_text(hint);
     let color = if enabled {
         palette.text
     } else {
         palette.text_muted
     };
     ui.painter().text(
-        button.rect.center() + vec2(0.0, 0.5),
+        button.rect.center() + vec2(0.0, SKIP_NUMBER_DROP),
         egui::Align2::CENTER_CENTER,
         "5",
-        fonts::strong(8.0),
+        fonts::strong(SKIP_NUMBER_SIZE),
         color,
     );
     button
@@ -4905,7 +4985,7 @@ fn media_card(
                 }
                 // The stage colour stays dark in both themes, so this label reads the same.
                 let length = painter.layout_no_wrap(
-                    text::short_duration(entry.info.duration),
+                    text::whole_time(entry.info.duration),
                     FontId::new(11.0, FontFamily::Proportional),
                     palette.clip_video_text,
                 );
@@ -5439,6 +5519,91 @@ mod tests {
 
     fn moved(at: egui::Pos2) -> Vec<egui::Event> {
         vec![egui::Event::PointerMoved(at)]
+    }
+
+    /// Draws this review's changes on the real screen, with no window. Run with
+    /// `$env:BARECLIP_SCREENS = '<folder>'; ./scripts/cargo.ps1 test -p bareclip-app draw_the_tidying_screens '--' --ignored`
+    #[test]
+    #[ignore = "needs a real GPU, and draws pictures to look at rather than checking anything"]
+    fn draw_the_tidying_screens() {
+        let folder = std::env::var_os("BARECLIP_SCREENS").map_or_else(
+            || std::env::temp_dir().join("bareclip-screens"),
+            PathBuf::from,
+        );
+        let ctx = context();
+        let mut camera = Camera::new(folder);
+
+        let mut one = two_videos(&ctx);
+        camera.shoot(&ctx, &mut one, vec![], "tidy-01-one-track-lanes");
+
+        let mut editor = on_two_tracks(&ctx);
+        camera.shoot(&ctx, &mut editor, vec![], "tidy-02-two-tracks-no-lanes");
+        let area = editor.timeline_state.layout.area;
+        let far = pos2(area.right() - 30.0, area.center().y);
+        camera.shoot(&ctx, &mut editor, moved(far), "tidy-03-hover-past-the-end");
+
+        // Where a new track lands now that there are no lanes.
+        let top = editor.timeline_state.layout.track(0);
+        let from = pos2(
+            editor.timeline_state.scale.x_of(Ticks::from_seconds(0.5)),
+            top.center().y,
+        );
+        let above = pos2(from.x, top.top() - 4.0);
+        begin_drag(&ctx, &mut editor, from, above);
+        camera.shoot(&ctx, &mut editor, moved(above), "tidy-04-new-track-above");
+        let below = pos2(from.x, editor.timeline_state.layout.track(1).bottom() + 6.0);
+        camera.shoot(&ctx, &mut editor, moved(below), "tidy-05-new-track-below");
+        run_frame(
+            &ctx,
+            &mut editor,
+            pointer_button(from, egui::PointerButton::Primary, false),
+        );
+        editor.undo();
+        run_frame(&ctx, &mut editor, moved(pos2(640.0, 100.0)));
+
+        open_size_menu(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "tidy-06-size-menu");
+        let row = named_rect(&ctx, &mut editor, "Vertical 9:16");
+        run_frame(&ctx, &mut editor, moved(row.center()));
+        for _ in 0..60 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "tidy-07-size-menu-note");
+        click(&ctx, &mut editor, pos2(640.0, 400.0));
+        run_frame(&ctx, &mut editor, vec![]);
+
+        click_named(&ctx, &mut editor, "Settings");
+        let_dialog_open(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Waveforms on audio");
+        for _ in 0..30 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "tidy-08-settings-dark");
+        ctx.set_theme(egui::ThemePreference::Light);
+        run_frame(&ctx, &mut editor, vec![]);
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "tidy-09-settings-light");
+        click_named(&ctx, &mut editor, "Done");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        // A trim, from each end, on the light theme and then the dark.
+        let mut trimming = with_videos(&ctx, &[test_clip()]);
+        let scale = trimming.timeline_state.scale;
+        let y = trimming.timeline_state.track.center().y;
+        let end = pos2(scale.x_of(Ticks::from_seconds(4.0)) - 4.0, y);
+        let to = pos2(scale.x_of(Ticks::from_seconds(3.0)), y);
+        begin_drag(&ctx, &mut trimming, end, to);
+        camera.shoot(&ctx, &mut trimming, moved(to), "tidy-10-trim-end-light");
+        ctx.set_theme(egui::ThemePreference::Dark);
+        run_frame(&ctx, &mut trimming, vec![]);
+        camera.shoot(&ctx, &mut trimming, moved(to), "tidy-11-trim-end-dark");
+        end_drag(&ctx, &mut trimming, to);
+        run_frame(&ctx, &mut trimming, vec![]);
+        let start = pos2(scale.x_of(Ticks(0)) + 4.0, y);
+        let to = pos2(scale.x_of(Ticks::from_seconds(1.0)), y);
+        begin_drag(&ctx, &mut trimming, start, to);
+        camera.shoot(&ctx, &mut trimming, moved(to), "tidy-12-trim-start-dark");
+        end_drag(&ctx, &mut trimming, to);
     }
 
     /// Pictures of a mixed project: its export window, and black bars in the preview.
@@ -6231,18 +6396,33 @@ mod tests {
             .collect()
     }
 
-    /// Whether a piece of text is on screen. Plain text is reported as a value, not a name.
-    fn says(ctx: &egui::Context, editor: &mut Editor, text: &str) -> bool {
-        ctx.enable_accesskit();
-        let output = run_frame(ctx, editor, vec![]);
-        let update = output
-            .platform_output
-            .accesskit_update
-            .expect("the tree is reported");
-        update
-            .nodes
-            .iter()
-            .any(|(_, node)| node.value() == Some(text) || node.label() == Some(text))
+    /// Every piece of text a frame drew inside a part of the screen.
+    fn text_in(output: &egui::FullOutput, area: egui::Rect) -> Vec<String> {
+        fn gather(shape: &egui::Shape, area: egui::Rect, found: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) if area.contains(text.pos) => {
+                    found.push(text.galley.text().to_owned());
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        gather(shape, area, found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        for clipped in &output.shapes {
+            gather(&clipped.shape, area, &mut found);
+        }
+        found
+    }
+
+    /// Runs enough frames for everything that animates to finish, so a frame asks for no more.
+    fn settle_animations(ctx: &egui::Context, editor: &mut Editor) {
+        for _ in 0..40 {
+            run_frame(ctx, editor, vec![]);
+        }
     }
 
     /// Where the control with this name is, so a test presses it the way a person would.
@@ -6727,7 +6907,7 @@ mod tests {
     }
 
     #[test]
-    fn trimming_shows_the_clips_start_and_end_until_it_finishes() {
+    fn trimming_shows_the_clips_length_and_where_it_starts_and_ends() {
         let ctx = context();
         let mut editor = with_videos(&ctx, &[test_clip()]);
         let scale = editor.timeline_state.scale;
@@ -6736,15 +6916,410 @@ mod tests {
         let to = pos2(scale.x_of(Ticks::from_seconds(3.0)), y);
 
         begin_drag(&ctx, &mut editor, from, to);
+        run_frame(&ctx, &mut editor, vec![]);
+        let output = run_frame(&ctx, &mut editor, vec![]);
 
         let clip = editor.project.tracks.played().clips()[0];
-        // The readout was drawn before this frame's trim, so it can trail by one step.
-        let (start, end) = editor.timeline_state.trim_readout.expect("it is showing");
-        assert_eq!(start, clip.start);
-        assert!((end.as_seconds() - clip.end().as_seconds()).abs() < 0.2);
+        let on_ruler = text_in(&output, editor.timeline_state.ruler);
+        assert!(on_ruler.contains(&text::clip_length(clip.duration())));
+        let (start, end, edge) = editor.timeline_state.trim_readout.expect("it is showing");
+        assert_eq!((start, end), (clip.start, clip.end()));
+        assert_eq!(edge, ClipEdge::End);
+        for time in [start, end] {
+            let whole = text::nearest_second(time);
+            assert!(on_ruler.contains(&whole), "{whole} isn't in {on_ruler:?}");
+        }
 
         end_drag(&ctx, &mut editor, to);
         assert_eq!(editor.timeline_state.trim_readout, None);
+    }
+
+    #[test]
+    fn trimming_the_start_lights_up_the_start() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let scale = editor.timeline_state.scale;
+        let y = editor.timeline_state.track.center().y;
+        let from = pos2(scale.x_of(Ticks(0)) + 4.0, y);
+        let to = pos2(scale.x_of(Ticks::from_seconds(1.0)), y);
+
+        begin_drag(&ctx, &mut editor, from, to);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let (.., edge) = editor.timeline_state.trim_readout.expect("it is showing");
+        assert_eq!(edge, ClipEdge::Start);
+        end_drag(&ctx, &mut editor, to);
+    }
+
+    #[test]
+    fn moving_a_clip_or_only_selecting_it_doesnt_show_where_it_starts_and_ends() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        editor.selected = Some(editor.project.tracks.played().clips()[0].id);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.timeline_state.trim_readout, None);
+
+        let scale = editor.timeline_state.scale;
+        let y = editor.timeline_state.track.center().y;
+        let from = pos2(scale.x_of(Ticks::from_seconds(2.0)), y);
+        let to = pos2(scale.x_of(Ticks::from_seconds(3.0)), y);
+        begin_drag(&ctx, &mut editor, from, to);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert_eq!(editor.timeline_state.trim_readout, None);
+        end_drag(&ctx, &mut editor, to);
+    }
+
+    #[test]
+    fn the_time_has_no_hours_until_it_reaches_one() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+
+        let output = run_frame(&ctx, &mut editor, vec![]);
+
+        let everything = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
+        let drawn = text_in(&output, everything);
+        assert!(drawn.contains(&"0:00.00".to_owned()), "{drawn:?}");
+        assert!(
+            !drawn.iter().any(|text| text.contains("00:00:")),
+            "{drawn:?}"
+        );
+    }
+
+    #[test]
+    fn a_videos_name_shows_only_after_the_pointer_rests_on_it_and_fades_away_after() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let name = editor.media[0].name.clone();
+        let area = editor.timeline_state.layout.area;
+        let output = run_frame(&ctx, &mut editor, vec![]);
+        assert!(!text_in(&output, area).contains(&name), "not at rest");
+
+        let scale = editor.timeline_state.scale;
+        let over = pos2(
+            scale.x_of(Ticks::from_seconds(1.0)),
+            editor.timeline_state.track.center().y,
+        );
+        run_frame(&ctx, &mut editor, moved(over));
+        for _ in 0..30 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        assert_eq!(editor.timeline_state.named_clip, None, "half a second in");
+
+        let mut output = run_frame(&ctx, &mut editor, vec![]);
+        for _ in 0..45 {
+            output = run_frame(&ctx, &mut editor, vec![]);
+        }
+        let clip = editor.project.tracks.played().clips()[0].id;
+        assert_eq!(editor.timeline_state.named_clip, Some(clip));
+        assert!(text_in(&output, area).contains(&name));
+
+        run_frame(&ctx, &mut editor, moved(pos2(640.0, 100.0)));
+        assert_eq!(editor.timeline_state.named_clip, None);
+        for _ in 0..30 {
+            output = run_frame(&ctx, &mut editor, vec![]);
+        }
+        assert!(!text_in(&output, area).contains(&name), "it has gone again");
+    }
+
+    #[test]
+    fn resting_on_a_video_asks_for_a_frame_when_the_wait_ends_rather_than_every_frame() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        wait_for_strip(&ctx, &mut editor);
+        settle_animations(&ctx, &mut editor);
+        let scale = editor.timeline_state.scale;
+        let over = pos2(
+            scale.x_of(Ticks::from_seconds(1.0)),
+            editor.timeline_state.track.center().y,
+        );
+
+        let wait_after = |output: &egui::FullOutput| {
+            output
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .expect("the window is there")
+                .repaint_delay
+        };
+        let resting = run_frame(&ctx, &mut editor, vec![]);
+        assert!(
+            wait_after(&resting) > Duration::from_secs(3600),
+            "it stays idle"
+        );
+
+        run_frame(&ctx, &mut editor, moved(over));
+        // A pointer moving always asks for one more frame, whatever is under it.
+        run_frame(&ctx, &mut editor, vec![]);
+        let output = run_frame(&ctx, &mut editor, vec![]);
+
+        let wait = wait_after(&output);
+        assert!(wait > Duration::from_millis(500), "{wait:?}");
+        assert!(wait <= Duration::from_secs(1), "{wait:?}");
+    }
+
+    #[test]
+    fn sound_and_images_keep_their_names_on_them() {
+        let ctx = context();
+        let image = image_file("named", "800x600", "orange");
+        let mut editor = with_videos(&ctx, &[image.as_path(), song_file()]);
+        let names: Vec<String> = editor
+            .media
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+
+        let output = run_frame(&ctx, &mut editor, vec![]);
+
+        let on_tracks = text_in(&output, editor.timeline_state.layout.area);
+        for name in names {
+            assert!(on_tracks.contains(&name), "{name} is not in {on_tracks:?}");
+        }
+    }
+
+    #[test]
+    fn a_clip_at_another_speed_says_so_with_no_need_to_point_at_it() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let clip = editor.project.tracks.played().clips()[0].id;
+        let area = editor.timeline_state.layout.area;
+        let output = run_frame(&ctx, &mut editor, vec![]);
+        assert!(!text_in(&output, area).contains(&"1x".to_owned()));
+
+        editor
+            .project
+            .tracks
+            .set_speed(clip, Speed::default().with_factor(2.0));
+        let output = run_frame(&ctx, &mut editor, vec![]);
+
+        assert!(text_in(&output, area).contains(&"2x".to_owned()));
+    }
+
+    #[test]
+    fn the_title_strip_is_tall_enough_for_a_name_box_the_size_of_the_logos_text() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+
+        let label = text::project_title(project::DEFAULT_NAME, editor.has_unsaved_changes());
+        let name = named_rect(&ctx, &mut editor, &label);
+
+        assert_eq!(name.height(), components::NAME_BAR_HEIGHT);
+        assert!(name.top() >= 0.0);
+        assert!(name.bottom() <= TITLE_STRIP_HEIGHT);
+    }
+
+    /// Right-clicks the first clip, ready to use its menu.
+    fn open_clip_menu(ctx: &egui::Context, editor: &mut Editor) -> ClipId {
+        let clip = editor.project.tracks.tracks()[0].clips()[0];
+        let at = pos2(
+            editor.timeline_state.scale.x_of(Ticks::from_seconds(1.0)),
+            editor.timeline_state.track.center().y,
+        );
+        secondary_click(ctx, editor, at);
+        let_dialog_open(ctx, editor);
+        clip.id
+    }
+
+    /// Points at a line of the menu, which opens what is beside it. The toolbar over the picture
+    /// has a Speed button too, and the menu's is the lower one.
+    fn open_flyout(ctx: &egui::Context, editor: &mut Editor, name: &str) {
+        let line = named_nodes(ctx, editor)
+            .into_iter()
+            .filter(|(label, ..)| label == name)
+            .map(|(_, rect, _)| rect)
+            .max_by(|a, b| a.top().total_cmp(&b.top()))
+            .unwrap_or_else(|| panic!("nothing is named {name}"));
+        run_frame(ctx, editor, moved(line.center()));
+        let_dialog_open(ctx, editor);
+    }
+
+    fn type_and_press(ctx: &egui::Context, editor: &mut Editor, typed: &str, key: Key) {
+        run_frame(ctx, editor, vec![egui::Event::Text(typed.to_owned())]);
+        run_frame(
+            ctx,
+            editor,
+            vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        run_frame(ctx, editor, vec![]);
+        run_frame(ctx, editor, vec![]);
+    }
+
+    #[test]
+    fn the_clips_menu_changes_its_speed_stays_open_and_is_one_undo_step() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        let id = open_clip_menu(&ctx, &mut editor);
+        let before = picture_clip(&editor);
+        open_flyout(&ctx, &mut editor, "Speed");
+
+        click_named(&ctx, &mut editor, "2x");
+
+        assert_eq!(picture_clip(&editor).speed, times(2.0));
+        assert_eq!(picture_clip(&editor).id, id);
+        assert_eq!(
+            editor.timeline_state.menu_target,
+            Some(timeline::MenuTarget::Clip(id)),
+            "a press beside the menu leaves it open"
+        );
+        editor.undo();
+        assert_eq!(picture_clip(&editor).speed, before.speed);
+    }
+
+    #[test]
+    fn the_box_in_the_clips_menu_takes_a_finer_speed_than_the_slider() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        open_clip_menu(&ctx, &mut editor);
+        open_flyout(&ctx, &mut editor, "Speed");
+
+        click_named(&ctx, &mut editor, "Speed value");
+        type_and_press(&ctx, &mut editor, "0.75", Key::Enter);
+
+        assert_eq!(picture_clip(&editor).speed, times(0.75));
+        editor.undo();
+        assert_eq!(picture_clip(&editor).speed, Speed::default());
+    }
+
+    #[test]
+    fn clicking_away_from_the_speed_box_uses_what_was_typed() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        open_clip_menu(&ctx, &mut editor);
+        open_flyout(&ctx, &mut editor, "Speed");
+
+        click_named(&ctx, &mut editor, "Speed value");
+        run_frame(&ctx, &mut editor, vec![egui::Event::Text("3".to_owned())]);
+        click(&ctx, &mut editor, pos2(640.0, 100.0));
+
+        assert_eq!(picture_clip(&editor).speed, times(3.0));
+        assert_eq!(editor.timeline_state.menu_target, None);
+    }
+
+    #[test]
+    fn escape_leaves_the_speed_as_it_was_and_nonsense_changes_nothing() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        open_clip_menu(&ctx, &mut editor);
+        open_flyout(&ctx, &mut editor, "Speed");
+
+        click_named(&ctx, &mut editor, "Speed value");
+        type_and_press(&ctx, &mut editor, "fast", Key::Enter);
+        assert_eq!(picture_clip(&editor).speed, Speed::default());
+
+        click_named(&ctx, &mut editor, "Speed value");
+        type_and_press(&ctx, &mut editor, "4", Key::Escape);
+        assert_eq!(picture_clip(&editor).speed, Speed::default());
+    }
+
+    #[test]
+    fn typing_in_the_speed_box_doesnt_set_off_shortcuts() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        editor.seek(Ticks::from_seconds(1.0));
+        run_frame(&ctx, &mut editor, vec![]);
+        open_clip_menu(&ctx, &mut editor);
+        open_flyout(&ctx, &mut editor, "Speed");
+        click_named(&ctx, &mut editor, "Speed value");
+        let clips = editor.project.tracks.tracks()[0].clips().len();
+
+        type_and_press(&ctx, &mut editor, "s", Key::S);
+
+        assert_eq!(editor.project.tracks.tracks()[0].clips().len(), clips);
+    }
+
+    #[test]
+    fn dragging_the_speed_slider_in_the_menu_lands_on_tenths_past_the_menu_and_is_one_undo_step() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        open_clip_menu(&ctx, &mut editor);
+        open_flyout(&ctx, &mut editor, "Speed");
+        let slider = named_rect(&ctx, &mut editor, "Clip speed");
+
+        // Far enough left to pass over the menu's own lines.
+        let to = pos2(slider.left() - 200.0, slider.center().y);
+        begin_drag(&ctx, &mut editor, slider.center(), to);
+        assert!(is_named(&ctx, &mut editor, "Clip speed"), "it stays open");
+        assert_eq!(picture_clip(&editor).speed, times(0.1));
+
+        let partway = pos2(slider.center().x + 7.0, slider.center().y);
+        run_frame(&ctx, &mut editor, moved(partway));
+        run_frame(&ctx, &mut editor, vec![]);
+        let factor = picture_clip(&editor).speed.as_factor();
+        assert!(
+            ((factor * 10.0).round() - factor * 10.0).abs() < 1e-6,
+            "{factor}"
+        );
+
+        end_drag(&ctx, &mut editor, partway);
+        assert!(is_named(&ctx, &mut editor, "Clip speed"));
+        editor.undo();
+        assert_eq!(picture_clip(&editor).speed, Speed::default());
+    }
+
+    #[test]
+    fn the_clips_menu_mutes_and_detaches_from_audio_and_closes_after() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        let id = open_clip_menu(&ctx, &mut editor);
+        open_flyout(&ctx, &mut editor, "Audio");
+
+        click_named(&ctx, &mut editor, "Mute");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(picture_clip(&editor).sound.muted);
+        assert_eq!(editor.timeline_state.menu_target, None);
+        editor.undo();
+        assert!(!picture_clip(&editor).sound.muted);
+
+        open_clip_menu(&ctx, &mut editor);
+        open_flyout(&ctx, &mut editor, "Audio");
+        click_named(&ctx, &mut editor, "Detach sound");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.project.tracks.audio_tracks().len(), 1);
+        assert_eq!(
+            editor.project.tracks.clip(id).map(|clip| clip.sound.muted),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn the_clips_menu_only_offers_what_the_clip_can_do() {
+        let ctx = context();
+        let mut silent = with_videos(&ctx, &[test_clip()]);
+        open_clip_menu(&ctx, &mut silent);
+        assert!(is_named(&ctx, &mut silent, "Speed"));
+        assert!(!is_named(&ctx, &mut silent, "Audio"));
+
+        let image = image_file("menu", "800x600", "orange");
+        let mut still = with_videos(&ctx, &[image.as_path()]);
+        open_clip_menu(&ctx, &mut still);
+        assert!(!is_named(&ctx, &mut still, "Speed"));
+        assert!(!is_named(&ctx, &mut still, "Audio"));
+    }
+
+    #[test]
+    fn moving_on_to_another_line_closes_whats_beside_the_menu_and_a_click_outside_closes_it() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        open_clip_menu(&ctx, &mut editor);
+        open_flyout(&ctx, &mut editor, "Speed");
+        assert!(is_named(&ctx, &mut editor, "Clip speed"));
+
+        let duplicate = named_rect(&ctx, &mut editor, "Duplicate");
+        run_frame(&ctx, &mut editor, moved(duplicate.center()));
+        let_dialog_open(&ctx, &mut editor);
+        assert!(!is_named(&ctx, &mut editor, "Clip speed"));
+        assert!(is_named(&ctx, &mut editor, "Duplicate"));
+
+        click(&ctx, &mut editor, pos2(640.0, 100.0));
+        assert!(!is_named(&ctx, &mut editor, "Duplicate"));
+        assert_eq!(editor.timeline_state.menu_target, None);
     }
 
     #[test]
@@ -7691,18 +8266,49 @@ mod tests {
     }
 
     #[test]
+    fn past_the_last_clip_the_time_under_the_pointer_waits_at_the_end() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let total = editor.project.tracks.duration();
+        let scale = editor.timeline_state.scale;
+        let track = editor.timeline_state.track;
+        let area = editor.timeline_state.layout.area;
+
+        // Just past the end, far past it, on the empty track and on the ruler.
+        let end = scale.x_of(total);
+        for at in [
+            pos2(end + 3.0, track.center().y),
+            pos2(area.right() - 20.0, track.center().y),
+            pos2(area.right() - 20.0, track.top() - 12.0),
+        ] {
+            assert_eq!(
+                hover_readout_at(&ctx, &mut editor, at),
+                Some(total),
+                "{at:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_timeline_has_no_time_under_the_pointer() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip()]);
+        let area = editor.timeline_state.layout.area;
+
+        assert_eq!(hover_readout_at(&ctx, &mut editor, area.center()), None);
+    }
+
+    #[test]
     fn hovering_the_empty_timeline_shows_the_time_there() {
         let ctx = context();
         let mut editor = with_videos(&ctx, &[test_clip()]);
         let scale = editor.timeline_state.scale;
         let track = editor.timeline_state.track;
 
-        // On the ruler, even above a clip, and on the empty timeline after the video.
-        for (time, y) in [(2.5, track.top() - 12.0), (4.8, track.center().y)] {
-            let at = pos2(scale.x_of(Ticks::from_seconds(time)), y);
-            let shown = hover_readout_at(&ctx, &mut editor, at).expect("a time is shown");
-            assert!((shown.as_seconds() - time).abs() < 0.02, "{shown:?}");
-        }
+        // On the ruler, even above a clip.
+        let at = pos2(scale.x_of(Ticks::from_seconds(2.5)), track.top() - 12.0);
+        let shown = hover_readout_at(&ctx, &mut editor, at).expect("a time is shown");
+        assert!((shown.as_seconds() - 2.5).abs() < 0.02, "{shown:?}");
 
         let away = pos2(track.center().x, 100.0);
         assert_eq!(hover_readout_at(&ctx, &mut editor, away), None);
@@ -8396,6 +9002,121 @@ mod tests {
         let scale = editor.timeline_state.scale;
         let x = scale.x_of(Ticks((clip.start.0 + clip.end().0) / 2));
         pos2(x, editor.timeline_state.layout.track(0).center().y)
+    }
+
+    /// Two videos, moved so that each has its own track.
+    fn on_two_tracks(ctx: &egui::Context) -> Editor {
+        let mut editor = two_videos(ctx);
+        let from = second_video_middle(&editor);
+        let lane = editor.timeline_state.layout.new_lane_below();
+        let to = pos2(from.x, lane.center().y);
+        begin_drag(ctx, &mut editor, from, to);
+        end_drag(ctx, &mut editor, to);
+        run_frame(ctx, &mut editor, vec![]);
+        assert_eq!(editor.project.tracks.tracks().len(), 2);
+        editor
+    }
+
+    fn press_without_following_up(ctx: &egui::Context, editor: &mut Editor, at: egui::Pos2) {
+        run_frame(ctx, editor, moved(at));
+        run_frame(
+            ctx,
+            editor,
+            pointer_button(at, egui::PointerButton::Primary, true),
+        );
+        run_frame(
+            ctx,
+            editor,
+            pointer_button(at, egui::PointerButton::Primary, false),
+        );
+    }
+
+    #[test]
+    fn the_lanes_go_once_there_are_two_tracks_and_come_back_with_one() {
+        let ctx = context();
+        let mut editor = two_videos(&ctx);
+        let area = editor.timeline_state.layout.area;
+        let lanes_say = |output: &egui::FullOutput| {
+            let shown = text_in(output, area);
+            ["Drag a clip here for a new track", "Add audio"]
+                .map(|hint| shown.contains(&hint.to_owned()))
+        };
+        let output = run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(lanes_say(&output), [true, true]);
+
+        let from = second_video_middle(&editor);
+        let lane = editor.timeline_state.layout.new_lane_below();
+        let to = pos2(from.x, lane.center().y);
+        begin_drag(&ctx, &mut editor, from, to);
+        end_drag(&ctx, &mut editor, to);
+        run_frame(&ctx, &mut editor, vec![]);
+        let output = run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.project.tracks.tracks().len(), 2);
+        assert_eq!(lanes_say(&output), [false, false]);
+
+        editor.undo();
+        run_frame(&ctx, &mut editor, vec![]);
+        let output = run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(lanes_say(&output), [true, true]);
+    }
+
+    #[test]
+    fn pressing_the_lane_below_one_track_adds_audio() {
+        let ctx = context();
+        let mut editor = two_videos(&ctx);
+        let lane = editor.timeline_state.layout.new_lane_below();
+
+        press_without_following_up(&ctx, &mut editor, lane.center());
+
+        // Taken back before the next frame, which would open the file picker.
+        assert!(std::mem::take(&mut editor.add_audio_requested));
+    }
+
+    #[test]
+    fn pressing_below_two_tracks_only_moves_the_playhead() {
+        let ctx = context();
+        let mut editor = on_two_tracks(&ctx);
+        let lane = editor.timeline_state.layout.new_lane_below();
+
+        press_without_following_up(&ctx, &mut editor, lane.center());
+
+        assert!(!std::mem::take(&mut editor.add_audio_requested));
+    }
+
+    #[test]
+    fn a_clip_can_still_make_a_new_track_past_either_end_of_two_tracks() {
+        let ctx = context();
+        let row_of = |editor: &Editor, row: usize| editor.project.tracks.tracks()[row].clips()[0];
+        let middle_of = |editor: &Editor, row: usize| {
+            let clip = row_of(editor, row);
+            pos2(
+                editor
+                    .timeline_state
+                    .scale
+                    .x_of(Ticks(clip.start.0 + clip.duration().0 / 2)),
+                editor.timeline_state.layout.track(row).center().y,
+            )
+        };
+
+        // Off the bottom of the last track, and the clip from the top row goes under it.
+        let mut below = on_two_tracks(&ctx);
+        let moving = row_of(&below, 0).id;
+        let from = middle_of(&below, 0);
+        let to = pos2(from.x, below.timeline_state.layout.track(1).bottom() + 20.0);
+        begin_drag(&ctx, &mut below, from, to);
+        end_drag(&ctx, &mut below, to);
+        assert_eq!(below.project.tracks.tracks().len(), 2, "its own row went");
+        assert_eq!(row_of(&below, 1).id, moving);
+
+        // Off the top of the first track, and the clip from the bottom row goes over it.
+        let mut above = on_two_tracks(&ctx);
+        let moving = row_of(&above, 1).id;
+        let from = middle_of(&above, 1);
+        let to = pos2(from.x, above.timeline_state.layout.track(0).top() - 2.0);
+        begin_drag(&ctx, &mut above, from, to);
+        end_drag(&ctx, &mut above, to);
+        assert_eq!(above.project.tracks.tracks().len(), 2, "its own row went");
+        assert_eq!(row_of(&above, 0).id, moving);
     }
 
     #[test]
@@ -9194,6 +9915,8 @@ mod tests {
     fn a_video_with_no_sound_has_an_empty_shape() {
         let ctx = context();
         let mut editor = in_panel_only(&ctx, &[test_clip()]);
+        editor.settings.waveforms_on_clips = true;
+        editor.apply_strip_settings(&ctx);
 
         wait_for_strip(&ctx, &mut editor);
 
@@ -9215,62 +9938,62 @@ mod tests {
     }
 
     #[test]
-    fn turning_thumbnails_off_stops_reading_and_forgets_them_and_on_reads_them_again() {
+    fn turning_waveforms_on_reads_them_and_off_forgets_them_keeping_the_pictures() {
         let ctx = context();
         let mut editor = in_panel_only(&ctx, &[test_clip()]);
         wait_for_strip(&ctx, &mut editor);
+        assert!(editor.media[0].sound_shape.is_none(), "they start off");
+        assert!(!editor.media[0].strip_pictures.is_empty());
 
-        editor.settings.thumbnails = false;
-        editor.apply_strip_settings(&ctx);
-
-        assert!(editor.media[0].strip_pictures.is_empty());
-        assert!(
-            editor.media[0].strip_reader.is_none(),
-            "the sound was already read"
-        );
-        assert!(editor.media[0].sound_shape.is_some());
-
-        editor.settings.thumbnails = true;
+        editor.settings.waveforms_on_clips = true;
         editor.apply_strip_settings(&ctx);
         wait_for_strip(&ctx, &mut editor);
+        assert!(editor.media[0].sound_shape.is_some());
 
+        editor.settings.waveforms_on_clips = false;
+        editor.apply_strip_settings(&ctx);
+        assert!(editor.media[0].sound_shape.is_none());
+        assert!(
+            editor.media[0].strip_reader.is_none(),
+            "the pictures were already read"
+        );
         assert!(!editor.media[0].strip_pictures.is_empty());
     }
 
     #[test]
-    fn turning_waveforms_off_forgets_them_and_on_reads_them_again() {
-        let ctx = context();
-        let mut editor = in_panel_only(&ctx, &[test_clip()]);
-        wait_for_strip(&ctx, &mut editor);
-
-        editor.settings.waveforms = false;
-        editor.apply_strip_settings(&ctx);
-        assert!(editor.media[0].sound_shape.is_none());
-        assert!(
-            !editor.media[0].strip_pictures.is_empty(),
-            "pictures are kept"
-        );
-
-        editor.settings.waveforms = true;
-        editor.apply_strip_settings(&ctx);
-        wait_for_strip(&ctx, &mut editor);
-        assert!(editor.media[0].sound_shape.is_some());
-    }
-
-    #[test]
-    fn with_both_off_a_new_video_is_never_read_for_its_clips() {
+    fn a_sound_file_isnt_read_for_its_clip_while_waveforms_are_off() {
         let ctx = context();
         let mut editor = Editor::new(&ctx, false);
-        editor.settings.thumbnails = false;
-        editor.settings.waveforms = false;
 
-        editor.import(&ctx, &[test_clip().to_path_buf()]);
+        editor.import(&ctx, &[song_file().to_path_buf()]);
 
         assert!(editor.media[0].strip_reader.is_none());
     }
 
     #[test]
-    fn the_settings_dialog_turns_clip_pictures_off_and_remembers_it() {
+    fn only_waveforms_on_audio_read_a_sound_files_shape() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        editor.import(&ctx, &[song_file().to_path_buf()]);
+
+        editor.settings.waveforms_on_clips = true;
+        editor.apply_strip_settings(&ctx);
+        assert!(editor.media[0].strip_reader.is_none(), "that's for videos");
+
+        editor.settings.waveforms_on_clips = false;
+        editor.settings.waveforms_on_audio = true;
+        editor.apply_strip_settings(&ctx);
+        assert!(editor.media[0].strip_reader.is_some());
+        wait_for_strip(&ctx, &mut editor);
+        assert!(editor.media[0].sound_shape.is_some());
+
+        editor.settings.waveforms_on_audio = false;
+        editor.apply_strip_settings(&ctx);
+        assert!(editor.media[0].sound_shape.is_none(), "it's forgotten");
+    }
+
+    #[test]
+    fn the_settings_dialog_offers_two_waveform_switches_and_remembers_each() {
         let ctx = context();
         let folder = project_folder("strip-settings");
         let mut editor = with_storage(&ctx, &folder);
@@ -9280,11 +10003,23 @@ mod tests {
 
         click_named(&ctx, &mut editor, "Settings");
         let_dialog_open(&ctx, &mut editor);
-        click_named(&ctx, &mut editor, "Thumbnails on clips");
+        assert!(!is_named(&ctx, &mut editor, "Thumbnails on clips"));
+        click_named(&ctx, &mut editor, "Waveforms on clips");
 
-        assert!(!editor.settings.thumbnails);
-        assert!(editor.media[0].strip_pictures.is_empty());
-        assert!(!with_storage(&ctx, &folder).settings.thumbnails);
+        assert!(editor.settings.waveforms_on_clips);
+        assert!(!editor.settings.waveforms_on_audio);
+        let saved = with_storage(&ctx, &folder).settings;
+        assert!(saved.waveforms_on_clips && !saved.waveforms_on_audio);
+
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Waveforms on audio");
+        assert!(editor.settings.waveforms_on_audio);
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Waveforms on clips");
+        assert!(!editor.settings.waveforms_on_clips);
+        assert!(editor.settings.waveforms_on_audio, "it doesn't change both");
+        let saved = with_storage(&ctx, &folder).settings;
+        assert!(!saved.waveforms_on_clips && saved.waveforms_on_audio);
     }
 
     #[test]
@@ -10864,27 +11599,19 @@ mod tests {
     }
 
     #[test]
-    fn pressing_a_rows_buttons_mutes_and_soloes_it_with_undo() {
+    fn rows_have_no_sound_buttons_of_their_own() {
         let ctx = context();
         let sound = clip_with_sound();
         let mut editor = with_videos(&ctx, &[&sound, song_file()]);
-        run_frame(&ctx, &mut editor, vec![]);
 
-        click_named(&ctx, &mut editor, "Mute row 1");
-        assert!(editor.project.tracks.row_sounds()[0].muted);
-        assert!(is_named(&ctx, &mut editor, "Unmute row 1"));
-        editor.undo();
-        assert!(!editor.project.tracks.row_sounds()[0].muted);
-
-        click_named(&ctx, &mut editor, "Solo row 2");
-        assert!(editor.project.tracks.has_solo());
-        let spans = heard_spans(&editor.media, &editor.project.tracks);
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].path, song_file());
+        for name in ["Mute row 1", "Mute row 2", "Solo row 1", "Solo row 2"] {
+            assert!(!is_named(&ctx, &mut editor, name), "{name}");
+        }
+        assert!(is_named(&ctx, &mut editor, "Mute clip"));
     }
 
     #[test]
-    fn what_is_heard_follows_mute_and_solo_with_every_clip_otherwise_playing() {
+    fn every_clip_plays_unless_it_is_muted() {
         let ctx = context();
         let sound = clip_with_sound();
         let editor = with_videos(&ctx, &[&sound, song_file()]);
@@ -10893,28 +11620,6 @@ mod tests {
 
         assert_eq!(spans.len(), 2);
         assert!(spans.iter().all(|span| span.bus == Bus::All(0)));
-    }
-
-    #[test]
-    fn the_export_window_warns_when_a_row_is_on_solo() {
-        let ctx = context();
-        let sound = clip_with_sound();
-        let mut editor = with_videos(&ctx, &[&sound, song_file()]);
-        let warning = "A row is on Solo, so only its sound goes in the finished video.";
-        editor.export_state = ExportState::Choosing;
-        let_dialog_open(&ctx, &mut editor);
-        assert!(!says(&ctx, &mut editor, warning));
-
-        editor.project.tracks.set_row_sound(
-            1,
-            bareclip_core::sound::RowSound {
-                muted: false,
-                solo: true,
-            },
-        );
-        let_dialog_open(&ctx, &mut editor);
-
-        assert!(says(&ctx, &mut editor, warning));
     }
 
     #[test]
@@ -11092,6 +11797,41 @@ mod tests {
         editor.undo();
         assert_eq!(picture_clip(&editor).speed, Speed::default());
         assert_eq!(picture_clip(&editor).duration(), clip.duration());
+    }
+
+    #[test]
+    fn the_quick_speeds_are_two_even_rows_of_four_up_to_the_limit() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        let clip = picture_clip(&editor);
+        editor.selected = Some(clip.id);
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Speed");
+        let_dialog_open(&ctx, &mut editor);
+
+        let places: Vec<egui::Rect> = ["0.25x", "0.5x", "1x", "1.5x", "2x", "4x", "8x", "16x"]
+            .map(|name| named_rect(&ctx, &mut editor, name))
+            .to_vec();
+        for row in places.chunks(4) {
+            assert!(
+                row.iter()
+                    .all(|place| (place.top() - row[0].top()).abs() < 0.5)
+            );
+            assert!(
+                row.iter()
+                    .all(|place| (place.width() - row[0].width()).abs() < 0.5)
+            );
+            assert!(row.windows(2).all(|pair| pair[0].right() < pair[1].left()));
+        }
+        assert!(places[0].bottom() <= places[4].top());
+        for column in 0..4 {
+            assert!((places[column].left() - places[column + 4].left()).abs() < 0.5);
+        }
+
+        click_named(&ctx, &mut editor, "16x");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(picture_clip(&editor).speed.as_factor(), 16.0);
     }
 
     #[test]
@@ -11926,13 +12666,6 @@ mod tests {
             ..ClipSound::default()
         };
         editor.project.tracks.set_clip_sound(song.id, changed);
-        editor.project.tracks.set_row_sound(
-            0,
-            bareclip_core::sound::RowSound {
-                muted: true,
-                solo: false,
-            },
-        );
 
         let folder = project_folder("sound-settings");
         let path = folder.join("sound.bareclip");
@@ -11943,7 +12676,6 @@ mod tests {
 
         assert_eq!(reopened.project.tracks.audio_tracks().len(), 1);
         assert_eq!(sound_row_clip(&reopened).sound, changed);
-        assert!(reopened.project.tracks.row_sounds()[0].muted);
     }
 
     /// Draws the speed controls on the real screen, with no window. Run with
@@ -11977,6 +12709,32 @@ mod tests {
         click_named(&ctx, &mut editor, "Speed");
         let_dialog_open(&ctx, &mut editor);
         camera.shoot(&ctx, &mut editor, vec![], "speed-02-menu");
+        click(&ctx, &mut editor, pos2(640.0, 60.0));
+
+        open_clip_menu(&ctx, &mut editor);
+        open_flyout(&ctx, &mut editor, "Speed");
+        camera.shoot(&ctx, &mut editor, vec![], "speed-03-right-click");
+        open_flyout(&ctx, &mut editor, "Audio");
+        camera.shoot(&ctx, &mut editor, vec![], "speed-04-right-click-audio");
+        click(&ctx, &mut editor, pos2(640.0, 60.0));
+
+        // The name of a video after the pointer has rested on it.
+        let over = pos2(
+            editor.timeline_state.scale.x_of(Ticks::from_seconds(1.0)),
+            editor.timeline_state.track.center().y,
+        );
+        run_frame(&ctx, &mut editor, moved(over));
+        for _ in 0..90 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "speed-05-name-on-hover");
+        click_named(
+            &ctx,
+            &mut editor,
+            &text::project_title(project::DEFAULT_NAME, true),
+        );
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "speed-06-renaming");
     }
 
     /// Draws images on the real screen, with no window. Run with
@@ -12082,15 +12840,8 @@ mod tests {
             },
         );
         editor.selected = Some(first.id);
-        editor.project.tracks.set_row_sound(
-            1,
-            bareclip_core::sound::RowSound {
-                muted: true,
-                solo: false,
-            },
-        );
         run_frame(&ctx, &mut editor, vec![]);
-        camera.shoot(&ctx, &mut editor, vec![], "sound-02-fades-and-muted-row");
+        camera.shoot(&ctx, &mut editor, vec![], "sound-02-fades");
 
         click_named(&ctx, &mut editor, "Sound");
         let_dialog_open(&ctx, &mut editor);
@@ -12699,6 +13450,98 @@ mod tests {
         assert_eq!(last_moment_by(Ticks(0), Ticks(0)), Ticks(0));
     }
 
+    /// What the Size menu calls a ratio, from its numbers.
+    fn size_row(numbers: &str) -> String {
+        SIZE_GROUPS
+            .iter()
+            .flat_map(|group| group.iter())
+            .find(|choice| choice.numbers == numbers)
+            .map_or_else(
+                || numbers.to_owned(),
+                |choice| format!("{} {}", choice.name, choice.numbers),
+            )
+    }
+
+    fn open_size_menu(ctx: &egui::Context, editor: &mut Editor) {
+        let button = named_nodes(ctx, editor)
+            .into_iter()
+            .find(|(label, ..)| label.starts_with("Size:"))
+            .expect("the Size button is there")
+            .1;
+        click(ctx, editor, button.center());
+        let_dialog_open(ctx, editor);
+    }
+
+    #[test]
+    fn the_size_menu_lists_every_ratio_once_with_its_numbers() {
+        let listed: Vec<_> = SIZE_GROUPS.iter().flat_map(|group| group.iter()).collect();
+        assert_eq!(listed.len(), bareclip_core::canvas::RATIOS.len());
+        for (ratio, numbers) in bareclip_core::canvas::RATIOS {
+            let choice = listed
+                .iter()
+                .find(|choice| choice.ratio == ratio)
+                .unwrap_or_else(|| panic!("{numbers} is listed"));
+            assert_eq!(choice.numbers, numbers);
+            assert!(!choice.name.is_empty() && !choice.note.is_empty());
+        }
+    }
+
+    #[test]
+    fn two_by_three_can_be_picked_from_the_size_menu() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+
+        pick_size(&ctx, &mut editor, "2:3");
+
+        assert_eq!(size_button_says(&ctx, &mut editor), "Size: 2:3");
+        // The test video is 320 x 180, and encoders need even sizes.
+        assert_eq!(editor.project.canvas.size(), (214, 320));
+    }
+
+    #[test]
+    fn a_shapes_explanation_only_shows_once_the_pointer_has_rested_on_it() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        open_size_menu(&ctx, &mut editor);
+        let whole = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
+        let note = "Instagram Reels and TikTok";
+        let row = named_rect(&ctx, &mut editor, "Vertical 9:16");
+        let output = run_frame(&ctx, &mut editor, vec![]);
+        assert!(!text_in(&output, whole).contains(&note.to_owned()));
+
+        run_frame(&ctx, &mut editor, moved(row.center()));
+        let mut output = run_frame(&ctx, &mut editor, vec![]);
+        for _ in 0..20 {
+            output = run_frame(&ctx, &mut editor, vec![]);
+        }
+        assert!(
+            !text_in(&output, whole).contains(&note.to_owned()),
+            "a third of a second in"
+        );
+
+        for _ in 0..30 {
+            output = run_frame(&ctx, &mut editor, vec![]);
+        }
+        assert!(text_in(&output, whole).contains(&note.to_owned()));
+
+        // Moving on starts the wait again, for what is now under the pointer.
+        let other = named_rect(&ctx, &mut editor, "Square 1:1");
+        run_frame(&ctx, &mut editor, moved(other.center()));
+        for _ in 0..20 {
+            output = run_frame(&ctx, &mut editor, vec![]);
+        }
+        let shown = text_in(&output, whole);
+        assert!(!shown.contains(&note.to_owned()), "it has gone");
+        assert!(
+            !shown.contains(&"Instagram posts".to_owned()),
+            "right at the wait's end"
+        );
+        for _ in 0..30 {
+            output = run_frame(&ctx, &mut editor, vec![]);
+        }
+        assert!(text_in(&output, whole).contains(&"Instagram posts".to_owned()));
+    }
+
     /// Picks a choice from the Size menu.
     fn pick_size(ctx: &egui::Context, editor: &mut Editor, name: &str) {
         let button = named_nodes(ctx, editor)
@@ -12708,7 +13551,7 @@ mod tests {
             .1;
         click(ctx, editor, button.center());
         run_frame(ctx, editor, vec![]);
-        click_named(ctx, editor, name);
+        click_named(ctx, editor, &size_row(name));
         run_frame(ctx, editor, vec![]);
     }
 
@@ -12761,7 +13604,7 @@ mod tests {
             .1;
         click(&ctx, &mut empty, button.center());
         run_frame(&ctx, &mut empty, vec![]);
-        assert!(is_named(&ctx, &mut empty, "21:9"));
+        assert!(is_named(&ctx, &mut empty, "Cinema 21:9"));
         assert!(!is_named(&ctx, &mut empty, "Original"));
     }
 

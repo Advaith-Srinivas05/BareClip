@@ -78,8 +78,11 @@ pub struct Settings {
     /// Whether edits go to the project's own file without being asked.
     pub auto_save: bool,
     pub export_cuts: ExportCuts,
-    pub thumbnails: bool,
-    pub waveforms: bool,
+    /// Whether clips on picture rows show the shape of their sound. The older `waveforms` key was
+    /// on by default and was written to everyone's file, so it is deliberately not read.
+    pub waveforms_on_clips: bool,
+    /// The same for sound rows, which holds sound files and sound detached from a video.
+    pub waveforms_on_audio: bool,
 }
 
 impl Default for Settings {
@@ -88,13 +91,28 @@ impl Default for Settings {
             theme: ThemeSetting::System,
             auto_save: false,
             export_cuts: ExportCuts::FrameExact,
-            thumbnails: true,
-            waveforms: true,
+            waveforms_on_clips: false,
+            waveforms_on_audio: false,
         }
     }
 }
 
 impl Settings {
+    /// Whether a clip on this kind of row shows the shape of its sound.
+    pub fn shows_waveform(&self, on_sound_row: bool) -> bool {
+        if on_sound_row {
+            self.waveforms_on_audio
+        } else {
+            self.waveforms_on_clips
+        }
+    }
+
+    /// Whether this kind of file's sound shape needs reading. A video needs it for its sound rows
+    /// too, because its sound can be detached onto one at any time.
+    pub fn reads_sound_shape(&self, sound_only: bool) -> bool {
+        self.waveforms_on_audio || (self.waveforms_on_clips && !sound_only)
+    }
+
     /// Reads the settings. A missing or damaged file just means the defaults.
     pub fn load(folder: &Path) -> Self {
         fs::read_to_string(folder.join(SETTINGS_FILE))
@@ -300,8 +318,8 @@ mod tests {
             theme: ThemeSetting::Light,
             auto_save: true,
             export_cuts: ExportCuts::Fastest,
-            thumbnails: false,
-            waveforms: false,
+            waveforms_on_clips: true,
+            waveforms_on_audio: true,
         };
 
         settings.save(&folder).expect("they can be saved");
@@ -340,8 +358,52 @@ mod tests {
         let settings = Settings::load(&folder);
 
         assert_eq!(settings.theme, ThemeSetting::Light);
-        assert!(!settings.waveforms);
         assert!(!settings.auto_save);
+    }
+
+    #[test]
+    fn waveforms_start_off_even_for_settings_saved_with_them_on() {
+        let folder = temporary_folder("settings-waveforms");
+        assert!(!Settings::default().waveforms_on_clips);
+        assert!(!Settings::default().waveforms_on_audio);
+        fs::write(
+            folder.join(SETTINGS_FILE),
+            r#"{"theme":"dark","thumbnails":false,"waveforms":true}"#,
+        )
+        .expect("it can be written");
+
+        let settings = Settings::load(&folder);
+
+        assert_eq!(settings.theme, ThemeSetting::Dark);
+        assert!(!settings.waveforms_on_clips);
+        assert!(!settings.waveforms_on_audio);
+    }
+
+    #[test]
+    fn clips_and_audio_each_have_their_own_waveform_setting() {
+        let clips_only = Settings {
+            waveforms_on_clips: true,
+            ..Settings::default()
+        };
+        assert!(clips_only.shows_waveform(false));
+        assert!(!clips_only.shows_waveform(true));
+        assert!(clips_only.reads_sound_shape(false));
+        assert!(!clips_only.reads_sound_shape(true), "no clip would show it");
+
+        let audio_only = Settings {
+            waveforms_on_audio: true,
+            ..Settings::default()
+        };
+        assert!(!audio_only.shows_waveform(false));
+        assert!(audio_only.shows_waveform(true));
+        assert!(audio_only.reads_sound_shape(true));
+        assert!(
+            audio_only.reads_sound_shape(false),
+            "a video's sound can be detached onto a sound row"
+        );
+
+        assert!(!Settings::default().reads_sound_shape(false));
+        assert!(!Settings::default().reads_sound_shape(true));
     }
 
     #[test]
