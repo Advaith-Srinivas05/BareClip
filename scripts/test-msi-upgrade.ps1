@@ -16,7 +16,10 @@ function Assert-That([bool]$Condition, [string]$Message) {
 }
 
 function Invoke-Msi([string[]]$Arguments) {
-    $Process = Start-Process msiexec.exe -ArgumentList $Arguments -Wait -PassThru
+    # Start-Process -Wait can go on waiting after the installer has gone. The handle keeps the exit code.
+    $Process = Start-Process msiexec.exe -ArgumentList $Arguments -PassThru
+    $null = $Process.Handle
+    $Process.WaitForExit()
     return $Process.ExitCode
 }
 
@@ -88,6 +91,53 @@ finally {
 }
 Assert-That ($ExitCode -eq 0) "it uninstalled (exit $ExitCode)"
 Assert-That (-not (Test-Path (Join-Path $Parent 'BareClip'))) 'the BareClip folder is gone'
+Assert-That (-not (Test-Path 'HKCU:\Software\BareClip')) 'the registry entries are gone'
+
+# An upgrade stays in a whole path chosen in the one folder box, which needn't be inside a parent.
+$Chosen = Join-Path $Parent 'somewhere else\BareClip'
+$ExitCode = Invoke-Msi @('/i', "`"$Old`"", '/qn', '/l*v', "`"$Log`"", "INSTALLFOLDER=`"$Chosen\`"")
+Assert-That ($ExitCode -eq 0) "the older version installed in a whole chosen path (exit $ExitCode)"
+try {
+    $ExitCode = Invoke-Msi @('/i', "`"$New`"", '/qn', '/l*v', "`"$Log`"")
+    Assert-That ($ExitCode -eq 0) "the newer version installed over it (exit $ExitCode)"
+    $Installed = @(Get-Installed)
+    Assert-That ($Installed.Count -eq 1 -and $Installed[0].Version -like '0.1.1*') 'there is one copy, and it is the newer one'
+    Assert-That (Test-Path (Join-Path $Chosen 'bareclip.exe')) 'it stayed in the chosen path'
+    Assert-That (-not (Test-Path $InstallDir)) 'nothing went to the usual folder'
+}
+finally {
+    foreach ($Product in Get-Installed) {
+        $ExitCode = Invoke-Msi @('/x', $Product.Code, '/qn', '/l*v', "`"$Log`"")
+    }
+}
+Assert-That ($ExitCode -eq 0) "it uninstalled (exit $ExitCode)"
+Assert-That (-not (Test-Path $Chosen)) 'the chosen folder is gone'
+
+# The real first release, if it is here, only knows about the parent folder. Upgrading from it has
+# to find its install and stay there.
+$Released = Join-Path $Root 'dist\BareClip-0.1.0.msi'
+$Current = Join-Path $Root 'dist\BareClip.msi'
+if (Test-Path $Released) {
+    $ExitCode = Invoke-Msi @('/i', "`"$Released`"", '/qn', '/l*v', "`"$Log`"", "INSTALLPARENT=`"$Parent\`"")
+    Assert-That ($ExitCode -eq 0) "the real 0.1.0 installed (exit $ExitCode)"
+    try {
+        $ExitCode = Invoke-Msi @('/i', "`"$Current`"", '/qn', '/l*v', "`"$Log`"")
+        Assert-That ($ExitCode -eq 0) "this version installed over the real 0.1.0 (exit $ExitCode)"
+        $Installed = @(Get-Installed)
+        Assert-That ($Installed.Count -eq 1 -and $Installed[0].Version -notlike '0.1.0*') "there is one copy, now $($Installed[0].Version)"
+        Assert-That (Test-Path (Join-Path $Parent 'BareClip\bareclip.exe')) 'it stayed where 0.1.0 was'
+        Assert-That (-not (Test-Path $InstallDir)) 'nothing went to the usual folder'
+    }
+    finally {
+        foreach ($Product in Get-Installed) {
+            $ExitCode = Invoke-Msi @('/x', $Product.Code, '/qn', '/l*v', "`"$Log`"")
+        }
+    }
+    Assert-That ($ExitCode -eq 0) "it uninstalled (exit $ExitCode)"
+}
+else {
+    Write-Host 'skipped: dist\BareClip-0.1.0.msi is not here, so the real first release was not tried.'
+}
 Assert-That (-not (Test-Path 'HKCU:\Software\BareClip')) 'the registry entries are gone'
 Remove-Item -Recurse -Force $Parent
 Write-Host 'The upgrade test passed.'

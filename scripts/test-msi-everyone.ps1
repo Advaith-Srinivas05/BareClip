@@ -21,7 +21,10 @@ function Assert-That([bool]$Condition, [string]$Message) {
 }
 
 function Invoke-Msi([string[]]$Arguments) {
-    $Process = Start-Process msiexec.exe -ArgumentList $Arguments -Wait -PassThru
+    # Start-Process -Wait can go on waiting after the installer has gone. The handle keeps the exit code.
+    $Process = Start-Process msiexec.exe -ArgumentList $Arguments -PassThru
+    $null = $Process.Handle
+    $Process.WaitForExit()
     return $Process.ExitCode
 }
 
