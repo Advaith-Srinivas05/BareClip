@@ -25,7 +25,8 @@ use bareclip_core::{
 };
 use bareclip_export::{
     FullPlan, LAYERED_REASON, LayeredClip, LayeredRequest, LayeredStretch, ProjectReport, Route,
-    export_layered, export_project, full_output_path, route_for, size_problem,
+    copying_suits, export_layered, export_project, full_output_path, mixed_rates, route_for,
+    size_problem,
 };
 use bareclip_media::{
     DecodeStep, ExportPart, ExportRequest, MediaError, MediaInfo, PreviewFrame, SoundShape,
@@ -260,6 +261,13 @@ impl MediaFilter {
 }
 
 /// A video in the project.
+/// How to join videos with different frame rates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RatePick {
+    Copy,
+    Redraw,
+}
+
 struct MediaEntry {
     id: MediaId,
     info: MediaInfo,
@@ -346,6 +354,8 @@ pub struct Editor {
     notice: Option<String>,
     export_state: ExportState,
     mode: CutMode,
+    /// How to join videos with different frame rates, if the user has picked for this export.
+    rate_pick: Option<RatePick>,
     confirm_remove: Vec<MediaId>,
     project_name: String,
     /// The file this project saves to, once it has one.
@@ -476,6 +486,7 @@ impl Editor {
             notice: None,
             export_state: ExportState::Closed,
             mode: CutMode::FrameExact,
+            rate_pick: None,
             confirm_remove: Vec::new(),
             project_name: project::DEFAULT_NAME.to_owned(),
             project_path: None,
@@ -1338,6 +1349,7 @@ impl Editor {
 
     /// Starts exporting, first pointing out any dead space on the timeline.
     fn open_export(&mut self) {
+        self.rate_pick = None;
         self.export_state = if self.project.tracks.gaps().is_empty() {
             ExportState::Choosing
         } else {
@@ -1738,13 +1750,12 @@ impl Editor {
         videos
     }
 
-    /// How the timeline would be exported as it is now.
-    fn export_route(&self) -> Route {
+    /// How the timeline would be exported, leaving aside any difference in frame rates.
+    fn route_before_rates(&self, videos: &[MediaInfo]) -> Route {
         if self.takes_layers() {
             return Route::Full(LAYERED_REASON.to_owned());
         }
-        let videos = self.videos_on_timeline();
-        let route = route_for(&videos, !self.project.tracks.gaps().is_empty());
+        let route = route_for(videos, !self.project.tracks.gaps().is_empty());
         if route != Route::Fast {
             return route;
         }
@@ -1752,6 +1763,52 @@ impl Editor {
             .final_canvas()
             .and_then(|canvas| videos.iter().find_map(|video| size_problem(canvas, video)));
         misfit.map_or(Route::Fast, Route::Full)
+    }
+
+    /// Why joining these videos is a choice between copying and redrawing, if it is. Videos that
+    /// have to be redrawn anyway have no choice to make.
+    fn rate_choice(&self) -> Option<String> {
+        let videos = self.videos_on_timeline();
+        (self.route_before_rates(&videos) == Route::Fast)
+            .then(|| mixed_rates(&videos))
+            .flatten()
+    }
+
+    /// Which way the choice starts, before the user picks. Copying is only for videos already
+    /// uneven inside, so one whose frames haven't been read yet counts against it.
+    fn rate_pick_at_first(&self) -> RatePick {
+        let tables: Option<Vec<_>> = self
+            .videos_on_timeline()
+            .iter()
+            .map(|info| {
+                self.media
+                    .iter()
+                    .find(|entry| entry.info.path == info.path)?
+                    .index
+                    .clone()
+            })
+            .collect();
+        if tables.is_some_and(|tables| copying_suits(tables.iter().map(|frames| &**frames))) {
+            RatePick::Copy
+        } else {
+            RatePick::Redraw
+        }
+    }
+
+    fn current_rate_pick(&self) -> RatePick {
+        self.rate_pick.unwrap_or_else(|| self.rate_pick_at_first())
+    }
+
+    /// How the timeline would be exported as it is now.
+    fn export_route(&self) -> Route {
+        let route = self.route_before_rates(&self.videos_on_timeline());
+        if route != Route::Fast {
+            return route;
+        }
+        match self.rate_choice() {
+            Some(reason) if self.current_rate_pick() == RatePick::Redraw => Route::Full(reason),
+            _ => Route::Fast,
+        }
     }
 
     /// The shape and size of the finished video, which the preview shows too.
@@ -3538,6 +3595,8 @@ impl Editor {
         let full_plan = FullPlan::on_canvas(&self.videos_on_timeline(), self.project.canvas.size());
         let ready = self.export_parts().is_some();
         let summary = self.plan_description();
+        let rate_choice = self.rate_choice();
+        let rate_pick = self.current_rate_pick();
 
         egui::Modal::new(egui::Id::unique("export_dialog")).frame(dialog_frame(ctx)).show(ctx, |ui| {
             ui.set_width(440.0);
@@ -3574,11 +3633,48 @@ impl Editor {
                 ExportState::Choosing => {
                     components::dialog_title(ui, &icons::UPLOAD, palette.accent, "Export");
                     ui.add_space(14.0);
+                    if let Some(reason) = &rate_choice {
+                        ui.label(
+                            RichText::new("These videos have different frame rates")
+                                .font(fonts::strong(13.0)),
+                        );
+                        ui.add_space(4.0);
+                        ui.colored_label(palette.text_muted, reason);
+                        ui.add_space(10.0);
+                        if components::choice_card(
+                            ui,
+                            palette,
+                            &icons::ZAP,
+                            "Copy",
+                            "Fast, at full quality. The pace changes where they join, which some software handles badly.",
+                            rate_pick == RatePick::Copy,
+                        )
+                        .clicked()
+                        {
+                            self.rate_pick = Some(RatePick::Copy);
+                        }
+                        ui.add_space(8.0);
+                        if components::choice_card(
+                            ui,
+                            palette,
+                            &icons::PENCIL,
+                            "Redraw",
+                            "Slower and re-encoded, but one steady rate that all software handles.",
+                            rate_pick == RatePick::Redraw,
+                        )
+                        .clicked()
+                        {
+                            self.rate_pick = Some(RatePick::Redraw);
+                        }
+                        ui.add_space(14.0);
+                    }
                     if let Route::Full(reason) = &route {
                         ui.label(RichText::new("Full export").font(fonts::strong(13.0)));
                         ui.add_space(4.0);
-                        ui.colored_label(palette.text_muted, reason);
-                        ui.add_space(8.0);
+                        if rate_choice.is_none() {
+                            ui.colored_label(palette.text_muted, reason);
+                            ui.add_space(8.0);
+                        }
                         ui.label(text::full_export_plan(&full_plan));
                         ui.add_space(18.0);
                         components::dialog_buttons(ui, |ui| {
@@ -3595,10 +3691,12 @@ impl Editor {
                     }
                     ui.label(RichText::new("Fast export").font(fonts::strong(13.0)));
                     ui.add_space(4.0);
-                    ui.colored_label(
-                        palette.text_muted,
-                        "These videos match, so they can be copied rather than redrawn.",
-                    );
+                    if rate_choice.is_none() {
+                        ui.colored_label(
+                            palette.text_muted,
+                            "These videos match, so they can be copied rather than redrawn.",
+                        );
+                    }
                     ui.add_space(10.0);
                     if components::choice_card(
                         ui,
@@ -4258,6 +4356,66 @@ mod tests {
     fn small_clip() -> &'static Path {
         static CLIP: OnceLock<PathBuf> = OnceLock::new();
         CLIP.get_or_init(|| make_clip("editor-small", "160x90"))
+    }
+
+    /// A short clip at a steady rate.
+    fn clip_at_rate(name: &str, rate: u32) -> PathBuf {
+        let folder = std::env::temp_dir().join("bareclip-app-tests");
+        std::fs::create_dir_all(&folder).expect("the folder can be created");
+        let path = folder.join(format!("{name}-{}.mp4", std::process::id()));
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg(format!("testsrc2=s=320x180:r={rate}:d=2,format=yuv420p"))
+            .args(["-c:v", "libopenh264", "-b:v", "1M", "-g", "30"])
+            .arg(&path)
+            .status()
+            .expect("ffmpeg is on PATH");
+        assert!(status.success());
+        path
+    }
+
+    /// A short clip whose frames keep changing pace, like real screen recordings.
+    fn uneven_clip(name: &str, rate: u32) -> PathBuf {
+        let folder = std::env::temp_dir().join("bareclip-app-tests");
+        std::fs::create_dir_all(&folder).expect("the folder can be created");
+        let path = folder.join(format!("{name}-{}.mp4", std::process::id()));
+        let frame = 1.0 / f64::from(rate);
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg(format!("testsrc2=s=320x180:r={rate}:d=2,format=yuv420p"))
+            .args([
+                "-vf",
+                &format!("setpts='(N*{frame}+0.3*{frame}*sin(N*2.1))/TB'"),
+                "-fps_mode",
+                "passthrough",
+                "-c:v",
+                "libopenh264",
+                "-b:v",
+                "1M",
+                "-g",
+                "30",
+            ])
+            .arg(&path)
+            .status()
+            .expect("ffmpeg is on PATH");
+        assert!(status.success());
+        path
     }
 
     /// A clip whose sound has a regular beat, so its shape is easy to judge by eye.
@@ -9701,6 +9859,75 @@ mod tests {
         let editor = with_videos(&ctx, &[test_clip(), second_clip()]);
 
         assert_eq!(editor.export_route(), Route::Fast);
+    }
+
+    #[test]
+    fn steady_videos_at_different_rates_start_on_redraw_and_can_be_copied() {
+        let ctx = context();
+        let slow = clip_at_rate("steady-24", 24);
+        let fast = clip_at_rate("steady-60", 60);
+        let mut editor = with_videos(&ctx, &[&slow, &fast]);
+
+        assert!(editor.rate_choice().is_some());
+        assert_eq!(editor.current_rate_pick(), RatePick::Redraw);
+        assert!(matches!(editor.export_route(), Route::Full(_)));
+
+        editor.rate_pick = Some(RatePick::Copy);
+        assert_eq!(editor.export_route(), Route::Fast);
+    }
+
+    #[test]
+    fn videos_uneven_inside_at_different_rates_start_on_copy_and_can_be_redrawn() {
+        let ctx = context();
+        let first = uneven_clip("uneven-a", 25);
+        let second = uneven_clip("uneven-b", 50);
+        let mut editor = with_videos(&ctx, &[&first, &second]);
+
+        assert!(editor.rate_choice().is_some());
+        assert_eq!(editor.current_rate_pick(), RatePick::Copy);
+        assert_eq!(editor.export_route(), Route::Fast);
+
+        editor.rate_pick = Some(RatePick::Redraw);
+        assert!(matches!(editor.export_route(), Route::Full(_)));
+    }
+
+    #[test]
+    fn the_export_window_offers_copy_and_redraw_only_when_rates_differ() {
+        let ctx = context();
+        let slow = clip_at_rate("offered-24", 24);
+        let fast = clip_at_rate("offered-60", 60);
+        let mut mixed = with_videos(&ctx, &[&slow, &fast]);
+        mixed.export_state = ExportState::Choosing;
+        let_dialog_open(&ctx, &mut mixed);
+        assert!(is_named(&ctx, &mut mixed, "Copy"));
+        assert!(is_named(&ctx, &mut mixed, "Redraw"));
+
+        let mut same = with_videos(&ctx, &[test_clip(), second_clip()]);
+        same.export_state = ExportState::Choosing;
+        let_dialog_open(&ctx, &mut same);
+        assert!(!is_named(&ctx, &mut same, "Copy"));
+        assert!(!is_named(&ctx, &mut same, "Redraw"));
+    }
+
+    #[test]
+    fn a_pick_between_copy_and_redraw_only_lasts_for_one_export() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        editor.rate_pick = Some(RatePick::Copy);
+
+        editor.open_export();
+
+        assert_eq!(editor.rate_pick, None);
+    }
+
+    #[test]
+    fn videos_with_a_different_size_have_no_rate_choice_to_make() {
+        let ctx = context();
+        let slow = clip_at_rate("sized-24", 24);
+        let small = small_clip();
+        let editor = with_videos(&ctx, &[&slow, small]);
+
+        assert_eq!(editor.rate_choice(), None);
     }
 
     #[test]
