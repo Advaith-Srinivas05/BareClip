@@ -16,12 +16,13 @@ use crate::{
     speed::Speed,
     time::Ticks,
     timeline::{MediaId, TimeRange, Timeline},
+    title::Title,
     tracks::Tracks,
 };
 
 pub const EXTENSION: &str = "bareclip";
 /// Goes up whenever the format changes in a way older versions can't read.
-const CURRENT_VERSION: u32 = 5;
+const CURRENT_VERSION: u32 = 6;
 /// Files older than this had their size worked out from the largest video.
 const FIRST_VERSION_WITH_CANVAS: u32 = 3;
 pub const DEFAULT_NAME: &str = "untitled";
@@ -30,6 +31,13 @@ pub const DEFAULT_NAME: &str = "untitled";
 pub struct SavedMedia {
     pub id: u64,
     pub path: PathBuf,
+}
+
+/// A title as it is written down, under the id its clip refers to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedTitle {
+    pub id: u64,
+    pub title: Title,
 }
 
 /// A clip as it is written down. Clips get fresh ids when loaded.
@@ -82,6 +90,9 @@ pub struct ProjectFile {
     pub version: u32,
     pub name: String,
     pub media: Vec<SavedMedia>,
+    /// What each title's clip says and how it looks. Older files have none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub titles: Vec<SavedTitle>,
     /// Highest track first, each with its clips in order.
     pub tracks: Vec<Vec<SavedClip>>,
     /// The rows of sound below those, from the top down.
@@ -130,6 +141,7 @@ impl ProjectFile {
                 .into_iter()
                 .map(|(id, path)| SavedMedia { id: id.0, path })
                 .collect(),
+            titles: Vec::new(),
             tracks: saved_rows(tracks.picture_tracks()),
             audio_tracks: saved_rows(tracks.audio_tracks()),
             row_sound: Vec::new(),

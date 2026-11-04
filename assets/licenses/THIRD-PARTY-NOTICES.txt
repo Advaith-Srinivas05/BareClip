@@ -26,6 +26,15 @@ The interface font. Copyright 2021 The Hanken Grotesk Project Authors, licensed
 under the SIL Open Font License version 1.1. See HankenGrotesk-OFL.txt.
 
 
+Title fonts
+-----------
+Abel, Abril Fatface, Alegreya Sans, Alfa Slab One, Allura, Arimo, DM Sans, Raleway,
+Rubik, Source Sans 3, Space Mono, Sriracha, Staatliches, Sue Ellen Francisco,
+Tajawal, Vampiro One, Vina Sans, Work Sans, Yesteryear and Zeyada, offered for
+titles. Each is licensed under the SIL Open Font License version 1.1, and each one's
+copyright and licence are in TitleFonts-OFL.txt.
+
+
 Lucide
 ------
 The interface's symbols. Copyright Lucide Icons and Contributors, licensed under

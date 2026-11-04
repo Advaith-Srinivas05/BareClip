@@ -55,6 +55,8 @@ pub const SPEED_REASON: &str =
     "A clip plays at another speed, so its frames are redrawn at their new times.";
 
 /// Why a project showing an image can't be copied.
+pub const TITLES_REASON: &str =
+    "Text has to be drawn onto the picture, so the video is drawn again.";
 pub const STILLS_REASON: &str =
     "Images have to be drawn into the video, so every frame is redrawn.";
 

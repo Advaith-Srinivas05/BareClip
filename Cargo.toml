@@ -7,6 +7,7 @@ members = [
     "crates/bareclip-export",
     "crates/bareclip-media",
     "crates/bareclip-render",
+    "crates/bareclip-text",
 ]
 
 [workspace.package]
@@ -21,7 +22,9 @@ bareclip-core = { path = "crates/bareclip-core" }
 bareclip-export = { path = "crates/bareclip-export" }
 bareclip-media = { path = "crates/bareclip-media" }
 bareclip-render = { path = "crates/bareclip-render" }
+bareclip-text = { path = "crates/bareclip-text" }
 bytemuck = "1"
+cosmic-text = { version = "0.19", default-features = false, features = ["std", "swash"] }
 cpal = "0.18"
 eframe = { version = "0.37", default-features = false, features = ["accesskit", "default_fonts", "wgpu"] }
 pollster = "1"

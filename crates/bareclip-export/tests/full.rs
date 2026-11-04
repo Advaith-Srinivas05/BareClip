@@ -799,6 +799,7 @@ fn whole(input: &Path, key: u64, start: f64, length: f64, placement: Placement) 
         },
         placement,
         speed: Default::default(),
+        title: None,
     }
 }
 
@@ -2050,6 +2051,7 @@ fn still_clip(input: &Path, key: u64, start: f64, length: f64) -> LayeredClip {
         },
         placement: Placement::default(),
         speed: Default::default(),
+        title: None,
     }
 }
 

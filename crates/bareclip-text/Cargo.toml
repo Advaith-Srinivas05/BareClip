@@ -1,0 +1,10 @@
+[package]
+name = "bareclip-text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bareclip-core.workspace = true
+cosmic-text.workspace = true

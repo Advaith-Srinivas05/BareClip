@@ -441,6 +441,30 @@ fn rotate_handle_at(shown: &Shown, frame: Rect, area: Rect) -> Pos2 {
     }
 }
 
+/// Where a title's rotate handle goes. Coming inside would cover the words, and a caption near the
+/// bottom of the picture is often too small to spare the room, so it tries each other side first.
+fn title_rotate_handle_at(shown: &Shown, frame: Rect, area: Rect) -> Pos2 {
+    let room = area.shrink(ROTATE_HANDLE_SIZE / 2.0);
+    for (x, y) in [(0.0, 1.0), (1.0, 0.0), (-1.0, 0.0), (0.0, -1.0)] {
+        let edge = on_screen(shown.at(x, y), frame);
+        let (across, down) = shown.turned(x, y);
+        let place = edge + vec2(across as f32, down as f32) * ROTATE_HANDLE_GAP;
+        if room.contains(place) {
+            return place;
+        }
+    }
+    rotate_handle_at(shown, frame, area)
+}
+
+/// Where the selected clip's rotate handle goes.
+fn selected_rotate_handle_at(shown: &Shown, view: &StageView) -> Pos2 {
+    if view.selected_is_title {
+        title_rotate_handle_at(shown, view.frame, view.area)
+    } else {
+        rotate_handle_at(shown, view.frame, view.area)
+    }
+}
+
 /// Where a toolbar this wide goes: just above the clip and centred on it, staying on the video
 /// area. When the row above the picture is free it can go up there, so it never has to cover a
 /// full-size clip.
@@ -613,6 +637,9 @@ pub struct StageView<'a> {
     pub can_go_back: bool,
     pub sound: Option<SelectedSound>,
     pub speed: Option<SelectedSpeed>,
+    /// The selected clip is a title, so it has no crop or flips, and its place comes from its
+    /// own controls rather than picture-in-picture.
+    pub selected_is_title: bool,
 }
 
 /// What happened on the stage this frame.
@@ -677,7 +704,7 @@ fn grab_at(
         .find(|clip| Some(clip.id) == view.selected)
     {
         let shown = Shown::of(selected.placement, selected.size, view.canvas);
-        let handle = rotate_handle_at(&shown, view.frame, view.area);
+        let handle = selected_rotate_handle_at(&shown, view);
         if handle.distance(pointer) <= ROTATE_HANDLE_SIZE / 2.0 {
             return Some((selected.id, DragKind::Rotate));
         }
@@ -883,7 +910,7 @@ pub fn show(
                 Stroke::new(1.5, palette.playhead_outline),
             );
         }
-        let handle = rotate_handle_at(&shown, view.frame, view.area);
+        let handle = selected_rotate_handle_at(&shown, view);
         state.rotate_handle = Some(handle);
         painter.circle(
             handle,
@@ -1399,7 +1426,8 @@ fn toolbar(
     let sound = view.sound.filter(|sound| sound.id == clip.id);
     let speed = view.speed.filter(|speed| speed.id == clip.id);
     let optional = f32::from(u8::from(sound.is_some())) + f32::from(u8::from(speed.is_some()));
-    let buttons = 5.0 + optional;
+    let is_title = view.selected_is_title;
+    let buttons = if is_title { 2.0 } else { 5.0 + optional };
     let width = TOOLBAR_PADDING * 2.0 + TOOLBAR_BUTTON * buttons;
     let rect = toolbar_rect(width, clip_rect, view.area, view.row_above_is_free);
     let id = ui.scope_id().with("stage-toolbar");
@@ -1433,12 +1461,12 @@ fn toolbar(
                         .on_hover_text(hint)
                 };
 
-            if button(ui, 0.0, icons::CROP, "Crop", "Crop").clicked() {
+            if !is_title && button(ui, 0.0, icons::CROP, "Crop", "Crop").clicked() {
                 state.cropping = Some(clip.id);
             }
             if button(
                 ui,
-                1.0,
+                if is_title { 0.0 } else { 1.0 },
                 icons::ROTATE_CW,
                 "Rotate by 90 degrees",
                 "Rotate by 90°",
@@ -1447,25 +1475,27 @@ fn toolbar(
             {
                 events.place = Some((clip.id, placement.turned_quarter(clip.size, view.canvas)));
             }
-            if button(
-                ui,
-                2.0,
-                icons::FLIP_HORIZONTAL_2,
-                "Flip left to right",
-                "Flip left to right",
-            )
-            .clicked()
+            if !is_title
+                && button(
+                    ui,
+                    2.0,
+                    icons::FLIP_HORIZONTAL_2,
+                    "Flip left to right",
+                    "Flip left to right",
+                )
+                .clicked()
             {
                 events.place = Some((clip.id, placement.flipped_across()));
             }
-            if button(
-                ui,
-                3.0,
-                icons::FLIP_VERTICAL_2,
-                "Flip top to bottom",
-                "Flip top to bottom",
-            )
-            .clicked()
+            if !is_title
+                && button(
+                    ui,
+                    3.0,
+                    icons::FLIP_VERTICAL_2,
+                    "Flip top to bottom",
+                    "Flip top to bottom",
+                )
+                .clicked()
             {
                 events.place = Some((clip.id, placement.flipped_down()));
             }
@@ -1561,20 +1591,22 @@ fn more_menu(
             slider.surrender_focus();
         }
     });
-    ui.separator();
-    menu_heading(ui, palette, "Picture in picture");
-    for (corner, name) in CanvasCorner::ALL {
-        if ui
-            .add(MenuItem::new(
-                palette,
-                icons::PICTURE_IN_PICTURE_2,
-                name,
-                "",
-            ))
-            .clicked()
-        {
-            let placed = placement.in_corner(corner, clip.size, view.canvas);
-            events.place = Some((clip.id, placed));
+    if !view.selected_is_title {
+        ui.separator();
+        menu_heading(ui, palette, "Picture in picture");
+        for (corner, name) in CanvasCorner::ALL {
+            if ui
+                .add(MenuItem::new(
+                    palette,
+                    icons::PICTURE_IN_PICTURE_2,
+                    name,
+                    "",
+                ))
+                .clicked()
+            {
+                let placed = placement.in_corner(corner, clip.size, view.canvas);
+                events.place = Some((clip.id, placed));
+            }
         }
     }
     ui.separator();
@@ -2165,6 +2197,40 @@ mod tests {
 
         assert!(area.contains(handle));
         assert_eq!(handle.y, 450.0 - ROTATE_HANDLE_GAP);
+    }
+
+    #[test]
+    fn a_titles_rotate_handle_goes_beside_it_rather_than_over_its_words() {
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(640.0, 360.0));
+        let picture = (100, 20);
+        let canvas = (640, 360);
+        let at_the_bottom = Placement {
+            center_y: WHOLE * 93 / 100,
+            scale: WHOLE * 100 / 640,
+            ..Placement::default()
+        };
+        let shown = Shown::of(at_the_bottom, picture, canvas);
+        let handle = title_rotate_handle_at(&shown, area, area);
+        let (left, right) = (
+            on_screen(shown.at(-1.0, 0.0), area).x,
+            on_screen(shown.at(1.0, 0.0), area).x,
+        );
+        assert!(
+            handle.x > right || handle.x < left,
+            "{handle:?} is over the words"
+        );
+        assert!(area.contains(handle));
+
+        let in_the_middle = Placement {
+            scale: WHOLE * 100 / 640,
+            ..Placement::default()
+        };
+        let shown = Shown::of(in_the_middle, picture, canvas);
+        let below = title_rotate_handle_at(&shown, area, area);
+        assert!(
+            below.y > on_screen(shown.at(0.0, 1.0), area).y,
+            "below is first choice"
+        );
     }
 
     #[test]

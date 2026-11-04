@@ -248,27 +248,33 @@ mod tests {
 
     const RATE: u32 = 48_000;
 
+    /// Made once, because tests run at the same time, and writing it again would change it under
+    /// any test reading it.
     fn level_file() -> std::path::PathBuf {
-        let folder = std::env::temp_dir().join("bareclip-audio-tests");
-        std::fs::create_dir_all(&folder).expect("the folder can be created");
-        let path = folder.join(format!("engine-{}.wav", std::process::id()));
-        let status = Process::new("ffmpeg")
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-            ])
-            .arg(format!("aevalsrc=0.25|0.25:d=1:s={RATE}"))
-            .args(["-c:a", "pcm_f32le"])
-            .arg(&path)
-            .status()
-            .expect("ffmpeg is on PATH");
-        assert!(status.success());
-        path
+        static FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        FILE.get_or_init(|| {
+            let folder = std::env::temp_dir().join("bareclip-audio-tests");
+            std::fs::create_dir_all(&folder).expect("the folder can be created");
+            let path = folder.join(format!("engine-{}.wav", std::process::id()));
+            let status = Process::new("ffmpeg")
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                ])
+                .arg(format!("aevalsrc=0.25|0.25:d=1:s={RATE}"))
+                .args(["-c:a", "pcm_f32le"])
+                .arg(&path)
+                .status()
+                .expect("ffmpeg is on PATH");
+            assert!(status.success());
+            path
+        })
+        .clone()
     }
 
     fn worker_with(spans: Vec<MixSpan>) -> (Worker, rtrb::Consumer<f32>) {

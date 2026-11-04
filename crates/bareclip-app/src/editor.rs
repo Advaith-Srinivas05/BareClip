@@ -1,6 +1,7 @@
 //! The editing screen: a media panel, the preview, and the timeline below them.
 
 use std::{
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -18,25 +19,28 @@ use bareclip_core::{
     },
     history::History,
     picture::StillPicture,
+    placement::Placement,
     project::{self, ProjectFile, write_atomic},
     sound::ClipSound,
     splice::{CutMode, FrameIndex},
     time::{Ticks, format_timecode},
-    timeline::{ClipEdge, ClipId, MediaId, TimeRange, Timeline},
+    timeline::{ClipEdge, ClipId, MediaId, STILL_LENGTH, TimeRange, Timeline},
+    title::{Title, TitleStyle},
     tracks::{OrderMove, TrackTarget, Tracks},
 };
 use bareclip_export::{
     CHOICES_REASON, ExportChoices, ExportRate, ExportSize, FullPlan, LAYERED_REASON, LayeredClip,
     LayeredRequest, LayeredStretch, ProjectReport, Route, SIZES, SPEED_REASON, STILLS_REASON,
-    SoundPlan, copying_suits, export_layered, export_sound_only, export_with_new_sound,
-    full_output_path, mixed_rates, rates_on_offer, route_for, size_problem, size_with_shorter_side,
-    sizes_on_offer, sound_labels,
+    SoundPlan, TITLES_REASON, copying_suits, export_layered, export_sound_only,
+    export_with_new_sound, full_output_path, mixed_rates, rates_on_offer, route_for, size_problem,
+    size_with_shorter_side, sizes_on_offer, sound_labels,
 };
 use bareclip_media::{
     DecodeStep, ExportPart, ExportRequest, MediaError, MediaInfo, PreviewFrame, Quality,
     SoundLabel, SoundShape, StripPicture, VideoPreview, can_write_gaps, export, picture_spacing,
     plan_export, probe, read_sound_shape, read_still, read_strip_pictures, scan_frames,
 };
+use bareclip_text::FontList;
 use eframe::egui::{
     self, Align, Color32, CornerRadius, FontFamily, FontId, Frame, Key, Layout, Margin, Modifiers,
     RichText, Sense, Stroke, TextureHandle, TextureOptions, UiBuilder, pos2, vec2,
@@ -390,8 +394,14 @@ enum RatePick {
     Redraw,
 }
 
+#[path = "titles.rs"]
+mod titles;
+use titles::{CopiedClip, DurationEdit, LeftPanel, TitleResize};
+
 struct MediaEntry {
     id: MediaId,
+    /// What a title's picture was last drawn from, for what canvas, and the scale that shows it.
+    title_drawn: Option<(Title, (u32, u32), i32)>,
     info: MediaInfo,
     name: String,
     /// When the file was created, on file systems that record it.
@@ -424,6 +434,8 @@ struct Snapshot {
     hidden: Vec<MediaId>,
     /// The finished video's size.
     canvas: Canvas,
+    /// What each title says and how it looks, under the id its clip refers to.
+    titles: BTreeMap<MediaId, Title>,
 }
 
 /// A trim in progress: where the clip's edge and the playhead were when the drag started.
@@ -524,6 +536,28 @@ pub struct Editor {
     /// Videos ticked in the panel, in the order they were ticked.
     selected_media: Vec<MediaId>,
     media_panel_open: bool,
+    /// What the left panel shows when it is open.
+    left_panel: LeftPanel,
+    /// The last number used for a title's id. They are never used again, even after undo.
+    next_title: u64,
+    /// The undo step for a title being typed in or having a control held.
+    title_before: Option<Snapshot>,
+    title_resize: Option<TitleResize>,
+    title_cards: HashMap<TitleStyle, TextureHandle>,
+    title_colour_text: Option<String>,
+    /// Whether a change to a caption's look goes to every caption on its row.
+    style_whole_row: bool,
+    /// The text box should take the keyboard when it next shows.
+    focus_title_text: bool,
+    pick_captions_requested: bool,
+    font_list: Option<FontList>,
+    font_search: String,
+    /// Each font's name drawn in itself, or `None` if it can't show it.
+    font_faces: HashMap<String, Option<TextureHandle>>,
+    /// Fonts already reported as missing, so a redraw doesn't keep saying so.
+    fonts_reported: Vec<String>,
+    clipboard: Option<CopiedClip>,
+    duration_edit: Option<DurationEdit>,
     media_sort: MediaSort,
     media_sort_descending: bool,
     media_filter: MediaFilter,
@@ -602,6 +636,7 @@ impl Editor {
                 tracks: Tracks::default(),
                 hidden: Vec::new(),
                 canvas: Canvas::default(),
+                titles: BTreeMap::new(),
             },
             history: History::default(),
             preview: Preview::new(use_sound, Arc::new(move || repaint.request_repaint())),
@@ -647,6 +682,21 @@ impl Editor {
             recovery_offers: Vec::new(),
             selected_media: Vec::new(),
             media_panel_open: true,
+            left_panel: LeftPanel::default(),
+            next_title: 0,
+            title_before: None,
+            title_resize: None,
+            title_cards: HashMap::new(),
+            title_colour_text: None,
+            style_whole_row: true,
+            focus_title_text: false,
+            pick_captions_requested: false,
+            font_list: None,
+            font_search: String::new(),
+            font_faces: HashMap::new(),
+            fonts_reported: Vec::new(),
+            clipboard: None,
+            duration_edit: None,
             media_sort: MediaSort::Name,
             media_sort_descending: false,
             media_filter: MediaFilter::All,
@@ -697,6 +747,7 @@ impl Editor {
             .collect();
         let mut file = ProjectFile::capture(&self.project_name, media, &self.project.tracks);
         file.canvas = self.project.canvas;
+        self.write_titles_to(&mut file);
         file
     }
 
@@ -747,6 +798,7 @@ impl Editor {
             tracks: Tracks::default(),
             hidden: Vec::new(),
             canvas: Canvas::default(),
+            titles: BTreeMap::new(),
         };
         self.history = History::default();
         self.selected = None;
@@ -912,6 +964,11 @@ impl Editor {
                 }
             }
         }
+        self.restore_titles(&file.titles);
+        for title in self.project.titles.keys() {
+            new_ids.insert(title.0, *title);
+            durations.insert(title.0, STILL_LENGTH);
+        }
         let fitted = |rows: &[Vec<project::SavedClip>]| -> Vec<Vec<project::SavedClip>> {
             rows.iter()
                 .map(|track| {
@@ -934,9 +991,11 @@ impl Editor {
             self.project.canvas.original = self.project.tracks.canvas(&|id| self.video_size(id));
         }
         self.settle_canvas();
+        self.sync_titles();
         self.project_name = file.name;
         self.project_path = path;
         self.media_panel_open = true;
+        self.left_panel = LeftPanel::Media;
         self.auto_save_held = unreadable;
         if unreadable && self.settings.auto_save {
             self.notice = Some(match self.notice.take() {
@@ -1128,7 +1187,7 @@ impl Editor {
     fn visible_media(&self) -> impl Iterator<Item = &MediaEntry> {
         self.media
             .iter()
-            .filter(|entry| !self.project.hidden.contains(&entry.id))
+            .filter(|entry| !entry.id.is_title() && !self.project.hidden.contains(&entry.id))
     }
 
     /// The videos the panel lists, filtered and in order.
@@ -1213,10 +1272,18 @@ impl Editor {
                 self.leave_project(ctx, LeaveFor::Open(path.clone()));
                 return;
             }
+            if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case(text::CAPTIONS_EXTENSION))
+            {
+                self.import_captions(path);
+                continue;
+            }
             match self.load(ctx, path) {
                 Ok(entry) => {
                     self.media.push(entry);
                     self.media_panel_open = true;
+                    self.left_panel = LeftPanel::Media;
                 }
                 Err(error) => {
                     let name = path.file_name().map_or_else(
@@ -1297,6 +1364,7 @@ impl Editor {
             still: None,
             sound_shape: None,
             strip_reader,
+            title_drawn: None,
         })
     }
 
@@ -1483,6 +1551,7 @@ impl Editor {
         let before = self.project.clone();
         if let Some(second) = self.project.tracks.split(clip.id, split_at) {
             self.history.record(before);
+            self.give_own_title(second);
             self.selected = Some(second);
             self.notice = None;
         } else {
@@ -1506,6 +1575,7 @@ impl Editor {
         let before = self.project.clone();
         if let Some(copy) = self.project.tracks.duplicate(id) {
             self.history.record(before);
+            self.give_own_title(copy);
             self.selected = Some(copy);
             self.after_clip_added();
         }
@@ -1885,6 +1955,9 @@ impl Editor {
     fn video_size(&self, id: MediaId) -> Option<(u32, u32)> {
         self.entry(id)
             .map(|entry| (entry.info.video.width, entry.info.video.height))
+            // A title only has a picture while it is near the playhead. Elsewhere it only needs
+            // to count as something that shows, and a title never hides what is under it.
+            .or_else(|| id.is_title().then_some((1, 1)))
     }
 
     /// The size of the finished video.
@@ -1946,13 +2019,20 @@ impl Editor {
                     .stack
                     .iter()
                     .filter_map(|clip| {
+                        let title = self.title_of(*clip).cloned();
+                        let input = if title.is_some() {
+                            PathBuf::new()
+                        } else {
+                            self.entry(clip.media)?.info.path.clone()
+                        };
                         Some(LayeredClip {
                             key: clip.id.0,
-                            input: self.entry(clip.media)?.info.path.clone(),
+                            input,
                             start: clip.start,
                             source: clip.source,
                             placement: clip.placement,
                             speed: clip.speed,
+                            title,
                         })
                     })
                     .collect(),
@@ -1972,7 +2052,8 @@ impl Editor {
             .tracks
             .stretches(canvas, &|id| self.video_size(id));
         for clip in stretches.iter().flat_map(|stretch| &stretch.stack) {
-            if !seen.contains(&clip.media) {
+            // A title isn't a video, and has no size or frame rate for the export to go by.
+            if !clip.is_title() && !seen.contains(&clip.media) {
                 seen.push(clip.media);
                 if let Some(entry) = self.entry(clip.media) {
                     videos.push(entry.info.clone());
@@ -1990,7 +2071,16 @@ impl Editor {
                     .tracks
                     .shows_other_speeds(canvas, &|id| self.video_size(id))
             });
-            let reason = if videos.iter().any(MediaInfo::is_still) {
+            let has_titles = self
+                .project
+                .tracks
+                .picture_tracks()
+                .iter()
+                .flat_map(Timeline::clips)
+                .any(|clip| clip.is_title());
+            let reason = if has_titles {
+                TITLES_REASON
+            } else if videos.iter().any(MediaInfo::is_still) {
                 STILLS_REASON
             } else if other_speeds {
                 SPEED_REASON
@@ -2384,6 +2474,7 @@ impl Editor {
             || self.missing_videos.is_some()
             || !self.recovery_offers.is_empty()
             || self.settings_open
+            || self.duration_edit.is_some()
             // Letters typed into a name are not commands.
             || ctx.egui_wants_keyboard_input();
         if blocked {
@@ -2413,6 +2504,14 @@ impl Editor {
             && let Some(selected) = self.selected
         {
             self.duplicate_clip(selected);
+        }
+        if consume(Modifiers::COMMAND, Key::C)
+            && let Some(selected) = self.selected
+        {
+            self.copy_clip(selected);
+        }
+        if consume(Modifiers::COMMAND, Key::V) {
+            self.paste_clip();
         }
         if consume(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z)
             || consume(Modifiers::COMMAND, Key::Y)
@@ -2522,6 +2621,9 @@ impl Editor {
         if std::mem::take(&mut self.add_audio_requested) {
             self.pick_audio(&ctx);
         }
+        if std::mem::take(&mut self.pick_captions_requested) {
+            self.pick_captions();
+        }
         let palette = theme::palette(&ctx);
         // The background shows through the gaps between the panels.
         ui.painter().rect_filled(ui.max_rect(), 0.0, palette.bg_app);
@@ -2529,6 +2631,7 @@ impl Editor {
         if ctx.input(|input| input.viewport().close_requested()) {
             self.handle_close_request(&ctx);
         }
+        self.sync_titles();
         self.poll_background(&ctx);
         self.handle_shortcuts(&ctx);
         self.take_dropped_files(&ctx);
@@ -2538,13 +2641,16 @@ impl Editor {
         self.title_strip(ui, palette);
         self.rail(ui, palette);
         self.media_panel(ui, palette);
+        self.title_panel(ui, palette);
         // The video and the timeline share one card, from here down to the stage.
         self.card_top_row(ui, palette);
         self.seek_bar_held = false;
         self.timeline_panel(ui, palette);
         self.stage(ui, palette);
         self.hold_playback_while_scrubbing();
+        self.settle_title_edit(&ctx);
         self.remove_dialog(&ctx, palette);
+        self.edit_duration_dialog(&ctx, palette);
         self.export_dialog(&ctx, palette);
         self.settings_dialog(&ctx, palette);
         self.missing_videos_dialog(&ctx, palette);
@@ -3074,56 +3180,7 @@ impl Editor {
         egui::Popup::menu(&button)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
-                for row in BACKGROUND_SWATCHES.chunks(8) {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 2.0;
-                        for (colour, name) in row {
-                            let [red, green, blue] = *colour;
-                            let swatch = ColourSwatch::new(
-                                palette,
-                                Color32::from_rgb(red, green, blue),
-                                name,
-                                *colour == current,
-                            );
-                            if ui.add(swatch).clicked() {
-                                picked = Some(*colour);
-                            }
-                        }
-                    });
-                }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Custom").size(13.0).color(palette.text_muted));
-                    let mut text = self
-                        .background_text
-                        .clone()
-                        .unwrap_or_else(|| colour_to_hex(current));
-                    let field = ui.add(
-                        egui::TextEdit::singleline(&mut text)
-                            .desired_width(80.0)
-                            .char_limit(7),
-                    );
-                    field.widget_info(|| {
-                        egui::WidgetInfo::labeled(egui::Role::TextInput, true, "Colour code")
-                    });
-                    if field.changed() {
-                        if let Some(colour) = colour_from_hex(&text) {
-                            picked = Some(colour);
-                        }
-                        self.background_text = Some(text);
-                    } else if !field.has_focus() {
-                        self.background_text = None;
-                    }
-                });
-                let mut chosen = shown;
-                egui::color_picker::color_picker_color32(
-                    ui,
-                    &mut chosen,
-                    egui::color_picker::Alpha::Opaque,
-                );
-                if chosen != shown {
-                    picked = Some([chosen.r(), chosen.g(), chosen.b()]);
-                }
+                picked = colour_choices(ui, palette, current, &mut self.background_text);
             });
         if let Some(colour) = picked {
             self.change_background(colour);
@@ -3220,17 +3277,23 @@ impl Editor {
             .show_separator_line(false)
             .frame(frame)
             .show(ui, |ui| {
-                let open = self.media_panel_open;
-                let hint = if open {
-                    "Close My media"
-                } else {
-                    "Open My media"
-                };
-                if components::rail_tab(ui, palette, &icons::FILM, "My media", open)
-                    .on_hover_text(hint)
-                    .clicked()
-                {
-                    self.media_panel_open = !open;
+                for (tab, icon, name) in [
+                    (LeftPanel::Media, &icons::FILM, "My media"),
+                    (LeftPanel::Text, &icons::TYPE, "Text"),
+                ] {
+                    let open = self.media_panel_open && self.left_panel == tab;
+                    let hint = if open {
+                        format!("Close {name}")
+                    } else {
+                        format!("Open {name}")
+                    };
+                    if components::rail_tab(ui, palette, icon, name, open)
+                        .on_hover_text(hint)
+                        .clicked()
+                    {
+                        self.media_panel_open = !open;
+                        self.left_panel = tab;
+                    }
                 }
             });
     }
@@ -3250,8 +3313,10 @@ impl Editor {
             .size_range(MEDIA_PANEL_MIN_WIDTH..=MEDIA_PANEL_MAX_WIDTH)
             .frame(frame)
             .show_collapsible(ui, &mut expanded, |ui| {
+                let on_text = self.left_panel == LeftPanel::Text;
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("My media").font(fonts::strong(15.0)));
+                    let heading = if on_text { "Text" } else { "My media" };
+                    ui.label(RichText::new(heading).font(fonts::strong(15.0)));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         close = ui
                             .add(
@@ -3268,6 +3333,10 @@ impl Editor {
                     });
                 });
                 ui.add_space(10.0);
+                if on_text {
+                    self.text_panel(ui, palette);
+                    return;
+                }
                 let width = ui.available_width();
                 // Once there are videos, what comes next is on the cards and the timeline.
                 let kind = if self.visible_media().next().is_none() {
@@ -3714,9 +3783,12 @@ impl Editor {
                 track,
                 start: clip.start,
                 end: clip.end(),
-                label: self
-                    .entry(clip.media)
-                    .map_or_else(String::new, |entry| entry.name.clone()),
+                label: match self.title_of(*clip) {
+                    Some(title) => Self::title_label(title),
+                    None => self
+                        .entry(clip.media)
+                        .map_or_else(String::new, |entry| entry.name.clone()),
+                },
                 media: clip.media,
                 source_start: clip.source.start,
                 has_sound: self.has_sound(clip.media),
@@ -3726,6 +3798,7 @@ impl Editor {
                     .settings
                     .shows_waveform(self.project.tracks.is_sound_row(track)),
                 is_still: clip.is_still(),
+                is_title: clip.is_title(),
                 speed: clip.speed,
                 fade_in: clip.sound.fade_in_on(clip.duration()),
                 fade_out: clip.sound.fade_out_on(clip.duration()),
@@ -3749,6 +3822,7 @@ impl Editor {
             position: self.position(),
             selected: self.selected,
             selected_gap: self.selected_gap,
+            can_paste: self.clipboard.is_some(),
         };
         let events = timeline::timeline(ui, palette, &mut self.timeline_state, &view);
         let pointer_down = ui.input(|input| input.pointer.any_down());
@@ -3783,6 +3857,14 @@ impl Editor {
         }
         if events.add_audio {
             self.add_audio_requested = true;
+        }
+        if events.add_text {
+            self.media_panel_open = true;
+            self.left_panel = LeftPanel::Media;
+            self.left_panel = LeftPanel::Text;
+        }
+        if let Some((style, time, target)) = events.drop_title {
+            self.add_title(style, time, Some(target));
         }
         if let Some(selection) = events.select {
             self.selected = selection;
@@ -3829,6 +3911,9 @@ impl Editor {
         match events.menu {
             Some(MenuAction::Split) => self.split_at_playhead(),
             Some(MenuAction::Duplicate(id)) => self.duplicate_clip(id),
+            Some(MenuAction::Copy(id)) => self.copy_clip(id),
+            Some(MenuAction::Paste) => self.paste_clip(),
+            Some(MenuAction::EditDuration(id)) => self.open_edit_duration(id),
             Some(MenuAction::Delete(id)) => {
                 self.selected = Some(id);
                 self.delete_selected();
@@ -3860,7 +3945,7 @@ impl Editor {
         let Some(clip) = self.project.tracks.clip(id) else {
             return;
         };
-        let Some(duration) = self.entry(clip.media).map(|entry| entry.info.duration) else {
+        let Some(duration) = self.footage_of(clip.media) else {
             return;
         };
         // The pointer moves along the timeline, and a fast clip gets through more footage there.
@@ -4090,6 +4175,7 @@ impl Editor {
             }),
             sound: self.selected_sound(),
             speed: self.selected_speed(),
+            selected_is_title: self.selected_title().is_some(),
         };
         let events = stage::show(ui, palette, &mut self.stage_state, &view);
         let pointer_down = ui.input(|input| input.pointer.any_down());
@@ -4109,9 +4195,14 @@ impl Editor {
         }
         if let Some((id, placement)) = events.place {
             let before = self.project.clone();
-            if self.project.tracks.set_placement(id, placement) && self.stage_before.is_none() {
+            let placement = self.title_placement(id, placement);
+            self.project.tracks.set_placement(id, placement);
+            if self.project != before && self.stage_before.is_none() {
                 self.stage_before = Some(before);
             }
+        }
+        if !pointer_down {
+            self.title_resize = None;
         }
         if let Some((id, sound)) = events.sound {
             let before = self.project.clone();
@@ -4651,6 +4742,61 @@ fn fitted(size: egui::Vec2, within: egui::Rect) -> egui::Rect {
 
 /// A rounded panel. The gap on its right and below it keeps it clear of its neighbours,
 /// and the rail or panel before it keeps it clear on the left.
+/// Swatches, a colour code and a picker. Returns a colour if one was picked. `typed` keeps a code
+/// partway through being typed.
+fn colour_choices(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    current: Colour,
+    typed: &mut Option<String>,
+) -> Option<Colour> {
+    let mut picked = None;
+    let [red, green, blue] = current;
+    let shown = Color32::from_rgb(red, green, blue);
+    for row in BACKGROUND_SWATCHES.chunks(8) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for (colour, name) in row {
+                let [red, green, blue] = *colour;
+                let swatch = ColourSwatch::new(
+                    palette,
+                    Color32::from_rgb(red, green, blue),
+                    name,
+                    *colour == current,
+                );
+                if ui.add(swatch).clicked() {
+                    picked = Some(*colour);
+                }
+            }
+        });
+    }
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Custom").size(13.0).color(palette.text_muted));
+        let mut text = typed.clone().unwrap_or_else(|| colour_to_hex(current));
+        let field = ui.add(
+            egui::TextEdit::singleline(&mut text)
+                .desired_width(80.0)
+                .char_limit(7),
+        );
+        field.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, "Colour code"));
+        if field.changed() {
+            if let Some(colour) = colour_from_hex(&text) {
+                picked = Some(colour);
+            }
+            *typed = Some(text);
+        } else if !field.has_focus() {
+            *typed = None;
+        }
+    });
+    let mut chosen = shown;
+    egui::color_picker::color_picker_color32(ui, &mut chosen, egui::color_picker::Alpha::Opaque);
+    if chosen != shown {
+        picked = Some([chosen.r(), chosen.g(), chosen.b()]);
+    }
+    picked
+}
+
 fn panel_card(fill: Color32, inner: Margin) -> Frame {
     Frame::new()
         .fill(fill)
@@ -4953,6 +5099,7 @@ fn media_card(
                     entry.info.duration
                 },
                 sound_only: entry.info.is_sound_only(),
+                title: None,
             };
             ui.dnd_drag_source(drag_id, payload, |ui| {
                 let width = ui.available_width();
@@ -5177,6 +5324,7 @@ mod tests {
     use super::*;
     use bareclip_core::placement::{Placement, WHOLE};
     use bareclip_core::speed::Speed;
+    use bareclip_core::title::TitleSpot;
     use eframe::{egui_wgpu, wgpu};
     use std::{process::Command, sync::OnceLock, time::Instant};
 
@@ -9038,8 +9186,7 @@ mod tests {
         let area = editor.timeline_state.layout.area;
         let lanes_say = |output: &egui::FullOutput| {
             let shown = text_in(output, area);
-            ["Drag a clip here for a new track", "Add audio"]
-                .map(|hint| shown.contains(&hint.to_owned()))
+            ["Add text", "Add audio"].map(|hint| shown.contains(&hint.to_owned()))
         };
         let output = run_frame(&ctx, &mut editor, vec![]);
         assert_eq!(lanes_say(&output), [true, true]);
@@ -12812,6 +12959,1458 @@ mod tests {
         camera.shoot(&ctx, &mut editor, vec![], "export-04-sound-only");
     }
 
+    // Titles.
+
+    /// A title added at the playhead, and its clip.
+    fn with_a_title(ctx: &egui::Context, editor: &mut Editor, style: TitleStyle) -> ClipId {
+        let time = editor.position();
+        editor.add_title(style, time, None);
+        run_frame(ctx, editor, vec![]);
+        editor.selected.expect("the new title is selected")
+    }
+
+    fn title_of_clip(editor: &Editor, id: ClipId) -> Title {
+        let clip = editor.project.tracks.clip(id).expect("the clip is there");
+        editor.title_of(clip).expect("it is a title").clone()
+    }
+
+    fn set_title_text(ctx: &egui::Context, editor: &mut Editor, id: ClipId, words: &str) {
+        let clip = editor.project.tracks.clip(id).expect("the clip is there");
+        editor.change_title(clip.media, |title| title.text = words.to_owned());
+        run_frame(ctx, editor, vec![]);
+    }
+
+    #[test]
+    fn the_text_tab_opens_the_text_panel_and_my_media_goes_back() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.left_panel, LeftPanel::Media);
+
+        click_named(&ctx, &mut editor, "Text");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.left_panel, LeftPanel::Text);
+        assert!(editor.media_panel_open);
+        assert!(is_named(&ctx, &mut editor, "Add Outlined"));
+
+        click_named(&ctx, &mut editor, "My media");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.left_panel, LeftPanel::Media);
+        assert!(!is_named(&ctx, &mut editor, "Add Outlined"));
+    }
+
+    #[test]
+    fn pressing_the_open_tab_closes_the_panel() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Text");
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Text");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(!editor.media_panel_open);
+    }
+
+    #[test]
+    fn pressing_a_style_adds_it_at_the_playhead_and_selects_it_for_five_seconds() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        editor.seek(Ticks::from_seconds(1.0));
+        let video = editor.project.tracks.played().clips()[0].id;
+        let video_start = editor.project.tracks.clip(video).map(|clip| clip.start);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        click_named(&ctx, &mut editor, "Text");
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Add Pill");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let id = editor.selected.expect("the title is selected");
+        assert_ne!(id, video);
+        let clip = editor
+            .project
+            .tracks
+            .clip(id)
+            .expect("it is on the timeline");
+        assert!(clip.is_title());
+        assert_eq!(clip.start, Ticks::from_seconds(1.0));
+        assert_eq!(clip.duration(), Ticks::from_seconds(5.0));
+        assert_eq!(title_of_clip(&editor, id).style, TitleStyle::Pill);
+        assert!(editor.project.tracks.is_text_row(0));
+        assert_eq!(
+            editor.project.tracks.clip(video).map(|clip| clip.start),
+            video_start,
+            "adding a title moves nothing else"
+        );
+    }
+
+    #[test]
+    fn the_lane_above_opens_the_text_panel_and_adds_nothing() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        let rows = editor.project.tracks.tracks().len();
+
+        let lane = editor.timeline_state.layout.new_lane_above();
+        press_without_following_up(&ctx, &mut editor, lane.center());
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert_eq!(editor.left_panel, LeftPanel::Text);
+        assert!(editor.media_panel_open);
+        assert_eq!(editor.project.tracks.tracks().len(), rows);
+    }
+
+    #[test]
+    fn dropping_a_style_on_the_timeline_makes_a_title_where_it_lands() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let events = timeline::TimelineEvents {
+            drop_title: Some((
+                TitleStyle::Framed,
+                Ticks::from_seconds(2.0),
+                TrackTarget::Existing(0),
+            )),
+            ..Default::default()
+        };
+        editor.apply_timeline_events(events, false);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let id = editor.selected.expect("the title is selected");
+        let clip = editor
+            .project
+            .tracks
+            .clip(id)
+            .expect("it is on the timeline");
+        assert_eq!(clip.start, Ticks::from_seconds(2.0));
+        assert_eq!(editor.project.tracks.track_of(id), Some(0));
+        assert_eq!(
+            editor.project.tracks.tracks().len(),
+            2,
+            "on a row of its own"
+        );
+    }
+
+    #[test]
+    fn titles_stay_out_of_the_media_panel() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        with_a_title(&ctx, &mut editor, TitleStyle::Plain);
+        assert_eq!(editor.visible_media().count(), 0);
+        assert_eq!(editor.listed_media().len(), 0);
+        assert!(editor.media.iter().any(|entry| entry.id.is_title()));
+    }
+
+    #[test]
+    fn a_title_on_its_own_makes_a_canvas_and_a_later_video_sets_the_size() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let id = with_a_title(&ctx, &mut editor, TitleStyle::Plain);
+        let drawn_for = editor.project.canvas.size();
+        assert_eq!(drawn_for, bareclip_core::canvas::EMPTY_SIZE);
+
+        let videos = with_videos(&ctx, &[test_clip()]);
+        let size = (
+            videos.media[0].info.video.width,
+            videos.media[0].info.video.height,
+        );
+        drop(videos);
+        let added = editor.load(&ctx, test_clip()).expect("it opens");
+        let media = added.id;
+        editor.media.push(added);
+        editor.add_to_timeline(media);
+        run_frame(&ctx, &mut editor, vec![]);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert_eq!(editor.project.canvas.size(), size);
+        let clip = editor.project.tracks.clip(id).expect("it stays");
+        assert!(clip.start.0 == 0);
+        let entry = editor.entry(clip.media).expect("it has an entry");
+        assert_eq!(entry.title_drawn.as_ref().map(|drawn| drawn.1), Some(size));
+    }
+
+    #[test]
+    fn selecting_a_title_shows_its_controls_and_other_clips_dont_have_them() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        let video = Some(editor.project.tracks.played().clips()[0].id);
+        assert!(!is_named(&ctx, &mut editor, "Title text"));
+
+        with_a_title(&ctx, &mut editor, TitleStyle::Plain);
+        for control in [
+            "Title text",
+            "Font: Hanken Grotesk",
+            "Title size",
+            "Text colour",
+            "Background colour",
+            "Middle",
+            "Bottom right",
+        ] {
+            assert!(is_named(&ctx, &mut editor, control), "{control}");
+        }
+        assert!(!is_named(&ctx, &mut editor, "Second line text"));
+        assert!(!is_named(&ctx, &mut editor, "Accent colour"));
+
+        editor.selected = video;
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(!is_named(&ctx, &mut editor, "Title text"));
+    }
+
+    #[test]
+    fn styles_only_show_the_controls_they_have() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        with_a_title(&ctx, &mut editor, TitleStyle::Underlined);
+        assert!(is_named(&ctx, &mut editor, "Second line text"));
+        assert!(is_named(&ctx, &mut editor, "Accent colour"));
+    }
+
+    #[test]
+    fn a_titles_toolbar_has_no_crop_flips_or_picture_in_picture() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        with_a_title(&ctx, &mut editor, TitleStyle::Plain);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(is_named(&ctx, &mut editor, "Rotate by 90 degrees"));
+        assert!(is_named(&ctx, &mut editor, "More"));
+        assert!(!is_named(&ctx, &mut editor, "Crop"));
+        assert!(!is_named(&ctx, &mut editor, "Flip left to right"));
+        assert!(!is_named(&ctx, &mut editor, "Speed"));
+        assert!(!is_named(&ctx, &mut editor, "Sound"));
+    }
+
+    #[test]
+    fn changing_the_words_redraws_the_picture_and_keeps_its_place_and_sharpness() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let id = with_a_title(&ctx, &mut editor, TitleStyle::Plain);
+        let media = editor.project.tracks.clip(id).expect("it is there").media;
+        let before = editor
+            .entry(media)
+            .and_then(|entry| entry.still.clone())
+            .expect("drawn");
+
+        set_title_text(&ctx, &mut editor, id, "A good many more words");
+
+        let after = editor
+            .entry(media)
+            .and_then(|entry| entry.still.clone())
+            .expect("drawn");
+        assert!(after.width > before.width);
+        assert_ne!(after.id, before.id, "the GPU has to be sent the new one");
+        let clip = editor.project.tracks.clip(id).expect("it is there");
+        let canvas = editor.project.canvas.size();
+        let rect = clip.placement.rect((after.width, after.height), canvas);
+        assert!(
+            (rect.width - after.width as f32).abs() < 1.0,
+            "it shows its own pixels"
+        );
+        assert_eq!(
+            TitleSpot::of(clip.placement, (after.width, after.height), canvas),
+            Some(TitleSpot::Middle),
+            "it stays in the middle"
+        );
+    }
+
+    #[test]
+    fn a_title_in_a_corner_stays_there_as_it_grows() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let id = with_a_title(&ctx, &mut editor, TitleStyle::LowerThird);
+        let clip = editor.project.tracks.clip(id).expect("it is there");
+        let canvas = editor.project.canvas.size();
+        let size = editor.video_size(clip.media).expect("it has a size");
+        assert_eq!(
+            TitleSpot::of(clip.placement, size, canvas),
+            Some(TitleSpot::BottomLeft)
+        );
+
+        set_title_text(&ctx, &mut editor, id, "Much, much longer words than before");
+
+        let clip = editor.project.tracks.clip(id).expect("it is there");
+        let size = editor.video_size(clip.media).expect("it has a size");
+        assert_eq!(
+            TitleSpot::of(clip.placement, size, canvas),
+            Some(TitleSpot::BottomLeft)
+        );
+    }
+
+    #[test]
+    fn pressing_a_position_moves_the_title_as_one_undo_step() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let id = with_a_title(&ctx, &mut editor, TitleStyle::Plain);
+        let before = editor
+            .project
+            .tracks
+            .clip(id)
+            .expect("it is there")
+            .placement;
+
+        click_named(&ctx, &mut editor, "Top right");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let clip = editor.project.tracks.clip(id).expect("it is there");
+        let canvas = editor.project.canvas.size();
+        let size = editor.video_size(clip.media).expect("it has a size");
+        assert_eq!(
+            TitleSpot::of(clip.placement, size, canvas),
+            Some(TitleSpot::TopRight)
+        );
+        editor.undo();
+        assert_eq!(
+            editor
+                .project
+                .tracks
+                .clip(id)
+                .expect("it is there")
+                .placement,
+            before
+        );
+    }
+
+    #[test]
+    fn one_go_of_typing_is_one_undo_step() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let id = with_a_title(&ctx, &mut editor, TitleStyle::Plain);
+        let clip = editor.project.tracks.clip(id).expect("it is there");
+        // As if the box still had the keyboard.
+        editor.change_title(clip.media, |title| title.text = "O".to_owned());
+        editor.change_title(clip.media, |title| title.text = "On".to_owned());
+        editor.change_title(clip.media, |title| title.text = "One".to_owned());
+        assert!(editor.title_before.is_some());
+
+        // Nothing has the keyboard any more, so the step ends.
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.title_before.is_none());
+        assert_eq!(title_of_clip(&editor, id).text, "One");
+
+        editor.undo();
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(title_of_clip(&editor, id).text, TitleStyle::Plain.name());
+        let media = clip.media;
+        let drawn = editor
+            .entry(media)
+            .and_then(|entry| entry.title_drawn.clone());
+        assert_eq!(
+            drawn.map(|drawn| drawn.0.text),
+            Some(TitleStyle::Plain.name().to_owned())
+        );
+    }
+
+    #[test]
+    fn undoing_a_new_title_takes_it_off_the_timeline_and_redo_brings_it_back() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        with_a_title(&ctx, &mut editor, TitleStyle::Plain);
+        editor.undo();
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.project.tracks.is_empty());
+        assert!(editor.project.titles.is_empty());
+        editor.redo();
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.project.titles.len(), 1);
+        assert_eq!(editor.project.tracks.tracks().len(), 1);
+    }
+
+    #[test]
+    fn a_corner_drag_changes_the_titles_size_and_it_is_redrawn_when_let_go() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let id = with_a_title(&ctx, &mut editor, TitleStyle::Plain);
+        let start = editor.project.tracks.clip(id).expect("it is there");
+        let size = title_of_clip(&editor, id).size;
+        let bigger = Placement {
+            scale: start.placement.scale * 2,
+            ..start.placement
+        };
+
+        let event = stage::StageEvents {
+            place: Some((id, bigger)),
+            ..Default::default()
+        };
+        editor.apply_stage_events(event, true);
+        assert_eq!(title_of_clip(&editor, id).size, size * 2);
+        assert!(editor.title_resize.is_some(), "held, so not drawn yet");
+        editor.sync_titles();
+        let held = editor.project.tracks.clip(id).expect("it is there");
+        assert_eq!(held.placement.scale, bigger.scale);
+
+        editor.apply_stage_events(stage::StageEvents::default(), false);
+        editor.sync_titles();
+        let let_go = editor.project.tracks.clip(id).expect("it is there");
+        let canvas = editor.project.canvas.size();
+        let picture = editor.video_size(let_go.media).expect("it has a size");
+        let rect = let_go.placement.rect(picture, canvas);
+        assert!(
+            (rect.width - picture.0 as f32).abs() < 1.0,
+            "sharp again at its new size"
+        );
+        assert!(picture.1 > editor_start_height(start, &editor));
+
+        editor.undo();
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(title_of_clip(&editor, id).size, size);
+    }
+
+    /// How tall a clip's title showed when it started, from its placement.
+    fn editor_start_height(start: bareclip_core::timeline::Clip, editor: &Editor) -> u32 {
+        let canvas = editor.project.canvas.size();
+        let share = f64::from(start.placement.scale) / f64::from(bareclip_core::placement::WHOLE);
+        // A plain title is far wider than it is tall, so it fits the canvas by its width.
+        (share * f64::from(canvas.1)) as u32 / 3
+    }
+
+    #[test]
+    fn reset_puts_a_title_back_how_its_style_started_rather_than_filling_the_picture() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let id = with_a_title(&ctx, &mut editor, TitleStyle::Subtitle);
+        let started = editor.project.tracks.clip(id).expect("it is there");
+        let media = started.media;
+        editor.change_title(media, |title| title.size *= 3);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let event = stage::StageEvents {
+            place: Some((id, Placement::default())),
+            ..Default::default()
+        };
+        editor.apply_stage_events(event, false);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let clip = editor.project.tracks.clip(id).expect("it is there");
+        let canvas = editor.project.canvas.size();
+        let size = editor.video_size(media).expect("it has a size");
+        assert_eq!(
+            title_of_clip(&editor, id).size,
+            TitleStyle::Subtitle.starting_size()
+        );
+        assert_eq!(
+            TitleSpot::of(clip.placement, size, canvas),
+            Some(TitleSpot::BottomMiddle)
+        );
+        assert_eq!(clip.placement.scale, started.placement.scale);
+    }
+
+    #[test]
+    fn a_split_and_a_duplicate_each_get_a_title_of_their_own() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let first = with_a_title(&ctx, &mut editor, TitleStyle::Plain);
+        editor.seek(Ticks::from_seconds(2.0));
+        run_frame(&ctx, &mut editor, vec![]);
+        editor.split_at_playhead();
+        run_frame(&ctx, &mut editor, vec![]);
+        let second = editor.selected.expect("the second part is selected");
+        assert_ne!(first, second);
+
+        set_title_text(&ctx, &mut editor, second, "Changed");
+        assert_eq!(title_of_clip(&editor, first).text, TitleStyle::Plain.name());
+        assert_eq!(title_of_clip(&editor, second).text, "Changed");
+
+        editor.duplicate_clip(second);
+        run_frame(&ctx, &mut editor, vec![]);
+        let copy = editor.selected.expect("the copy is selected");
+        set_title_text(&ctx, &mut editor, copy, "Copy");
+        assert_eq!(title_of_clip(&editor, second).text, "Changed");
+        assert_eq!(title_of_clip(&editor, copy).text, "Copy");
+    }
+
+    #[test]
+    fn a_title_saves_and_comes_back_with_everything_about_it() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let id = with_a_title(&ctx, &mut editor, TitleStyle::Boxed);
+        let media = editor.project.tracks.clip(id).expect("it is there").media;
+        editor.change_title(media, |title| {
+            title.text = "Saved words".to_owned();
+            title.second_text = "And these".to_owned();
+            title.font = "Abril Fatface".to_owned();
+            title.colour = [1, 2, 3];
+            title.background = Some([4, 5, 6]);
+        });
+        run_frame(&ctx, &mut editor, vec![]);
+        let saved = title_of_clip(&editor, id);
+        let placement = editor
+            .project
+            .tracks
+            .clip(id)
+            .expect("it is there")
+            .placement;
+        let path =
+            std::env::temp_dir().join(format!("bareclip-title-{}.bareclip", std::process::id()));
+        assert!(editor.save_to(&path), "it saves");
+
+        let mut back = Editor::new(&ctx, false);
+        back.open_project(&ctx, &path);
+        run_frame(&ctx, &mut back, vec![]);
+
+        assert!(!back.has_unsaved_changes(), "opening it changes nothing");
+        let row = &back.project.tracks.tracks()[0];
+        let clip = row.clips()[0];
+        assert!(clip.is_title());
+        assert_eq!(back.title_of(clip), Some(&saved));
+        assert_eq!(clip.placement, placement);
+        assert!(
+            back.entry(clip.media)
+                .and_then(|entry| entry.still.clone())
+                .is_some()
+        );
+        assert_eq!(clip.duration(), Ticks::from_seconds(5.0));
+        let _ = std::fs::remove_file(&path);
+
+        // A title made after opening doesn't take the id of one already there.
+        let another = with_a_title(&ctx, &mut back, TitleStyle::Plain);
+        let new = back
+            .project
+            .tracks
+            .clip(another)
+            .expect("it is there")
+            .media;
+        assert_ne!(new, clip.media);
+    }
+
+    #[test]
+    fn a_deleted_titles_words_dont_stay_in_the_file() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let id = with_a_title(&ctx, &mut editor, TitleStyle::Plain);
+        assert_eq!(editor.current_file().titles.len(), 1);
+        editor.selected = Some(id);
+        editor.delete_selected();
+        assert!(editor.current_file().titles.is_empty());
+    }
+
+    #[test]
+    fn a_missing_font_is_reported_once_and_kept_in_the_file() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let id = with_a_title(&ctx, &mut editor, TitleStyle::Plain);
+        let media = editor.project.tracks.clip(id).expect("it is there").media;
+        editor.change_title(media, |title| {
+            title.font = "Nobody Has This Font".to_owned()
+        });
+        run_frame(&ctx, &mut editor, vec![]);
+        let notice = editor.notice.take().expect("it says so");
+        assert!(notice.contains("Nobody Has This Font"), "{notice}");
+
+        set_title_text(&ctx, &mut editor, id, "More words");
+        assert!(editor.notice.is_none(), "only said once");
+        assert_eq!(title_of_clip(&editor, id).font, "Nobody Has This Font");
+    }
+
+    #[test]
+    fn a_title_on_the_timeline_says_its_first_line_of_words() {
+        let title = Title {
+            text: "\nFirst line\nSecond line".to_owned(),
+            ..Title::default()
+        };
+        assert_eq!(Editor::title_label(&title), "First line");
+        let empty = Title {
+            text: String::new(),
+            ..Title::in_style(TitleStyle::Framed)
+        };
+        assert_eq!(Editor::title_label(&empty), "Framed");
+    }
+
+    #[test]
+    fn a_project_with_a_title_says_why_it_is_redrawn() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.export_route(), Route::Fast);
+        with_a_title(&ctx, &mut editor, TitleStyle::Plain);
+        assert_eq!(editor.export_route(), Route::Full(TITLES_REASON.to_owned()));
+    }
+
+    #[test]
+    fn a_title_exports_over_the_video_as_it_shows() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        for _ in 0..20 {
+            run_frame(&ctx, &mut editor, vec![]);
+            thread::sleep(Duration::from_millis(10));
+        }
+        // A big white box in the middle is easy to find in the finished video.
+        let id = with_a_title(&ctx, &mut editor, TitleStyle::TextBox);
+        let media = editor.project.tracks.clip(id).expect("it is there").media;
+        editor.change_title(media, |title| {
+            title.background = Some([255, 255, 255]);
+            title.colour = [255, 255, 255];
+            title.size = 200_000;
+        });
+        run_frame(&ctx, &mut editor, vec![]);
+        let output = output_called("with-title");
+
+        let report = exported_report(&ctx, &mut editor, &output);
+
+        assert!(matches!(report, ProjectReport::Full(_)), "{report:?}");
+        let mut reader = bareclip_media::PictureReader::open(&output).expect("it opens");
+        let picture = reader
+            .next_picture()
+            .expect("it decodes")
+            .expect("it has a picture");
+        let view = picture.view();
+        let middle = view.height as usize / 2 * view.y_stride + view.width as usize / 2;
+        assert!(
+            view.y[middle] > 200,
+            "the title shows, at {}",
+            view.y[middle]
+        );
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn a_project_of_only_a_title_exports() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        with_a_title(&ctx, &mut editor, TitleStyle::Plain);
+        let output = output_called("only-title");
+        let report = exported_report(&ctx, &mut editor, &output);
+        assert!(matches!(report, ProjectReport::Full(_)), "{report:?}");
+        let info = probe(&output).expect("it can be read");
+        assert!((info.duration.as_seconds() - 5.0).abs() < 0.2);
+        let _ = std::fs::remove_file(&output);
+    }
+
+    // Captions.
+
+    fn subtitle_file(name: &str, contents: &str) -> PathBuf {
+        let folder = std::env::temp_dir().join("bareclip-app-tests");
+        std::fs::create_dir_all(&folder).expect("the folder can be created");
+        let path = folder.join(format!("{name}-{}.srt", std::process::id()));
+        std::fs::write(&path, contents).expect("it can be written");
+        path
+    }
+
+    /// As many captions as asked for, a second each with half a second between.
+    fn long_subtitles(count: usize) -> String {
+        let time = |millis: usize| {
+            format!(
+                "{:02}:{:02}:{:02},{:03}",
+                millis / 3_600_000,
+                millis / 60_000 % 60,
+                millis / 1000 % 60,
+                millis % 1000
+            )
+        };
+        (0..count)
+            .map(|number| {
+                let start = number * 1500;
+                format!(
+                    "{}\n{} --> {}\nCaption number {number}\n\n",
+                    number + 1,
+                    time(start),
+                    time(start + 1000)
+                )
+            })
+            .collect()
+    }
+
+    const TWO_CAPTIONS: &str = "1\n00:00:01,000 --> 00:00:02,000\nFirst\n\n2\n00:00:03,000 --> 00:00:04,500\nSecond\nline\n";
+
+    fn captions_on_top(editor: &Editor) -> Vec<bareclip_core::timeline::Clip> {
+        editor.project.tracks.tracks()[0].clips().to_vec()
+    }
+
+    #[test]
+    fn importing_captions_puts_each_at_its_time_above_everything_as_one_undo_step() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let video = editor.project.tracks.played().clips()[0];
+        let path = subtitle_file("two", TWO_CAPTIONS);
+
+        editor.import_captions(&path);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let captions = captions_on_top(&editor);
+        assert_eq!(captions.len(), 2);
+        assert_eq!(captions[0].start, Ticks::from_seconds(1.0));
+        assert_eq!(captions[1].start, Ticks::from_seconds(3.0));
+        assert_eq!(captions[1].duration(), Ticks::from_seconds(1.5));
+        let second = editor.title_of(captions[1]).expect("it is a title");
+        assert_eq!(second.text, "Second\nline");
+        assert_eq!(second.style, TitleStyle::Subtitle);
+        assert_eq!(second.spot, Some(TitleSpot::BottomMiddle));
+        assert_eq!(
+            editor.project.tracks.clip(video.id),
+            Some(video),
+            "nothing else moved"
+        );
+        assert!(editor.notice.is_none(), "this space is for problems");
+        assert_eq!(
+            editor.visible_media().count(),
+            1,
+            "they aren't in the media panel"
+        );
+
+        editor.undo();
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.project.tracks.tracks().len(), 1);
+        assert!(editor.project.titles.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_subtitle_file_added_like_any_other_goes_in_as_captions() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let path = subtitle_file("dropped", TWO_CAPTIONS);
+        editor.import(&ctx, std::slice::from_ref(&path));
+        assert_eq!(captions_on_top(&editor).len(), 2);
+        assert_eq!(editor.visible_media().count(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_file_with_no_captions_says_so_and_changes_nothing() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let path = subtitle_file("empty", "Just some notes\n");
+        editor.import_captions(&path);
+        assert!(editor.project.tracks.is_empty());
+        assert!(!editor.history.can_undo());
+        assert!(
+            editor
+                .notice
+                .as_deref()
+                .is_some_and(|said| said.contains("no captions"))
+        );
+        let _ = std::fs::remove_file(&path);
+
+        editor.notice = None;
+        editor.import_captions(&path);
+        assert!(
+            editor
+                .notice
+                .as_deref()
+                .is_some_and(|said| said.contains("could not be opened"))
+        );
+    }
+
+    #[test]
+    fn only_titles_near_the_playhead_have_a_picture() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let path = subtitle_file("many", &long_subtitles(100));
+        editor.import_captions(&path);
+        run_frame(&ctx, &mut editor, vec![]);
+        let drawn = |editor: &Editor| {
+            editor
+                .media
+                .iter()
+                .filter(|entry| entry.id.is_title())
+                .count()
+        };
+        assert!(drawn(&editor) <= 2, "{} are drawn", drawn(&editor));
+
+        editor.seek(Ticks::from_seconds(60.2));
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(drawn(&editor) <= 2, "{} are drawn", drawn(&editor));
+        let showing = editor.project.tracks.stack_at(
+            Ticks::from_seconds(60.2),
+            editor.project.canvas.size(),
+            &|id| editor.video_size(id),
+        );
+        let entry = editor
+            .entry(showing[0].media)
+            .expect("the one showing is drawn");
+        assert!(entry.still.is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn playing_through_captions_doesnt_make_a_saved_project_look_changed() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let path = subtitle_file("saved", &long_subtitles(20));
+        editor.import_captions(&path);
+        run_frame(&ctx, &mut editor, vec![]);
+        let project =
+            std::env::temp_dir().join(format!("bareclip-captions-{}.bareclip", std::process::id()));
+        assert!(editor.save_to(&project));
+        assert!(!editor.has_unsaved_changes());
+
+        for seconds in [4.2, 15.2, 25.7] {
+            editor.seek(Ticks::from_seconds(seconds));
+            run_frame(&ctx, &mut editor, vec![]);
+            assert!(!editor.has_unsaved_changes(), "at {seconds}");
+        }
+
+        let mut back = Editor::new(&ctx, false);
+        back.open_project(&ctx, &project);
+        run_frame(&ctx, &mut back, vec![]);
+        assert_eq!(back.project.titles.len(), 20);
+        assert!(!back.has_unsaved_changes());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&project);
+    }
+
+    #[test]
+    fn a_caption_comes_back_right_after_undo_even_if_it_was_drawn_since() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let path = subtitle_file("undo", TWO_CAPTIONS);
+        editor.import_captions(&path);
+        // Something to undo, from before the caption at 3 seconds was ever drawn.
+        let first = captions_on_top(&editor)[0].id;
+        editor.duplicate_clip(first);
+        editor.seek(Ticks::from_seconds(3.2));
+        run_frame(&ctx, &mut editor, vec![]);
+        let drawn = captions_on_top(&editor)
+            .last()
+            .copied()
+            .expect("it is there");
+
+        editor.undo();
+        editor.seek(Ticks::from_seconds(3.2));
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let back = captions_on_top(&editor)
+            .last()
+            .copied()
+            .expect("it is there");
+        assert_eq!(
+            back.placement.scale, drawn.placement.scale,
+            "it still fits its picture"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn selected_caption_with_keyboard(ctx: &egui::Context, editor: &mut Editor) -> ClipId {
+        let id = with_a_title(ctx, editor, TitleStyle::Subtitle);
+        editor.focus_title_text = true;
+        run_frame(ctx, editor, vec![]);
+        run_frame(ctx, editor, vec![]);
+        id
+    }
+
+    #[test]
+    fn enter_in_a_caption_starts_the_next_one_right_after_it_looking_the_same() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let first = selected_caption_with_keyboard(&ctx, &mut editor);
+        let media = editor
+            .project
+            .tracks
+            .clip(first)
+            .expect("it is there")
+            .media;
+        editor.change_title(media, |title| {
+            title.text = "One".to_owned();
+            title.font = "Abel".to_owned();
+        });
+        run_frame(&ctx, &mut editor, key_event(Key::Enter, Modifiers::NONE));
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let second = editor.selected.expect("the new one is selected");
+        assert_ne!(second, first);
+        let (one, two) = (
+            editor.project.tracks.clip(first).expect("it is there"),
+            editor.project.tracks.clip(second).expect("it is there"),
+        );
+        assert_eq!(two.start, one.end());
+        assert_eq!(two.duration(), one.duration());
+        assert_eq!(
+            editor.project.tracks.track_of(first),
+            editor.project.tracks.track_of(second)
+        );
+        let title = title_of_clip(&editor, second);
+        assert_eq!(title.text, "");
+        assert_eq!(title.font, "Abel");
+        assert_eq!(title_of_clip(&editor, first).text, "One");
+        assert_eq!(editor.position(), two.start, "it shows what is being typed");
+        assert!(
+            ctx.egui_wants_keyboard_input(),
+            "the box keeps the keyboard"
+        );
+
+        editor.undo();
+        assert!(editor.project.tracks.clip(second).is_none());
+        assert_eq!(
+            title_of_clip(&editor, first).text,
+            "One",
+            "the typing is its own step"
+        );
+    }
+
+    #[test]
+    fn enter_goes_to_the_caption_already_there_rather_than_making_another() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let path = subtitle_file(
+            "touching",
+            "00:00:01,000 --> 00:00:02,000\nOne\n\n00:00:02,020 --> 00:00:03,000\nTwo\n",
+        );
+        editor.import_captions(&path);
+        let captions = captions_on_top(&editor);
+        editor.selected = Some(captions[0].id);
+        editor.focus_title_text = true;
+        run_frame(&ctx, &mut editor, vec![]);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        run_frame(&ctx, &mut editor, key_event(Key::Enter, Modifiers::NONE));
+
+        assert_eq!(editor.selected, Some(captions[1].id));
+        assert_eq!(captions_on_top(&editor).len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_new_caption_stops_short_of_the_next_one() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let path = subtitle_file(
+            "room",
+            "00:00:01,000 --> 00:00:05,000\nLong\n\n00:00:06,000 --> 00:00:07,000\nNext\n",
+        );
+        editor.import_captions(&path);
+        let captions = captions_on_top(&editor);
+        editor.selected = Some(captions[0].id);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        editor.next_caption();
+
+        let after = captions_on_top(&editor);
+        assert_eq!(after.len(), 3);
+        assert_eq!(after[1].start, Ticks::from_seconds(5.0));
+        assert_eq!(after[1].duration(), Ticks::from_seconds(1.0));
+        assert_eq!(
+            after[2].start,
+            Ticks::from_seconds(6.0),
+            "the next one didn't move"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn enter_only_starts_a_new_caption_on_captions() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let id = with_a_title(&ctx, &mut editor, TitleStyle::Plain);
+        editor.focus_title_text = true;
+        run_frame(&ctx, &mut editor, vec![]);
+        run_frame(&ctx, &mut editor, vec![]);
+        run_frame(&ctx, &mut editor, key_event(Key::Enter, Modifiers::NONE));
+        assert_eq!(editor.selected, Some(id));
+        assert_eq!(editor.project.titles.len(), 1);
+    }
+
+    #[test]
+    fn a_change_to_a_captions_look_goes_to_the_whole_row_but_never_its_words() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let path = subtitle_file("row", TWO_CAPTIONS);
+        editor.import_captions(&path);
+        let captions = captions_on_top(&editor);
+        editor.selected = Some(captions[0].id);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(is_named(
+            &ctx,
+            &mut editor,
+            "Change every caption on this row"
+        ));
+
+        editor.change_title_look(captions[0].media, |title| {
+            title.font = "Abel".to_owned();
+            title.colour = [1, 2, 3];
+        });
+        run_frame(&ctx, &mut editor, vec![]);
+        for caption in &captions {
+            let title = editor.title_of(*caption).expect("it is a title");
+            assert_eq!(title.font, "Abel");
+            assert_eq!(title.colour, [1, 2, 3]);
+        }
+        assert_eq!(
+            editor.title_of(captions[0]).map(|t| t.text.as_str()),
+            Some("First")
+        );
+        assert_eq!(
+            editor.title_of(captions[1]).map(|t| t.text.as_str()),
+            Some("Second\nline")
+        );
+
+        editor.undo();
+        run_frame(&ctx, &mut editor, vec![]);
+        for caption in &captions {
+            assert_eq!(
+                editor.title_of(*caption).map(|t| t.colour),
+                Some([255, 255, 255])
+            );
+        }
+
+        click_named(&ctx, &mut editor, "Change every caption on this row");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(!editor.style_whole_row);
+        editor.change_title_look(captions[0].media, |title| title.colour = [9, 9, 9]);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(
+            editor.title_of(captions[0]).map(|t| t.colour),
+            Some([9, 9, 9])
+        );
+        assert_eq!(
+            editor.title_of(captions[1]).map(|t| t.colour),
+            Some([255, 255, 255])
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn other_styles_have_no_row_to_change() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let id = with_a_title(&ctx, &mut editor, TitleStyle::Plain);
+        editor.duplicate_clip(id);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.caption_mates().is_empty());
+        assert!(!is_named(
+            &ctx,
+            &mut editor,
+            "Change every caption on this row"
+        ));
+    }
+
+    #[test]
+    fn a_title_moved_by_hand_stops_following_its_position() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let id = with_a_title(&ctx, &mut editor, TitleStyle::Plain);
+        let clip = editor.project.tracks.clip(id).expect("it is there");
+        let moved = Placement {
+            center_x: clip.placement.center_x + 100_000,
+            ..clip.placement
+        };
+        let event = stage::StageEvents {
+            place: Some((id, moved)),
+            ..Default::default()
+        };
+        editor.apply_stage_events(event, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(title_of_clip(&editor, id).spot, None);
+
+        set_title_text(&ctx, &mut editor, id, "Longer words than before");
+        let after = editor.project.tracks.clip(id).expect("it is there");
+        assert_eq!(
+            after.placement.center_x, moved.center_x,
+            "it stays where it was put"
+        );
+    }
+
+    #[test]
+    fn captions_export_at_their_own_times() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let path = subtitle_file(
+            "export",
+            "00:00:00,000 --> 00:00:01,000\nOne\n\n00:00:02,000 --> 00:00:03,000\nTwo\n",
+        );
+        editor.import_captions(&path);
+        let captions = captions_on_top(&editor);
+        editor.selected = Some(captions[0].id);
+        run_frame(&ctx, &mut editor, vec![]);
+        // A big white box at the bottom is easy to find in the finished video.
+        editor.change_title_look(captions[0].media, |title| {
+            title.background = Some([255, 255, 255]);
+            title.colour = [255, 255, 255];
+            title.size = 200_000;
+        });
+        run_frame(&ctx, &mut editor, vec![]);
+        let output = output_called("captions");
+
+        let report = exported_report(&ctx, &mut editor, &output);
+        assert!(matches!(report, ProjectReport::Full(_)), "{report:?}");
+
+        let mut reader = bareclip_media::PictureReader::open(&output).expect("it opens");
+        let mut seen = Vec::new();
+        while let Some(picture) = reader.next_picture().expect("it decodes") {
+            let view = picture.view();
+            let at = (view.height as usize * 9 / 10) * view.y_stride + view.width as usize / 2;
+            seen.push((picture.time().as_seconds(), view.y[at]));
+        }
+        let bright_at = |moment: f64| {
+            seen.iter()
+                .min_by(|a, b| (a.0 - moment).abs().total_cmp(&(b.0 - moment).abs()))
+                .is_some_and(|(_, level)| *level > 200)
+        };
+        assert!(bright_at(0.5), "the first shows");
+        assert!(!bright_at(1.5), "nothing shows between them");
+        assert!(bright_at(2.5), "the second shows");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&output);
+    }
+
+    /// What a long subtitle file costs. `./scripts/cargo.ps1 test --release -p bareclip-app --bin bareclip how_long_captions_take '--' --ignored --nocapture`
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn how_long_captions_take() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        for count in [500, 3000] {
+            let path = subtitle_file(&format!("long-{count}"), &long_subtitles(count));
+            let started = Instant::now();
+            editor.import_captions(&path);
+            println!("{count} captions: imported in {:?}", started.elapsed());
+            run_frame(&ctx, &mut editor, vec![]);
+            let started = Instant::now();
+            for _ in 0..60 {
+                run_frame(&ctx, &mut editor, vec![]);
+            }
+            println!("  one frame at rest: {:?}", started.elapsed() / 60);
+            let started = Instant::now();
+            for step in 0..60 {
+                editor.seek(Ticks::from_seconds(f64::from(step) * 37.0));
+                run_frame(&ctx, &mut editor, vec![]);
+            }
+            println!("  one frame jumping about: {:?}", started.elapsed() / 60);
+            let started = Instant::now();
+            let _ = editor.current_file();
+            println!("  writing the project down: {:?}", started.elapsed());
+            let started = Instant::now();
+            let _ = editor.project.clone();
+            println!("  taking an undo step: {:?}", started.elapsed());
+            let _ = std::fs::remove_file(&path);
+            editor.undo();
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+    }
+
+    // Copying, pasting and how long a clip lasts.
+
+    fn right_click_menu_on(ctx: &egui::Context, editor: &mut Editor, id: ClipId) {
+        let row = editor.project.tracks.track_of(id).expect("it is on a row");
+        let clip = editor.project.tracks.clip(id).expect("it is there");
+        let scale = editor.timeline_state.scale;
+        let x = scale.x_of(Ticks((clip.start.0 + clip.end().0) / 2));
+        let y = editor.timeline_state.layout.track(row).center().y;
+        secondary_click(ctx, editor, pos2(x, y));
+        let_dialog_open(ctx, editor);
+    }
+
+    #[test]
+    fn the_clip_menu_has_the_same_lines_on_every_kind_of_clip() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        let video = editor.project.tracks.played().clips()[0].id;
+        let title = with_a_title(&ctx, &mut editor, TitleStyle::Plain);
+        for id in [video, title] {
+            right_click_menu_on(&ctx, &mut editor, id);
+            for line in [
+                "Duplicate",
+                "Copy",
+                "Paste",
+                "Delete",
+                "Split",
+                "Edit duration",
+            ] {
+                assert!(is_named(&ctx, &mut editor, line), "{line}");
+            }
+            run_frame(&ctx, &mut editor, key_event(Key::Escape, Modifiers::NONE));
+        }
+    }
+
+    #[test]
+    fn copying_a_clip_and_pasting_it_puts_a_copy_at_the_playhead_as_one_undo_step() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        let original = editor.project.tracks.played().clips()[0].id;
+        let source = editor
+            .project
+            .tracks
+            .clip(original)
+            .expect("it is there")
+            .source;
+        let end = editor
+            .project
+            .tracks
+            .clip(original)
+            .expect("it is there")
+            .end();
+        let placed = Placement {
+            opacity: 500_000,
+            ..Placement::default()
+        };
+        editor.project.tracks.set_placement(original, placed);
+
+        run_frame(&ctx, &mut editor, key_event(Key::C, Modifiers::COMMAND));
+        editor.seek(Ticks(end.0 + Ticks::from_seconds(5.0).0));
+        run_frame(&ctx, &mut editor, vec![]);
+        let at = editor.position();
+        run_frame(&ctx, &mut editor, key_event(Key::V, Modifiers::COMMAND));
+
+        let pasted = editor.selected.expect("the copy is selected");
+        assert_ne!(pasted, original);
+        let clip = editor
+            .project
+            .tracks
+            .clip(pasted)
+            .expect("it is on the timeline");
+        assert_eq!(clip.source, source);
+        assert_eq!(clip.placement, placed);
+        assert_eq!(clip.start, at);
+        assert_eq!(
+            editor.project.tracks.track_of(pasted),
+            editor.project.tracks.track_of(original)
+        );
+
+        editor.undo();
+        assert!(editor.project.tracks.clip(pasted).is_none());
+        assert!(editor.project.tracks.clip(original).is_some());
+    }
+
+    #[test]
+    fn pasting_with_nothing_copied_does_nothing() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        run_frame(&ctx, &mut editor, key_event(Key::V, Modifiers::COMMAND));
+        assert!(editor.project.tracks.is_empty());
+        assert!(!editor.history.can_undo());
+    }
+
+    #[test]
+    fn a_pasted_title_has_a_title_of_its_own_and_lands_on_a_row_of_titles() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let original = with_a_title(&ctx, &mut editor, TitleStyle::Plain);
+        editor.copy_clip(original);
+        editor.seek(Ticks::from_seconds(10.0));
+        run_frame(&ctx, &mut editor, vec![]);
+        editor.paste_clip();
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let pasted = editor.selected.expect("the copy is selected");
+        assert!(
+            editor
+                .project
+                .tracks
+                .is_text_row(editor.project.tracks.track_of(pasted).expect("it landed"))
+        );
+        set_title_text(&ctx, &mut editor, pasted, "Pasted");
+        assert_eq!(
+            title_of_clip(&editor, original).text,
+            TitleStyle::Plain.name()
+        );
+    }
+
+    #[test]
+    fn a_copied_clip_can_come_back_after_its_video_was_removed_from_the_panel() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        let media = editor.media[0].id;
+        editor.add_to_timeline(media);
+        run_frame(&ctx, &mut editor, vec![]);
+        editor.copy_clip(editor.selected.expect("it is selected"));
+        editor.remove_media(media);
+        assert_eq!(editor.visible_media().count(), 0);
+        editor.paste_clip();
+        assert_eq!(editor.visible_media().count(), 1);
+    }
+
+    #[test]
+    fn typing_a_duration_makes_a_title_that_long_as_one_undo_step() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let id = with_a_title(&ctx, &mut editor, TitleStyle::Plain);
+        editor.open_edit_duration(id);
+        let_dialog_open(&ctx, &mut editor);
+        assert_eq!(
+            editor
+                .duration_edit
+                .as_ref()
+                .map(|edit| edit.typed.as_str()),
+            Some("5")
+        );
+        assert!(is_named(&ctx, &mut editor, "Duration"));
+
+        editor.duration_edit.as_mut().expect("it is open").typed = "1:30".to_owned();
+        click_named(&ctx, &mut editor, "Apply");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert!(editor.duration_edit.is_none());
+        let clip = editor.project.tracks.clip(id).expect("it is there");
+        assert_eq!(clip.duration(), Ticks::from_seconds(90.0));
+        editor.undo();
+        let clip = editor.project.tracks.clip(id).expect("it is there");
+        assert_eq!(clip.duration(), Ticks::from_seconds(5.0));
+    }
+
+    #[test]
+    fn something_that_isnt_a_duration_leaves_the_clip_alone_and_the_window_open() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let id = with_a_title(&ctx, &mut editor, TitleStyle::Plain);
+        editor.open_edit_duration(id);
+        let_dialog_open(&ctx, &mut editor);
+        editor.duration_edit.as_mut().expect("it is open").typed = "soon".to_owned();
+        click_named(&ctx, &mut editor, "Apply");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.duration_edit.is_some());
+        assert!(editor.notice.is_some());
+        let clip = editor.project.tracks.clip(id).expect("it is there");
+        assert_eq!(clip.duration(), Ticks::from_seconds(5.0));
+    }
+
+    #[test]
+    fn a_video_cant_be_made_longer_than_its_footage_and_says_so() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        let footage = editor.media[0].info.duration;
+        let id = editor.project.tracks.played().clips()[0].id;
+
+        assert!(editor.apply_duration(id, "9000"));
+
+        let clip = editor.project.tracks.clip(id).expect("it is there");
+        assert_eq!(clip.source.end, footage);
+        assert!(editor.notice.is_some());
+    }
+
+    /// `$env:BARECLIP_SCREENS = '<folder>'; ./scripts/cargo.ps1 test -p bareclip-app --bin bareclip draw_the_title_screens '--' --ignored`
+    #[test]
+    #[ignore = "makes pictures to look at, not a check"]
+    fn draw_the_title_screens() {
+        let folder = std::env::var_os("BARECLIP_SCREENS").map_or_else(
+            || std::env::temp_dir().join("bareclip-screens"),
+            PathBuf::from,
+        );
+        let ctx = context();
+        let mut camera = Camera::new(folder);
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        editor.use_gpu(LayerDisplay::new(
+            camera.device.clone(),
+            camera.queue.clone(),
+            camera.renderer.clone(),
+        ));
+        for _ in 0..30 {
+            run_frame(&ctx, &mut editor, vec![]);
+            thread::sleep(Duration::from_millis(10));
+        }
+        for _ in 0..12 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "title-01-lanes");
+
+        click_named(&ctx, &mut editor, "Text");
+        for _ in 0..12 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "title-02-text-panel");
+
+        with_a_title(&ctx, &mut editor, TitleStyle::Outlined);
+        for _ in 0..12 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "title-03-selected");
+
+        click_named(&ctx, &mut editor, "Font: Hanken Grotesk");
+        for _ in 0..24 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "title-04-font-list");
+        run_frame(&ctx, &mut editor, key_event(Key::Escape, Modifiers::NONE));
+
+        click_named(&ctx, &mut editor, "Text colour");
+        for _ in 0..12 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "title-05-colour");
+        run_frame(&ctx, &mut editor, key_event(Key::Escape, Modifiers::NONE));
+
+        with_a_title(&ctx, &mut editor, TitleStyle::LowerThird);
+        for _ in 0..12 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "title-06-two-titles");
+
+        let id = editor.selected.expect("the title is selected");
+        right_click_menu_on(&ctx, &mut editor, id);
+        for _ in 0..12 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "title-07-clip-menu");
+        run_frame(&ctx, &mut editor, key_event(Key::Escape, Modifiers::NONE));
+
+        editor.open_edit_duration(id);
+        for _ in 0..12 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "title-08-duration");
+        editor.duration_edit = None;
+
+        // A full-size project, to judge how sharp the words really are.
+        let big = make_clip("title-screen-big", "1920x1080");
+        let mut editor = with_videos(&ctx, &[&big]);
+        editor.use_gpu(LayerDisplay::new(
+            camera.device.clone(),
+            camera.queue.clone(),
+            camera.renderer.clone(),
+        ));
+        for _ in 0..30 {
+            run_frame(&ctx, &mut editor, vec![]);
+            thread::sleep(Duration::from_millis(10));
+        }
+        with_a_title(&ctx, &mut editor, TitleStyle::Underlined);
+        for _ in 0..30 {
+            run_frame(&ctx, &mut editor, vec![]);
+            thread::sleep(Duration::from_millis(10));
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "title-09-full-size");
+
+        // Captions from a file, with the controls they add.
+        let path = subtitle_file("screen", TWO_CAPTIONS);
+        editor.import_captions(&path);
+        editor.left_panel = LeftPanel::Text;
+        let captions = captions_on_top(&editor);
+        editor.selected = Some(captions[0].id);
+        editor.seek(Ticks::from_seconds(1.2));
+        for _ in 0..30 {
+            run_frame(&ctx, &mut editor, vec![]);
+            thread::sleep(Duration::from_millis(10));
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "title-10-captions");
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// `$env:BARECLIP_SCREENS = '<folder>'; ./scripts/cargo.ps1 test -p bareclip-app draw_the_sound_screens '--' --ignored`
     #[test]
     #[ignore = "needs a real GPU, and draws pictures to look at rather than checking anything"]
@@ -13775,6 +15374,7 @@ mod tests {
             speed: Default::default(),
         };
         let mut file = ProjectFile {
+            titles: Vec::new(),
             audio_tracks: Vec::new(),
             row_sound: Vec::new(),
             version: 2,

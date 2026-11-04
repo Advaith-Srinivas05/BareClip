@@ -46,6 +46,8 @@ pub struct Stretch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RowKind {
     Picture,
+    /// Only holds titles. These sit among the picture rows, because they are pictures too.
+    Text,
     Sound,
 }
 
@@ -163,14 +165,21 @@ impl Tracks {
         self.picture_rows
     }
 
-    /// Where a drop on this target really lands for a clip of one kind or the other.
-    pub fn target_for(&self, target: TrackTarget, sound_only: bool) -> TrackTarget {
+    /// Where a drop on this target really lands for a clip of this media.
+    pub fn target_for(&self, target: TrackTarget, media: MediaId, sound_only: bool) -> TrackTarget {
         let kind = if sound_only {
             RowKind::Sound
+        } else if media.is_title() {
+            RowKind::Text
         } else {
             RowKind::Picture
         };
         self.fitted_target(target, kind)
+    }
+
+    /// Whether a row only holds titles.
+    pub fn is_text_row(&self, row: usize) -> bool {
+        self.kind_of_row(row) == RowKind::Text
     }
 
     /// Whether a row only holds sound.
@@ -298,10 +307,17 @@ impl Tracks {
         }
     }
 
-    /// Adds a clip after every other picture, on the top row, so nothing covers it and
-    /// nothing has to move for it.
+    /// Adds a clip after every other picture, on the top row that takes it, so nothing covers it
+    /// and nothing has to move for it. Titles don't count, because they go over pictures.
     pub fn push(&mut self, media: MediaId, source: TimeRange) -> ClipId {
-        let end = self.played.duration();
+        let end = self
+            .picture_tracks()
+            .iter()
+            .flat_map(Timeline::clips)
+            .filter(|clip| !clip.is_title())
+            .map(|clip| clip.end())
+            .max()
+            .unwrap_or(Ticks(0));
         self.place(media, source, end, TrackTarget::Existing(0))
     }
 
@@ -313,10 +329,106 @@ impl Tracks {
         wanted: Ticks,
         target: TrackTarget,
     ) -> ClipId {
-        let index = self.make_room(target, RowKind::Picture);
+        let kind = Self::kind_of_picture(media);
+        let index = self.make_room(target, kind);
         let id = self.tracks[index].place(media, source, wanted);
         self.refresh();
         id
+    }
+
+    /// Adds a title exactly at a moment, without moving anything: on the top row if that is a row
+    /// of titles with room, or otherwise on a new row above everything.
+    pub fn place_title(&mut self, media: MediaId, source: TimeRange, time: Ticks) -> ClipId {
+        let (start, end) = (time, Ticks(time.0 + source.duration().0));
+        let room_on_top = self.picture_rows > 0
+            && self.is_text_row(0)
+            && !self.tracks[0]
+                .clips()
+                .iter()
+                .any(|clip| clip.start < end && start < clip.end());
+        let target = if room_on_top {
+            TrackTarget::Existing(0)
+        } else {
+            TrackTarget::New(0)
+        };
+        self.place(media, source, time, target)
+    }
+
+    /// Adds a lot of titles at once, each at exactly its own time, on as few new rows above
+    /// everything as keeps them from overlapping. `titles` must be in order of time. Returns the
+    /// new clips.
+    pub fn place_captions(&mut self, titles: &[(MediaId, TimeRange, Ticks)]) -> Vec<ClipId> {
+        let mut rows: Vec<Vec<Clip>> = Vec::new();
+        let mut ids = Vec::with_capacity(titles.len());
+        for (media, source, start) in titles {
+            let clip = Clip {
+                id: next_clip_id(),
+                media: *media,
+                start: *start,
+                source: *source,
+                placement: Placement::default(),
+                sound: ClipSound::default(),
+                speed: Speed::default(),
+            };
+            ids.push(clip.id);
+            let free = rows
+                .iter_mut()
+                .find(|row| row.last().is_none_or(|last| last.end() <= clip.start));
+            match free {
+                Some(row) => row.push(clip),
+                None => rows.push(vec![clip]),
+            }
+        }
+        self.picture_rows += rows.len();
+        for (place, row) in rows.into_iter().enumerate() {
+            self.tracks.insert(place, Timeline::from_ordered(row));
+        }
+        self.refresh();
+        ids
+    }
+
+    /// Adds a copy of a clip as close as it can get to a moment, on the row it came from if there
+    /// still is one of its kind there, showing `media`.
+    pub fn place_copy(
+        &mut self,
+        clip: Clip,
+        media: MediaId,
+        wanted: Ticks,
+        target: TrackTarget,
+        sound_only: bool,
+    ) -> ClipId {
+        let kind = if sound_only {
+            RowKind::Sound
+        } else {
+            Self::kind_of_picture(media)
+        };
+        let index = self.make_room(target, kind);
+        let id = self.tracks[index].place_copy(clip, media, wanted);
+        self.refresh();
+        id
+    }
+
+    /// Makes a clip show something else. A split or a copy of a title gets a title of its own this
+    /// way, so changing one doesn't change the other.
+    pub fn set_media(&mut self, id: ClipId, media: MediaId) -> bool {
+        let Some(track) = self.track_of(id) else {
+            return false;
+        };
+        let changed = self.tracks[track].set_media(id, media);
+        self.refresh();
+        changed
+    }
+
+    /// Makes a clip last this long on the timeline, as far as its footage allows. It keeps its
+    /// start, and later clips on its row move along only as far as they must. Returns whether that
+    /// changed anything.
+    pub fn set_duration(&mut self, id: ClipId, duration: Ticks, source_length: Ticks) -> bool {
+        let Some(track) = self.track_of(id) else {
+            return false;
+        };
+        let changed = self.tracks[track].set_duration(id, duration, source_length);
+        self.refresh();
+        changed
     }
 
     /// Adds sound after whatever is on the top sound row.
@@ -550,7 +662,10 @@ impl Tracks {
         let overlapping = self.overlapping_tracks(clip);
         let above = overlapping.iter().copied().filter(|index| *index < own);
         let below = overlapping.iter().copied().filter(|index| *index > own);
-        let is_free = |index: usize| !overlapping.contains(&index) && index != own;
+        let kind = self.kind_of_row(own);
+        let is_free = |index: usize| {
+            !overlapping.contains(&index) && index != own && self.kind_of_row(index) == kind
+        };
         let target = match order {
             OrderMove::Forward | OrderMove::ToFront => {
                 let past = if order == OrderMove::Forward {
@@ -604,11 +719,14 @@ impl Tracks {
     ) -> Vec<Clip> {
         let mut stack = Vec::new();
         for track in self.picture_tracks() {
-            let found = track
-                .clips()
-                .iter()
-                .find(|clip| time >= clip.start && time < clip.end());
-            let Some(clip) = found else {
+            // Clips are in order of time, and a project can hold thousands of captions.
+            let clips = track.clips();
+            let after = clips.partition_point(|clip| clip.start <= time);
+            let Some(clip) = after
+                .checked_sub(1)
+                .map(|index| &clips[index])
+                .filter(|clip| time < clip.end())
+            else {
                 continue;
             };
             stack.push(*clip);
@@ -836,6 +954,21 @@ impl Tracks {
     fn kind_of_row(&self, row: usize) -> RowKind {
         if self.is_sound_row(row) {
             RowKind::Sound
+        } else if self
+            .tracks
+            .get(row)
+            .and_then(|track| track.clips().first())
+            .is_some_and(|clip| clip.is_title())
+        {
+            RowKind::Text
+        } else {
+            RowKind::Picture
+        }
+    }
+
+    fn kind_of_picture(media: MediaId) -> RowKind {
+        if media.is_title() {
+            RowKind::Text
         } else {
             RowKind::Picture
         }
@@ -843,19 +976,42 @@ impl Tracks {
 
     /// The nearest target to this one that a kind of clip can go on.
     fn fitted_target(&self, target: TrackTarget, kind: RowKind) -> TrackTarget {
-        let rows = match kind {
-            RowKind::Picture => 0..self.picture_rows,
-            RowKind::Sound => self.picture_rows..self.tracks.len(),
-        };
-        match target {
-            TrackTarget::Existing(row) if rows.contains(&row) => target,
+        let pictures = 0..self.picture_rows;
+        match (kind, target) {
+            (RowKind::Sound, TrackTarget::Existing(row))
+                if row >= self.picture_rows && row < self.tracks.len() =>
+            {
+                target
+            }
             // The two kinds meet in the middle, so that is the nearest row of the other kind.
-            TrackTarget::Existing(_) if rows.is_empty() => TrackTarget::New(self.picture_rows),
-            TrackTarget::Existing(_) => TrackTarget::Existing(match kind {
-                RowKind::Picture => self.picture_rows - 1,
-                RowKind::Sound => self.picture_rows,
-            }),
-            TrackTarget::New(row) => TrackTarget::New(row.clamp(rows.start, rows.end)),
+            (RowKind::Sound, TrackTarget::Existing(_)) if self.audio_tracks().is_empty() => {
+                TrackTarget::New(self.picture_rows)
+            }
+            (RowKind::Sound, TrackTarget::Existing(_)) => TrackTarget::Existing(self.picture_rows),
+            (RowKind::Sound, TrackTarget::New(row)) => {
+                TrackTarget::New(row.clamp(self.picture_rows, self.tracks.len()))
+            }
+            (_, TrackTarget::New(row)) => TrackTarget::New(row.min(self.picture_rows)),
+            (RowKind::Text, TrackTarget::Existing(row)) if self.is_text_row(row) => target,
+            // A title dropped on anything else makes a row of its own just above it.
+            (RowKind::Text, TrackTarget::Existing(row)) => {
+                TrackTarget::New(row.min(self.picture_rows))
+            }
+            (RowKind::Picture, TrackTarget::Existing(row))
+                if pictures.contains(&row) && !self.is_text_row(row) =>
+            {
+                target
+            }
+            (RowKind::Picture, TrackTarget::Existing(row)) => {
+                let nearest = pictures
+                    .filter(|other| !self.is_text_row(*other))
+                    .min_by_key(|other| other.abs_diff(row));
+                match nearest {
+                    Some(other) => TrackTarget::Existing(other),
+                    // Only titles so far, and pictures go under them.
+                    None => TrackTarget::New(self.picture_rows),
+                }
+            }
         }
     }
 
@@ -866,7 +1022,7 @@ impl Tracks {
             TrackTarget::New(index) => index,
         };
         self.tracks.insert(new_at, Timeline::default());
-        if kind == RowKind::Picture {
+        if kind != RowKind::Sound {
             self.picture_rows += 1;
         }
         new_at
@@ -1006,6 +1162,7 @@ fn merged(covered: Vec<TimeRange>, track: &Timeline) -> Vec<TimeRange> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::time::TICKS_PER_SECOND;
 
     use crate::placement::WHOLE;
 
@@ -1032,6 +1189,362 @@ mod tests {
 
     fn sound_of(tracks: &Tracks, id: ClipId) -> ClipSound {
         tracks.clip(id).expect("the clip is there").sound
+    }
+
+    fn seconds(start: i64, end: i64) -> TimeRange {
+        range(start * TICKS_PER_SECOND, end * TICKS_PER_SECOND)
+    }
+
+    fn a_title() -> MediaId {
+        MediaId::for_title(1)
+    }
+
+    #[test]
+    fn a_new_title_goes_on_a_row_of_its_own_above_everything_and_moves_nothing() {
+        let mut tracks = Tracks::default();
+        let video = tracks.push(MediaId(1), seconds(0, 10));
+        let title = tracks.place_title(a_title(), TimeRange::new_title(), Ticks(TICKS_PER_SECOND));
+
+        assert_eq!(tracks.track_of(title), Some(0));
+        assert_eq!(tracks.track_of(video), Some(1));
+        assert!(tracks.is_text_row(0));
+        assert!(!tracks.is_text_row(1));
+        assert_eq!(tracks.clip(video).map(|clip| clip.start), Some(Ticks(0)));
+        assert_eq!(
+            tracks.clip(title).map(|clip| clip.start),
+            Some(Ticks(TICKS_PER_SECOND))
+        );
+    }
+
+    #[test]
+    fn captions_land_at_exactly_their_times_on_one_new_row_above_everything() {
+        let mut tracks = Tracks::default();
+        let video = tracks.push(MediaId(1), seconds(0, 10));
+        let source = TimeRange::new_title();
+        let times = [0, 2, 3, 9];
+        let titles: Vec<(MediaId, TimeRange, Ticks)> = times
+            .iter()
+            .enumerate()
+            .map(|(number, at)| {
+                (
+                    MediaId::for_title(number as u64),
+                    TimeRange {
+                        start: source.start,
+                        end: Ticks(source.start.0 + TICKS_PER_SECOND),
+                    },
+                    Ticks(at * TICKS_PER_SECOND),
+                )
+            })
+            .collect();
+
+        let ids = tracks.place_captions(&titles);
+
+        assert_eq!(tracks.picture_rows(), 2);
+        assert!(tracks.is_text_row(0));
+        assert_eq!(tracks.track_of(video), Some(1));
+        for (id, at) in ids.iter().zip(times) {
+            assert_eq!(tracks.track_of(*id), Some(0));
+            assert_eq!(
+                tracks.clip(*id).map(|clip| clip.start),
+                Some(Ticks(at * TICKS_PER_SECOND))
+            );
+        }
+    }
+
+    #[test]
+    fn captions_that_overlap_go_on_another_row_and_keep_their_times() {
+        let mut tracks = Tracks::default();
+        let source = TimeRange::new_title();
+        let lasting = |length: i64| TimeRange {
+            start: source.start,
+            end: Ticks(source.start.0 + length * TICKS_PER_SECOND),
+        };
+        let ids = tracks.place_captions(&[
+            (MediaId::for_title(1), lasting(4), Ticks(0)),
+            (MediaId::for_title(2), lasting(1), Ticks(TICKS_PER_SECOND)),
+            (
+                MediaId::for_title(3),
+                lasting(1),
+                Ticks(5 * TICKS_PER_SECOND),
+            ),
+        ]);
+        assert_eq!(tracks.tracks().len(), 2);
+        assert_eq!(tracks.track_of(ids[0]), Some(0));
+        assert_eq!(tracks.track_of(ids[1]), Some(1));
+        assert_eq!(
+            tracks.track_of(ids[2]),
+            Some(0),
+            "the first row has room again"
+        );
+        assert_eq!(
+            tracks.clip(ids[1]).map(|clip| clip.start),
+            Some(Ticks(TICKS_PER_SECOND))
+        );
+    }
+
+    #[test]
+    fn what_is_at_a_moment_is_found_among_many_clips_and_in_the_gaps_between() {
+        let mut tracks = Tracks::default();
+        let source = TimeRange::new_title();
+        let titles: Vec<(MediaId, TimeRange, Ticks)> = (0..1000)
+            .map(|number| {
+                (
+                    MediaId::for_title(number),
+                    TimeRange {
+                        start: source.start,
+                        end: Ticks(source.start.0 + TICKS_PER_SECOND),
+                    },
+                    Ticks(number as i64 * 2 * TICKS_PER_SECOND),
+                )
+            })
+            .collect();
+        tracks.place_captions(&titles);
+        let at = |seconds: f64| tracks.stack_at(Ticks::from_seconds(seconds), WIDE, &all_wide);
+        assert_eq!(at(0.0)[0].media, MediaId::for_title(0));
+        assert_eq!(at(1000.5)[0].media, MediaId::for_title(500));
+        assert!(at(1001.5).is_empty());
+        assert!(at(5000.0).is_empty());
+    }
+
+    #[test]
+    fn a_new_title_lasts_five_seconds() {
+        let mut tracks = Tracks::default();
+        let title = tracks.place_title(a_title(), TimeRange::new_title(), Ticks(0));
+        assert_eq!(
+            tracks.clip(title).map(|clip| clip.duration()),
+            Some(Ticks(5 * TICKS_PER_SECOND))
+        );
+    }
+
+    #[test]
+    fn titles_share_a_row_if_there_is_room_and_otherwise_open_another_above() {
+        let mut tracks = Tracks::default();
+        let first = tracks.place_title(a_title(), TimeRange::new_title(), Ticks(0));
+        let later = tracks.place_title(
+            MediaId::for_title(2),
+            TimeRange::new_title(),
+            Ticks(6 * TICKS_PER_SECOND),
+        );
+        assert_eq!(tracks.track_of(later), tracks.track_of(first));
+
+        let over = tracks.place_title(
+            MediaId::for_title(3),
+            TimeRange::new_title(),
+            Ticks(TICKS_PER_SECOND),
+        );
+        assert_eq!(tracks.track_of(over), Some(0));
+        assert_eq!(tracks.track_of(first), Some(1));
+        assert_eq!(tracks.clip(first).map(|clip| clip.start), Some(Ticks(0)));
+    }
+
+    #[test]
+    fn a_video_never_lands_on_a_row_of_titles() {
+        let mut tracks = Tracks::default();
+        tracks.place_title(a_title(), TimeRange::new_title(), Ticks(0));
+        let video = tracks.place(
+            MediaId(1),
+            seconds(0, 2),
+            Ticks(0),
+            TrackTarget::Existing(0),
+        );
+        assert_eq!(tracks.track_of(video), Some(1), "it makes a row below");
+        assert!(tracks.is_text_row(0));
+
+        let pushed = tracks.push(MediaId(2), seconds(0, 2));
+        assert_eq!(tracks.track_of(pushed), tracks.track_of(video));
+    }
+
+    #[test]
+    fn a_title_never_lands_on_a_row_of_pictures_or_sound() {
+        let mut tracks = Tracks::default();
+        let video = tracks.push(MediaId(1), seconds(0, 2));
+        tracks.push_sound(MediaId(2), seconds(0, 2));
+        let on_picture = tracks.place(
+            a_title(),
+            TimeRange::new_title(),
+            Ticks(0),
+            TrackTarget::Existing(0),
+        );
+        assert_eq!(tracks.track_of(on_picture), Some(0));
+        assert_eq!(tracks.track_of(video), Some(1));
+
+        let on_sound = tracks.place(
+            MediaId::for_title(2),
+            TimeRange::new_title(),
+            Ticks(0),
+            TrackTarget::Existing(2),
+        );
+        assert!(tracks.is_text_row(tracks.track_of(on_sound).expect("it landed")));
+        assert!(!tracks.is_sound_row(tracks.track_of(on_sound).expect("it landed")));
+    }
+
+    #[test]
+    fn a_title_can_sit_between_pictures_and_goes_behind_what_is_above_it() {
+        let mut tracks = Tracks::default();
+        let lower = tracks.push(MediaId(1), seconds(0, 8));
+        let upper = tracks.place(MediaId(2), seconds(0, 8), Ticks(0), TrackTarget::New(0));
+        let title = tracks.place(
+            a_title(),
+            TimeRange::new_title(),
+            Ticks(0),
+            TrackTarget::New(1),
+        );
+
+        assert_eq!(tracks.track_of(upper), Some(0));
+        assert_eq!(tracks.track_of(title), Some(1));
+        assert_eq!(tracks.track_of(lower), Some(2));
+        assert!(tracks.is_text_row(1));
+    }
+
+    #[test]
+    fn dragging_a_title_only_lands_it_on_rows_of_titles() {
+        let mut tracks = Tracks::default();
+        tracks.push(MediaId(1), seconds(0, 8));
+        let title = tracks.place_title(a_title(), TimeRange::new_title(), Ticks(0));
+        tracks.move_clip(title, Ticks(0), TrackTarget::Existing(1));
+        assert!(tracks.is_text_row(tracks.track_of(title).expect("it is there")));
+        assert_eq!(tracks.picture_rows(), 2);
+    }
+
+    #[test]
+    fn the_order_of_a_video_doesnt_land_it_on_a_row_of_titles() {
+        let mut tracks = Tracks::default();
+        let lower = tracks.push(MediaId(1), seconds(0, 8));
+        let upper = tracks.place(MediaId(2), seconds(0, 8), Ticks(0), TrackTarget::New(0));
+        tracks.place_title(
+            a_title(),
+            TimeRange::new_title(),
+            Ticks(20 * TICKS_PER_SECOND),
+        );
+
+        assert!(tracks.move_in_order(lower, OrderMove::ToFront));
+        for row in 0..tracks.picture_rows() {
+            if tracks.is_text_row(row) {
+                assert!(
+                    tracks.tracks()[row]
+                        .clips()
+                        .iter()
+                        .all(|clip| clip.is_title())
+                );
+            }
+        }
+        assert_ne!(tracks.track_of(lower), tracks.track_of(upper));
+    }
+
+    #[test]
+    fn a_row_of_titles_goes_when_its_last_title_does() {
+        let mut tracks = Tracks::default();
+        tracks.push(MediaId(1), seconds(0, 8));
+        let title = tracks.place_title(a_title(), TimeRange::new_title(), Ticks(0));
+        assert!(tracks.remove(title));
+        assert_eq!(tracks.picture_rows(), 1);
+        assert!(!tracks.is_text_row(0));
+    }
+
+    #[test]
+    fn a_copy_placed_elsewhere_keeps_how_it_looks_and_takes_its_new_media() {
+        let mut tracks = Tracks::default();
+        let original = tracks.push(MediaId(1), seconds(0, 4));
+        let placed = Placement {
+            opacity: 500_000,
+            ..Placement::default()
+        };
+        tracks.set_placement(original, placed);
+        let clip = tracks.clip(original).expect("it is there");
+        let copy = tracks.place_copy(
+            clip,
+            MediaId(1),
+            Ticks(10 * TICKS_PER_SECOND),
+            TrackTarget::Existing(0),
+            false,
+        );
+        let copied = tracks.clip(copy).expect("it landed");
+        assert_ne!(copy, original);
+        assert_eq!(copied.placement, placed);
+        assert_eq!(copied.source, clip.source);
+        assert_eq!(copied.start, Ticks(10 * TICKS_PER_SECOND));
+        assert_eq!(tracks.clip(original).map(|c| c.start), Some(Ticks(0)));
+    }
+
+    #[test]
+    fn a_title_can_be_given_a_title_of_its_own() {
+        let mut tracks = Tracks::default();
+        let title = tracks.place_title(a_title(), TimeRange::new_title(), Ticks(0));
+        let copy = tracks.duplicate(title).expect("it copied");
+        assert_eq!(tracks.clips_using(a_title()), 2);
+        assert!(tracks.set_media(copy, MediaId::for_title(2)));
+        assert_eq!(tracks.clips_using(a_title()), 1);
+        assert_eq!(tracks.clips_using(MediaId::for_title(2)), 1);
+    }
+
+    #[test]
+    fn a_duration_shortens_or_lengthens_a_clip_from_its_end() {
+        let mut tracks = Tracks::default();
+        let clip = tracks.push(MediaId(1), seconds(0, 10));
+        let footage = Ticks(20 * TICKS_PER_SECOND);
+
+        assert!(tracks.set_duration(clip, Ticks(4 * TICKS_PER_SECOND), footage));
+        let shorter = tracks.clip(clip).expect("it is there");
+        assert_eq!(shorter.start, Ticks(0));
+        assert_eq!(shorter.duration(), Ticks(4 * TICKS_PER_SECOND));
+
+        assert!(tracks.set_duration(clip, Ticks(12 * TICKS_PER_SECOND), footage));
+        let longer = tracks.clip(clip).expect("it is there");
+        assert_eq!(longer.duration(), Ticks(12 * TICKS_PER_SECOND));
+        assert_eq!(longer.source.start, Ticks(0));
+    }
+
+    #[test]
+    fn a_duration_cant_run_past_the_end_of_the_footage() {
+        let mut tracks = Tracks::default();
+        let clip = tracks.push(MediaId(1), seconds(0, 10));
+        let footage = Ticks(10 * TICKS_PER_SECOND);
+        assert!(!tracks.set_duration(clip, Ticks(30 * TICKS_PER_SECOND), footage));
+        assert_eq!(
+            tracks.clip(clip).map(|clip| clip.duration()),
+            Some(Ticks(10 * TICKS_PER_SECOND))
+        );
+    }
+
+    #[test]
+    fn a_longer_duration_pushes_later_clips_only_as_far_as_they_must() {
+        let mut tracks = Tracks::default();
+        let first = tracks.push(MediaId(1), seconds(0, 4));
+        let second = tracks.place(
+            MediaId(2),
+            seconds(0, 4),
+            Ticks(6 * TICKS_PER_SECOND),
+            TrackTarget::Existing(0),
+        );
+        let footage = Ticks(30 * TICKS_PER_SECOND);
+
+        assert!(tracks.set_duration(first, Ticks(5 * TICKS_PER_SECOND), footage));
+        assert_eq!(
+            tracks.clip(second).map(|clip| clip.start),
+            Some(Ticks(6 * TICKS_PER_SECOND)),
+            "it still fits"
+        );
+        assert!(tracks.set_duration(first, Ticks(8 * TICKS_PER_SECOND), footage));
+        assert_eq!(
+            tracks.clip(second).map(|clip| clip.start),
+            Some(Ticks(8 * TICKS_PER_SECOND)),
+            "it moves just far enough"
+        );
+    }
+
+    #[test]
+    fn a_duration_on_a_clip_at_another_speed_goes_by_the_timeline() {
+        let mut tracks = Tracks::default();
+        let clip = tracks.push(MediaId(1), seconds(0, 20));
+        tracks.set_speed(clip, Speed::default().with_factor(2.0));
+        assert!(tracks.set_duration(
+            clip,
+            Ticks(4 * TICKS_PER_SECOND),
+            Ticks(20 * TICKS_PER_SECOND)
+        ));
+        let shorter = tracks.clip(clip).expect("it is there");
+        assert_eq!(shorter.duration(), Ticks(4 * TICKS_PER_SECOND));
+        assert_eq!(shorter.source.duration(), Ticks(8 * TICKS_PER_SECOND));
     }
 
     #[test]

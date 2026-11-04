@@ -15,6 +15,7 @@ bareclip-core.workspace = true
 bareclip-export.workspace = true
 bareclip-media.workspace = true
 bareclip-render.workspace = true
+bareclip-text.workspace = true
 eframe.workspace = true
 rfd.workspace = true
 serde.workspace = true

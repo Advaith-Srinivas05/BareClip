@@ -15,6 +15,7 @@ use bareclip_core::{
     speed::Speed,
     time::Ticks,
     timeline::TimeRange,
+    title::Title,
 };
 use bareclip_media::{MediaError, MediaInfo, Quality, probe, read_still, same_file};
 use bareclip_render::{Compositor, Layer, LayerPicture, needs_compositor};
@@ -38,6 +39,8 @@ pub struct LayeredClip {
     pub source: TimeRange,
     pub placement: Placement,
     pub speed: Speed,
+    /// What to draw for a title, which has no file behind it.
+    pub title: Option<Title>,
 }
 
 impl LayeredClip {
@@ -111,7 +114,7 @@ fn opened<'a>(
 fn videos_of(stretches: &[LayeredStretch]) -> Result<Vec<MediaInfo>, MediaError> {
     let mut videos: Vec<MediaInfo> = Vec::new();
     for clip in stretches.iter().flat_map(|stretch| &stretch.stack) {
-        if !videos.iter().any(|info| info.path == clip.input) {
+        if clip.title.is_none() && !videos.iter().any(|info| info.path == clip.input) {
             videos.push(probe(&clip.input)?);
         }
     }
@@ -133,6 +136,7 @@ pub fn export_layered(
     let writes_over_a_source = stretches
         .iter()
         .flat_map(|stretch| &stretch.stack)
+        .filter(|clip| clip.title.is_none())
         .map(|clip| &clip.input)
         .chain(request.sound.spans.iter().map(|span| &span.path))
         .any(|input| same_file(input, &request.output));
@@ -172,11 +176,14 @@ pub fn export_layered(
     let mut stills: HashMap<PathBuf, StillPicture> = HashMap::new();
     for clip in stretches.iter().flat_map(|stretch| &stretch.stack) {
         if clip.source.is_still()
+            && clip.title.is_none()
             && let Entry::Vacant(place) = stills.entry(clip.input.clone())
         {
             place.insert(read_still(&clip.input)?);
         }
     }
+    // Only the titles showing are kept, because a project can hold thousands of captions.
+    let mut titles: HashMap<u64, (StillPicture, Placement)> = HashMap::new();
     let mut feeds: HashMap<u64, PictureFeed> = HashMap::new();
     let mut current_stretch = None;
     // Whether the last frame written was dead space, or else came from the current stretch.
@@ -210,6 +217,15 @@ pub fn export_layered(
             // A clip that carries on keeps its decoder, so it doesn't have to find its place again.
             let stack = stretch_index.map_or(&[][..], |index| &stretches[index].stack[..]);
             feeds.retain(|key, _| stack.iter().any(|clip| clip.key == *key));
+            titles.retain(|key, _| stack.iter().any(|clip| clip.key == *key));
+            for clip in stack {
+                if let (Some(title), Entry::Vacant(place)) = (&clip.title, titles.entry(clip.key)) {
+                    let drawing = bareclip_text::draw_title(title, canvas);
+                    let size = (drawing.picture.width, drawing.picture.height);
+                    let placed = title.placed(clip.placement, size, drawing.scale, canvas);
+                    place.insert((drawing.picture, placed));
+                }
+            }
             for clip in stack.iter().filter(|clip| !clip.source.is_still()) {
                 if let Entry::Vacant(place) = feeds.entry(clip.key) {
                     let from = TimeRange {
@@ -247,6 +263,16 @@ pub fn export_layered(
                     let layers: Vec<Layer> = stack
                         .iter()
                         .filter_map(|clip| {
+                            if let Some((picture, placed)) = titles.get(&clip.key) {
+                                let placement = placed.at(Ticks(time.0 - clip.start.0));
+                                let size = (picture.width, picture.height);
+                                return Some(Layer {
+                                    picture: picture.into(),
+                                    rect: placement.rect(size, canvas),
+                                    opacity: placement.opacity as f32 / WHOLE as f32,
+                                    look: placement.look(),
+                                });
+                            }
                             let picture: LayerPicture = if clip.source.is_still() {
                                 stills.get(&clip.input)?.into()
                             } else {
@@ -366,6 +392,7 @@ mod tests {
             },
             placement: Placement::default(),
             speed: Speed::default(),
+            title: None,
         };
 
         assert_eq!(clip.source_time(seconds(12.0)), seconds(5.0));
@@ -383,6 +410,7 @@ mod tests {
             },
             placement: Placement::default(),
             speed: Speed::default().with_factor(2.0),
+            title: None,
         };
 
         assert_eq!(clip.source_time(seconds(11.0)), seconds(5.0));

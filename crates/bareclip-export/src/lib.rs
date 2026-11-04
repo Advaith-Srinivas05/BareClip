@@ -15,8 +15,9 @@ pub use layered::{LayeredClip, LayeredRequest, LayeredStretch, export_layered};
 pub use mixed::{SoundPlan, SoundReport, export_sound_only, export_with_new_sound};
 pub use plan::{
     CHOICES_REASON, ExportChoices, ExportRate, ExportSize, FullPlan, LAYERED_REASON, Route, SIZES,
-    SPEED_REASON, STILLS_REASON, copying_suits, final_size, frame_rate_for, mixed_rates,
-    rates_on_offer, route_for, size_problem, size_with_shorter_side, sizes_on_offer, sound_labels,
+    SPEED_REASON, STILLS_REASON, TITLES_REASON, copying_suits, final_size, frame_rate_for,
+    mixed_rates, rates_on_offer, route_for, size_problem, size_with_shorter_side, sizes_on_offer,
+    sound_labels,
 };
 pub use sink::VideoSink;
 

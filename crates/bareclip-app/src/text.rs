@@ -427,9 +427,78 @@ fn compare_digit_runs(a: &str, b: &str) -> Ordering {
     a.len().cmp(&b.len()).then_with(|| a.cmp(b))
 }
 
+/// The kind of file captions are imported from.
+pub const CAPTIONS_EXTENSION: &str = "srt";
+
+/// A clip's length the way the Edit duration window starts it off, such as 5 or 1:30.5.
+pub fn duration_to_type(duration: Ticks) -> String {
+    let hundredths = (duration.as_seconds() * 100.0).round() as i64;
+    let (whole, part) = (hundredths / 100, hundredths % 100);
+    let fraction = match part {
+        0 => String::new(),
+        part if part % 10 == 0 => format!(".{}", part / 10),
+        part => format!(".{part:02}"),
+    };
+    if whole >= 60 {
+        format!("{}:{:02}{fraction}", whole / 60, whole % 60)
+    } else {
+        format!("{whole}{fraction}")
+    }
+}
+
+/// A length someone typed, in seconds: 5, 5.5, 5s, 1:30 or 1:02:03.5. `None` for anything else.
+pub fn typed_duration(typed: &str) -> Option<f64> {
+    let typed = typed.trim().trim_end_matches(['s', 'S']).trim();
+    if typed.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = typed.split(':').collect();
+    if parts.len() > 3 {
+        return None;
+    }
+    let mut seconds = 0.0;
+    for part in parts {
+        let value: f64 = part.trim().parse().ok()?;
+        if !value.is_finite() || value < 0.0 {
+            return None;
+        }
+        seconds = seconds * 60.0 + value;
+    }
+    (seconds > 0.0).then_some(seconds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_typed_length_can_be_seconds_or_minutes_and_seconds() {
+        assert_eq!(typed_duration("5"), Some(5.0));
+        assert_eq!(typed_duration(" 5.5s "), Some(5.5));
+        assert_eq!(typed_duration("1:30"), Some(90.0));
+        assert_eq!(typed_duration("1:02:03.5"), Some(3723.5));
+    }
+
+    #[test]
+    fn anything_that_isnt_a_length_is_refused() {
+        for typed in ["", "s", "abc", "-5", "0", "1:2:3:4", "1:x", "inf", "NaN"] {
+            assert_eq!(typed_duration(typed), None, "{typed}");
+        }
+    }
+
+    #[test]
+    fn a_length_is_offered_the_way_it_is_typed() {
+        for (seconds, shown) in [
+            (5.0, "5"),
+            (5.5, "5.5"),
+            (5.25, "5.25"),
+            (90.0, "1:30"),
+            (90.5, "1:30.5"),
+        ] {
+            assert_eq!(duration_to_type(Ticks::from_seconds(seconds)), shown);
+            assert_eq!(typed_duration(shown), Some(seconds));
+        }
+    }
 
     #[test]
     fn a_speed_is_named_with_no_needless_decimals() {

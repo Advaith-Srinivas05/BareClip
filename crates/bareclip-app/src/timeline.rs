@@ -4,6 +4,7 @@ use bareclip_core::{
     speed::Speed,
     time::{Ticks, format_timecode},
     timeline::{ClipEdge, ClipId, MediaId, TimeRange},
+    title::TitleStyle,
     tracks::{TrackTarget, Tracks},
 };
 use bareclip_media::SoundShape;
@@ -24,6 +25,8 @@ use crate::{
 const RULER_HEIGHT: f32 = 24.0;
 /// A track keeps this height however tall the timeline gets, so more height shows more space.
 const TRACK_HEIGHT: f32 = 56.0;
+/// Titles have no pictures along them, so their rows take half the room.
+const TEXT_TRACK_HEIGHT: f32 = 28.0;
 const TRACK_GAP: f32 = 6.0;
 /// The dashed lanes above and below the tracks, which a clip can be dropped on.
 const NEW_LANE_HEIGHT: f32 = 26.0;
@@ -96,7 +99,7 @@ const HATCH_SPACING: f32 = 8.0;
 const TRIM_TAG_GAP: f32 = 4.0;
 /// How strongly the outline of a quiet label on the ruler shows.
 const RULER_TAG_EDGE: f32 = 0.45;
-const NEW_TRACK_HINT: &str = "Drag a clip here for a new track";
+const ADD_TEXT_HINT: &str = "Add text";
 const ADD_AUDIO_HINT: &str = "Add audio";
 /// Room left of the rows, so the playhead's head isn't cut off at the very start.
 const TRACKS_LEFT: f32 = 10.0;
@@ -194,6 +197,8 @@ pub struct ClipView {
     pub shows_waveform: bool,
     /// Whether it shows an image.
     pub is_still: bool,
+    /// Whether it shows a title.
+    pub is_title: bool,
     pub speed: Speed,
     /// How long its fades really are.
     pub fade_in: Ticks,
@@ -230,6 +235,8 @@ pub struct TimelineView<'a> {
     pub position: Ticks,
     pub selected: Option<ClipId>,
     pub selected_gap: Option<Ticks>,
+    /// Whether a clip has been copied and can be pasted.
+    pub can_paste: bool,
 }
 
 /// A video being dragged from the media panel.
@@ -239,6 +246,8 @@ pub struct MediaDrag {
     pub length: Ticks,
     /// A file with no picture, which can only go on a row of sound.
     pub sound_only: bool,
+    /// A style being dragged from the Text panel, which makes a new title where it lands.
+    pub title: Option<TitleStyle>,
 }
 
 /// The part of a clip under the pointer.
@@ -276,6 +285,8 @@ pub struct TrackLayout {
     pub area: Rect,
     pub count: usize,
     pub scroll: f32,
+    /// Which rows are thin rows of titles, one bit each from the top.
+    pub thin: u64,
 }
 
 impl TrackLayout {
@@ -286,7 +297,7 @@ impl TrackLayout {
     }
 
     /// How tall the tracks and any dashed lanes are together.
-    fn content_height(count: usize) -> f32 {
+    fn content_height(count: usize, thin: u64) -> f32 {
         if count == 0 {
             return 0.0;
         }
@@ -296,17 +307,41 @@ impl TrackLayout {
         } else {
             0.0
         };
-        lanes + (TRACK_HEIGHT * count as f32) + (TRACK_GAP * gaps)
+        let rows: f32 = (0..count).map(|row| Self::height_of(row, thin)).sum();
+        lanes + rows + (TRACK_GAP * gaps)
+    }
+
+    /// How tall a row is.
+    fn height_of(row: usize, thin: u64) -> f32 {
+        if row < u64::BITS as usize && thin & (1 << row) != 0 {
+            TEXT_TRACK_HEIGHT
+        } else {
+            TRACK_HEIGHT
+        }
+    }
+
+    /// Which rows are thin, for a project's rows.
+    fn thin_rows(tracks: &Tracks) -> u64 {
+        (0..tracks.tracks().len().min(u64::BITS as usize))
+            .filter(|row| tracks.is_text_row(*row))
+            .fold(0, |rows, row| rows | (1 << row))
     }
 
     /// How far the tracks can scroll. Nothing scrolls while they all fit.
-    fn furthest_scroll(count: usize, height: f32) -> f32 {
-        (Self::content_height(count) - height).max(0.0)
+    fn furthest_scroll(count: usize, thin: u64, height: f32) -> f32 {
+        (Self::content_height(count, thin) - height).max(0.0)
+    }
+
+    /// How far down a row starts from the first one.
+    fn offset_of(&self, row: usize) -> f32 {
+        (0..row)
+            .map(|above| Self::height_of(above, self.thin) + TRACK_GAP)
+            .sum()
     }
 
     /// The top of the first track. While everything fits the tracks sit in the middle.
     fn first_top(&self) -> f32 {
-        let room = self.area.height() - Self::content_height(self.count);
+        let room = self.area.height() - Self::content_height(self.count, self.thin);
         let content_top = if room > 0.0 {
             self.area.top() + room / 2.0
         } else {
@@ -321,10 +356,10 @@ impl TrackLayout {
     }
 
     pub fn track(&self, index: usize) -> Rect {
-        let top = self.first_top() + index as f32 * (TRACK_HEIGHT + TRACK_GAP);
+        let top = self.first_top() + self.offset_of(index);
         Rect::from_min_size(
             pos2(self.area.left(), top),
-            vec2(self.area.width(), TRACK_HEIGHT),
+            vec2(self.area.width(), Self::height_of(index, self.thin)),
         )
     }
 
@@ -339,7 +374,7 @@ impl TrackLayout {
 
     /// Where the lane below is, or where one lights up during a drag once lanes are hidden.
     pub fn new_lane_below(&self) -> Rect {
-        let top = self.first_top() + self.count as f32 * (TRACK_HEIGHT + TRACK_GAP);
+        let top = self.first_top() + self.offset_of(self.count);
         Rect::from_min_size(
             pos2(self.area.left(), top),
             vec2(self.area.width(), NEW_LANE_HEIGHT),
@@ -496,6 +531,9 @@ pub enum MenuTarget {
 pub enum MenuAction {
     Split,
     Duplicate(ClipId),
+    Copy(ClipId),
+    Paste,
+    EditDuration(ClipId),
     Delete(ClipId),
     ToggleMute(ClipId),
     Detach(ClipId),
@@ -581,6 +619,7 @@ impl Default for TimelineState {
                 area: Rect::NOTHING,
                 count: 0,
                 scroll: 0.0,
+                thin: 0,
             },
             scale: TimeScale {
                 visible_start: Ticks(0),
@@ -713,6 +752,10 @@ pub struct TimelineEvents {
     pub toggle_clip_mute: Option<ClipId>,
     /// The lane for adding audio was pressed.
     pub add_audio: bool,
+    /// The lane for adding text was pressed.
+    pub add_text: bool,
+    /// A style from the Text panel was dropped here.
+    pub drop_title: Option<(TitleStyle, Ticks, TrackTarget)>,
     pub seek: Option<Ticks>,
     pub select: Option<Option<ClipId>>,
     /// Comes with `select`: the dead space that was clicked on, if any.
@@ -1102,7 +1145,9 @@ fn draw_clip(
     (face, scale): (Option<&ClipFace>, &TimeScale),
     look: ClipLook,
 ) {
-    let fill = if clip.sound_only {
+    let fill = if clip.is_title {
+        palette.clip_overlay
+    } else if clip.sound_only {
         palette.clip_audio
     } else {
         palette.clip_video
@@ -1213,10 +1258,13 @@ fn draw_clip_name(
     if width <= 0.0 {
         return;
     }
-    let label = Rect::from_min_size(
-        pos2(left, shown.top() + CLIP_LABEL_TOP),
-        vec2(width, CLIP_LABEL_HEIGHT),
-    );
+    // A thin row of titles has no room above its name.
+    let top = if clip.is_title {
+        shown.center().y - CLIP_LABEL_HEIGHT / 2.0
+    } else {
+        shown.top() + CLIP_LABEL_TOP
+    };
+    let label = Rect::from_min_size(pos2(left, top), vec2(width, CLIP_LABEL_HEIGHT));
     let backing = palette.stage.gamma_multiply(CLIP_LABEL_BACKING);
     let clipped = painter.with_clip_rect(label.intersect(painter.clip_rect()));
     clipped.rect_filled(label, 4.0, backing);
@@ -1228,7 +1276,9 @@ fn draw_clip_name(
                 pos2(text_left + CLIP_ICON_SIZE / 2.0, label.center().y),
                 CLIP_ICON_SIZE,
             ),
-            if clip.sound_only {
+            if clip.is_title {
+                &icons::TYPE
+            } else if clip.sound_only {
                 &icons::MUSIC
             } else if clip.is_still {
                 &icons::IMAGE
@@ -1520,15 +1570,6 @@ fn timeline_menu(
                 .tracks
                 .clip(id)
                 .is_some_and(|clip| view.position >= clip.start && view.position < clip.end());
-            let split = ui
-                .add_enabled(
-                    under_playhead,
-                    MenuItem::new(palette, icons::SCISSORS, "Split", "S"),
-                )
-                .on_disabled_hover_text("Move the playhead inside this clip to split it");
-            if plain_line(split, flyouts) {
-                action = Some(MenuAction::Split);
-            }
             let duplicate = ui.add(MenuItem::new(
                 palette,
                 icons::COPY_PLUS,
@@ -1538,9 +1579,34 @@ fn timeline_menu(
             if plain_line(duplicate, flyouts) {
                 action = Some(MenuAction::Duplicate(id));
             }
+            let copy = ui.add(MenuItem::new(palette, icons::COPY, "Copy", "Ctrl+C"));
+            if plain_line(copy, flyouts) {
+                action = Some(MenuAction::Copy(id));
+            }
+            let paste = ui.add_enabled(
+                view.can_paste,
+                MenuItem::new(palette, icons::CLIPBOARD_PASTE, "Paste", "Ctrl+V"),
+            );
+            if plain_line(paste, flyouts) {
+                action = Some(MenuAction::Paste);
+            }
             let delete = ui.add(MenuItem::new(palette, icons::TRASH_2, "Delete", "Del"));
             if plain_line(delete, flyouts) {
                 action = Some(MenuAction::Delete(id));
+            }
+            ui.separator();
+            let split = ui
+                .add_enabled(
+                    under_playhead,
+                    MenuItem::new(palette, icons::SCISSORS, "Split", "S"),
+                )
+                .on_disabled_hover_text("Move the playhead inside this clip to split it");
+            if plain_line(split, flyouts) {
+                action = Some(MenuAction::Split);
+            }
+            let duration = ui.add(MenuItem::new(palette, icons::CLOCK, "Edit duration", ""));
+            if plain_line(duration, flyouts) {
+                action = Some(MenuAction::EditDuration(id));
             }
             if let Some(clip) = view.clips.iter().find(|clip| clip.id == id) {
                 let mut picked = (None, None);
@@ -1843,12 +1909,14 @@ pub fn timeline(
         pos2(scale.left + scale.width, rect.bottom() - 6.0),
     );
     let track_count = view.tracks.tracks().len();
-    let furthest = TrackLayout::furthest_scroll(track_count, area.height());
+    let thin = TrackLayout::thin_rows(view.tracks);
+    let furthest = TrackLayout::furthest_scroll(track_count, thin, area.height());
     state.track_scroll = state.track_scroll.clamp(0.0, furthest);
     let layout = TrackLayout {
         area,
         count: track_count,
         scroll: state.track_scroll,
+        thin,
     };
     state.layout = layout;
     state.ruler = ruler;
@@ -1978,6 +2046,7 @@ pub fn timeline(
                     let snapped = snap_start(wanted, length, &targets, tolerance);
                     let target = view.tracks.target_for(
                         layout.move_target_at(pointer.y, clip.track),
+                        clip.media,
                         clip.sound_only,
                     );
                     let landing = view.tracks.landing(target, Some(id), snapped, length);
@@ -1997,6 +2066,11 @@ pub fn timeline(
             && layout.new_lane_below().contains(pointer)
         {
             events.add_audio = true;
+        } else if response.clicked()
+            && TrackLayout::has_lanes(track_count)
+            && layout.new_lane_above().contains(pointer)
+        {
+            events.add_text = true;
         } else if response.clicked() {
             events.seek = Some(Ticks(time.0.clamp(0, total.0)));
             let in_area = area.contains(pointer);
@@ -2117,11 +2191,13 @@ pub fn timeline(
             &area_painter,
             palette,
             layout.new_lane_above(),
-            NEW_TRACK_HINT,
+            ADD_TEXT_HINT,
         );
         let below = layout.new_lane_below();
         draw_new_track_lane(&area_painter, palette, below, ADD_AUDIO_HINT);
-        if pointer_over.is_some_and(|pointer| below.contains(pointer)) {
+        if pointer_over.is_some_and(|pointer| {
+            below.contains(pointer) || layout.new_lane_above().contains(pointer)
+        }) {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
     }
@@ -2197,9 +2273,9 @@ pub fn timeline(
         hover_time,
         dragged_pointer,
     ) {
-        let target = view
-            .tracks
-            .target_for(layout.target_at(pointer.y), drag.sound_only);
+        let target =
+            view.tracks
+                .target_for(layout.target_at(pointer.y), drag.media, drag.sound_only);
         let start = view
             .tracks
             .landing(target, None, drop_at(&drag, time), drag.length);
@@ -2220,11 +2296,11 @@ pub fn timeline(
         hover_time,
         dragged_pointer,
     ) {
-        events.drop_media = Some((
-            drag.media,
-            drop_at(&drag, time),
-            layout.target_at(pointer.y),
-        ));
+        let place = (drop_at(&drag, time), layout.target_at(pointer.y));
+        match drag.title {
+            Some(style) => events.drop_title = Some((style, place.0, place.1)),
+            None => events.drop_media = Some((drag.media, place.0, place.1)),
+        }
     }
 
     if furthest > 0.0 {
@@ -2505,6 +2581,7 @@ mod tests {
             sound_only: false,
             shows_waveform: false,
             is_still: false,
+            is_title: false,
             speed: Speed::default(),
             fade_in: Ticks(0),
             fade_out: Ticks(0),
@@ -2930,6 +3007,7 @@ mod tests {
             area: Rect::from_min_size(pos2(0.0, 100.0), vec2(800.0, height)),
             count,
             scroll: 0.0,
+            thin: 0,
         }
     }
 
@@ -2951,7 +3029,7 @@ mod tests {
 
         // With no lanes in the way the tracks don't need room for them, and just fit.
         let snug = TRACK_HEIGHT * 3.0 + TRACK_GAP * 4.0;
-        assert_eq!(TrackLayout::furthest_scroll(3, snug), 0.0);
+        assert_eq!(TrackLayout::furthest_scroll(3, 0, snug), 0.0);
         let first = layout(3, snug).track(0).top();
         assert!((first - (100.0 + TRACK_GAP)).abs() < 0.01, "{first}");
     }
@@ -3167,8 +3245,8 @@ mod tests {
 
     #[test]
     fn tracks_only_scroll_when_they_do_not_all_fit() {
-        assert_eq!(TrackLayout::furthest_scroll(2, 400.0), 0.0);
-        assert!(TrackLayout::furthest_scroll(8, 200.0) > 0.0);
+        assert_eq!(TrackLayout::furthest_scroll(2, 0, 400.0), 0.0);
+        assert!(TrackLayout::furthest_scroll(8, 0, 200.0) > 0.0);
     }
 
     #[test]

@@ -32,6 +32,14 @@ impl TimeRange {
             end: Ticks(STILL_START + STILL_CLIP_SECONDS * TICKS_PER_SECOND),
         }
     }
+
+    /// The stretch a new title starts on.
+    pub fn new_title() -> Self {
+        Self {
+            start: Ticks(STILL_START),
+            end: Ticks(STILL_START + TITLE_CLIP_SECONDS * TICKS_PER_SECOND),
+        }
+    }
 }
 
 const SECONDS_PER_HOUR: i64 = 3600;
@@ -43,6 +51,8 @@ const STILL_START: i64 = 1000 * SECONDS_PER_HOUR * TICKS_PER_SECOND;
 const STILL_FLOOR: i64 = 100 * SECONDS_PER_HOUR * TICKS_PER_SECOND;
 /// How long a new clip of an image lasts.
 const STILL_CLIP_SECONDS: i64 = 4;
+/// How long a new title lasts.
+const TITLE_CLIP_SECONDS: i64 = 5;
 /// How long an image counts as being.
 pub const STILL_LENGTH: Ticks = Ticks(2 * STILL_START);
 
@@ -103,6 +113,11 @@ impl Clip {
     /// Whether this clip shows an image.
     pub fn is_still(self) -> bool {
         self.source.is_still()
+    }
+
+    /// Whether this clip shows a title.
+    pub fn is_title(self) -> bool {
+        self.media.is_title()
     }
 
     /// When this clip ends on the timeline.
@@ -346,6 +361,56 @@ impl Timeline {
             speed: Speed::default(),
         });
         id
+    }
+
+    /// Adds a copy of a clip as close as it can get to a moment, as a new clip showing `media`.
+    pub(crate) fn place_copy(&mut self, clip: Clip, media: MediaId, wanted: Ticks) -> ClipId {
+        let id = next_clip_id();
+        let start = self.landing(None, wanted, clip.duration());
+        self.settle(Clip {
+            id,
+            media,
+            start,
+            ..clip
+        });
+        id
+    }
+
+    /// Makes a clip show something else, leaving everything else about it alone.
+    pub(crate) fn set_media(&mut self, id: ClipId, media: MediaId) -> bool {
+        let Some(index) = self.index_of(id) else {
+            return false;
+        };
+        self.clips[index].media = media;
+        true
+    }
+
+    /// Makes a clip last this long, as `set_speed` does: it keeps its start, and later clips move
+    /// along only as far as they must. It can't run past the end of its footage. Returns whether
+    /// that changed anything.
+    pub(crate) fn set_duration(
+        &mut self,
+        id: ClipId,
+        duration: Ticks,
+        source_length: Ticks,
+    ) -> bool {
+        let Some(clip) = self.clip(id) else {
+            return false;
+        };
+        let wanted_end = clip.source.start.0 + clip.speed.in_footage(duration).0;
+        let end = wanted_end.min(source_length.0).max(clip.source.start.0 + 1);
+        if end == clip.source.end.0 {
+            return false;
+        }
+        self.remove(id);
+        self.settle(Clip {
+            source: TimeRange {
+                start: clip.source.start,
+                end: Ticks(end),
+            },
+            ..clip
+        });
+        true
     }
 
     /// Puts a copy of a clip straight after it, moving later clips along if they need room.

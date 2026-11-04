@@ -55,6 +55,7 @@ fn main() {
                     source,
                     placement: Placement::default(),
                     speed,
+                    title: None,
                 }],
             }],
             sound: if info.audio.is_empty() {

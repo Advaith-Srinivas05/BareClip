@@ -9,6 +9,8 @@ pub mod project;
 pub mod sound;
 pub mod speed;
 pub mod splice;
+pub mod srt;
 pub mod time;
 pub mod timeline;
+pub mod title;
 pub mod tracks;

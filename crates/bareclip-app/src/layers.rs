@@ -625,8 +625,22 @@ mod tests {
         at: Ticks,
         compositor: &mut Compositor,
     ) -> Vec<u8> {
+        drawn_by_the_preview_with_titles(tracks, infos, &HashMap::new(), at, compositor)
+    }
+
+    /// The same, with pictures already drawn for the titles among the clips.
+    fn drawn_by_the_preview_with_titles(
+        tracks: &Tracks,
+        infos: &[MediaInfo],
+        titles: &HashMap<MediaId, Arc<StillPicture>>,
+        at: Ticks,
+        compositor: &mut Compositor,
+    ) -> Vec<u8> {
         let lookup = |id: MediaId| infos.get(id.0 as usize).cloned();
         let size_of = |id: MediaId| {
+            if let Some(title) = titles.get(&id) {
+                return Some((title.width, title.height));
+            }
             infos
                 .get(id.0 as usize)
                 .map(|info| (info.video.width, info.video.height))
@@ -642,6 +656,9 @@ mod tests {
             .iter()
             .filter(|clip| clip.is_still())
             .map(|clip| {
+                if let Some(title) = titles.get(&clip.media) {
+                    return (clip.media, title.clone());
+                }
                 let info = lookup(clip.media).expect("the image is known");
                 let still = bareclip_media::read_still(&info.path).expect("the image can be read");
                 (clip.media, Arc::new(still))
@@ -814,6 +831,7 @@ mod tests {
                         source: clip.source,
                         placement: clip.placement,
                         speed: clip.speed,
+                        title: None,
                     })
                     .collect(),
             })
@@ -947,6 +965,7 @@ mod tests {
                         source: clip.source,
                         placement: clip.placement,
                         speed: clip.speed,
+                        title: None,
                     })
                     .collect(),
             })
@@ -1068,6 +1087,7 @@ mod tests {
                         source: clip.source,
                         placement: clip.placement,
                         speed: clip.speed,
+                        title: None,
                     })
                     .collect(),
             })
@@ -1132,6 +1152,139 @@ mod tests {
         );
         let elsewhere = drawn_by_the_preview(&moved, &infos, at, &mut compositor);
         assert!(average_difference(&elsewhere, &shown) > difference * 3.0);
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn a_title_looks_the_same_in_the_preview_and_the_export() {
+        let path = detailed_clip("under-title", "testsrc2");
+        let infos = vec![probe(&path).expect("the video can be read")];
+        let source = TimeRange {
+            start: Ticks(0),
+            end: seconds(3.0),
+        };
+        let canvas = (infos[0].video.width, infos[0].video.height);
+        let title = bareclip_core::title::Title {
+            text: "Same in both\nTwo lines".to_owned(),
+            size: WHOLE / 8,
+            colour: [255, 255, 0],
+            background: Some([200, 0, 80]),
+            spot: Some(bareclip_core::title::TitleSpot::BottomLeft),
+            ..bareclip_core::title::Title::in_style(bareclip_core::title::TitleStyle::Outlined)
+        };
+        let drawing = bareclip_text::draw_title(&title, canvas);
+        let size = (drawing.picture.width, drawing.picture.height);
+        let picture = Arc::new(drawing.picture);
+        let media = MediaId::for_title(1);
+
+        let mut tracks = Tracks::default();
+        let video = tracks.place(MediaId(0), source, Ticks(0), TrackTarget::New(0));
+        let on_top = tracks.place_title(media, TimeRange::new_title(), Ticks(0));
+        let start = Placement {
+            scale: drawing.scale,
+            opacity: WHOLE * 9 / 10,
+            rotation: 12_000,
+            ..Placement::default()
+        };
+        tracks.set_placement(on_top, title.placed(start, size, drawing.scale, canvas));
+        let without = {
+            let mut tracks = tracks.clone();
+            tracks.remove(on_top);
+            tracks
+        };
+        assert!(tracks.clip(video).is_some());
+        let titles = HashMap::from([(media, picture.clone())]);
+        let Some(mut compositor) = compositor_of(canvas) else {
+            return;
+        };
+
+        let at = seconds(1.0);
+        let previewed =
+            drawn_by_the_preview_with_titles(&tracks, &infos, &titles, at, &mut compositor);
+
+        let output = std::env::temp_dir().join(format!(
+            "bareclip-app-tests/title-matches-{}.mp4",
+            std::process::id()
+        ));
+        let size_of = |id: MediaId| {
+            if id == media {
+                Some(size)
+            } else {
+                Some(canvas)
+            }
+        };
+        let stretches = tracks
+            .stretches(canvas, &size_of)
+            .into_iter()
+            .map(|stretch| bareclip_export::LayeredStretch {
+                start: stretch.start,
+                end: stretch.end,
+                stack: stretch
+                    .stack
+                    .iter()
+                    .map(|clip| bareclip_export::LayeredClip {
+                        key: clip.id.0,
+                        input: if clip.media == media {
+                            PathBuf::new()
+                        } else {
+                            path.clone()
+                        },
+                        start: clip.start,
+                        source: clip.source,
+                        placement: clip.placement,
+                        speed: clip.speed,
+                        title: (clip.media == media).then(|| title.clone()),
+                    })
+                    .collect(),
+            })
+            .collect();
+        let request = bareclip_export::LayeredRequest {
+            output: output.clone(),
+            stretches,
+            sound: bareclip_export::SoundPlan::default(),
+            canvas: Some(canvas),
+            background: [0, 0, 0],
+            quality: Default::default(),
+            rate: Default::default(),
+        };
+        bareclip_export::export_layered(
+            &request,
+            &std::sync::atomic::AtomicBool::new(false),
+            &|_| {},
+        )
+        .expect("the export succeeds");
+
+        let mut reader = bareclip_media::PictureReader::open(&output).expect("the export opens");
+        reader.seek(at).expect("it seeks");
+        let exported = loop {
+            let picture = reader
+                .next_picture()
+                .expect("it decodes")
+                .expect("the moment is in the video");
+            if picture.time() >= at {
+                break picture;
+            }
+        };
+        let layer = Layer {
+            picture: exported.view().into(),
+            rect: bareclip_render::fit_inside(exported.size(), canvas),
+            opacity: 1.0,
+            look: bareclip_render::PictureLook::PLAIN,
+        };
+        compositor.draw_for_display(&[layer]).expect("it draws");
+        let shown = compositor.read_display().expect("it reads back");
+
+        let difference = average_difference(&previewed, &shown);
+        assert!(
+            difference < 6.0,
+            "the export differs from the preview by {difference:.2} out of 255"
+        );
+        // With no title on it this has to come out far apart, so the comparison means something.
+        let plain = drawn_by_the_preview(&without, &infos, at, &mut compositor);
+        assert!(
+            average_difference(&plain, &shown) > difference * 3.0,
+            "the title made too little difference to tell"
+        );
         let _ = std::fs::remove_file(&output);
     }
 
@@ -1519,6 +1672,7 @@ mod tests {
                         source: clip.source,
                         placement: clip.placement,
                         speed: clip.speed,
+                        title: None,
                     })
                     .collect(),
             })

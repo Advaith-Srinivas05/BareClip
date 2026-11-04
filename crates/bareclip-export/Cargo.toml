@@ -10,6 +10,7 @@ bareclip-audio.workspace = true
 bareclip-core.workspace = true
 bareclip-media.workspace = true
 bareclip-render.workspace = true
+bareclip-text.workspace = true
 
 [dev-dependencies]
 ffmpeg-next.workspace = true

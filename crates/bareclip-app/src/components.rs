@@ -51,6 +51,7 @@ const NOTE_PADDING: egui::Vec2 = vec2(8.0, 5.0);
 const SETTINGS_CARD_RADIUS: u8 = 8;
 const SETTINGS_ROW_PADDING: f32 = 12.0;
 const SETTINGS_ROW_HEIGHT: f32 = 44.0;
+const SPOT_BUTTON_SIZE: f32 = 26.0;
 const SETTINGS_ROW_WITH_DETAIL_HEIGHT: f32 = 54.0;
 const SWITCH_SIZE: egui::Vec2 = vec2(34.0, 18.0);
 const SWITCH_KNOB_RADIUS: f32 = 6.0;
@@ -858,6 +859,50 @@ pub fn settings_divider(ui: &mut Ui, palette: &Palette) {
 
 /// A round colour to pick, with a ring around the chosen one. It shows the colour itself, so it
 /// sits outside the palette, and its name is what screen readers and tests go by.
+/// One of the nine places in a position grid.
+pub struct SpotButton<'a> {
+    palette: &'a Palette,
+    name: &'a str,
+    chosen: bool,
+}
+
+impl<'a> SpotButton<'a> {
+    pub fn new(palette: &'a Palette, name: &'a str, chosen: bool) -> Self {
+        Self {
+            palette,
+            name,
+            chosen,
+        }
+    }
+}
+
+impl Widget for SpotButton<'_> {
+    fn ui(self, ui: &mut Ui) -> Response {
+        let (rect, response) =
+            ui.allocate_exact_size(vec2(SPOT_BUTTON_SIZE, SPOT_BUTTON_SIZE), Sense::click());
+        let name = self.name;
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, name));
+        if ui.is_rect_visible(rect) {
+            let palette = self.palette;
+            let fill = if self.chosen {
+                palette.accent
+            } else if response.hovered() {
+                palette.raised
+            } else {
+                palette.bg_app
+            };
+            ui.painter().rect(
+                rect,
+                2.0,
+                fill,
+                Stroke::new(1.0, palette.border_strong),
+                StrokeKind::Inside,
+            );
+        }
+        response
+    }
+}
+
 pub struct ColourSwatch<'a> {
     palette: &'a Palette,
     colour: Color32,
