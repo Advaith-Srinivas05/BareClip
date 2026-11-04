@@ -8,6 +8,7 @@ use std::{
 use bareclip_core::{
     splice::{FrameEntry, FrameIndex},
     time::{Ticks, TimeBase},
+    timeline::STILL_LENGTH,
 };
 use ffmpeg_next as ffmpeg;
 use ffmpeg_next::{
@@ -71,6 +72,16 @@ impl MediaInfo {
     pub fn is_sound_only(&self) -> bool {
         self.video.codec.is_empty()
     }
+
+    /// Whether this file is one picture, like a PNG.
+    pub fn is_still(&self) -> bool {
+        self.duration == STILL_LENGTH
+    }
+}
+
+/// Whether FFmpeg read a file as an image. A GIF counts, because only its first picture is used.
+fn is_image_format(name: &str) -> bool {
+    name == "image2" || name == "gif" || name.ends_with("_pipe")
 }
 
 /// Why two videos cannot be joined by copying, in words for the user. They must share
@@ -137,6 +148,7 @@ pub fn probe(path: &Path) -> Result<MediaInfo, MediaError> {
     crate::init()?;
     let size_bytes = std::fs::metadata(path)?.len();
     let input = ffmpeg::format::input(path)?;
+    let still = is_image_format(input.format().name());
 
     let video = match video_stream_of(&input) {
         Some(video_stream) => {
@@ -152,7 +164,7 @@ pub fn probe(path: &Path) -> Result<MediaInfo, MediaError> {
                 height: decoder.height(),
                 pixel_format: format!("{:?}", decoder.format()),
                 time_base: to_time_base(video_stream.time_base()),
-                frame_rate: if rate.denominator() == 0 {
+                frame_rate: if still || rate.denominator() == 0 {
                     0.0
                 } else {
                     f64::from(rate.numerator()) / f64::from(rate.denominator())
@@ -165,6 +177,17 @@ pub fn probe(path: &Path) -> Result<MediaInfo, MediaError> {
         }
         None => VideoInfo::no_picture(),
     };
+
+    if still {
+        return Ok(MediaInfo {
+            path: path.to_owned(),
+            container: input.format().name().to_owned(),
+            size_bytes,
+            duration: STILL_LENGTH,
+            video,
+            audio: Vec::new(),
+        });
+    }
 
     let mut audio = Vec::new();
     for stream in input.streams() {

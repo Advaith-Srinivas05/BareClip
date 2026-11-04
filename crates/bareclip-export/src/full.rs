@@ -275,7 +275,7 @@ pub fn export_full(
                     report.repeated_frames += 1;
                 } else if let Some(picture) = feed.shown.as_ref() {
                     let layer = Layer {
-                        picture: picture.view(),
+                        picture: picture.view().into(),
                         rect: fit_inside(picture.size(), canvas),
                         opacity: 1.0,
                         look: bareclip_render::PictureLook::PLAIN,

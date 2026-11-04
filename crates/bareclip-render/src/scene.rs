@@ -1,12 +1,41 @@
 //! What goes on a canvas, and whether that takes the GPU at all.
 
-use bareclip_core::picture::{ColorFormat, Yuv420};
+use bareclip_core::picture::{ColorFormat, StillPicture, Yuv420};
 pub use bareclip_core::placement::{PictureLook, Rect, fit_inside};
+
+/// What a layer shows.
+#[derive(Clone, Copy, Debug)]
+pub enum LayerPicture<'a> {
+    Video(Yuv420<'a>),
+    /// An image, which can be see-through in places.
+    Still(&'a StillPicture),
+}
+
+impl<'a> From<Yuv420<'a>> for LayerPicture<'a> {
+    fn from(picture: Yuv420<'a>) -> Self {
+        Self::Video(picture)
+    }
+}
+
+impl<'a> From<&'a StillPicture> for LayerPicture<'a> {
+    fn from(picture: &'a StillPicture) -> Self {
+        Self::Still(picture)
+    }
+}
+
+impl LayerPicture<'_> {
+    pub fn size(&self) -> (u32, u32) {
+        match self {
+            Self::Video(picture) => (picture.width, picture.height),
+            Self::Still(picture) => (picture.width, picture.height),
+        }
+    }
+}
 
 /// One picture on the canvas. Later layers are drawn over earlier ones.
 #[derive(Clone, Copy, Debug)]
 pub struct Layer<'a> {
-    pub picture: Yuv420<'a>,
+    pub picture: LayerPicture<'a>,
     pub rect: Rect,
     /// 0 is invisible, and 1 hides what is underneath.
     pub opacity: f32,
@@ -20,6 +49,9 @@ pub fn needs_compositor(layers: &[Layer], canvas: (u32, u32)) -> bool {
     match layers {
         [] => false,
         [only] => {
+            let LayerPicture::Video(picture) = only.picture else {
+                return true;
+            };
             let full_canvas = Rect {
                 x: 0.0,
                 y: 0.0,
@@ -29,8 +61,8 @@ pub fn needs_compositor(layers: &[Layer], canvas: (u32, u32)) -> bool {
             only.opacity < 1.0
                 || !only.look.is_plain()
                 || only.rect != full_canvas
-                || (only.picture.width, only.picture.height) != canvas
-                || only.picture.color != ColorFormat::OUTPUT
+                || (picture.width, picture.height) != canvas
+                || picture.color != ColorFormat::OUTPUT
         }
         _ => true,
     }
@@ -44,7 +76,7 @@ mod tests {
     fn layer(black: &BlackPicture, canvas: (u32, u32)) -> Layer<'_> {
         let picture = black.view();
         Layer {
-            picture,
+            picture: picture.into(),
             rect: fit_inside((picture.width, picture.height), canvas),
             opacity: 1.0,
             look: PictureLook::PLAIN,
@@ -137,12 +169,31 @@ mod tests {
     #[test]
     fn a_picture_in_other_colours_needs_the_gpu_or_it_would_look_wrong() {
         let black = BlackPicture::new(64, 36);
-        let mut other = layer(&black, (64, 36));
-        other.picture.color.matrix = ColorMatrix::Bt601;
+        let recoloured = |change: fn(&mut ColorFormat)| {
+            let mut picture = black.view();
+            change(&mut picture.color);
+            Layer {
+                picture: picture.into(),
+                ..layer(&black, (64, 36))
+            }
+        };
+
+        let other = recoloured(|color| color.matrix = ColorMatrix::Bt601);
         assert!(needs_compositor(&[other], (64, 36)));
 
-        let mut full = layer(&black, (64, 36));
-        full.picture.color.full_range = true;
+        let full = recoloured(|color| color.full_range = true);
         assert!(needs_compositor(&[full], (64, 36)));
+    }
+
+    #[test]
+    fn an_image_always_needs_the_gpu_even_at_the_canvass_exact_size() {
+        let black = BlackPicture::new(64, 36);
+        let still = StillPicture::new(64, 36, vec![0; 64 * 36 * 4]);
+        let layer = Layer {
+            picture: (&still).into(),
+            ..layer(&black, (64, 36))
+        };
+
+        assert!(needs_compositor(&[layer], (64, 36)));
     }
 }

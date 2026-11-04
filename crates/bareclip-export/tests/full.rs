@@ -2010,3 +2010,153 @@ fn cancelling_a_sound_export_leaves_nothing_behind() {
         .count();
     assert_eq!(leftovers, 0);
 }
+
+/// A PNG of half see-through white.
+fn see_through_image() -> PathBuf {
+    clip(
+        "see-through.png",
+        &to_strings(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "color=white@0.5:s=160x90,format=rgba",
+            "-frames:v",
+            "1",
+        ]),
+    )
+}
+
+fn solid_image(name: &str, colour: &str) -> PathBuf {
+    let source = format!("color={colour}:s=160x90");
+    clip(
+        name,
+        &to_strings(&["-f", "lavfi", "-i", &source, "-frames:v", "1"]),
+    )
+}
+
+fn still_clip(input: &Path, key: u64, start: f64, length: f64) -> LayeredClip {
+    let source = TimeRange::new_still();
+    LayeredClip {
+        key,
+        input: input.to_owned(),
+        start: seconds(start),
+        source: TimeRange {
+            start: source.start,
+            end: Ticks(source.start.0 + seconds(length).0),
+        },
+        placement: Placement::default(),
+    }
+}
+
+/// How bright the middle of a file's first picture is.
+fn first_middle(path: &Path) -> u8 {
+    let pictures = pictures_of(path);
+    pictures.first().expect("it has pictures").middle
+}
+
+#[test]
+fn an_image_reads_as_one_picture_with_nothing_to_play() {
+    let image = solid_image("solid-red.png", "red");
+
+    let info = probe(&image).expect("the image can be read");
+
+    assert!(info.is_still());
+    assert!(!info.is_sound_only());
+    assert_eq!((info.video.width, info.video.height), (160, 90));
+    assert_eq!(info.video.frame_rate, 0.0);
+    assert!(info.audio.is_empty());
+}
+
+#[test]
+fn each_kind_of_image_can_be_read() {
+    for (name, extra) in [
+        ("kind.png", vec![]),
+        ("kind.jpg", vec![]),
+        ("kind.webp", vec![]),
+        ("kind.bmp", vec![]),
+        ("kind.gif", vec![]),
+    ] {
+        let mut arguments =
+            to_strings(&["-f", "lavfi", "-i", "color=blue:s=64x36", "-frames:v", "1"]);
+        arguments.extend::<Vec<String>>(extra);
+        let image = clip(name, &arguments);
+
+        let info = probe(&image).unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert!(info.is_still(), "{name} read as {}", info.container);
+        let still =
+            bareclip_media::read_still(&image).unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_eq!((still.width, still.height), (64, 36), "{name}");
+    }
+}
+
+#[test]
+fn a_transparent_png_keeps_how_see_through_it_is_and_a_jpeg_is_solid() {
+    let see_through = bareclip_media::read_still(&see_through_image()).expect("it can be read");
+    let alpha = see_through.rgba[3];
+    assert!((120..=135).contains(&alpha), "alpha came out as {alpha}");
+
+    let solid = bareclip_media::read_still(&clip(
+        "solid.jpg",
+        &to_strings(&["-f", "lavfi", "-i", "color=red:s=64x36", "-frames:v", "1"]),
+    ))
+    .expect("it can be read");
+    assert_eq!(solid.rgba[3], 255);
+}
+
+#[test]
+fn a_project_of_only_images_exports_at_a_steady_rate_for_their_length() {
+    let image = solid_image("only-image.png", "white");
+    let job = LayeredRequest {
+        canvas: Some((320, 180)),
+        ..layered_request(
+            "only-images",
+            vec![stretch(0.0, 2.0, vec![still_clip(&image, 1, 0.0, 2.0)])],
+            Vec::new(),
+        )
+    };
+
+    let report = export_layered(&job, &AtomicBool::new(false), &|_| {}).expect("it exports");
+
+    let info = probe(&job.output).expect("the file can be read");
+    assert!(!info.is_still());
+    assert!((info.duration.as_seconds() - 2.0).abs() < 0.1);
+    assert_eq!((report.width, report.height), (320, 180));
+    assert_eq!(
+        report.frames, 60,
+        "no video means the plain default of 30 fps"
+    );
+    assert!(first_middle(&job.output) > 200, "the image shows");
+    let _ = std::fs::remove_file(&job.output);
+}
+
+#[test]
+fn a_see_through_image_lets_the_video_under_it_show_in_the_export() {
+    let video = clip(
+        "black-under-image.mp4",
+        &encoded("color=black:s=320x180:r=30:d=2".to_owned(), &[]),
+    );
+    let job = LayeredRequest {
+        canvas: Some((320, 180)),
+        ..layered_request(
+            "image-over-video",
+            vec![stretch(
+                0.0,
+                1.0,
+                vec![
+                    whole(&video, 1, 0.0, 1.0, Placement::default()),
+                    still_clip(&see_through_image(), 2, 0.0, 1.0),
+                ],
+            )],
+            vec![part(&video, 0.0, 1.0, 0.0)],
+        )
+    };
+
+    export_layered(&job, &AtomicBool::new(false), &|_| {}).expect("it exports");
+
+    let middle = first_middle(&job.output);
+    assert!(
+        (100..=160).contains(&middle),
+        "half white over black came out as {middle}"
+    );
+    let _ = std::fs::remove_file(&job.output);
+}

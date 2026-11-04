@@ -370,7 +370,14 @@ impl Preview {
         time: Ticks,
     ) {
         self.position = time.clamp(Ticks(0), self.length(timeline));
-        let Some(location) = timeline.locate(self.position) else {
+        // Past the last video the project can still be going, on sound or images, with nothing
+        // left to decode.
+        let past_the_videos =
+            self.position >= timeline.duration() && self.position < self.length(timeline);
+        let location = (!past_the_videos)
+            .then(|| timeline.locate(self.position))
+            .flatten();
+        let Some(location) = location else {
             self.pause_all();
             self.current = None;
             if self.length(timeline) == Ticks(0) {

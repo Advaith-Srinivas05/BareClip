@@ -8,7 +8,10 @@ use std::{
 
 use bareclip_core::picture::{ColorFormat, Yuv420};
 
-use crate::{color, scene::Layer};
+use crate::{
+    color,
+    scene::{Layer, LayerPicture},
+};
 
 /// Wide enough that adding and removing see-through layers doesn't build up rounding errors.
 const CANVAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -51,6 +54,10 @@ impl std::error::Error for RenderError {}
 /// A picture's planes on the GPU, kept to be filled again by the next frame of its size.
 struct LayerSlot {
     size: (u32, u32),
+    /// Which image this holds, if it holds one. An image never changes, so it only goes to the GPU
+    /// once, and a large one can stay on screen without being sent again for every frame.
+    still: Option<u64>,
+    holds_still: bool,
     y: wgpu::Texture,
     u: wgpu::Texture,
     v: wgpu::Texture,
@@ -447,9 +454,14 @@ impl Compositor {
         &self.gpu_name
     }
 
-    fn new_slot(&self, size: (u32, u32)) -> LayerSlot {
-        let chroma = (size.0.div_ceil(2), size.1.div_ceil(2));
-        let plane = |plane_size: (u32, u32)| {
+    /// Room for a picture. An image only uses the first plane, which holds all of its colours.
+    fn new_slot(&self, size: (u32, u32), holds_still: bool) -> LayerSlot {
+        let chroma = if holds_still {
+            (1, 1)
+        } else {
+            (size.0.div_ceil(2), size.1.div_ceil(2))
+        };
+        let plane = |plane_size: (u32, u32), format: wgpu::TextureFormat| {
             self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("picture plane"),
                 size: wgpu::Extent3d {
@@ -460,12 +472,22 @@ impl Compositor {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::R8Unorm,
+                format,
                 usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             })
         };
-        let (y, u, v) = (plane(size), plane(chroma), plane(chroma));
+        let first = if holds_still {
+            wgpu::TextureFormat::Rgba8Unorm
+        } else {
+            wgpu::TextureFormat::R8Unorm
+        };
+        let others = wgpu::TextureFormat::R8Unorm;
+        let (y, u, v) = (
+            plane(size, first),
+            plane(chroma, others),
+            plane(chroma, others),
+        );
         let uniform = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("layer"),
             size: LAYER_UNIFORM_SIZE,
@@ -501,6 +523,8 @@ impl Compositor {
         });
         LayerSlot {
             size,
+            still: None,
+            holds_still,
             y,
             u,
             v,
@@ -510,41 +534,62 @@ impl Compositor {
     }
 
     fn upload(&mut self, index: usize, layer: &Layer) {
-        let picture = &layer.picture;
-        let size = (picture.width, picture.height);
+        let size = layer.picture.size();
+        let holds_still = matches!(layer.picture, LayerPicture::Still(_));
         if index == self.slots.len() {
-            let slot = self.new_slot(size);
+            let slot = self.new_slot(size, holds_still);
             self.slots.push(slot);
-        } else if self.slots[index].size != size {
-            self.slots[index] = self.new_slot(size);
+        } else if self.slots[index].size != size || self.slots[index].holds_still != holds_still {
+            self.slots[index] = self.new_slot(size, holds_still);
         }
 
-        let slot = &self.slots[index];
-        let chroma = picture.chroma_size();
-        for (texture, data, stride, plane_size) in [
-            (&slot.y, picture.y, picture.y_stride, size),
-            (&slot.u, picture.u, picture.uv_stride, chroma),
-            (&slot.v, picture.v, picture.uv_stride, chroma),
-        ] {
-            self.queue.write_texture(
+        let write = |queue: &wgpu::Queue,
+                     texture: &wgpu::Texture,
+                     data: &[u8],
+                     row: usize,
+                     area: (u32, u32)| {
+            queue.write_texture(
                 texture.as_image_copy(),
                 data,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(stride as u32),
+                    bytes_per_row: Some(row as u32),
                     rows_per_image: None,
                 },
                 wgpu::Extent3d {
-                    width: plane_size.0,
-                    height: plane_size.1,
+                    width: area.0,
+                    height: area.1,
                     depth_or_array_layers: 1,
                 },
             );
-        }
+        };
+        let rows = match layer.picture {
+            LayerPicture::Video(picture) => {
+                let slot = &self.slots[index];
+                let chroma = picture.chroma_size();
+                write(&self.queue, &slot.y, picture.y, picture.y_stride, size);
+                write(&self.queue, &slot.u, picture.u, picture.uv_stride, chroma);
+                write(&self.queue, &slot.v, picture.v, picture.uv_stride, chroma);
+                color::to_rgb(picture.color)
+            }
+            LayerPicture::Still(picture) => {
+                if self.slots[index].still != Some(picture.id) {
+                    write(
+                        &self.queue,
+                        &self.slots[index].y,
+                        &picture.rgba,
+                        size.0 as usize * 4,
+                        size,
+                    );
+                    self.slots[index].still = Some(picture.id);
+                }
+                [[0.0; 4]; 3]
+            }
+        };
+        let slot = &self.slots[index];
 
         let (width, height) = (self.size.0 as f32, self.size.1 as f32);
         let rect = layer.rect;
-        let rows = color::to_rgb(picture.color);
         let radians = layer.look.degrees.to_radians();
         // Cropping reads only part of the picture, and a flip reads it from the other side.
         let [left, top, right, bottom] = layer.look.source;
@@ -591,7 +636,7 @@ impl Compositor {
             rows[2][3],
             layer.opacity,
             soft_edges,
-            0.0,
+            if holds_still { 1.0 } else { 0.0 },
             0.0,
         ];
         self.queue
@@ -860,6 +905,7 @@ mod tests {
     use super::*;
     use crate::scene::{PictureLook, Rect, fit_inside};
     use bareclip_core::picture::ColorMatrix;
+    use bareclip_core::picture::StillPicture;
 
     /// Stored values for a flat colour, with the planes the size a picture needs.
     struct Flat {
@@ -899,7 +945,7 @@ mod tests {
 
         fn filling(&self, canvas: (u32, u32)) -> Layer<'_> {
             Layer {
-                picture: self.view(),
+                picture: self.view().into(),
                 rect: fit_inside((self.width, self.height), canvas),
                 opacity: 1.0,
                 look: PictureLook::PLAIN,
@@ -934,7 +980,7 @@ mod tests {
         compositor.set_background([255, 0, 0]);
         let blue = Flat::new(16, 18, BLUE_HD);
         let layer = Layer {
-            picture: blue.view(),
+            picture: blue.view().into(),
             rect: Rect {
                 x: 32.0,
                 y: 0.0,
@@ -1130,7 +1176,7 @@ mod tests {
         let layers = [
             red.filling((64, 36)),
             Layer {
-                picture: blue.view(),
+                picture: blue.view().into(),
                 rect: Rect {
                     x: 32.0,
                     y: 0.0,
@@ -1300,7 +1346,7 @@ mod tests {
         let bottom = Flat::new(128, 72, RED_HD);
         let top = Flat::new(32, 18, BLUE_HD);
         let small = Layer {
-            picture: top.view(),
+            picture: top.view().into(),
             rect: Rect {
                 x: 64.0,
                 y: 36.0,
@@ -1329,7 +1375,7 @@ mod tests {
         let top = Flat::new(32, 18, BLUE_HD);
         fn placed(flat: &Flat, x: f32) -> Layer<'_> {
             Layer {
-                picture: flat.view(),
+                picture: flat.view().into(),
                 rect: Rect {
                     x,
                     y: 0.0,
@@ -1425,7 +1471,7 @@ mod tests {
             color: ColorFormat::OUTPUT,
         };
         let layer = Layer {
-            picture,
+            picture: picture.into(),
             rect: fit_inside((64, 36), (64, 36)),
             opacity: 1.0,
             look: PictureLook::PLAIN,
@@ -1470,6 +1516,112 @@ mod tests {
 
         assert_near(first, RED_HD);
         assert_near(second, BLUE_HD);
+    }
+
+    /// An image of one colour, as the file reader would hand it over.
+    fn still_of(size: (u32, u32), [red, green, blue]: [u8; 3], alpha: u8) -> StillPicture {
+        let scale = |value: u8| ((u32::from(value) * u32::from(alpha) + 127) / 255) as u8;
+        let pixel = [scale(red), scale(green), scale(blue), alpha];
+        StillPicture::new(size.0, size.1, pixel.repeat((size.0 * size.1) as usize))
+    }
+
+    fn image_layer(still: &StillPicture, rect: Rect) -> Layer<'_> {
+        Layer {
+            picture: still.into(),
+            rect,
+            opacity: 1.0,
+            look: PictureLook::PLAIN,
+        }
+    }
+
+    #[test]
+    fn a_solid_image_covers_what_is_behind_it_in_its_own_colours() {
+        let Ok(mut compositor) = Compositor::new(64, 36) else {
+            return;
+        };
+        compositor.set_background([0, 0, 0]);
+        let still = still_of((8, 8), [255, 255, 255], 255);
+        let whole = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 64.0,
+            height: 36.0,
+        };
+
+        let drawn = compositor
+            .render(&[image_layer(&still, whole)])
+            .expect("it draws");
+
+        let (luma, ..) = at(&drawn, 32, 18);
+        assert!(luma >= 233, "white came out as {luma}");
+    }
+
+    #[test]
+    fn a_see_through_image_shows_what_is_behind_it() {
+        let Ok(mut compositor) = Compositor::new(64, 36) else {
+            return;
+        };
+        compositor.set_background([255, 255, 255]);
+        let black = still_of((8, 8), [0, 0, 0], 128);
+        let invisible = still_of((8, 8), [255, 0, 0], 0);
+        let left = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 32.0,
+            height: 36.0,
+        };
+        let right = Rect { x: 32.0, ..left };
+
+        let drawn = compositor
+            .render(&[image_layer(&black, left), image_layer(&invisible, right)])
+            .expect("it draws");
+
+        let (half, ..) = at(&drawn, 16, 18);
+        assert!(
+            (110..=145).contains(&half),
+            "half see-through came out as {half}"
+        );
+        let (clear, u, v) = at(&drawn, 48, 18);
+        assert!(clear >= 233, "invisible still dimmed it to {clear}");
+        assert!(
+            (u - 128).abs() <= 3 && (v - 128).abs() <= 3,
+            "invisible red still tinted it: {u}, {v}"
+        );
+    }
+
+    #[test]
+    fn an_image_and_a_video_can_take_turns_in_the_same_place() {
+        let Ok(mut compositor) = Compositor::new(64, 36) else {
+            return;
+        };
+        compositor.set_background([0, 0, 0]);
+        let still = still_of((64, 36), [255, 255, 255], 255);
+        let black = bareclip_core::picture::BlackPicture::new(64, 36);
+        let whole = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 64.0,
+            height: 36.0,
+        };
+        let video = Layer {
+            picture: black.view().into(),
+            rect: whole,
+            opacity: 1.0,
+            look: PictureLook::PLAIN,
+        };
+
+        for _ in 0..2 {
+            let (shown, ..) = at(
+                &compositor
+                    .render(&[image_layer(&still, whole)])
+                    .expect("it draws"),
+                32,
+                18,
+            );
+            assert!(shown >= 233, "the image came out as {shown}");
+            let (shown, ..) = at(&compositor.render(&[video]).expect("it draws"), 32, 18);
+            assert!(shown <= 20, "the video came out as {shown}");
+        }
     }
 
     #[test]

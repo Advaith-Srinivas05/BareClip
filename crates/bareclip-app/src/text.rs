@@ -12,9 +12,10 @@ use bareclip_media::{AudioInfo, ExportReport, MediaInfo, Quality};
 pub const VIDEO_EXTENSIONS: [&str; 6] = ["mp4", "mkv", "mov", "webm", "avi", "ts"];
 /// Sound with no picture.
 pub const AUDIO_EXTENSIONS: [&str; 7] = ["mp3", "wav", "flac", "m4a", "aac", "ogg", "opus"];
-/// Everything that can be added to a project: videos, and sound on its own.
-pub const MEDIA_EXTENSIONS: [&str; 13] = [
+/// Everything that can be added to a project: videos, sound on its own, and images.
+pub const MEDIA_EXTENSIONS: [&str; 19] = [
     "mp4", "mkv", "mov", "webm", "avi", "ts", "mp3", "wav", "flac", "m4a", "aac", "ogg", "opus",
+    "jpg", "jpeg", "png", "webp", "bmp", "gif",
 ];
 
 /// A project's name as Windows will accept it for a file.
@@ -125,6 +126,14 @@ pub fn codec_name(codec: &str) -> String {
 }
 
 pub fn video_summary(info: &MediaInfo) -> String {
+    if info.is_still() {
+        return format!(
+            "{}, {} x {}",
+            image_kind(&info.video.codec),
+            info.video.width,
+            info.video.height
+        );
+    }
     format!(
         "{}, {} x {}, {:.2} fps",
         codec_name(&info.video.codec),
@@ -132,6 +141,14 @@ pub fn video_summary(info: &MediaInfo) -> String {
         info.video.height,
         info.video.frame_rate
     )
+}
+
+/// The usual name for a kind of image.
+fn image_kind(codec: &str) -> String {
+    match codec {
+        "mjpeg" => "JPEG".to_owned(),
+        other => other.to_uppercase(),
+    }
 }
 
 pub fn audio_track_summary(position: usize, track: &AudioInfo) -> String {
