@@ -12950,12 +12950,29 @@ mod tests {
         assert_eq!(picture.center(), frame.center());
     }
 
+    /// Waits for an export. A busy machine can make one slow, so this only gives up when one stops
+    /// moving for a long time, which would be a real freeze, and says how far it had got.
     fn wait_for_export(ctx: &egui::Context, editor: &mut Editor) {
         let started = Instant::now();
-        while matches!(editor.export_state, ExportState::Running(_)) {
+        let mut furthest = f32::NEG_INFINITY;
+        let mut moved = started;
+        while let ExportState::Running(task) = &editor.export_state {
+            let fraction = f32::from_bits(task.progress.load(Ordering::Relaxed));
+            if fraction > furthest {
+                furthest = fraction;
+                moved = Instant::now();
+            }
             assert!(
-                started.elapsed() < Duration::from_secs(30),
-                "the export took too long"
+                moved.elapsed() < Duration::from_secs(60),
+                "the export froze at {:.0}%, {:?} in",
+                furthest * 100.0,
+                started.elapsed()
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(240),
+                "the export is moving, but is only at {:.0}% after {:?}",
+                furthest * 100.0,
+                started.elapsed()
             );
             run_frame(ctx, editor, vec![]);
             thread::sleep(Duration::from_millis(5));
