@@ -105,7 +105,7 @@ fn layers_of(pictures: &[DecodedPicture]) -> Vec<Layer<'_>> {
         .iter()
         .zip(places)
         .map(|(picture, rect)| Layer {
-            picture: picture.view(),
+            picture: picture.view().into(),
             rect,
             opacity: 1.0,
             look: bareclip_render::PictureLook::PLAIN,
@@ -196,7 +196,7 @@ fn scaled_export(source: &Path, frames: u32, output: &Path) -> f64 {
     for _ in 0..frames {
         let picture = feed.recv().expect("the decoder is running");
         let layer = Layer {
-            picture: picture.view(),
+            picture: picture.view().into(),
             rect: fit_inside(picture.size(), (WIDTH, HEIGHT)),
             opacity: 1.0,
             look: bareclip_render::PictureLook::PLAIN,

@@ -6,4 +6,4 @@ mod compositor;
 mod scene;
 
 pub use compositor::{Compositor, RenderError};
-pub use scene::{Layer, PictureLook, Rect, fit_inside, needs_compositor};
+pub use scene::{Layer, LayerPicture, PictureLook, Rect, fit_inside, needs_compositor};

@@ -18,6 +18,7 @@ use bareclip_core::{
         colour_to_hex,
     },
     history::History,
+    picture::StillPicture,
     project::{self, ProjectFile, write_atomic},
     sound::ClipSound,
     splice::{CutMode, FrameIndex},
@@ -27,14 +28,15 @@ use bareclip_core::{
 };
 use bareclip_export::{
     CHOICES_REASON, ExportChoices, ExportRate, ExportSize, FullPlan, LAYERED_REASON, LayeredClip,
-    LayeredRequest, LayeredStretch, ProjectReport, Route, SIZES, SoundPlan, copying_suits,
-    export_layered, export_sound_only, export_with_new_sound, full_output_path, mixed_rates,
-    rates_on_offer, route_for, size_problem, size_with_shorter_side, sizes_on_offer, sound_labels,
+    LayeredRequest, LayeredStretch, ProjectReport, Route, SIZES, STILLS_REASON, SoundPlan,
+    copying_suits, export_layered, export_sound_only, export_with_new_sound, full_output_path,
+    mixed_rates, rates_on_offer, route_for, size_problem, size_with_shorter_side, sizes_on_offer,
+    sound_labels,
 };
 use bareclip_media::{
     DecodeStep, ExportPart, ExportRequest, MediaError, MediaInfo, PreviewFrame, Quality,
     SoundLabel, SoundShape, StripPicture, VideoPreview, can_write_gaps, export, picture_spacing,
-    plan_export, probe, read_sound_shape, read_strip_pictures, scan_frames,
+    plan_export, probe, read_sound_shape, read_still, read_strip_pictures, scan_frames,
 };
 use eframe::egui::{
     self, Align, Color32, CornerRadius, FontFamily, FontId, Frame, Key, Layout, Margin, Modifiers,
@@ -135,6 +137,7 @@ const EMPTY_HINT_MAX_HEIGHT: f32 = 200.0;
 const DIALOG_RADIUS: u8 = 10;
 /// A dialog's own buttons are never narrower than this, so short names still feel solid.
 const DIALOG_BUTTON_WIDTH: f32 = 84.0;
+const STILL_THUMBNAIL_WIDTH: usize = 320;
 const EXPORT_DROPDOWN_WIDTH: f32 = 128.0;
 const MATCH_SOURCE: &str = "Match source";
 /// The playback buttons: four of 32, the play button, and the spaces between them.
@@ -221,6 +224,8 @@ fn start_strip_reader(
 enum ScanMessage {
     Thumbnail(PreviewFrame),
     Frames(Result<FrameIndex, MediaError>),
+    /// An image has no frames to find, only itself to read.
+    Still(Result<StillPicture, MediaError>),
 }
 
 /// What the videos in the panel are ordered by.
@@ -248,24 +253,27 @@ enum MediaFilter {
     All,
     Videos,
     Audio,
+    Images,
     OnTimeline,
     NotOnTimeline,
 }
 
 impl MediaFilter {
-    const ALL: [(Self, &'static str); 5] = [
+    const ALL: [(Self, &'static str); 6] = [
         (Self::All, "Everything"),
         (Self::Videos, "Videos"),
         (Self::Audio, "Audio"),
+        (Self::Images, "Images"),
         (Self::OnTimeline, "On the timeline"),
         (Self::NotOnTimeline, "Not on the timeline"),
     ];
 
-    fn keeps(self, used: bool, sound_only: bool) -> bool {
+    fn keeps(self, used: bool, info: &MediaInfo) -> bool {
         match self {
             Self::All => true,
-            Self::Videos => !sound_only,
-            Self::Audio => sound_only,
+            Self::Videos => !info.is_sound_only() && !info.is_still(),
+            Self::Audio => info.is_sound_only(),
+            Self::Images => info.is_still(),
             Self::OnTimeline => used,
             Self::NotOnTimeline => !used,
         }
@@ -327,6 +335,8 @@ struct MediaEntry {
     /// What its clips show, as far as it has been read, with pictures in order of time.
     strip_pictures: Vec<(Ticks, TextureHandle)>,
     strip_pictures_done: bool,
+    /// What an image shows, once it has been read.
+    still: Option<Arc<StillPicture>>,
     sound_shape: Option<SoundShape>,
     strip_reader: Option<StripReader>,
 }
@@ -662,7 +672,7 @@ impl Editor {
     /// Clears everything down to an empty project.
     fn start_new_project(&mut self) {
         self.wait_for_auto_save();
-        self.preview.pause(self.project.tracks.played());
+        self.preview.pause(self.project.tracks.played_videos());
         self.media.clear();
         self.project = Snapshot {
             tracks: Tracks::default(),
@@ -1039,7 +1049,7 @@ impl Editor {
     }
 
     fn position(&self) -> Ticks {
-        self.preview.position(self.project.tracks.played())
+        self.preview.position(self.project.tracks.played_videos())
     }
 
     fn entry(&self, id: MediaId) -> Option<&MediaEntry> {
@@ -1058,10 +1068,7 @@ impl Editor {
         let used = |entry: &MediaEntry| tracks.clips_using(entry.id) > 0;
         let mut listed: Vec<&MediaEntry> = self
             .visible_media()
-            .filter(|entry| {
-                self.media_filter
-                    .keeps(used(entry), entry.info.is_sound_only())
-            })
+            .filter(|entry| self.media_filter.keeps(used(entry), &entry.info))
             .collect();
         listed.sort_by(|a, b| {
             let by_name = || text::natural_order(&a.name, &b.name);
@@ -1089,7 +1096,11 @@ impl Editor {
             ..
         } = self;
         preview.set_project_length(project.tracks.duration());
-        preview.seek(project.tracks.played(), &|id| media_info(media, id), time);
+        preview.seek(
+            project.tracks.played_videos(),
+            &|id| media_info(media, id),
+            time,
+        );
         if self.project.tracks.is_empty() {
             self.picture = None;
         }
@@ -1100,7 +1111,7 @@ impl Editor {
     fn hold_playback_while_scrubbing(&mut self) {
         let scrubbing = self.timeline_state.drag == TimelineDrag::Scrub || self.seek_bar_held;
         if scrubbing && self.preview.is_playing() {
-            self.preview.pause(self.project.tracks.played());
+            self.preview.pause(self.project.tracks.played_videos());
             self.resume_after_scrub = true;
         } else if !scrubbing && std::mem::take(&mut self.resume_after_scrub) {
             let at_the_end = self.position() >= self.project.tracks.duration();
@@ -1117,7 +1128,7 @@ impl Editor {
             media,
             ..
         } = self;
-        preview.toggle(project.tracks.played(), &|id| media_info(media, id));
+        preview.toggle(project.tracks.played_videos(), &|id| media_info(media, id));
     }
 
     /// Remembers the project as it is now, ready for a change that can be undone.
@@ -1163,10 +1174,19 @@ impl Editor {
         let progress = Arc::new(AtomicU32::new(0));
         let cancel_scan = Arc::new(AtomicBool::new(false));
         let sound_only = info.is_sound_only();
+        let is_still = info.is_still();
         // Sound has no frames to find or pictures to show.
         let scan = (!sound_only).then(|| {
             let (sender, scan) = mpsc::channel();
             let scan_path = path.to_owned();
+            if is_still {
+                let repaint = ctx.clone();
+                thread::spawn(move || {
+                    let _ = sender.send(ScanMessage::Still(read_still(&scan_path)));
+                    repaint.request_repaint();
+                });
+                return scan;
+            }
             let scan_progress = progress.clone();
             let scan_cancel = cancel_scan.clone();
             let repaint = ctx.clone();
@@ -1189,7 +1209,7 @@ impl Editor {
         });
 
         let want_pictures = self.settings.thumbnails && !sound_only;
-        let strip_reader = (want_pictures || self.settings.waveforms)
+        let strip_reader = (!is_still && (want_pictures || self.settings.waveforms))
             .then(|| start_strip_reader(ctx, &info, want_pictures, self.settings.waveforms));
         let id = MediaId(self.next_media);
         self.next_media += 1;
@@ -1205,6 +1225,7 @@ impl Editor {
             thumbnail: None,
             strip_pictures: Vec::new(),
             strip_pictures_done: false,
+            still: None,
             sound_shape: None,
             strip_reader,
         })
@@ -1212,6 +1233,9 @@ impl Editor {
 
     fn full_range(&self, id: MediaId) -> Option<TimeRange> {
         let entry = self.entry(id)?;
+        if entry.info.is_still() {
+            return Some(TimeRange::new_still());
+        }
         Some(TimeRange {
             start: Ticks(0),
             end: entry.info.duration,
@@ -1385,7 +1409,7 @@ impl Editor {
             self.notice = Some("Move the playhead inside a clip to split it there.".to_owned());
             return;
         };
-        self.preview.pause(self.project.tracks.played());
+        self.preview.pause(self.project.tracks.played_videos());
         let source_time = Ticks(clip.source.start.0 + position.0 - clip.start.0);
         let split_at = self.snap_to_frame(clip.media, source_time);
         let before = self.project.clone();
@@ -1472,14 +1496,14 @@ impl Editor {
     }
 
     fn step_frame(&mut self, forward: bool) {
-        self.preview.pause(self.project.tracks.played());
+        self.preview.pause(self.project.tracks.played_videos());
         let position = self.position();
         let gap_step = Ticks::from_seconds(if forward {
             GAP_STEP_SECONDS
         } else {
             -GAP_STEP_SECONDS
         });
-        let Some(location) = self.project.tracks.played().locate(position) else {
+        let Some(location) = self.project.tracks.played_videos().locate(position) else {
             self.seek(Ticks(position.0 + gap_step.0));
             return;
         };
@@ -1510,6 +1534,7 @@ impl Editor {
 
     fn poll_background(&mut self, ctx: &egui::Context) {
         let mut problem = None;
+        let mut still_arrived = false;
         for entry in &mut self.media {
             let Some(scan) = &entry.scan else {
                 continue;
@@ -1527,6 +1552,26 @@ impl Editor {
                             image,
                             TextureOptions::LINEAR,
                         ));
+                    }
+                    ScanMessage::Still(Ok(still)) => {
+                        let image = shrunk_still(&still);
+                        entry.thumbnail = Some(ctx.load_texture(
+                            format!("thumbnail-{}", entry.id.0),
+                            image,
+                            TextureOptions::LINEAR,
+                        ));
+                        // The same picture stands in all along its clips.
+                        if let Some(thumbnail) = entry.thumbnail.clone() {
+                            entry.strip_pictures = vec![(Ticks(0), thumbnail)];
+                            entry.strip_pictures_done = true;
+                        }
+                        entry.still = Some(Arc::new(still));
+                        still_arrived = true;
+                        finished = true;
+                    }
+                    ScanMessage::Still(Err(error)) => {
+                        problem = Some(format!("{} can't be shown. {error}", entry.name));
+                        finished = true;
                     }
                     ScanMessage::Frames(Ok(index)) => {
                         entry.index = Some(Arc::new(index));
@@ -1547,6 +1592,9 @@ impl Editor {
         if problem.is_some() {
             self.notice = problem;
         }
+        if still_arrived {
+            self.layer_pictures.picture_arrived();
+        }
         self.poll_strip_readers(ctx);
 
         self.settle_canvas();
@@ -1566,7 +1614,7 @@ impl Editor {
         } = self;
         let lookup = |id: MediaId| media_info(media, id);
         if preview.planes() != layered {
-            preview.set_planes(layered, project.tracks.played(), &lookup);
+            preview.set_planes(layered, project.tracks.played_videos(), &lookup);
             *layer_pictures = LayerPictures::default();
             if let Some(display) = layer_display {
                 display.forget();
@@ -1576,7 +1624,7 @@ impl Editor {
             heard_spans(media, &project.tracks),
             project.tracks.duration(),
         );
-        let frame = preview.update(project.tracks.played(), &lookup);
+        let frame = preview.update(project.tracks.played_videos(), &lookup);
         if let (true, Some(canvas), Some(display)) = (layered, canvas, layer_display.as_mut()) {
             let size_of = |id: MediaId| {
                 media
@@ -1585,7 +1633,7 @@ impl Editor {
                     .map(|entry| (entry.info.video.width, entry.info.video.height))
             };
             let now = last_moment_by(
-                preview.position(project.tracks.played()),
+                preview.position(project.tracks.played_videos()),
                 project.tracks.duration(),
             );
             let mut stack = project.tracks.stack_at(now, canvas, &size_of);
@@ -1615,9 +1663,20 @@ impl Editor {
                 *notice = Some(problem);
             }
             let background = project.canvas.background;
-            if let Err(error) =
-                display.draw(layer_pictures, &stack, now, canvas, background, &size_of)
-            {
+            let still_of = |id: MediaId| {
+                media
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .and_then(|entry| entry.still.clone())
+            };
+            if let Err(error) = display.draw(
+                layer_pictures,
+                &stack,
+                now,
+                (canvas, background),
+                &size_of,
+                &still_of,
+            ) {
                 *notice = Some(error.to_string());
             }
         } else if let Some(frame) = frame {
@@ -1636,7 +1695,7 @@ impl Editor {
             *notice = Some(error);
         }
         if preview.is_playing() {
-            let position = preview.position(project.tracks.played());
+            let position = preview.position(project.tracks.played_videos());
             timeline_state.follow(position, project.tracks.duration());
             ctx.request_repaint();
         }
@@ -1704,6 +1763,14 @@ impl Editor {
         let (thumbnails, waveforms) = (self.settings.thumbnails, self.settings.waveforms);
         for entry in &mut self.media {
             entry.strip_reader = None;
+            // An image is its own picture, already in memory, with nothing to read.
+            if entry.info.is_still() {
+                entry.strip_pictures = match (&entry.thumbnail, thumbnails) {
+                    (Some(thumbnail), true) => vec![(Ticks(0), thumbnail.clone())],
+                    _ => Vec::new(),
+                };
+                continue;
+            }
             if !thumbnails {
                 entry.strip_pictures.clear();
                 entry.strip_pictures_done = false;
@@ -1763,7 +1830,13 @@ impl Editor {
     /// Lets the first video set the project's size, and an empty timeline forget it.
     fn settle_canvas(&mut self) {
         let mut canvas = self.project.canvas;
-        canvas.settle(&self.project.tracks, &|id| self.video_size(id));
+        // Only videos set the size, because a photo can be far larger than any video needs.
+        let size_of = |id: MediaId| {
+            self.entry(id)
+                .filter(|entry| !entry.info.is_still())
+                .map(|entry| (entry.info.video.width, entry.info.video.height))
+        };
+        canvas.settle(&self.project.tracks, &size_of);
         self.project.canvas = canvas;
     }
 
@@ -1846,7 +1919,12 @@ impl Editor {
     /// How the timeline would be exported, leaving aside any difference in frame rates.
     fn route_before_rates(&self, videos: &[MediaInfo]) -> Route {
         if self.takes_layers() {
-            return Route::Full(LAYERED_REASON.to_owned());
+            let reason = if videos.iter().any(MediaInfo::is_still) {
+                STILLS_REASON
+            } else {
+                LAYERED_REASON
+            };
+            return Route::Full(reason.to_owned());
         }
         let tracks = &self.project.tracks;
         if tracks.played().is_empty() {
@@ -1919,14 +1997,39 @@ impl Editor {
             && self.own_tracks_kept_apart().len() + tracks.audio_tracks().len() > 1
     }
 
+    /// Everything heard just as it was recorded, with each of its tracks kept apart. This goes by
+    /// what can be heard rather than what is on top, or the sound of a video under an image or a
+    /// silent overlay would stop while that was showing.
+    fn recorded_sound_plan(&self) -> SoundPlan {
+        let spans = self.project.tracks.sound_spans(&|id| self.has_sound(id));
+        let mut heard: Vec<MediaInfo> = Vec::new();
+        let spans = spans
+            .into_iter()
+            .filter_map(|span| {
+                let info = &self.entry(span.media)?.info;
+                if !heard.iter().any(|known| known.path == info.path) {
+                    heard.push(info.clone());
+                }
+                Some(MixSpan {
+                    path: info.path.clone(),
+                    start: span.start,
+                    source: span.source,
+                    sound: span.sound,
+                    bus: Bus::ByTrack(0),
+                })
+            })
+            .collect();
+        SoundPlan {
+            spans,
+            tracks: sound_labels(&heard),
+        }
+    }
+
     /// What the finished video's sound comes from, and the tracks it goes on.
     fn sound_plan(&self) -> SoundPlan {
         let tracks = &self.project.tracks;
         if self.sound_is_plain() && !self.sound_only {
-            return SoundPlan::as_recorded(
-                &self.export_parts().unwrap_or_default(),
-                &self.videos_on_timeline(),
-            );
+            return self.recorded_sound_plan();
         }
         let apart = self.keep_sound_apart && self.can_keep_sound_apart() && !self.sound_only;
         let own = self.own_tracks_kept_apart();
@@ -2104,8 +2207,10 @@ impl Editor {
     }
 
     fn start_export_to(&mut self, ctx: &egui::Context, output: PathBuf) {
+        // Only copying needs to know where each frame of a video is.
         let parts = self.export_parts();
-        if parts.is_none() && !self.sound_only {
+        let redrawn = matches!(self.export_route(), Route::Full(_));
+        if parts.is_none() && !self.sound_only && !redrawn {
             return;
         }
         let parts = parts.unwrap_or_default();
@@ -2188,8 +2293,8 @@ impl Editor {
 
     fn pick_files(&mut self, ctx: &egui::Context) {
         let picked = rfd::FileDialog::new()
-            .set_title("Add videos and audio")
-            .add_filter("Video and audio files", &text::MEDIA_EXTENSIONS)
+            .set_title("Add media")
+            .add_filter("Video, audio and image files", &text::MEDIA_EXTENSIONS)
             .add_filter("All files", &["*"])
             .pick_files();
         if let Some(paths) = picked {
@@ -2722,7 +2827,7 @@ impl Editor {
         if let Some(index) = find
             && let Some(path) = rfd::FileDialog::new()
                 .set_title("Find video")
-                .add_filter("Video and audio files", &text::MEDIA_EXTENSIONS)
+                .add_filter("Video, audio and image files", &text::MEDIA_EXTENSIONS)
                 .add_filter("All files", &["*"])
                 .pick_file()
         {
@@ -2809,7 +2914,7 @@ impl Editor {
                 "The shape of the finished video, now {width} x {height}"
             ));
         egui::Popup::menu(&button).show(|ui| {
-            let has_video = !self.project.tracks.is_empty();
+            let has_video = self.project.canvas.original.is_some();
             if has_video
                 && ui
                     .add(MenuItem::choice(
@@ -3513,6 +3618,7 @@ impl Editor {
                 has_sound: self.has_sound(clip.media),
                 muted: clip.sound.muted,
                 sound_only: self.project.tracks.is_sound_row(track),
+                is_still: clip.is_still(),
                 fade_in: clip.sound.fade_in_on(clip.duration()),
                 fade_out: clip.sound.fade_out_on(clip.duration()),
             })
@@ -3570,7 +3676,7 @@ impl Editor {
         if let Some((id, edge, pointer)) = events.trim_started
             && let Some(clip) = self.project.tracks.clip(id)
         {
-            self.preview.pause(self.project.tracks.played());
+            self.preview.pause(self.project.tracks.played_videos());
             self.record();
             let source = match edge {
                 ClipEdge::Start => clip.source.start,
@@ -3683,7 +3789,11 @@ impl Editor {
             let canvas = self.canvas_size();
             let played = self.project.tracks.played();
             let only_sound = played.is_empty() && !self.project.tracks.is_empty();
-            if self.preview.in_gap(played) || only_sound {
+            // With an image there may be no video playing at all, and what shows is drawn anyway.
+            let drawn_stills = self.layer_display.is_some() && self.project.tracks.has_stills();
+            if (self.preview.in_gap(self.project.tracks.played_videos()) || only_sound)
+                && !drawn_stills
+            {
                 if let Some(size) = canvas {
                     let [red, green, blue] = self.project.canvas.background;
                     ui.painter().rect_filled(
@@ -3952,7 +4062,8 @@ impl Editor {
         let gap_length = Ticks(gaps.iter().map(|gap| gap.duration().0).sum());
         let route = self.export_route();
         let full_plan = self.export_plan();
-        let ready = self.export_parts().is_some() || self.sound_only;
+        let ready =
+            self.export_parts().is_some() || self.sound_only || matches!(route, Route::Full(_));
         let sizes = self.export_sizes();
         let rates = rates_on_offer(&self.videos_on_timeline());
         let has_sound = !self.sound_spans_for_export().is_empty();
@@ -4486,7 +4597,9 @@ fn cards_are_compact(width: f32, columns: usize) -> bool {
 
 /// The lines of detail under a card's name, and whether each one is a warning.
 fn card_details(entry: &MediaEntry) -> Vec<(String, bool)> {
-    let first = if entry.scan.is_some() {
+    let first = if entry.scan.is_some() && entry.info.is_still() {
+        "Reading".to_owned()
+    } else if entry.scan.is_some() {
         let fraction = f32::from_bits(entry.progress.load(Ordering::Relaxed)) * 100.0;
         format!("Reading frames {fraction:.0}%")
     } else {
@@ -4566,6 +4679,32 @@ fn shrunk_image(rgba: &[u8], [width, height]: [usize; 2], factor: usize) -> egui
                         sum[channel] += u32::from(pixel[channel]) * alpha / 255;
                     }
                     sum[3] += alpha;
+                    count += 1;
+                }
+            }
+            shrunk.extend(sum.map(|total| (total / count) as u8));
+        }
+    }
+    egui::ColorImage::from_rgba_premultiplied(size, &shrunk)
+}
+
+/// A small copy of an image, for its card and clips. Its colours are already scaled by how
+/// see-through it is, so they can simply be averaged.
+fn shrunk_still(still: &StillPicture) -> egui::ColorImage {
+    let (width, height) = (still.width as usize, still.height as usize);
+    let factor = (width / STILL_THUMBNAIL_WIDTH).max(1);
+    let size = [width.div_ceil(factor), height.div_ceil(factor)];
+    let mut shrunk = Vec::with_capacity(size[0] * size[1] * 4);
+    for y in 0..size[1] {
+        for x in 0..size[0] {
+            let mut sum = [0_u32; 4];
+            let mut count = 0;
+            for source_y in (y * factor)..((y + 1) * factor).min(height) {
+                for source_x in (x * factor)..((x + 1) * factor).min(width) {
+                    let pixel = &still.rgba[(source_y * width + source_x) * 4..][..4];
+                    for (total, value) in sum.iter_mut().zip(pixel) {
+                        *total += u32::from(*value);
+                    }
                     count += 1;
                 }
             }
@@ -4671,7 +4810,11 @@ fn media_card(
             let drag_id = egui::Id::unique(("media-card", entry.id.0));
             let payload = MediaDrag {
                 media: entry.id,
-                length: entry.info.duration,
+                length: if entry.info.is_still() {
+                    TimeRange::new_still().duration()
+                } else {
+                    entry.info.duration
+                },
                 sound_only: entry.info.is_sound_only(),
             };
             ui.dnd_drag_source(drag_id, payload, |ui| {
@@ -4698,6 +4841,10 @@ fn media_card(
                         &icons::MUSIC,
                         palette.clip_video_text,
                     );
+                }
+                // An image has no length of its own to mention.
+                if entry.info.is_still() {
+                    return;
                 }
                 // The stage colour stays dark in both themes, so this label reads the same.
                 let length = painter.layout_no_wrap(
@@ -10826,6 +10973,309 @@ mod tests {
         let _ = std::fs::remove_file(&output);
     }
 
+    /// An image of a given size and colour, made once for each name.
+    fn image_file(name: &str, size: &str, colour: &str) -> PathBuf {
+        let folder = std::env::temp_dir().join("bareclip-app-tests");
+        std::fs::create_dir_all(&folder).expect("the folder can be created");
+        let path = folder.join(format!("{name}-{}.png", std::process::id()));
+        if !path.exists() {
+            let status = Command::new("ffmpeg")
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                ])
+                .arg(format!("color={colour}:s={size},format=rgba"))
+                .args(["-frames:v", "1"])
+                .arg(&path)
+                .status()
+                .expect("ffmpeg is on PATH");
+            assert!(status.success());
+        }
+        path
+    }
+
+    #[test]
+    fn a_new_image_goes_on_a_picture_row_for_four_seconds_with_its_own_kind_of_card() {
+        let ctx = context();
+        let image = image_file("card", "640x480", "red");
+        let editor = with_videos(&ctx, &[&image]);
+
+        let clip = picture_clip(&editor);
+        assert!(clip.is_still());
+        assert_eq!(clip.duration(), Ticks::from_seconds(4.0));
+        assert!(editor.project.tracks.audio_tracks().is_empty());
+        let entry = &editor.media[0];
+        assert!(
+            entry.thumbnail.is_some(),
+            "its picture is ready for its card"
+        );
+        assert!(entry.still.is_some());
+        assert_eq!(entry.strip_pictures.len(), 1, "and for its clips");
+        assert!(entry.index.is_none(), "it has no frames to look through");
+        let details: Vec<String> = card_details(entry)
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect();
+        assert!(
+            details.contains(&"PNG, 640 x 480".to_owned()),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn filter_tells_images_from_videos_and_sound() {
+        let ctx = context();
+        let image = image_file("filter", "64x36", "red");
+        let sound = clip_with_sound();
+        let mut editor = Editor::new(&ctx, false);
+        editor.import(&ctx, &[image, sound, song_file().to_path_buf()]);
+        settle(&ctx, &mut editor);
+
+        let shown = |editor: &mut Editor, filter| {
+            editor.media_filter = filter;
+            editor.listed_media().len()
+        };
+        assert_eq!(shown(&mut editor, MediaFilter::All), 3);
+        assert_eq!(shown(&mut editor, MediaFilter::Images), 1);
+        assert_eq!(shown(&mut editor, MediaFilter::Videos), 1);
+        assert_eq!(shown(&mut editor, MediaFilter::Audio), 1);
+    }
+
+    #[test]
+    fn an_image_doesnt_set_the_projects_size_but_the_first_video_does() {
+        let ctx = context();
+        let image = image_file("size", "4032x3024", "red");
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&image]);
+        assert_eq!(editor.project.canvas.size(), (1920, 1080));
+        assert_eq!(editor.project.canvas.name(), "16:9");
+
+        editor.import(&ctx, &[sound]);
+        settle(&ctx, &mut editor);
+        let video = editor.media[1].id;
+        editor.add_to_timeline(video);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let info = &editor.media[1].info;
+        assert_eq!(
+            editor.project.canvas.size(),
+            (info.video.width, info.video.height)
+        );
+    }
+
+    #[test]
+    fn a_ratio_picked_by_hand_stays_when_only_an_image_is_on_the_timeline() {
+        let ctx = context();
+        let image = image_file("ratio", "640x480", "red");
+        let mut editor = with_videos(&ctx, &[&image]);
+
+        editor.choose_ratio(Some((9, 16)));
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let (width, height) = editor.project.canvas.size();
+        assert!(height > width);
+    }
+
+    #[test]
+    fn an_image_can_be_stretched_split_and_moved_like_any_clip() {
+        let ctx = context();
+        let image = image_file("stretch", "64x36", "red");
+        let mut editor = with_videos(&ctx, &[&image]);
+        let clip = picture_clip(&editor);
+        let length = editor.media[0].info.duration;
+
+        editor.project.tracks.trim(
+            clip.id,
+            ClipEdge::End,
+            Ticks(clip.source.start.0 + Ticks::from_seconds(600.0).0),
+            length,
+            Ticks(1),
+        );
+        assert_eq!(picture_clip(&editor).duration(), Ticks::from_seconds(600.0));
+
+        let second = editor
+            .project
+            .tracks
+            .split(
+                clip.id,
+                Ticks(clip.source.start.0 + Ticks::from_seconds(10.0).0),
+            )
+            .expect("it splits");
+        let halves = editor.project.tracks.picture_tracks()[0].clips();
+        assert_eq!(halves.len(), 2);
+        assert!(halves.iter().all(|half| half.is_still()));
+        assert_eq!(
+            editor.project.tracks.clip(second).map(|clip| clip.start),
+            Some(Ticks::from_seconds(10.0))
+        );
+    }
+
+    #[test]
+    fn an_image_takes_the_full_route_and_says_why_with_no_frames_to_wait_for() {
+        let ctx = context();
+        let image = image_file("route", "320x180", "white");
+        let mut editor = with_videos(&ctx, &[&image]);
+
+        assert_eq!(editor.export_route(), Route::Full(STILLS_REASON.to_owned()));
+        let output = output_called("only-image");
+        let report = exported_report(&ctx, &mut editor, &output);
+
+        assert!(matches!(report, ProjectReport::Full(_)), "{report:?}");
+        let info = probe(&output).expect("it can be read");
+        assert_eq!((info.video.width, info.video.height), (1920, 1080));
+        assert!(info.audio.is_empty());
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn an_image_over_a_video_keeps_the_videos_sound_all_the_way_through() {
+        let ctx = context();
+        let image = image_file("over", "64x36", "white");
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        editor.import(&ctx, &[image]);
+        settle(&ctx, &mut editor);
+        let still = editor.media[1].id;
+        editor.drop_on_timeline(still, Ticks(0), TrackTarget::New(0));
+        run_frame(&ctx, &mut editor, vec![]);
+        let video = editor
+            .project
+            .tracks
+            .picture_tracks()
+            .iter()
+            .flat_map(|row| row.clips())
+            .find(|clip| !clip.is_still())
+            .copied()
+            .expect("the video is still there");
+
+        let plan = editor.sound_plan();
+
+        assert_eq!(plan.spans.len(), 1);
+        assert_eq!(
+            plan.spans[0].source, video.source,
+            "sound doesn't stop under the image"
+        );
+        assert_eq!(plan.tracks.len(), 1);
+        let output = output_called("image-over-sound");
+        exported_report(&ctx, &mut editor, &output);
+        assert_eq!(probe(&output).expect("it can be read").audio.len(), 1);
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn a_silent_overlay_doesnt_stop_the_sound_of_the_video_under_it() {
+        let ctx = context();
+        let silent = test_clip().to_path_buf();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        editor.import(&ctx, &[silent]);
+        settle(&ctx, &mut editor);
+        let overlay = editor.media[1].id;
+        assert!(!editor.has_sound(overlay));
+        editor.drop_on_timeline(overlay, Ticks(0), TrackTarget::New(0));
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let plan = editor.sound_plan();
+
+        assert_eq!(plan.spans.len(), 1);
+        assert_eq!(plan.spans[0].start, Ticks(0));
+        assert_eq!(
+            plan.spans[0].source.duration(),
+            editor.media[0].info.duration
+        );
+    }
+
+    #[test]
+    fn a_project_of_only_images_plays_through_to_its_end() {
+        let ctx = context();
+        let image = image_file("plays", "64x36", "white");
+        let mut editor = with_videos(&ctx, &[&image]);
+        let clip = picture_clip(&editor);
+        editor.project.tracks.trim(
+            clip.id,
+            ClipEdge::End,
+            Ticks(clip.source.start.0 + Ticks::from_seconds(0.3).0),
+            editor.media[0].info.duration,
+            Ticks(1),
+        );
+
+        editor.toggle_playback();
+        assert!(editor.preview.is_playing());
+        let started = Instant::now();
+        while editor.preview.is_playing() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "it never finished"
+            );
+            run_frame(&ctx, &mut editor, vec![]);
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(editor.position(), Ticks::from_seconds(0.3));
+    }
+
+    #[test]
+    fn a_video_plays_on_after_an_image_ends_and_an_image_after_a_video_ends() {
+        let ctx = context();
+        let image = image_file("after", "64x36", "white");
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound, &image]);
+        let video_end = editor.media[0].info.duration;
+        assert_eq!(editor.project.tracks.played_videos().duration(), video_end);
+        assert_eq!(
+            editor.project.tracks.duration(),
+            Ticks(video_end.0 + Ticks::from_seconds(4.0).0)
+        );
+
+        editor.seek(Ticks(video_end.0 + Ticks::from_seconds(1.0).0));
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert!(editor.preview.in_gap(editor.project.tracks.played_videos()));
+        assert_eq!(
+            editor.position(),
+            Ticks(video_end.0 + Ticks::from_seconds(1.0).0)
+        );
+    }
+
+    #[test]
+    fn an_image_has_no_sound_controls() {
+        let ctx = context();
+        let image = image_file("no-sound", "64x36", "white");
+        let mut editor = with_videos(&ctx, &[&image]);
+        editor.selected = Some(picture_clip(&editor).id);
+
+        assert!(editor.selected_sound().is_none());
+    }
+
+    #[test]
+    fn an_image_clip_survives_saving_and_opening() {
+        let ctx = context();
+        let folder = std::env::temp_dir().join("bareclip-app-tests");
+        std::fs::create_dir_all(&folder).expect("the folder can be created");
+        let path = folder.join(format!("image-project-{}.bareclip", std::process::id()));
+        let image = image_file("saved", "64x36", "white");
+        let mut editor = with_videos(&ctx, &[&image]);
+        let clip = picture_clip(&editor);
+        assert!(editor.save_to(&path));
+
+        let mut reopened = Editor::new(&ctx, false);
+        reopened.open_project(&ctx, &path);
+        settle(&ctx, &mut reopened);
+        run_frame(&ctx, &mut reopened, vec![]);
+
+        let back = picture_clip(&reopened);
+        assert!(back.is_still());
+        assert_eq!(back.source, clip.source);
+        assert_eq!(back.start, clip.start);
+        assert!(reopened.media[0].still.is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn choosing_anything_but_match_source_redraws_and_going_back_copies_again() {
         let ctx = context();
@@ -11213,7 +11663,48 @@ mod tests {
         assert!(reopened.project.tracks.row_sounds()[0].muted);
     }
 
-    /// Draws sound on the real screen, with no window. Run with
+    /// Draws images on the real screen, with no window. Run with
+    /// `$env:BARECLIP_SCREENS = '<folder>'; ./scripts/cargo.ps1 test -p bareclip-app draw_the_image_screens '--' --ignored`
+    #[test]
+    #[ignore = "needs a real GPU, and draws pictures to look at rather than checking anything"]
+    fn draw_the_image_screens() {
+        let folder = std::env::var_os("BARECLIP_SCREENS").map_or_else(
+            || std::env::temp_dir().join("bareclip-screens"),
+            PathBuf::from,
+        );
+        let ctx = context();
+        let mut camera = Camera::new(folder);
+        let image = image_file("screen", "800x600", "orange@0.6");
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        editor.use_gpu(LayerDisplay::new(
+            camera.device.clone(),
+            camera.queue.clone(),
+            camera.renderer.clone(),
+        ));
+        editor.import(&ctx, &[image]);
+        settle(&ctx, &mut editor);
+        let still = editor.media[1].id;
+        editor.drop_on_timeline(still, Ticks::from_seconds(1.0), TrackTarget::New(0));
+        for _ in 0..30 {
+            run_frame(&ctx, &mut editor, vec![]);
+            thread::sleep(Duration::from_millis(10));
+        }
+        editor.seek(Ticks::from_seconds(2.0));
+        for _ in 0..30 {
+            run_frame(&ctx, &mut editor, vec![]);
+            thread::sleep(Duration::from_millis(10));
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "image-01-over-video");
+
+        editor.selected = None;
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Filter");
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "image-02-filter");
+    }
+
+    /// Draws the export window on the real screen, with no window. Run with
     /// `$env:BARECLIP_SCREENS = '<folder>'; ./scripts/cargo.ps1 test -p bareclip-app draw_the_export_screens '--' --ignored`
     #[test]
     #[ignore = "needs a real GPU, and draws pictures to look at rather than checking anything"]

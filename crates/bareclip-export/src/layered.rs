@@ -10,13 +10,13 @@ use std::{
 
 use bareclip_core::{
     canvas::{BLACK, Colour},
-    picture::BlackPicture,
+    picture::{BlackPicture, StillPicture},
     placement::{Placement, WHOLE},
     time::Ticks,
     timeline::TimeRange,
 };
-use bareclip_media::{MediaError, MediaInfo, Quality, probe, same_file};
-use bareclip_render::{Compositor, Layer, needs_compositor};
+use bareclip_media::{MediaError, MediaInfo, Quality, probe, read_still, same_file};
+use bareclip_render::{Compositor, Layer, LayerPicture, needs_compositor};
 
 use crate::{
     ExportRate, FullPlan, FullReport,
@@ -163,6 +163,14 @@ pub fn export_layered(
     let black = BlackPicture::new(settings.width, settings.height);
     let mut sound = SoundFeed::new(&request.sound);
 
+    let mut stills: HashMap<PathBuf, StillPicture> = HashMap::new();
+    for clip in stretches.iter().flat_map(|stretch| &stretch.stack) {
+        if clip.source.is_still()
+            && let Entry::Vacant(place) = stills.entry(clip.input.clone())
+        {
+            place.insert(read_still(&clip.input)?);
+        }
+    }
     let mut feeds: HashMap<u64, PictureFeed> = HashMap::new();
     let mut current_stretch = None;
     // Whether the last frame written was dead space, or else came from the current stretch.
@@ -196,7 +204,7 @@ pub fn export_layered(
             // A clip that carries on keeps its decoder, so it doesn't have to find its place again.
             let stack = stretch_index.map_or(&[][..], |index| &stretches[index].stack[..]);
             feeds.retain(|key, _| stack.iter().any(|clip| clip.key == *key));
-            for clip in stack {
+            for clip in stack.iter().filter(|clip| !clip.source.is_still()) {
                 if let Entry::Vacant(place) = feeds.entry(clip.key) {
                     let from = TimeRange {
                         start: clip.source_time(time).max(clip.source.start),
@@ -231,11 +239,15 @@ pub fn export_layered(
                     let layers: Vec<Layer> = stack
                         .iter()
                         .filter_map(|clip| {
-                            let picture = feeds.get(&clip.key)?.shown.as_ref()?;
+                            let picture: LayerPicture = if clip.source.is_still() {
+                                stills.get(&clip.input)?.into()
+                            } else {
+                                feeds.get(&clip.key)?.shown.as_ref()?.view().into()
+                            };
                             let placement = clip.placement.at(Ticks(time.0 - clip.start.0));
                             let size = sizes.get(&clip.input).copied()?;
                             Some(Layer {
-                                picture: picture.view(),
+                                picture,
                                 rect: placement.rect(size, canvas),
                                 opacity: placement.opacity as f32 / WHOLE as f32,
                                 look: placement.look(),
@@ -252,8 +264,8 @@ pub fn export_layered(
                                 .map_err(render_error)?;
                         writer.write_picture(&drawn)?;
                         report.composited_frames += 1;
-                    } else {
-                        writer.write_picture(&layers[0].picture)?;
+                    } else if let LayerPicture::Video(picture) = &layers[0].picture {
+                        writer.write_picture(picture)?;
                         report.direct_frames += 1;
                     }
                 }

@@ -8,11 +8,12 @@ use std::{
 };
 
 use bareclip_core::{
+    picture::StillPicture,
     time::Ticks,
     timeline::{Clip, ClipId, MediaId},
 };
 use bareclip_media::{MediaInfo, PreviewFrame, fit_preview_size};
-use bareclip_render::{Compositor, Layer, RenderError};
+use bareclip_render::{Compositor, Layer, LayerPicture, RenderError};
 use eframe::{
     egui::{self, mutex::RwLock},
     egui_wgpu, wgpu,
@@ -25,6 +26,18 @@ use crate::player::{Notify, PREVIEW_HEIGHT, PREVIEW_WIDTH, Player};
 const LATE_LIMIT: Duration = Duration::from_millis(500);
 /// How long it gets to recover from one jump before it can jump again.
 const CATCH_UP_EVERY: Duration = Duration::from_secs(2);
+
+/// The videos in a stack that need a player of their own, which is all but the top one, because
+/// the main `Preview` plays that. An image has nothing to play.
+fn followed_videos(stack: &[Clip]) -> Vec<Clip> {
+    let mut videos: Vec<Clip> = stack
+        .iter()
+        .filter(|clip| !clip.is_still())
+        .copied()
+        .collect();
+    videos.pop();
+    videos
+}
 
 /// Where a moment on the timeline falls in a clip's video.
 fn source_time(clip: &Clip, now: Ticks) -> Ticks {
@@ -90,23 +103,21 @@ impl LayerPictures {
         notify: &Notify,
     ) -> Option<String> {
         let mut problem = None;
-        let under = stack.split_last().map_or(&[][..], |(_, under)| under);
+        let under = followed_videos(stack);
         let (coming_at, coming) = match &moment.coming {
-            Some((at, stack)) if moment.playing => {
-                (*at, stack.split_last().map_or(&[][..], |(_, under)| under))
-            }
-            _ => (moment.now, &[][..]),
+            Some((at, stack)) if moment.playing => (*at, followed_videos(stack)),
+            _ => (moment.now, Vec::new()),
         };
 
         self.followers.retain(|follower| {
             let wanted = under
                 .iter()
-                .chain(coming)
+                .chain(&coming)
                 .any(|clip| clip.id == follower.clip);
             // One that was getting ready for a moment that was jumped away from starts over.
             wanted && !(follower.waiting && moment.jumped)
         });
-        for clip in coming {
+        for clip in &coming {
             if under.iter().any(|shown| shown.id == clip.id)
                 || self.followers.iter().any(|f| f.clip == clip.id)
             {
@@ -129,7 +140,7 @@ impl LayerPictures {
                 Err(error) => problem = Some(error),
             }
         }
-        for clip in under {
+        for clip in &under {
             let known = self.followers.iter().any(|f| f.clip == clip.id);
             if known {
                 continue;
@@ -209,6 +220,11 @@ impl LayerPictures {
         problem
     }
 
+    /// Says an image has just finished loading, so the canvas is out of date.
+    pub fn picture_arrived(&mut self) {
+        self.changed = true;
+    }
+
     /// Whether the canvas needs drawing again for this stack.
     pub fn needs_drawing(&self, stack: &[Clip]) -> bool {
         self.changed || self.drawn != stack
@@ -218,7 +234,7 @@ impl LayerPictures {
     pub fn is_ready(&self, stack: &[Clip]) -> bool {
         stack
             .iter()
-            .all(|clip| self.pictures.contains_key(&clip.id))
+            .all(|clip| clip.is_still() || self.pictures.contains_key(&clip.id))
     }
 
     /// Draws the stack. `size_of` gives each video's real size, because the size of the picture
@@ -230,12 +246,23 @@ impl LayerPictures {
         now: Ticks,
         canvas: (u32, u32),
         size_of: &dyn Fn(MediaId) -> Option<(u32, u32)>,
+        still_of: &dyn Fn(MediaId) -> Option<Arc<StillPicture>>,
     ) -> Result<(), RenderError> {
         let target = compositor.size();
+        let stills: Vec<(MediaId, Arc<StillPicture>)> = stack
+            .iter()
+            .filter(|clip| clip.is_still())
+            .filter_map(|clip| Some((clip.media, still_of(clip.media)?)))
+            .collect();
         let layers: Vec<Layer> = stack
             .iter()
             .filter_map(|clip| {
-                let picture = self.pictures.get(&clip.id)?.view()?;
+                let picture: LayerPicture = if clip.is_still() {
+                    let (_, still) = stills.iter().find(|(media, _)| *media == clip.media)?;
+                    (&**still).into()
+                } else {
+                    self.pictures.get(&clip.id)?.view()?.into()
+                };
                 let placement = clip.placement.at(Ticks(now.0 - clip.start.0));
                 let size = size_of(clip.media)?;
                 Some(Layer {
@@ -340,9 +367,9 @@ impl LayerDisplay {
         pictures: &mut LayerPictures,
         stack: &[Clip],
         now: Ticks,
-        canvas: (u32, u32),
-        background: [u8; 3],
+        (canvas, background): ((u32, u32), [u8; 3]),
         size_of: &dyn Fn(MediaId) -> Option<(u32, u32)>,
+        still_of: &dyn Fn(MediaId) -> Option<Arc<StillPicture>>,
     ) -> Result<(), RenderError> {
         self.compositor_for(canvas)?.set_background(background);
         // Places are worked out from the canvas, so a new one means drawing them again.
@@ -351,7 +378,14 @@ impl LayerDisplay {
         if !wanted || (!self.drawn && !pictures.is_ready(stack)) {
             return Ok(());
         }
-        pictures.draw(self.compositor_for(canvas)?, stack, now, canvas, size_of)?;
+        pictures.draw(
+            self.compositor_for(canvas)?,
+            stack,
+            now,
+            canvas,
+            size_of,
+            still_of,
+        )?;
         self.drawn = true;
         self.drawn_on = Some((canvas, background));
         Ok(())
@@ -567,16 +601,26 @@ mod tests {
         let canvas = tracks.canvas(&size_of).expect("there is a canvas");
         let notify: Notify = Arc::new(|| {});
         let mut preview = Preview::new(false, notify.clone());
-        preview.set_planes(true, tracks.played(), &lookup);
-        preview.seek(tracks.played(), &lookup, at);
+        preview.set_planes(true, tracks.played_videos(), &lookup);
+        preview.seek(tracks.played_videos(), &lookup, at);
         let mut pictures = LayerPictures::default();
         let stack = tracks.stack_at(at, canvas, &size_of);
+        let stills: HashMap<MediaId, Arc<StillPicture>> = stack
+            .iter()
+            .filter(|clip| clip.is_still())
+            .map(|clip| {
+                let info = lookup(clip.media).expect("the image is known");
+                let still = bareclip_media::read_still(&info.path).expect("the image can be read");
+                (clip.media, Arc::new(still))
+            })
+            .collect();
         let exact = |pictures: &LayerPictures| {
             stack.iter().all(|clip| {
-                pictures
-                    .pictures
-                    .get(&clip.id)
-                    .is_some_and(|picture| picture.time >= at)
+                clip.is_still()
+                    || pictures
+                        .pictures
+                        .get(&clip.id)
+                        .is_some_and(|picture| picture.time >= at)
             })
         };
         let started = Instant::now();
@@ -585,7 +629,7 @@ mod tests {
                 started.elapsed() < Duration::from_secs(20),
                 "the exact pictures never came"
             );
-            let top = preview.update(tracks.played(), &lookup);
+            let top = preview.update(tracks.played_videos(), &lookup);
             let moment = Moment {
                 now: at,
                 playing: false,
@@ -597,9 +641,143 @@ mod tests {
             thread::sleep(Duration::from_millis(2));
         }
         pictures
-            .draw(compositor, &stack, at, canvas, &size_of)
+            .draw(compositor, &stack, at, canvas, &size_of, &|id| {
+                stills.get(&id).cloned()
+            })
             .expect("it draws");
         compositor.read_display().expect("it reads back")
+    }
+
+    #[test]
+    fn a_see_through_image_looks_the_same_in_the_preview_and_the_export() {
+        let video = detailed_clip("under-image", "testsrc2");
+        let folder = std::env::temp_dir().join("bareclip-app-tests");
+        let image = folder.join(format!("layers-image-{}.png", std::process::id()));
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg("color=orange@0.5:s=320x180,format=rgba")
+            .args(["-frames:v", "1"])
+            .arg(&image)
+            .status()
+            .expect("ffmpeg is on PATH");
+        assert!(status.success());
+        let infos: Vec<MediaInfo> = [&video, &image]
+            .iter()
+            .map(|path| probe(path).expect("it can be read"))
+            .collect();
+        let source = TimeRange {
+            start: Ticks(0),
+            end: seconds(3.0),
+        };
+        let mut tracks = Tracks::default();
+        tracks.place(MediaId(0), source, Ticks(0), TrackTarget::New(0));
+        let still = tracks.place(
+            MediaId(1),
+            TimeRange::new_still(),
+            Ticks(0),
+            TrackTarget::New(0),
+        );
+        tracks.set_placement(
+            still,
+            Placement {
+                center_x: WHOLE * 7 / 10,
+                center_y: WHOLE * 4 / 10,
+                scale: WHOLE / 2,
+                rotation: 20_000,
+                ..Placement::default()
+            },
+        );
+        let size_of = |id: MediaId| {
+            infos
+                .get(id.0 as usize)
+                .map(|info| (info.video.width, info.video.height))
+        };
+        let canvas = (infos[0].video.width, infos[0].video.height);
+        let Some(mut compositor) = compositor_of(canvas) else {
+            return;
+        };
+        let at = seconds(1.0);
+        let previewed = drawn_by_the_preview(&tracks, &infos, at, &mut compositor);
+
+        let output = folder.join(format!("layers-image-matches-{}.mp4", std::process::id()));
+        let paths = [video.clone(), image.clone()];
+        let stretches = tracks
+            .stretches(canvas, &size_of)
+            .into_iter()
+            .map(|stretch| bareclip_export::LayeredStretch {
+                start: stretch.start,
+                end: stretch.end,
+                stack: stretch
+                    .stack
+                    .iter()
+                    .map(|clip| bareclip_export::LayeredClip {
+                        key: clip.id.0,
+                        input: paths[clip.media.0 as usize].clone(),
+                        start: clip.start,
+                        source: clip.source,
+                        placement: clip.placement,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let request = bareclip_export::LayeredRequest {
+            output: output.clone(),
+            stretches,
+            sound: bareclip_export::SoundPlan::default(),
+            canvas: Some(canvas),
+            background: [0, 0, 0],
+            quality: Default::default(),
+            rate: Default::default(),
+        };
+        bareclip_export::export_layered(
+            &request,
+            &std::sync::atomic::AtomicBool::new(false),
+            &|_| {},
+        )
+        .expect("the export succeeds");
+
+        let mut reader = bareclip_media::PictureReader::open(&output).expect("the export opens");
+        reader.seek(at).expect("it seeks");
+        let exported = loop {
+            let picture = reader
+                .next_picture()
+                .expect("it decodes")
+                .expect("the moment is in the video");
+            if picture.time() >= at {
+                break picture;
+            }
+        };
+        let layer = Layer {
+            picture: exported.view().into(),
+            rect: bareclip_render::fit_inside(exported.size(), canvas),
+            opacity: 1.0,
+            look: bareclip_render::PictureLook::PLAIN,
+        };
+        compositor.draw_for_display(&[layer]).expect("it draws");
+        let shown = compositor.read_display().expect("it reads back");
+
+        let difference = average_difference(&previewed, &shown);
+        assert!(
+            difference < 6.0,
+            "the export differs from the preview by {difference:.2} out of 255"
+        );
+        // Without the image the picture is clearly different, so the comparison means something.
+        let mut without = tracks.clone();
+        without.remove(still);
+        let plain = drawn_by_the_preview(&without, &infos, at, &mut compositor);
+        assert!(
+            average_difference(&previewed, &plain) > difference + 2.0,
+            "the image made no difference"
+        );
+        let _ = std::fs::remove_file(&output);
     }
 
     #[test]
@@ -699,7 +877,7 @@ mod tests {
             }
         };
         let layer = Layer {
-            picture: exported.view(),
+            picture: exported.view().into(),
             rect: bareclip_render::fit_inside(exported.size(), canvas),
             opacity: 1.0,
             look: bareclip_render::PictureLook::PLAIN,
@@ -756,7 +934,7 @@ mod tests {
         let plain = first_frame(&mut plain);
         let planes = first_frame(&mut planes);
         let layer = Layer {
-            picture: planes.view().expect("it has planes"),
+            picture: planes.view().expect("it has planes").into(),
             rect: bareclip_render::fit_inside(size, size),
             opacity: 1.0,
             look: bareclip_render::PictureLook::PLAIN,
@@ -998,7 +1176,7 @@ mod tests {
             if pictures.needs_drawing(&stack) {
                 let before = Instant::now();
                 pictures
-                    .draw(&mut compositor, &stack, now, canvas, &size_of)
+                    .draw(&mut compositor, &stack, now, canvas, &size_of, &|_| None)
                     .expect("it draws");
                 slowest_draw = slowest_draw.max(before.elapsed());
                 draws += 1;
@@ -1186,7 +1364,7 @@ mod tests {
                     continue;
                 }
                 let layer = Layer {
-                    picture: picture.view(),
+                    picture: picture.view().into(),
                     rect: bareclip_render::fit_inside(picture.size(), canvas),
                     opacity: 1.0,
                     look: bareclip_render::PictureLook::PLAIN,

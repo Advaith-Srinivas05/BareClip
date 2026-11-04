@@ -178,6 +178,8 @@ pub struct ClipView {
     pub muted: bool,
     /// Whether it is on a row of sound, with no picture.
     pub sound_only: bool,
+    /// Whether it shows an image.
+    pub is_still: bool,
     /// How long its fades really are.
     pub fade_in: Ticks,
     pub fade_out: Ticks,
@@ -1043,6 +1045,8 @@ fn draw_clip(
                 ),
                 if clip.sound_only {
                     &icons::MUSIC
+                } else if clip.is_still {
+                    &icons::IMAGE
                 } else {
                     &icons::FILM
                 },
@@ -2210,6 +2214,7 @@ mod tests {
             has_sound: false,
             muted: false,
             sound_only: false,
+            is_still: false,
             fade_in: Ticks(0),
             fade_out: Ticks(0),
         }

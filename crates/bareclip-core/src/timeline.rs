@@ -2,7 +2,11 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{placement::Placement, sound::ClipSound, time::Ticks};
+use crate::{
+    placement::Placement,
+    sound::ClipSound,
+    time::{TICKS_PER_SECOND, Ticks},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimeRange {
@@ -14,7 +18,32 @@ impl TimeRange {
     pub fn duration(self) -> Ticks {
         Ticks(self.end.0 - self.start.0)
     }
+
+    /// Whether this is a stretch of an image rather than of real footage.
+    pub fn is_still(self) -> bool {
+        self.start.0 >= STILL_FLOOR
+    }
+
+    /// The stretch a new clip of an image starts on.
+    pub fn new_still() -> Self {
+        Self {
+            start: Ticks(STILL_START),
+            end: Ticks(STILL_START + STILL_CLIP_SECONDS * TICKS_PER_SECOND),
+        }
+    }
 }
+
+const SECONDS_PER_HOUR: i64 = 3600;
+/// An image has no footage, so it counts as very long footage of one picture. Every rule for
+/// trimming, splitting and moving clips then applies to it as it stands. Its clips start this far
+/// in, so that they can stretch either way.
+const STILL_START: i64 = 1000 * SECONDS_PER_HOUR * TICKS_PER_SECOND;
+/// Nothing this far into a file is real footage, even with a clip stretched a long way left.
+const STILL_FLOOR: i64 = 100 * SECONDS_PER_HOUR * TICKS_PER_SECOND;
+/// How long a new clip of an image lasts.
+const STILL_CLIP_SECONDS: i64 = 4;
+/// How long an image counts as being.
+pub const STILL_LENGTH: Ticks = Ticks(2 * STILL_START);
 
 /// A video added to the project.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -46,6 +75,11 @@ pub struct Clip {
 impl Clip {
     pub fn duration(self) -> Ticks {
         self.source.duration()
+    }
+
+    /// Whether this clip shows an image.
+    pub fn is_still(self) -> bool {
+        self.source.is_still()
     }
 
     /// When this clip ends on the timeline.
@@ -463,6 +497,42 @@ mod tests {
         for pair in timeline.clips().windows(2) {
             assert!(pair[0].end() <= pair[1].start, "{pair:?}");
         }
+    }
+
+    #[test]
+    fn a_new_image_clip_lasts_four_seconds_and_counts_as_an_image() {
+        let source = TimeRange::new_still();
+
+        assert_eq!(source.duration(), Ticks::from_seconds(4.0));
+        assert!(source.is_still());
+        assert!(!range(0, 100).is_still());
+    }
+
+    #[test]
+    fn an_image_clip_stretches_either_way_and_is_still_an_image() {
+        let mut timeline = Timeline::default();
+        let source = TimeRange::new_still();
+        let id = timeline.place(VIDEO, source, Ticks::from_seconds(100.0));
+
+        timeline.trim(
+            id,
+            ClipEdge::Start,
+            Ticks(source.start.0 - Ticks::from_seconds(60.0).0),
+            STILL_LENGTH,
+            Ticks(1),
+        );
+        timeline.trim(
+            id,
+            ClipEdge::End,
+            Ticks(source.end.0 + Ticks::from_seconds(3600.0).0),
+            STILL_LENGTH,
+            Ticks(1),
+        );
+
+        let clip = timeline.clip(id).expect("it is still there");
+        assert_eq!(clip.start, Ticks::from_seconds(40.0));
+        assert_eq!(clip.duration(), Ticks::from_seconds(3664.0));
+        assert!(clip.is_still());
     }
 
     #[test]

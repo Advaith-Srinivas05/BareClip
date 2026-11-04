@@ -16,6 +16,8 @@ struct Layer {
     to_blue: vec4<f32>,
     opacity: f32,
     soft_edges: f32,
+    // 1 for an image, whose first plane holds colours and how see-through each pixel is.
+    still: f32,
 };
 
 @group(0) @binding(0) var<uniform> layer: Layer;
@@ -51,8 +53,9 @@ fn vertex_main(@builtin(vertex_index) index: u32) -> Corner {
 @fragment
 fn fragment_main(corner: Corner) -> @location(0) vec4<f32> {
     let read = mix(layer.read_from, layer.read_to, corner.spot);
+    let first = textureSample(y_plane, smooth_sampler, read);
     let stored = vec4<f32>(
-        textureSample(y_plane, smooth_sampler, read).r,
+        first.r,
         textureSample(u_plane, smooth_sampler, read).r,
         textureSample(v_plane, smooth_sampler, read).r,
         1.0,
@@ -61,10 +64,16 @@ fn fragment_main(corner: Corner) -> @location(0) vec4<f32> {
     // picture would otherwise have.
     let inward = min(corner.spot, 1.0 - corner.spot) / max(fwidth(corner.spot), vec2<f32>(0.0001));
     let edge = clamp(min(inward.x, inward.y), 0.0, 1.0);
+    let fade = layer.opacity * mix(1.0, edge, layer.soft_edges);
+    if layer.still > 0.5 {
+        // Stored scaled by how see-through it is, which keeps smoothing from bleeding the colour
+        // of invisible pixels into an edge. Blending wants it unscaled.
+        return vec4<f32>(first.rgb / max(first.a, 0.0001), first.a * fade);
+    }
     return vec4<f32>(
         dot(layer.to_red, stored),
         dot(layer.to_green, stored),
         dot(layer.to_blue, stored),
-        layer.opacity * mix(1.0, edge, layer.soft_edges),
+        fade,
     );
 }

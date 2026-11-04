@@ -91,6 +91,7 @@ pub struct Tracks {
     /// One for each row, in the same order.
     row_sounds: Vec<RowSound>,
     played: Timeline,
+    played_videos: Timeline,
     /// Where nothing plays on any row.
     gaps: Vec<TimeRange>,
 }
@@ -131,6 +132,7 @@ impl Tracks {
             picture_rows: pictures.len(),
             row_sounds,
             played: Timeline::default(),
+            played_videos: Timeline::default(),
             gaps: Vec::new(),
         };
         restored.refresh();
@@ -196,6 +198,20 @@ impl Tracks {
     /// What actually plays and exports: the visible stretch of every clip, in order.
     pub fn played(&self) -> &Timeline {
         &self.played
+    }
+
+    /// The same, with images treated as if they weren't there. This is what has to be decoded: a
+    /// video under a logo is still the video to play, and an image has nothing to play.
+    pub fn played_videos(&self) -> &Timeline {
+        &self.played_videos
+    }
+
+    /// Whether any row holds an image.
+    pub fn has_stills(&self) -> bool {
+        self.picture_tracks()
+            .iter()
+            .flat_map(Timeline::clips)
+            .any(|clip| clip.is_still())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -588,11 +604,13 @@ impl Tracks {
                 continue;
             };
             stack.push(*clip);
-            let hides = size_of(clip.media).is_some_and(|size| {
-                clip.placement
-                    .at(Ticks(time.0 - clip.start.0))
-                    .hides_below(size, canvas)
-            });
+            // Any image might be see-through, so what is under one always shows.
+            let hides = !clip.is_still()
+                && size_of(clip.media).is_some_and(|size| {
+                    clip.placement
+                        .at(Ticks(time.0 - clip.start.0))
+                        .hides_below(size, canvas)
+                });
             if hides {
                 break;
             }
@@ -704,7 +722,7 @@ impl Tracks {
                 || stretch
                     .stack
                     .iter()
-                    .any(|clip| !clip.placement.is_default())
+                    .any(|clip| clip.is_still() || !clip.placement.is_default())
         })
     }
 
@@ -863,6 +881,25 @@ impl Tracks {
         self.picture_rows = picture_rows;
         self.tracks.retain(|track| !track.is_empty());
         self.played = flatten(self.picture_tracks());
+        self.played_videos = if self.has_stills() {
+            let videos: Vec<Timeline> = self
+                .picture_tracks()
+                .iter()
+                .map(|track| {
+                    Timeline::from_ordered(
+                        track
+                            .clips()
+                            .iter()
+                            .filter(|clip| !clip.is_still())
+                            .copied()
+                            .collect(),
+                    )
+                })
+                .collect();
+            flatten(&videos)
+        } else {
+            self.played.clone()
+        };
         self.gaps = gaps_between(&self.tracks);
     }
 }
@@ -1917,6 +1954,56 @@ mod tests {
 
         assert_eq!(stack.last().map(|clip| clip.id), Some(above));
         assert_eq!(tracks.played().clips()[0].id, above);
+    }
+
+    #[test]
+    fn an_image_makes_a_project_take_layers_even_alone() {
+        let mut tracks = Tracks::default();
+        tracks.place(VIDEO, TimeRange::new_still(), Ticks(0), TrackTarget::New(0));
+
+        assert!(tracks.needs_layers(WIDE, &all_wide));
+        assert!(tracks.has_stills());
+    }
+
+    #[test]
+    fn what_is_under_a_full_size_image_still_shows() {
+        let mut tracks = Tracks::default();
+        let video = tracks.place(VIDEO, range(0, 100), Ticks(0), TrackTarget::New(0));
+        let still = tracks.place(OTHER, TimeRange::new_still(), Ticks(0), TrackTarget::New(0));
+
+        let stack = tracks.stack_at(Ticks(10), WIDE, &all_wide);
+
+        assert_eq!(ids(&stack), [video, still]);
+    }
+
+    #[test]
+    fn the_video_under_an_image_is_the_one_to_decode() {
+        let mut tracks = Tracks::default();
+        let video = tracks.place(VIDEO, range(0, 100), Ticks(0), TrackTarget::New(0));
+        let still = tracks.place(OTHER, TimeRange::new_still(), Ticks(0), TrackTarget::New(0));
+
+        assert_eq!(tracks.played().clips()[0].id, still);
+        assert_eq!(tracks.played_videos().clips().len(), 1);
+        assert_eq!(tracks.played_videos().clips()[0].id, video);
+    }
+
+    #[test]
+    fn an_image_counts_as_a_picture_so_it_is_not_a_picture_gap() {
+        let mut tracks = Tracks::default();
+        tracks.push(VIDEO, range(0, 100));
+        tracks.push(OTHER, TimeRange::new_still());
+
+        assert!(tracks.picture_gaps().is_empty());
+        assert!(!tracks.sound_outlasts_pictures());
+    }
+
+    #[test]
+    fn with_no_images_videos_and_pictures_are_the_same_thing() {
+        let mut tracks = Tracks::default();
+        tracks.push(VIDEO, range(0, 100));
+        tracks.place(OTHER, range(0, 20), Ticks(10), TrackTarget::New(0));
+
+        assert_eq!(tracks.played(), tracks.played_videos());
     }
 
     #[test]

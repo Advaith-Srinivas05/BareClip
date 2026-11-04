@@ -50,6 +50,10 @@ pub fn copying_suits<'a>(mut frames: impl Iterator<Item = &'a FrameIndex>) -> bo
 pub const LAYERED_REASON: &str =
     "Clips are resized, moved, see-through or showing together, so every frame is redrawn.";
 
+/// Why a project showing an image can't be copied.
+pub const STILLS_REASON: &str =
+    "Images have to be drawn into the video, so every frame is redrawn.";
+
 /// Picks the route: fast whenever that is possible, because nothing beats copying.
 pub fn route_for(videos: &[MediaInfo], has_gaps: bool) -> Route {
     let Some((first, others)) = videos.split_first() else {

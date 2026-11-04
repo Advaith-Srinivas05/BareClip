@@ -1,5 +1,7 @@
 //! A decoded picture, as plain memory that any crate can hand to any other.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 /// Which formula turns a video's stored brightness and colour values into red, green and blue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColorMatrix {
@@ -41,6 +43,34 @@ impl Yuv420<'_> {
     /// The size of the colour planes, rounded up so an odd-sized picture is fully covered.
     pub fn chroma_size(&self) -> (u32, u32) {
         (self.width.div_ceil(2), self.height.div_ceil(2))
+    }
+}
+
+/// An image, ready to draw. Its colours have already been scaled by how see-through each pixel is.
+#[derive(Clone, PartialEq, Eq)]
+pub struct StillPicture {
+    /// Tells images apart, so one already on the GPU isn't sent there again.
+    pub id: u64,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+impl StillPicture {
+    pub fn new(width: u32, height: u32, rgba: Vec<u8>) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self {
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
+            width,
+            height,
+            rgba,
+        }
+    }
+}
+
+impl std::fmt::Debug for StillPicture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "StillPicture({} x {})", self.width, self.height)
     }
 }
 

@@ -141,13 +141,15 @@ impl Canvas {
             return;
         }
         if self.original.is_none() {
-            // The earliest clip is the first one, however many arrived together.
+            // The earliest clip is the first one, however many arrived together. Anything
+            // with no size given, such as an image, doesn't get a say.
             let first = tracks
                 .picture_tracks()
                 .iter()
                 .flat_map(|track| track.clips())
-                .min_by_key(|clip| clip.start)
-                .and_then(|clip| size_of(clip.media));
+                .filter_map(|clip| Some((clip.start, size_of(clip.media)?)))
+                .min_by_key(|(start, _)| *start)
+                .map(|(_, size)| size);
             self.original = first.and_then(|size| final_size(&[size]));
         }
     }
