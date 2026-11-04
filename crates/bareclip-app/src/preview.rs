@@ -662,6 +662,29 @@ mod tests {
         panic!("frame {number} never appeared, last was {last:?}");
     }
 
+    /// Waits for any picture from a stretch of a clip. A playing preview skips pictures to stay on
+    /// time, so on a busy machine it can miss any one of them, and only a paused one can be held
+    /// to an exact picture.
+    fn wait_for_frame_in(
+        preview: &mut Preview,
+        timeline: &Timeline,
+        numbers: std::ops::RangeInclusive<u32>,
+    ) {
+        let started = Instant::now();
+        let mut seen = Vec::new();
+        while started.elapsed() < Duration::from_secs(10) {
+            if let Some(frame) = preview.update(timeline, &lookup) {
+                let number = number_of(&frame);
+                if numbers.contains(&number) {
+                    return;
+                }
+                seen.push(number);
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        panic!("nothing from {numbers:?} appeared, only {seen:?}");
+    }
+
     fn two_clip_timeline() -> Timeline {
         let mut timeline = Timeline::default();
         timeline.push(MediaId(1), range(1.0, 1.5));
@@ -714,8 +737,9 @@ mod tests {
 
         preview.play(played, &lookup);
 
-        wait_for_frame(&mut preview, played, 1016);
-        wait_for_frame(&mut preview, played, 54);
+        // The upper clip's half second of its video, then the rest of the lower clip.
+        wait_for_frame_in(&mut preview, played, 1015..=1029);
+        wait_for_frame_in(&mut preview, played, 53..=59);
     }
 
     #[test]
@@ -938,7 +962,7 @@ mod tests {
         let took = started.elapsed().as_secs_f64();
         assert!(!preview.in_gap(&timeline));
         assert!((0.45..0.9).contains(&took), "the gap took {took}s");
-        wait_for_frame(&mut preview, &timeline, 1015);
+        wait_for_frame_in(&mut preview, &timeline, 1015..=1024);
     }
 
     #[test]
@@ -974,7 +998,7 @@ mod tests {
         preview.play(&timeline, &lookup);
         assert!(preview.in_gap(&timeline));
 
-        wait_for_frame(&mut preview, &timeline, 30);
+        wait_for_frame_in(&mut preview, &timeline, 30..=38);
         assert!(!preview.in_gap(&timeline));
     }
 
