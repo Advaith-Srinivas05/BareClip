@@ -14,7 +14,7 @@ use std::{
 
 use bareclip_audio::{Bus, MixSpan};
 use bareclip_core::{
-    picture::Yuv420,
+    picture::{StillPicture, Yuv420},
     placement::{Placement, WHOLE},
     sound::{ClipSound, FULL_VOLUME},
     splice::CutMode,
@@ -2106,6 +2106,183 @@ fn a_transparent_png_keeps_how_see_through_it_is_and_a_jpeg_is_solid() {
     ))
     .expect("it can be read");
     assert_eq!(solid.rgba[3], 255);
+}
+
+/// A JPEG with a different colour in each corner: red, lime, then blue and white below them.
+fn four_corner_photo() -> PathBuf {
+    clip(
+        "four-corners.jpg",
+        &to_strings(&[
+            "-filter_complex",
+            "color=red:s=32x18[a];color=lime:s=32x18[b];color=blue:s=32x18[c];\
+             color=white:s=32x18[d];[a][b]hstack[top];[c][d]hstack[bottom];\
+             [top][bottom]vstack,format=yuvj444p",
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+        ]),
+    )
+}
+
+/// A copy of a JPEG saying which way up the camera was held, as phones write it.
+fn photo_held_at(orientation: u16, name: &str) -> PathBuf {
+    let jpeg = std::fs::read(four_corner_photo()).expect("the photo was made");
+    assert_eq!(jpeg[..2], [0xFF, 0xD8], "it starts as a JPEG does");
+    let mut note = b"Exif\0\0II*\0".to_vec();
+    note.extend(8u32.to_le_bytes());
+    note.extend(1u16.to_le_bytes());
+    note.extend(0x0112u16.to_le_bytes());
+    note.extend(3u16.to_le_bytes());
+    note.extend(1u32.to_le_bytes());
+    note.extend(u32::from(orientation).to_le_bytes());
+    note.extend(0u32.to_le_bytes());
+
+    let mut held = vec![0xFF, 0xD8, 0xFF, 0xE1];
+    held.extend(
+        u16::try_from(note.len() + 2)
+            .expect("it is short")
+            .to_be_bytes(),
+    );
+    held.extend(note);
+    held.extend(&jpeg[2..]);
+    let path = output_dir().join(name);
+    std::fs::write(&path, held).expect("the copy can be written");
+    path
+}
+
+/// Names the nearest of the four corner colours.
+fn corner_colour(still: &StillPicture, x: u32, y: u32) -> char {
+    let at = ((y * still.width + x) * 4) as usize;
+    let pixel = &still.rgba[at..at + 3];
+    [
+        ('R', [255, 0, 0]),
+        ('L', [0, 255, 0]),
+        ('B', [0, 0, 255]),
+        ('W', [255, 255, 255]),
+    ]
+    .into_iter()
+    .min_by_key(|(_, colour): &(char, [i32; 3])| {
+        pixel
+            .iter()
+            .zip(colour)
+            .map(|(got, want)| i32::from(*got).abs_diff(*want))
+            .sum::<u32>()
+    })
+    .expect("there are colours")
+    .0
+}
+
+/// The colours in the corners, reading across and then down.
+fn corners_of(still: &StillPicture) -> String {
+    let (right, bottom) = (still.width - 6, still.height - 6);
+    [(5, 5), (right, 5), (5, bottom), (right, bottom)]
+        .into_iter()
+        .map(|(x, y)| corner_colour(still, x, y))
+        .collect()
+}
+
+#[test]
+fn a_photo_shows_the_way_up_the_camera_was_held() {
+    for (orientation, size, corners) in [
+        (1, (64, 36), "RLBW"),
+        (2, (64, 36), "LRWB"),
+        (3, (64, 36), "WBLR"),
+        (4, (64, 36), "BWRL"),
+        (5, (36, 64), "RBLW"),
+        (6, (36, 64), "BRWL"),
+        (7, (36, 64), "WLBR"),
+        (8, (36, 64), "LWRB"),
+    ] {
+        let photo = photo_held_at(orientation, &format!("held-{orientation}.jpg"));
+
+        let still = bareclip_media::read_still(&photo).expect("it can be read");
+        assert_eq!(
+            (still.width, still.height),
+            size,
+            "orientation {orientation}"
+        );
+        assert_eq!(corners_of(&still), corners, "orientation {orientation}");
+
+        let info = probe(&photo).expect("it can be read");
+        assert_eq!(
+            (info.video.width, info.video.height),
+            size,
+            "pictures are placed by this size, so it has to agree, for orientation {orientation}"
+        );
+    }
+}
+
+#[test]
+fn a_photo_that_says_nothing_about_its_way_up_stays_as_it_is() {
+    let still = bareclip_media::read_still(&four_corner_photo()).expect("it can be read");
+    assert_eq!((still.width, still.height), (64, 36));
+    assert_eq!(corners_of(&still), "RLBW");
+}
+
+#[test]
+fn a_sideways_photo_exports_the_right_way_up() {
+    let photo = photo_held_at(6, "exported-sideways.jpg");
+    let job = LayeredRequest {
+        canvas: Some((180, 320)),
+        ..layered_request(
+            "sideways-photo",
+            vec![stretch(0.0, 0.5, vec![still_clip(&photo, 1, 0.0, 0.5)])],
+            Vec::new(),
+        )
+    };
+
+    export_layered(&job, &AtomicBool::new(false), &|_| {}).expect("it exports");
+
+    let mut reader = PictureReader::open(&job.output).expect("the export opens");
+    let picture = reader
+        .next_picture()
+        .expect("it decodes")
+        .expect("it has a picture");
+    let view = picture.view();
+    // Blue is the darkest of the four and white the brightest, with red and then lime between.
+    let (left, right) = (30, view.width as usize - 30);
+    let (top, bottom) = (40, view.height as usize - 40);
+    let corners = [
+        brightness_at(&view, left, top),
+        brightness_at(&view, right, top),
+        brightness_at(&view, left, bottom),
+        brightness_at(&view, right, bottom),
+    ];
+    assert!(
+        corners[0] < corners[1] && corners[1] < corners[3] && corners[3] < corners[2],
+        "expected blue, red, white and lime across and down, got {corners:?}"
+    );
+    let _ = std::fs::remove_file(&job.output);
+}
+
+/// How long adding a full-size phone photo holds the interface up, since `probe` now decodes it.
+#[test]
+#[ignore = "a measurement, not a check"]
+fn time_to_read_a_large_photos_size() {
+    let photo = clip(
+        "large-photo.jpg",
+        &to_strings(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=4032x3024",
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+        ]),
+    );
+    for _ in 0..5 {
+        let started = std::time::Instant::now();
+        let info = probe(&photo).expect("it can be read");
+        println!(
+            "{} x {} in {:?}",
+            info.video.width,
+            info.video.height,
+            started.elapsed()
+        );
+    }
 }
 
 #[test]

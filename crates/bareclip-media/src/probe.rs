@@ -157,11 +157,16 @@ pub fn probe(path: &Path) -> Result<MediaInfo, MediaError> {
             let codec = context.id();
             let decoder = context.decoder().video()?;
             let rate = video_stream.avg_frame_rate();
+            // A damaged image reports its problem when its picture is read, as it always has.
+            let (width, height) = still
+                .then(|| crate::still::upright_size(path).ok())
+                .flatten()
+                .unwrap_or((decoder.width(), decoder.height()));
             VideoInfo {
                 stream_index: video_stream.index(),
                 codec: codec.name().to_owned(),
-                width: decoder.width(),
-                height: decoder.height(),
+                width,
+                height,
                 pixel_format: format!("{:?}", decoder.format()),
                 time_base: to_time_base(video_stream.time_base()),
                 frame_rate: if still || rate.denominator() == 0 {
