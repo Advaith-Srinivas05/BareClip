@@ -14,6 +14,9 @@ pub struct FrameEntry {
     pub keyframe: bool,
 }
 
+/// The share of frames that can come early or late in a video that still counts as steady.
+const MOST_OFF_PACE_WHEN_STEADY: f64 = 0.02;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CutMode {
     /// Cuts land exactly where asked. The short sections around each cut are re-encoded.
@@ -93,6 +96,27 @@ impl FrameIndex {
 
     pub fn frames(&self) -> &[FrameEntry] {
         &self.frames
+    }
+
+    /// Whether frames come at an even pace. A few late ones are allowed, because a steady recording
+    /// can still drop the odd frame. Rounded timestamps count as even.
+    pub fn is_steady(&self) -> bool {
+        let mut gaps: Vec<i64> = self
+            .display_order
+            .windows(2)
+            .map(|pair| self.frames[pair[1]].pts - self.frames[pair[0]].pts)
+            .collect();
+        if gaps.len() < 2 {
+            return true;
+        }
+        gaps.sort_unstable();
+        let usual = gaps[gaps.len() / 2];
+        let allowed = (usual / 10).max(1);
+        let off_pace = gaps
+            .iter()
+            .filter(|gap| (**gap - usual).abs() > allowed)
+            .count();
+        off_pace as f64 / gaps.len() as f64 <= MOST_OFF_PACE_WHEN_STEADY
     }
 
     pub fn is_empty(&self) -> bool {
@@ -334,6 +358,56 @@ impl FrameIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shown_at(times: impl Iterator<Item = i64>) -> FrameIndex {
+        FrameIndex::new(
+            times
+                .map(|pts| FrameEntry {
+                    pts,
+                    dts: pts,
+                    duration: 1,
+                    keyframe: false,
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn even_frames_are_steady_even_with_rounded_times() {
+        assert!(shown_at((0..300).map(|frame| frame * 33)).is_steady());
+        // 30 fps in whole milliseconds: 33, 33, 34.
+        assert!(shown_at((0..300).map(|frame| frame * 1000 / 30)).is_steady());
+        // 144 fps in whole milliseconds: 7, 7, 7, 6.
+        assert!(shown_at((0..300).map(|frame| frame * 1000 / 144)).is_steady());
+    }
+
+    #[test]
+    fn a_steady_recording_can_drop_the_odd_frame() {
+        let times = (0..300)
+            .filter(|frame| frame % 100 != 50)
+            .map(|frame| frame * 33);
+
+        assert!(shown_at(times).is_steady());
+    }
+
+    #[test]
+    fn frames_that_keep_changing_pace_are_not_steady() {
+        // Like the owner's recordings, which wander between about 28 and 42 ms.
+        let mut time = 0;
+        let times: Vec<i64> = (0..300)
+            .map(|frame| {
+                time += [35, 28, 35, 42][frame % 4];
+                time
+            })
+            .collect();
+
+        assert!(!shown_at(times.into_iter()).is_steady());
+    }
+
+    #[test]
+    fn too_few_frames_to_tell_counts_as_steady() {
+        assert!(shown_at([0, 10].into_iter()).is_steady());
+    }
 
     /// Frames shown and stored in the same order, 10 units long, with a keyframe
     /// every `gop` frames.

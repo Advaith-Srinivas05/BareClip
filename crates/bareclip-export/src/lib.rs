@@ -12,7 +12,8 @@ use bareclip_media::{ExportReport, ExportRequest, MediaError, MediaInfo, export,
 
 pub use layered::{LayeredClip, LayeredRequest, LayeredStretch, export_layered};
 pub use plan::{
-    FullPlan, LAYERED_REASON, Route, final_size, frame_rate_for, route_for, size_problem,
+    FullPlan, LAYERED_REASON, Route, copying_suits, final_size, frame_rate_for, mixed_rates,
+    route_for, size_problem,
 };
 pub use sink::VideoSink;
 
@@ -64,9 +65,13 @@ pub fn export_project(
     bareclip_media::init()?;
     let videos = videos_of(request)?;
     let has_gaps = request.parts.iter().any(|part| part.gap_before.0 > 0);
+    let redraw_for_rates = mixed_rates(&videos).is_some()
+        && !copying_suits(request.parts.iter().map(|part| &*part.frames));
     match route_for(&videos, has_gaps) {
-        Route::Fast => export(request, cancel, progress).map(ProjectReport::Fast),
-        Route::Full(_) => {
+        Route::Fast if !redraw_for_rates => {
+            export(request, cancel, progress).map(ProjectReport::Fast)
+        }
+        Route::Fast | Route::Full(_) => {
             full::export_full(request, &FullPlan::for_videos(&videos), cancel, progress)
                 .map(ProjectReport::Full)
         }

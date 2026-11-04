@@ -1,6 +1,7 @@
 //! Which way a project gets exported, and what a full export will produce.
 
 pub use bareclip_core::placement::final_size;
+use bareclip_core::splice::FrameIndex;
 use bareclip_media::{MediaInfo, SoundLabel, VideoSettings, can_write_gaps, join_problem};
 
 /// How an export will work.
@@ -16,9 +17,9 @@ pub enum Route {
 /// uneven timing average below what they aimed for, and shouldn't lose the fast route over it.
 const SAME_RATE_RATIO: f64 = 1.15;
 
-/// Why two videos' frame rates are too different to copy into one file. Copying would make a
-/// file whose rate changes partway through, which some players handle badly.
-fn rate_problem(first: &MediaInfo, other: &MediaInfo) -> Option<String> {
+/// Why two videos' frame rates differ enough to matter. Copying them into one file makes it change
+/// pace partway through, which some software handles badly.
+fn rate_difference(first: &MediaInfo, other: &MediaInfo) -> Option<String> {
     let (a, b) = (first.video.frame_rate, other.video.frame_rate);
     if a <= 0.0 || b <= 0.0 || a.max(b) / a.min(b) <= SAME_RATE_RATIO {
         return None;
@@ -28,6 +29,21 @@ fn rate_problem(first: &MediaInfo, other: &MediaInfo) -> Option<String> {
         |name| name.to_string_lossy().into_owned(),
     );
     Some(format!("{name} runs at {b:.0} fps instead of {a:.0} fps."))
+}
+
+/// Why these videos' frame rates make joining them a choice between copying and redrawing.
+pub fn mixed_rates(videos: &[MediaInfo]) -> Option<String> {
+    let (first, others) = videos.split_first()?;
+    others
+        .iter()
+        .find_map(|other| rate_difference(first, other))
+}
+
+/// Whether copying is the better start for videos whose rates differ. Videos already uneven inside
+/// are the same kind of file once joined, but copying steady ones adds a change of pace that
+/// neither had.
+pub fn copying_suits<'a>(mut frames: impl Iterator<Item = &'a FrameIndex>) -> bool {
+    frames.all(|frames| !frames.is_steady())
 }
 
 /// Why a project with clips resized, moved or showing together can't be copied.
@@ -40,9 +56,6 @@ pub fn route_for(videos: &[MediaInfo], has_gaps: bool) -> Route {
         return Route::Fast;
     };
     if let Some(reason) = others.iter().find_map(|other| join_problem(first, other)) {
-        return Route::Full(reason);
-    }
-    if let Some(reason) = others.iter().find_map(|other| rate_problem(first, other)) {
         return Route::Full(reason);
     }
     if has_gaps && !can_write_gaps(&first.video.codec) {
@@ -182,7 +195,10 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    use bareclip_core::time::{Ticks, TimeBase};
+    use bareclip_core::{
+        splice::FrameEntry,
+        time::{Ticks, TimeBase},
+    };
     use bareclip_media::{AudioInfo, VideoInfo};
 
     fn audio(codec: &str, title: Option<&str>) -> AudioInfo {
@@ -246,27 +262,51 @@ mod tests {
     }
 
     #[test]
-    fn clearly_different_frame_rates_take_the_full_route() {
+    fn clearly_different_frame_rates_are_a_choice_rather_than_a_route() {
         let videos = [
             video(1920, 1080, 30.0, vec![]),
             video(1920, 1080, 60.0, vec![]),
         ];
 
-        let Route::Full(reason) = route_for(&videos, false) else {
-            panic!("copying would make the rate change partway through");
-        };
-
+        assert_eq!(route_for(&videos, false), Route::Fast);
+        let reason = mixed_rates(&videos).expect("the rates differ");
         assert!(reason.contains("60 fps instead of 30"), "{reason}");
     }
 
+    fn frames_at(times: &[i64]) -> FrameIndex {
+        FrameIndex::new(
+            times
+                .iter()
+                .map(|time| FrameEntry {
+                    pts: *time,
+                    dts: *time,
+                    duration: 1,
+                    keyframe: false,
+                })
+                .collect(),
+        )
+    }
+
     #[test]
-    fn a_recording_that_dipped_a_little_stays_on_the_fast_route() {
+    fn copying_suits_videos_that_are_all_uneven_already() {
+        let steady: Vec<i64> = (0..100).map(|frame| frame * 40).collect();
+        let uneven: Vec<i64> = (0..100).map(|frame| frame * 40 + frame % 3 * 15).collect();
+        let (steady, uneven) = (frames_at(&steady), frames_at(&uneven));
+
+        assert!(copying_suits([&uneven, &uneven].into_iter()));
+        assert!(!copying_suits([&steady, &steady].into_iter()));
+        assert!(!copying_suits([&uneven, &steady].into_iter()));
+    }
+
+    #[test]
+    fn a_recording_that_dipped_a_little_doesnt_count_as_a_different_rate() {
         let videos = [
             video(1920, 1080, 60.0, vec![]),
             video(1920, 1080, 56.3, vec![]),
         ];
 
         assert_eq!(route_for(&videos, false), Route::Fast);
+        assert_eq!(mixed_rates(&videos), None);
     }
 
     #[test]
