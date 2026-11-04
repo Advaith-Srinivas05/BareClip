@@ -643,6 +643,72 @@ impl Widget for NameBar<'_> {
     }
 }
 
+/// A button showing the current one of several choices, which opens them in a menu. Its name can
+/// say more than it shows, because several can show the same choice.
+pub struct Dropdown<'a> {
+    palette: &'a Palette,
+    name: &'a str,
+    current: &'a str,
+    width: f32,
+}
+
+impl<'a> Dropdown<'a> {
+    pub fn new(palette: &'a Palette, name: &'a str, current: &'a str, width: f32) -> Self {
+        Self {
+            palette,
+            name,
+            current,
+            width,
+        }
+    }
+}
+
+impl Widget for Dropdown<'_> {
+    fn ui(self, ui: &mut Ui) -> Response {
+        let size = vec2(self.width, SMALL_BUTTON_HEIGHT + 4.0);
+        let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+        let enabled = response.enabled();
+        let name = self.name;
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, name));
+        if ui.is_rect_visible(rect) {
+            let palette = self.palette;
+            let border = if response.hovered() || response.has_focus() {
+                palette.accent
+            } else {
+                palette.border
+            };
+            ui.painter().rect(
+                rect,
+                f32::from(RADIUS),
+                palette.bg_app,
+                Stroke::new(1.0, border),
+                StrokeKind::Inside,
+            );
+            ui.painter().text(
+                pos2(rect.left() + NAME_BAR_PADDING, rect.center().y),
+                Align2::LEFT_CENTER,
+                self.current,
+                FontId::new(12.0, FontFamily::Proportional),
+                palette.text,
+            );
+            let icon_size = 14.0;
+            icons::paint(
+                ui.painter(),
+                icons::square_at(
+                    pos2(
+                        rect.right() - NAME_BAR_PADDING - icon_size / 2.0,
+                        rect.center().y,
+                    ),
+                    icon_size,
+                ),
+                &icons::CHEVRON_DOWN,
+                palette.text_muted,
+            );
+        }
+        response
+    }
+}
+
 /// A tab on the tool rail, with its symbol above its name.
 pub fn rail_tab(
     ui: &mut Ui,

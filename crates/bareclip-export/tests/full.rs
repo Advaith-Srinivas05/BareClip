@@ -22,11 +22,11 @@ use bareclip_core::{
     timeline::TimeRange,
 };
 use bareclip_export::{
-    FullReport, LayeredClip, LayeredRequest, LayeredStretch, ProjectReport, SoundPlan,
-    export_layered, export_project, export_with_new_sound,
+    ExportRate, FullReport, LayeredClip, LayeredRequest, LayeredStretch, ProjectReport, SoundPlan,
+    export_layered, export_project, export_sound_only, export_with_new_sound,
 };
 use bareclip_media::{
-    ExportPart, ExportReport, ExportRequest, MediaError, PictureReader, SoundLabel, probe,
+    ExportPart, ExportReport, ExportRequest, MediaError, PictureReader, Quality, SoundLabel, probe,
 };
 use common::*;
 
@@ -161,7 +161,7 @@ fn run(request: &ExportRequest) -> ProjectReport {
 fn run_full(request: &ExportRequest) -> FullReport {
     match run(request) {
         ProjectReport::Full(report) => report,
-        ProjectReport::Fast(report) => panic!("it took the fast route: {report:?}"),
+        other => panic!("it took another route: {other:?}"),
     }
 }
 
@@ -816,6 +816,8 @@ fn layered_request(
         sound: SoundPlan::as_recorded(&sound, &videos),
         canvas: None,
         background: [0, 0, 0],
+        quality: Default::default(),
+        rate: Default::default(),
     }
 }
 
@@ -1163,6 +1165,8 @@ fn a_layered_export_over_one_of_its_videos_is_refused() {
         sound: SoundPlan::default(),
         canvas: None,
         background: [0, 0, 0],
+        quality: Default::default(),
+        rate: Default::default(),
     };
 
     let result = export_layered(&job, &AtomicBool::new(false), &|_| {});
@@ -1797,6 +1801,8 @@ fn a_clip_hidden_under_another_is_heard_in_a_layered_export() {
         ]),
         canvas: Some((320, 180)),
         background: [0, 0, 0],
+        quality: Default::default(),
+        rate: Default::default(),
     };
 
     let report = run_layered(&job);
@@ -1825,6 +1831,8 @@ fn music_that_outlasts_the_pictures_makes_the_video_longer_showing_the_backgroun
         sound: one_mix(vec![song_span(0.0, 3.0, Bus::All(0))]),
         canvas: Some((320, 180)),
         background: [40, 200, 90],
+        quality: Default::default(),
+        rate: Default::default(),
     };
 
     let report = run_layered(&job);
@@ -1847,6 +1855,8 @@ fn a_project_with_only_sound_exports_as_its_background_with_the_sound() {
         sound: one_mix(vec![song_span(0.0, 2.0, Bus::All(0))]),
         canvas: Some((320, 180)),
         background: [40, 200, 90],
+        quality: Default::default(),
+        rate: Default::default(),
     };
 
     let report = run_layered(&job);
@@ -1854,4 +1864,149 @@ fn a_project_with_only_sound_exports_as_its_background_with_the_sound() {
     assert_eq!(report.frames, 60);
     assert_eq!(report.black_frames, 60);
     assert!(level_between(&decode_audio(&job.output)[0], 0.5, 1.5) > 0.05);
+}
+
+#[test]
+fn a_chosen_size_and_frame_rate_are_what_the_file_comes_out_at() {
+    let input = large_clip();
+    let job = LayeredRequest {
+        canvas: Some((640, 360)),
+        rate: ExportRate::Fps(15),
+        quality: Quality::Balanced,
+        ..layered_request(
+            "chosen-size-and-rate",
+            vec![stretch(
+                0.0,
+                1.0,
+                vec![whole(&input, 1, 0.0, 1.0, Placement::default())],
+            )],
+            vec![part(&input, 0.0, 1.0, 0.0)],
+        )
+    };
+
+    let report = export_layered(&job, &AtomicBool::new(false), &|_| {}).expect("it exports");
+
+    let info = probe(&job.output).expect("the file can be read");
+    assert_eq!((info.video.width, info.video.height), (640, 360));
+    assert_eq!((report.width, report.height), (640, 360));
+    assert_eq!(report.frames, 15);
+    assert!(
+        (info.video.frame_rate - 15.0).abs() < 0.5,
+        "{}",
+        info.video.frame_rate
+    );
+    let _ = std::fs::remove_file(&job.output);
+}
+
+#[test]
+fn a_lower_quality_makes_a_smaller_file_from_the_same_picture() {
+    let input = large_clip();
+    let size_at = |name: &str, quality| {
+        let job = LayeredRequest {
+            quality,
+            ..layered_request(
+                name,
+                vec![stretch(
+                    0.0,
+                    1.0,
+                    vec![whole(&input, 1, 0.0, 1.0, Placement::default())],
+                )],
+                vec![part(&input, 0.0, 1.0, 0.0)],
+            )
+        };
+        export_layered(&job, &AtomicBool::new(false), &|_| {}).expect("it exports");
+        let size = std::fs::metadata(&job.output)
+            .expect("it was written")
+            .len();
+        let _ = std::fs::remove_file(&job.output);
+        size
+    };
+
+    let matching = size_at("quality-match", Quality::MatchSource);
+    let smaller = size_at("quality-smaller", Quality::Smaller);
+
+    assert!(smaller < matching, "{smaller} is not under {matching}");
+}
+
+fn song_spans(input: &Path, seconds_long: f64, start: f64) -> SoundPlan {
+    SoundPlan {
+        spans: vec![MixSpan {
+            path: input.to_path_buf(),
+            start: seconds(start),
+            source: TimeRange {
+                start: Ticks(0),
+                end: seconds(seconds_long),
+            },
+            sound: ClipSound::default(),
+            bus: Bus::All(0),
+        }],
+        tracks: vec![SoundLabel::default()],
+    }
+}
+
+#[test]
+fn sound_alone_is_saved_with_no_picture_for_as_long_as_it_can_be_heard() {
+    let output = output_path("sound-only", "m4a");
+    let plan = song_spans(&large_clip(), 1.0, 0.5);
+
+    let report =
+        export_sound_only(&plan, &output, &AtomicBool::new(false), &|_| {}).expect("it exports");
+
+    let info = probe(&output).expect("the file can be read");
+    assert!(info.is_sound_only());
+    assert_eq!(info.audio.len(), 1);
+    assert_eq!(report.length, seconds(1.5));
+    assert!(
+        (info.duration.as_seconds() - 1.5).abs() < 0.1,
+        "{}",
+        info.duration.as_seconds()
+    );
+    let _ = std::fs::remove_file(&output);
+}
+
+#[test]
+fn saving_sound_refuses_nothing_to_hear_and_overwriting_its_source() {
+    let cancel = AtomicBool::new(false);
+    let input = large_clip();
+
+    assert!(matches!(
+        export_sound_only(
+            &SoundPlan::default(),
+            &output_path("no-sound", "m4a"),
+            &cancel,
+            &|_| {}
+        ),
+        Err(MediaError::NothingToExport)
+    ));
+    assert!(matches!(
+        export_sound_only(&song_spans(&input, 1.0, 0.0), &input, &cancel, &|_| {}),
+        Err(MediaError::SameInputAndOutput)
+    ));
+}
+
+#[test]
+fn cancelling_a_sound_export_leaves_nothing_behind() {
+    let output = output_path("sound-cancelled", "m4a");
+    let _ = std::fs::remove_file(&output);
+
+    let outcome = export_sound_only(
+        &song_spans(&large_clip(), 1.0, 0.0),
+        &output,
+        &AtomicBool::new(true),
+        &|_| {},
+    );
+
+    assert!(matches!(outcome, Err(MediaError::Cancelled)));
+    assert!(!output.exists());
+    let leftovers = std::fs::read_dir(output.parent().expect("it has a folder"))
+        .expect("the folder can be read")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .contains("sound-cancelled")
+        })
+        .count();
+    assert_eq!(leftovers, 0);
 }

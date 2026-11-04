@@ -16,7 +16,7 @@ pub use export::{
     plan_export, same_file,
 };
 pub use full::{
-    DecodedPicture, PictureReader, SOUND_CHANNELS, SOUND_RATE, SoundLabel, VideoSettings,
+    DecodedPicture, PictureReader, Quality, SOUND_CHANNELS, SOUND_RATE, SoundLabel, VideoSettings,
     VideoWriter,
 };
 pub use preview::{

@@ -239,34 +239,88 @@ pub struct VideoSettings {
     /// For encoders that aim at a bit rate rather than a quality.
     pub bit_rate: usize,
     pub sound_tracks: Vec<SoundLabel>,
+    pub quality: Quality,
 }
 
-/// Settings that aim to look the same as the source. These are for whole videos, so unlike
-/// the short sections of the fast route they care about file size too.
-fn quality_options(name: &str) -> Dictionary<'static> {
+/// How much of a redrawn video's detail to keep, against how large the file gets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Quality {
+    /// Looks the same as the source, however large that makes the file.
+    #[default]
+    MatchSource,
+    /// About the source's size or smaller, and hard to tell from it.
+    Balanced,
+    /// About half of that, and it can show on some footage.
+    Smaller,
+}
+
+impl Quality {
+    pub const ALL: [Self; 3] = [Self::MatchSource, Self::Balanced, Self::Smaller];
+
+    /// The encoder's quality number, where lower keeps more.
+    fn level(self) -> &'static str {
+        match self {
+            Self::MatchSource => "19",
+            Self::Balanced => "23",
+            Self::Smaller => "28",
+        }
+    }
+
+    /// How much of the source's bit rate to use, on encoders with no quality number.
+    pub fn share_of_bit_rate(self) -> f64 {
+        match self {
+            Self::MatchSource => 1.0,
+            Self::Balanced => 0.66,
+            Self::Smaller => 0.4,
+        }
+    }
+}
+
+/// With no limit given, the graphics driver quietly applies a limit of its own, which held back
+/// footage with a high bit rate when measured. This one only exists to replace it, at one bit for
+/// every pixel of every frame, about five times what the busiest recording measured needed. The
+/// file's H.264 level follows this number, and players can refuse high levels, so a flat high
+/// limit made ordinary 1080p files say they need level 5.1 rather than 4.0.
+fn no_real_limit(settings: &VideoSettings) -> u64 {
+    let (num, den) = settings.frame_rate;
+    let rate = f64::from(num) / f64::from(den.max(1));
+    let pixels = f64::from(settings.width) * f64::from(settings.height);
+    ((pixels * rate) as u64).clamp(10_000_000, 300_000_000)
+}
+
+/// Settings for a whole video at a chosen quality. Unlike the short sections of the fast route,
+/// these care about file size too, unless the choice is to match the source.
+fn quality_options(name: &str, settings: &VideoSettings) -> Dictionary<'static> {
     let mut options = Dictionary::new();
-    let settings: &[(&str, &str)] = if name.ends_with("_nvenc") {
-        &[
+    let quality = settings.quality;
+    let level = quality.level();
+    let chosen: Vec<(&str, &str)> = if name.ends_with("_nvenc") {
+        vec![
             ("preset", "p5"),
             ("tune", "hq"),
             ("rc", "vbr"),
-            ("cq", "19"),
+            ("cq", level),
             ("spatial-aq", "1"),
         ]
     } else if name.ends_with("_amf") {
-        &[
+        vec![
             ("usage", "transcoding"),
             ("rc", "cqp"),
-            ("qp_i", "19"),
-            ("qp_p", "19"),
+            ("qp_i", level),
+            ("qp_p", level),
         ]
     } else if name.ends_with("_qsv") {
-        &[("global_quality", "19")]
+        vec![("global_quality", level)]
     } else {
-        &[]
+        Vec::new()
     };
-    for (key, value) in settings {
+    for (key, value) in chosen {
         options.set(key, value);
+    }
+    if quality == Quality::MatchSource && name.ends_with("_nvenc") {
+        let limit = no_real_limit(settings);
+        options.set("maxrate", &limit.to_string());
+        options.set("bufsize", &(limit * 2).to_string());
     }
     options
 }
@@ -312,7 +366,7 @@ fn open_video_encoder(
     });
     // MP4 keeps the decoder's settings in its header rather than in the stream.
     video.set_flags(codec::Flags::GLOBAL_HEADER);
-    let options = quality_options(name);
+    let options = quality_options(name, settings);
     if options.iter().next().is_none() {
         video.set_bit_rate(settings.bit_rate);
     }
@@ -703,7 +757,66 @@ mod tests {
     fn encoders_with_a_quality_setting_get_one() {
         crate::init().expect("FFmpeg starts");
 
-        assert!(quality_options("h264_nvenc").iter().next().is_some());
-        assert!(quality_options("h264_mf").iter().next().is_none());
+        assert!(
+            quality_options(
+                "h264_nvenc",
+                &settings_at((1920, 1080), 30, Quality::default())
+            )
+            .iter()
+            .next()
+            .is_some()
+        );
+        assert!(
+            quality_options(
+                "h264_mf",
+                &settings_at((1920, 1080), 30, Quality::default())
+            )
+            .iter()
+            .next()
+            .is_none()
+        );
+    }
+
+    fn settings_at(size: (u32, u32), rate: i32, quality: Quality) -> VideoSettings {
+        VideoSettings {
+            width: size.0,
+            height: size.1,
+            frame_rate: (rate, 1),
+            bit_rate: 1_000_000,
+            sound_tracks: Vec::new(),
+            quality,
+        }
+    }
+
+    #[test]
+    fn each_quality_asks_the_encoder_for_its_own_level() {
+        let cq = |quality| {
+            quality_options("h264_nvenc", &settings_at((1920, 1080), 30, quality))
+                .get("cq")
+                .map(str::to_owned)
+        };
+        assert_eq!(cq(Quality::MatchSource).as_deref(), Some("19"));
+        assert_eq!(cq(Quality::Balanced).as_deref(), Some("23"));
+        assert_eq!(cq(Quality::Smaller).as_deref(), Some("28"));
+    }
+
+    #[test]
+    fn only_matching_the_source_lifts_the_drivers_hidden_limit() {
+        let limit = |quality| {
+            quality_options("h264_nvenc", &settings_at((1920, 1080), 30, quality))
+                .get("maxrate")
+                .map(str::to_owned)
+        };
+        assert_eq!(limit(Quality::MatchSource).as_deref(), Some("62208000"));
+        assert_eq!(limit(Quality::Balanced), None);
+        assert_eq!(limit(Quality::Smaller), None);
+    }
+
+    #[test]
+    fn the_limit_grows_with_the_picture_but_stays_in_sensible_bounds() {
+        let limit = |size, rate| no_real_limit(&settings_at(size, rate, Quality::MatchSource));
+        assert_eq!(limit((1920, 1080), 60), 124_416_000);
+        assert_eq!(limit((320, 180), 30), 10_000_000);
+        assert_eq!(limit((3840, 2160), 120), 300_000_000);
     }
 }

@@ -2,7 +2,7 @@
 
 pub use bareclip_core::placement::final_size;
 use bareclip_core::splice::FrameIndex;
-use bareclip_media::{MediaInfo, SoundLabel, VideoSettings, can_write_gaps, join_problem};
+use bareclip_media::{MediaInfo, Quality, SoundLabel, VideoSettings, can_write_gaps, join_problem};
 
 /// How an export will work.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -169,14 +169,118 @@ impl FullPlan {
                 frame_rate: frame_rate_for(&rates),
                 bit_rate: bit_rate as usize,
                 sound_tracks,
+                quality: Quality::default(),
             },
         }
+    }
+
+    /// The same plan with the export window's choice of quality and frame rate.
+    pub fn with_choices(mut self, quality: Quality, rate: ExportRate) -> Self {
+        self.settings.quality = quality;
+        self.settings.bit_rate =
+            (self.settings.bit_rate as f64 * quality.share_of_bit_rate()) as usize;
+        if let ExportRate::Fps(fps) = rate {
+            self.settings.frame_rate = (fps as i32, 1);
+        }
+        self
     }
 
     pub fn frame_rate(&self) -> f64 {
         let (num, den) = self.settings.frame_rate;
         f64::from(num) / f64::from(den)
     }
+}
+
+/// The size of the finished video.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExportSize {
+    /// The project's own size.
+    #[default]
+    MatchSource,
+    /// This many pixels along the shorter side, keeping the project's shape.
+    Shorter(u32),
+}
+
+/// The frame rate of the finished video.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExportRate {
+    /// As fast as the fastest video.
+    #[default]
+    MatchSource,
+    Fps(u32),
+}
+
+/// What the export window can change about a finished video.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExportChoices {
+    pub size: ExportSize,
+    pub quality: Quality,
+    pub rate: ExportRate,
+}
+
+impl ExportChoices {
+    /// Whether these ask for anything a copy of the video can't give.
+    pub fn need_redrawing(&self) -> bool {
+        *self != Self::default()
+    }
+}
+
+/// Why choices in the export window mean every frame is redrawn.
+pub const CHOICES_REASON: &str =
+    "Your choices above change the picture, so it can't simply be copied.";
+
+/// Shorter sides offered, each with its usual name.
+pub const SIZES: [(u32, &str); 5] = [
+    (2160, "4K"),
+    (1440, "1440p"),
+    (1080, "1080p"),
+    (720, "720p"),
+    (480, "480p"),
+];
+/// Frame rates offered.
+pub const RATES: [u32; 3] = [60, 30, 24];
+/// The widest or tallest picture H.264 encoders can be relied on to take.
+const LARGEST_SIDE: u32 = 4096;
+
+/// A project's size with its shorter side at `shorter`. Encoders need even numbers.
+pub fn size_with_shorter_side((width, height): (u32, u32), shorter: u32) -> (u32, u32) {
+    let scaled = |side: u32| {
+        let exact = f64::from(side) * f64::from(shorter) / f64::from(width.min(height).max(1));
+        ((exact / 2.0).round() as u32 * 2).max(2)
+    };
+    (scaled(width), scaled(height))
+}
+
+/// The sizes worth offering for a project: anything but its own, up to the largest picture in it,
+/// so a large clip in a smaller project can keep its detail and nothing is blown up past its
+/// footage.
+pub fn sizes_on_offer(canvas: (u32, u32), pictures: &[(u32, u32)]) -> Vec<(u32, &'static str)> {
+    let largest = pictures
+        .iter()
+        .map(|(width, height)| *width.min(height))
+        .max()
+        .unwrap_or(0);
+    let own = canvas.0.min(canvas.1);
+    SIZES
+        .into_iter()
+        .filter(|(shorter, _)| *shorter != own && *shorter <= largest.max(own))
+        .filter(|(shorter, _)| {
+            let (width, height) = size_with_shorter_side(canvas, *shorter);
+            width.max(height) <= LARGEST_SIDE
+        })
+        .collect()
+}
+
+/// The frame rates worth offering, which are those below the fastest video's. A higher one would
+/// only repeat pictures.
+pub fn rates_on_offer(videos: &[MediaInfo]) -> Vec<u32> {
+    let rates: Vec<f64> = videos.iter().map(|info| info.video.frame_rate).collect();
+    let (num, den) = frame_rate_for(&rates);
+    let fastest = f64::from(num) / f64::from(den);
+    RATES
+        .into_iter()
+        .filter(|rate| f64::from(*rate) < fastest * (1.0 - CLOSE_ENOUGH))
+        .collect()
 }
 
 /// Why a video that could otherwise be copied can't be, because the project is another size.
@@ -205,6 +309,68 @@ mod tests {
         time::{Ticks, TimeBase},
     };
     use bareclip_media::{AudioInfo, VideoInfo};
+
+    #[test]
+    fn a_chosen_size_keeps_the_projects_shape_in_even_numbers() {
+        assert_eq!(size_with_shorter_side((1920, 1080), 720), (1280, 720));
+        assert_eq!(size_with_shorter_side((1080, 1920), 720), (720, 1280));
+        assert_eq!(size_with_shorter_side((1920, 992), 720), (1394, 720));
+        assert_eq!(size_with_shorter_side((1920, 1080), 1440), (2560, 1440));
+    }
+
+    #[test]
+    fn sizes_go_up_to_the_largest_picture_and_never_repeat_the_projects_own() {
+        let names = |canvas, pictures: &[(u32, u32)]| -> Vec<&str> {
+            sizes_on_offer(canvas, pictures)
+                .into_iter()
+                .map(|(_, name)| name)
+                .collect()
+        };
+        assert_eq!(
+            names((1920, 1080), &[(1920, 1080)]),
+            ["720p", "480p"],
+            "nothing is blown up past its footage"
+        );
+        assert_eq!(
+            names((1920, 1080), &[(1920, 1080), (2560, 1440)]),
+            ["1440p", "720p", "480p"],
+            "a larger clip in a smaller project can keep its detail"
+        );
+        assert_eq!(
+            names((1920, 992), &[(1920, 992)]),
+            ["720p", "480p"],
+            "a shorter side of 992 isn't blown up to 1080"
+        );
+    }
+
+    #[test]
+    fn a_size_too_wide_for_the_encoder_is_not_offered() {
+        let offered = sizes_on_offer((2520, 1080), &[(3840, 2160)]);
+
+        assert!(offered.iter().all(|(shorter, _)| *shorter != 2160));
+        assert!(offered.iter().any(|(shorter, _)| *shorter == 1440));
+    }
+
+    #[test]
+    fn only_choices_away_from_the_source_need_redrawing() {
+        assert!(!ExportChoices::default().need_redrawing());
+        for choices in [
+            ExportChoices {
+                size: ExportSize::Shorter(720),
+                ..ExportChoices::default()
+            },
+            ExportChoices {
+                quality: Quality::Balanced,
+                ..ExportChoices::default()
+            },
+            ExportChoices {
+                rate: ExportRate::Fps(30),
+                ..ExportChoices::default()
+            },
+        ] {
+            assert!(choices.need_redrawing());
+        }
+    }
 
     fn audio(codec: &str, title: Option<&str>) -> AudioInfo {
         AudioInfo {

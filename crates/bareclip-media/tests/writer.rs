@@ -20,6 +20,7 @@ fn settings() -> VideoSettings {
         frame_rate: (30, 1),
         bit_rate: 4_000_000,
         sound_tracks: vec![SoundLabel::default()],
+        quality: bareclip_media::Quality::default(),
     }
 }
 
