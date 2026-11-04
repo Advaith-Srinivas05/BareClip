@@ -1,5 +1,5 @@
-//! Shows several clips at once. The main `Preview` still plays the top clip, and its sound is the
-//! clock. Everything under it gets a player of its own that follows that clock with pictures only.
+//! Shows several clips at once. The main `Preview` still plays the top clip's pictures. Everything
+//! under it gets a player of its own that follows the same clock.
 
 use std::{
     collections::HashMap,
@@ -115,7 +115,7 @@ impl LayerPictures {
             let Some(info) = lookup(clip.media) else {
                 continue;
             };
-            match Player::open_as(&info, false, true, notify.clone()) {
+            match Player::open_as(&info, true, notify.clone()) {
                 Ok(mut player) => {
                     player.prepare(source_time(clip, coming_at));
                     self.followers.push(Follower {
@@ -137,7 +137,7 @@ impl LayerPictures {
             let Some(info) = lookup(clip.media) else {
                 continue;
             };
-            match Player::open_as(&info, false, true, notify.clone()) {
+            match Player::open_as(&info, true, notify.clone()) {
                 Ok(mut player) => {
                     player.seek(source_time(clip, moment.now));
                     if moment.playing {
@@ -402,6 +402,7 @@ mod tests {
                 end: seconds(source_start + length),
             },
             placement: Placement::default(),
+            sound: Default::default(),
         }
     }
 
@@ -672,7 +673,7 @@ mod tests {
         let request = bareclip_export::LayeredRequest {
             output: output.clone(),
             stretches,
-            sound: Vec::new(),
+            sound: bareclip_export::SoundPlan::default(),
             canvas: None,
             background: [0, 0, 0],
         };
@@ -897,6 +898,17 @@ mod tests {
     }
 
     fn real_time_run(sources: &[PathBuf], run_for: Duration, overlays_from: Ticks) -> Run {
+        run_against(sources, run_for, overlays_from, false)
+    }
+
+    /// With `on_sound_card`, every clip is decoded and mixed and goes to the real sound output, at
+    /// no volume so nothing is heard, and how much of it has played is the clock.
+    fn run_against(
+        sources: &[PathBuf],
+        run_for: Duration,
+        overlays_from: Ticks,
+        on_sound_card: bool,
+    ) -> Run {
         let infos: Vec<MediaInfo> = sources
             .iter()
             .map(|path| probe(path).expect("the video can be read"))
@@ -912,8 +924,26 @@ mod tests {
         assert!(tracks.needs_layers(canvas, &size_of));
 
         let notify: Notify = Arc::new(|| {});
-        let mut preview = Preview::new(false, notify.clone());
+        let mut preview = Preview::new(on_sound_card, notify.clone());
         preview.set_planes(true, tracks.played(), &lookup);
+        if on_sound_card {
+            let spans = tracks
+                .tracks()
+                .iter()
+                .flat_map(|track| track.clips())
+                .map(|clip| bareclip_audio::MixSpan {
+                    path: infos[clip.media.0 as usize].path.clone(),
+                    start: clip.start,
+                    source: clip.source,
+                    sound: bareclip_core::sound::ClipSound {
+                        volume: 0,
+                        ..Default::default()
+                    },
+                    bus: bareclip_audio::Bus::All(0),
+                })
+                .collect();
+            preview.set_sound(spans, tracks.duration());
+        }
         let mut pictures = LayerPictures::default();
         let target = bareclip_media::fit_preview_size(canvas.0, canvas.1, 1280, 720);
         let mut compositor = Compositor::new(target.0, target.1).expect("the GPU opens");
@@ -978,6 +1008,16 @@ mod tests {
             thread::sleep(Duration::from_millis(6));
         }
         let seconds = started.elapsed().as_secs_f64();
+        if on_sound_card {
+            assert!(
+                preview.sound_works(),
+                "there is no sound output to test with"
+            );
+            println!(
+                "    the clock reached {:.2} s in {seconds:.2} s of real time",
+                reached.as_seconds()
+            );
+        }
         // What each layer should have shown between where it started and where playback got to.
         let in_the_stretch = |clip: &Clip| -> Vec<Ticks> {
             let info = &infos[clip.media.0 as usize];
@@ -1078,7 +1118,7 @@ mod tests {
             })
             .collect();
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        let sound = tracks
+        let sound: Vec<bareclip_media::ExportPart> = tracks
             .played()
             .clips()
             .iter()
@@ -1095,7 +1135,7 @@ mod tests {
         let request = bareclip_export::LayeredRequest {
             output: output.clone(),
             stretches,
-            sound,
+            sound: bareclip_export::SoundPlan::as_recorded(&sound, &infos),
             canvas: None,
             background: [0, 0, 0],
         };
@@ -1181,6 +1221,24 @@ mod tests {
 
     /// The gate for layers: several videos playing against a real clock, with one full-size and
     /// two smaller. Set `BARECLIP_LAYER_FILES` to `a.mkv;b.mp4;c.mp4` to try real recordings.
+    /// Layers against the real sound card's clock, with every clip's sound being decoded and mixed.
+    /// Nothing is heard, because everything is at no volume. Only meaningful in a release build:
+    /// `$env:BARECLIP_LAYER_FILES = 'a.mkv;b.mp4;c.mp4'; cargo test --release -p bareclip-app layers_keep_up_on_the_sound_cards_clock -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs BARECLIP_LAYER_FILES, a GPU and a sound output"]
+    fn layers_keep_up_on_the_sound_cards_clock() {
+        let Some(files) = real_files() else {
+            eprintln!("set BARECLIP_LAYER_FILES");
+            return;
+        };
+        let run_for = Duration::from_secs(20);
+        let run = run_against(&files, run_for, Ticks(0), true);
+        let smooth = report("Real recordings, sound card clock", &run);
+        let late = run_against(&files, run_for, seconds(5.0), true);
+        report("The same, overlays arriving at 5 s", &late);
+        assert!(smooth);
+    }
+
     /// Only meaningful in a release build:
     /// `cargo test --release -p bareclip-app layers_hold_their_frame_rate -- --ignored --nocapture`
     #[test]

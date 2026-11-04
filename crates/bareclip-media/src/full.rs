@@ -334,13 +334,89 @@ fn open_sound_encoder() -> Result<encoder::Audio, ffmpeg::Error> {
     audio.open()
 }
 
-struct SoundOutput {
-    encoder: encoder::Audio,
+/// One stereo sound track being encoded into a file.
+pub(crate) struct SoundOutput {
+    pub(crate) encoder: encoder::Audio,
     stream: usize,
     /// Stereo samples waiting to make up a whole block for the encoder.
-    waiting: Vec<f32>,
+    pub(crate) waiting: Vec<f32>,
     written_frames: i64,
-    block_frames: usize,
+    pub(crate) block_frames: usize,
+}
+
+impl SoundOutput {
+    /// Adds a track to a file that hasn't started yet, as its stream number `stream`.
+    pub(crate) fn add_to(
+        output: &mut format::context::Output,
+        stream: usize,
+        label: &SoundLabel,
+    ) -> Result<Self, MediaError> {
+        let audio = open_sound_encoder()?;
+        let block_frames = match audio.frame_size() {
+            0 => 1024,
+            size => size as usize,
+        };
+        let mut added = output.add_stream(encoder::find(codec::Id::AAC))?;
+        added.set_parameters(&audio);
+        added.set_time_base(Rational(1, SOUND_RATE as i32));
+        let mut metadata = Dictionary::new();
+        if let Some(title) = &label.title {
+            metadata.set("title", title);
+            // This is where MP4 actually keeps a track's name.
+            metadata.set("handler_name", title);
+        }
+        if let Some(language) = &label.language {
+            metadata.set("language", language);
+        }
+        added.set_metadata(metadata);
+        Ok(Self {
+            encoder: audio,
+            stream,
+            waiting: Vec::new(),
+            written_frames: 0,
+            block_frames,
+        })
+    }
+
+    /// Sends this many frames of what is waiting to the encoder.
+    pub(crate) fn send_block(&mut self, frames: usize) -> Result<(), MediaError> {
+        let mut block = frame::Audio::new(
+            Sample::F32(SampleType::Planar),
+            frames,
+            ChannelLayout::STEREO,
+        );
+        block.set_rate(SOUND_RATE);
+        block.set_pts(Some(self.written_frames));
+        for channel in 0..SOUND_CHANNELS {
+            let plane = block.plane_mut::<f32>(channel);
+            for (into, sample) in plane
+                .iter_mut()
+                .zip(self.waiting.iter().skip(channel).step_by(SOUND_CHANNELS))
+            {
+                *into = *sample;
+            }
+        }
+        self.waiting.drain(..frames * SOUND_CHANNELS);
+        self.written_frames += frames as i64;
+        self.encoder.send_frame(&block)?;
+        Ok(())
+    }
+
+    /// Writes whatever the encoder has finished.
+    pub(crate) fn drain(
+        &mut self,
+        time_base: Rational,
+        output: &mut format::context::Output,
+    ) -> Result<(), MediaError> {
+        let from = Rational(1, SOUND_RATE as i32);
+        let mut packet = Packet::empty();
+        while self.encoder.receive_packet(&mut packet).is_ok() {
+            packet.set_stream(self.stream);
+            packet.rescale_ts(from, time_base);
+            packet.write_interleaved(output)?;
+        }
+        Ok(())
+    }
 }
 
 /// Copies a plane's rows into a frame with its own row length.
@@ -408,31 +484,7 @@ impl VideoWriter {
         }
         let mut sound = Vec::new();
         for (index, label) in settings.sound_tracks.iter().enumerate() {
-            let audio = open_sound_encoder()?;
-            let block_frames = match audio.frame_size() {
-                0 => 1024,
-                size => size as usize,
-            };
-            let mut stream = output.add_stream(encoder::find(codec::Id::AAC))?;
-            stream.set_parameters(&audio);
-            stream.set_time_base(Rational(1, SOUND_RATE as i32));
-            let mut metadata = Dictionary::new();
-            if let Some(title) = &label.title {
-                metadata.set("title", title);
-                // This is where MP4 actually keeps a track's name.
-                metadata.set("handler_name", title);
-            }
-            if let Some(language) = &label.language {
-                metadata.set("language", language);
-            }
-            stream.set_metadata(metadata);
-            sound.push(SoundOutput {
-                encoder: audio,
-                stream: index + 1,
-                waiting: Vec::new(),
-                written_frames: 0,
-                block_frames,
-            });
+            sound.push(SoundOutput::add_to(&mut output, index + 1, label)?);
         }
         output.write_header()?;
 
@@ -563,44 +615,17 @@ impl VideoWriter {
     }
 
     fn encode_sound_block(&mut self, track: usize, frames: usize) -> Result<(), MediaError> {
-        let sound = &mut self.sound[track];
-        let mut block = frame::Audio::new(
-            Sample::F32(SampleType::Planar),
-            frames,
-            ChannelLayout::STEREO,
-        );
-        block.set_rate(SOUND_RATE);
-        block.set_pts(Some(sound.written_frames));
-        for channel in 0..SOUND_CHANNELS {
-            let plane = block.plane_mut::<f32>(channel);
-            for (into, sample) in plane
-                .iter_mut()
-                .zip(sound.waiting.iter().skip(channel).step_by(SOUND_CHANNELS))
-            {
-                *into = *sample;
-            }
-        }
-        sound.waiting.drain(..frames * SOUND_CHANNELS);
-        sound.written_frames += frames as i64;
-        sound.encoder.send_frame(&block)?;
+        self.sound[track].send_block(frames)?;
         self.drain_sound(track)
     }
 
     fn drain_sound(&mut self, track: usize) -> Result<(), MediaError> {
-        let from = Rational(1, SOUND_RATE as i32);
         let to = self.sound_time_bases[track];
-        let stream = self.sound[track].stream;
-        let mut packet = Packet::empty();
-        while self.sound[track]
-            .encoder
-            .receive_packet(&mut packet)
-            .is_ok()
-        {
-            packet.set_stream(stream);
-            packet.rescale_ts(from, to);
-            packet.write_interleaved(self.output()?)?;
-        }
-        Ok(())
+        let Self { sound, output, .. } = self;
+        let output = output
+            .as_mut()
+            .ok_or(MediaError::Ffmpeg(ffmpeg::Error::InvalidData))?;
+        sound[track].drain(to, output)
     }
 
     /// Adds stereo samples to the end of a sound track.

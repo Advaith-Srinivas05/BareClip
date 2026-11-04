@@ -8,6 +8,8 @@ use bareclip_core::{
     placement::{
         CanvasCorner, CropSides, FULL_TURN, LARGEST_SCALE, Placement, SMALLEST_SCALE, WHOLE,
     },
+    sound::{ClipSound, FULL_VOLUME},
+    time::Ticks,
     timeline::ClipId,
     tracks::OrderMove,
 };
@@ -608,6 +610,7 @@ pub struct StageView<'a> {
     /// Whether the selected clip can go further forward, and further back.
     pub can_go_forward: bool,
     pub can_go_back: bool,
+    pub sound: Option<SelectedSound>,
 }
 
 /// What happened on the stage this frame.
@@ -617,6 +620,18 @@ pub struct StageEvents {
     pub select: Option<Option<ClipId>>,
     pub place: Option<(ClipId, Placement)>,
     pub order: Option<(ClipId, OrderMove)>,
+    pub sound: Option<(ClipId, ClipSound)>,
+    pub detach: Option<ClipId>,
+}
+
+/// The selected clip's sound, if it has any, for the toolbar's controls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectedSound {
+    pub id: ClipId,
+    pub sound: ClipSound,
+    pub length: Ticks,
+    /// A clip on a picture row with sound of its own can have it taken out.
+    pub can_detach: bool,
 }
 
 /// The crop handle at a place on the screen, on the clip being cropped.
@@ -890,8 +905,197 @@ pub fn show(
             box_around,
             &mut events,
         );
+    } else if let Some(selected) = &view.sound {
+        // Sound with no picture, or a clip somewhere else on the timeline: nothing shows to put
+        // the toolbar against, so it goes at the top of the picture.
+        sound_toolbar(ui, palette, view, selected, &mut events);
     }
     events
+}
+
+/// How wide the sound controls' popup is laid out, leaving room for labels and values.
+const SOUND_LABEL_WIDTH: f32 = 58.0;
+/// As far as the fade sliders go. Longer fades can be typed in, as in Clipchamp.
+const FADE_SLIDER_SECONDS: f64 = 2.0;
+
+fn sound_row_setup(ui: &mut egui::Ui, palette: &Palette) {
+    // The theme has no rail colour of its own that shows up on a raised surface.
+    let visuals = &mut ui.style_mut().visuals;
+    visuals.widgets.inactive.bg_fill = palette.border_strong;
+    visuals.widgets.hovered.bg_fill = palette.border_strong;
+    visuals.widgets.active.bg_fill = palette.border_strong;
+    visuals.selection.bg_fill = palette.accent;
+    ui.spacing_mut().slider_width = MORE_MENU_SLIDER_WIDTH;
+}
+
+fn sound_label(ui: &mut egui::Ui, palette: &Palette, text: &str) {
+    ui.add_space(8.0);
+    ui.add_sized(
+        vec2(SOUND_LABEL_WIDTH, 18.0),
+        egui::Label::new(egui::RichText::new(text).size(13.0).color(palette.text)),
+    );
+}
+
+/// A fade's slider and the box to type a longer one in. Returns the new length in ticks.
+fn fade_row(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    name: &str,
+    current: i64,
+    longest: Ticks,
+) -> Option<i64> {
+    let mut changed = None;
+    ui.horizontal(|ui| {
+        sound_row_setup(ui, palette);
+        sound_label(ui, palette, name);
+        let longest_seconds = longest.as_seconds();
+        let mut seconds = Ticks(current).as_seconds().min(longest_seconds);
+        let reach = FADE_SLIDER_SECONDS.min(longest_seconds).max(0.0);
+        let mut on_slider = seconds.min(reach);
+        let slider = ui
+            .add_enabled(
+                reach > 0.0,
+                Slider::new(&mut on_slider, 0.0..=reach)
+                    .show_value(false)
+                    .step_by(0.1)
+                    .trailing_fill(true),
+            )
+            .on_hover_text("Fades can reach up to half the clip");
+        slider.widget_info(|| egui::WidgetInfo::slider(slider.enabled(), on_slider, name));
+        if slider.changed() {
+            seconds = on_slider;
+            changed = Some(Ticks::from_seconds(seconds).0);
+        }
+        if slider.drag_stopped() || slider.clicked() {
+            slider.surrender_focus();
+        }
+        let typed = ui.add(
+            egui::DragValue::new(&mut seconds)
+                .range(0.0..=longest_seconds)
+                .speed(0.05)
+                .max_decimals(2)
+                .suffix(" s"),
+        );
+        if typed.changed() {
+            changed = Some(Ticks::from_seconds(seconds).0);
+        }
+    });
+    changed
+}
+
+/// Volume, fades, mute and taking the sound out of a video.
+fn sound_menu(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    selected: &SelectedSound,
+    events: &mut StageEvents,
+) {
+    let sound = selected.sound;
+    ui.horizontal(|ui| {
+        sound_row_setup(ui, palette);
+        sound_label(ui, palette, "Volume");
+        let percent = (f64::from(sound.volume) * 100.0 / f64::from(FULL_VOLUME)).round();
+        let mut volume = percent;
+        let slider = ui
+            .add(
+                Slider::new(&mut volume, 0.0..=200.0)
+                    .show_value(false)
+                    .step_by(1.0)
+                    .trailing_fill(true),
+            )
+            .on_hover_text("100% is as it was recorded");
+        slider.widget_info(|| egui::WidgetInfo::slider(slider.enabled(), volume, "Volume"));
+        ui.label(
+            egui::RichText::new(format!("{volume:.0}%"))
+                .size(13.0)
+                .color(palette.text_muted),
+        );
+        if slider.changed() {
+            events.sound = Some((
+                selected.id,
+                ClipSound {
+                    volume: (volume * f64::from(FULL_VOLUME) / 100.0).round() as u32,
+                    ..sound
+                },
+            ));
+        }
+        // Holding on to the keyboard would stop the arrow keys moving the playhead.
+        if slider.drag_stopped() || slider.clicked() {
+            slider.surrender_focus();
+        }
+    });
+    let longest = Ticks(selected.length.0 / 2);
+    if let Some(fade_in) = fade_row(ui, palette, "Fade in", sound.fade_in, longest) {
+        events.sound = Some((selected.id, ClipSound { fade_in, ..sound }));
+    }
+    if let Some(fade_out) = fade_row(ui, palette, "Fade out", sound.fade_out, longest) {
+        events.sound = Some((selected.id, ClipSound { fade_out, ..sound }));
+    }
+    ui.separator();
+    let (icon, name) = if sound.muted {
+        (icons::VOLUME_2, "Unmute clip")
+    } else {
+        (icons::VOLUME_X, "Mute clip")
+    };
+    if ui.add(MenuItem::new(palette, icon, name, "")).clicked() {
+        events.sound = Some((
+            selected.id,
+            ClipSound {
+                muted: !sound.muted,
+                ..sound
+            },
+        ));
+    }
+    if selected.can_detach
+        && ui
+            .add(MenuItem::new(palette, icons::UNLINK, "Detach sound", ""))
+            .on_hover_text("Puts this clip's sound on rows of its own, so it can be moved and changed by itself")
+            .clicked()
+    {
+        events.detach = Some(selected.id);
+        ui.close();
+    }
+}
+
+/// The toolbar for a selected clip with no picture on show, holding only its sound.
+fn sound_toolbar(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    view: &StageView,
+    selected: &SelectedSound,
+    events: &mut StageEvents,
+) {
+    let width = TOOLBAR_PADDING * 2.0 + TOOLBAR_BUTTON;
+    let rect = toolbar_rect(width, view.frame, view.area, view.row_above_is_free);
+    let id = ui.scope_id().with("stage-sound-toolbar");
+    egui::Area::new(id)
+        .order(egui::Order::Middle)
+        .fixed_pos(rect.min)
+        .fade_in(false)
+        .constrain(false)
+        .show(ui.ctx(), |ui| {
+            ui.set_min_size(rect.size());
+            ui.painter().rect(
+                rect,
+                8.0,
+                palette.raised,
+                Stroke::new(1.0, palette.border),
+                egui::StrokeKind::Inside,
+            );
+            let spot = Rect::from_min_size(
+                pos2(
+                    rect.left() + TOOLBAR_PADDING,
+                    rect.center().y - TOOLBAR_BUTTON / 2.0,
+                ),
+                vec2(TOOLBAR_BUTTON, TOOLBAR_BUTTON),
+            );
+            let button = IconButton::new(palette, Kind::Ghost, icons::VOLUME_2, "Sound")
+                .show_at(ui, id.with("sound"), spot)
+                .on_hover_text("Volume, fades and mute");
+            egui::Popup::menu(&button)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show(|ui| sound_menu(ui, palette, selected, events));
+        });
 }
 
 /// The rectangle around some points on the screen.
@@ -1023,7 +1227,8 @@ fn toolbar(
     clip_rect: Rect,
     events: &mut StageEvents,
 ) {
-    let buttons = 5.0;
+    let sound = view.sound.filter(|sound| sound.id == clip.id);
+    let buttons = if sound.is_some() { 6.0 } else { 5.0 };
     let width = TOOLBAR_PADDING * 2.0 + TOOLBAR_BUTTON * buttons;
     let rect = toolbar_rect(width, clip_rect, view.area, view.row_above_is_free);
     let id = ui.scope_id().with("stage-toolbar");
@@ -1093,7 +1298,13 @@ fn toolbar(
             {
                 events.place = Some((clip.id, placement.flipped_down()));
             }
-            let more = button(ui, 4.0, icons::ELLIPSIS, "More", "More");
+            if let Some(sound) = &sound {
+                let opened = button(ui, 4.0, icons::VOLUME_2, "Sound", "Volume, fades and mute");
+                egui::Popup::menu(&opened)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show(|ui| sound_menu(ui, palette, sound, events));
+            }
+            let more = button(ui, buttons - 1.0, icons::ELLIPSIS, "More", "More");
             egui::Popup::menu(&more)
                 .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                 .show(|ui| {

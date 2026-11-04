@@ -339,6 +339,9 @@ struct SectionWriter<'a> {
     section_start: i64,
     /// Where this section starts in the output.
     output_start: i64,
+    /// Nothing is shown before the start of the section, which matters when its first frame began
+    /// a little before the place the section is cut.
+    keep_from_start: bool,
     output_time_base: Rational,
     run: Option<EncodeRun>,
     /// A re-encoded part put different settings into the stream, so the next
@@ -355,6 +358,16 @@ impl SectionWriter<'_> {
             self.source.time_base,
             self.output_time_base,
         ) + self.output_start
+    }
+
+    /// Moves a display time to its place in the output.
+    fn shown_at(&self, timestamp: i64) -> i64 {
+        let place = self.to_output(timestamp);
+        if self.keep_from_start {
+            place.max(self.output_start)
+        } else {
+            place
+        }
     }
 
     fn output_duration(&self, duration: i64) -> i64 {
@@ -454,7 +467,7 @@ impl SectionWriter<'_> {
         let dts = packet.dts().unwrap_or(pts);
         let (place_pts, place_dts) = writer
             .video_timeline
-            .place(self.to_output(pts), self.to_output(dts));
+            .place(self.shown_at(pts), self.to_output(dts));
 
         let body = packet.data().unwrap_or_default();
         let mut output = if self.restore_settings && !self.packaging.source_settings.is_empty() {
@@ -540,6 +553,7 @@ fn write_black(
         encoder_name: Some(encoder_name),
         section_start: 0,
         output_start: cursor.to_pts(to_time_base(output_time_base)),
+        keep_from_start: false,
         output_time_base,
         run: Some(run),
         restore_settings: true,
@@ -703,6 +717,9 @@ struct SourceGroup {
     input: PathBuf,
     frames: Arc<FrameIndex>,
     gap_before: Ticks,
+    /// The stretch of its source to put exactly on the timeline, when other sound has to line up
+    /// with the picture. Otherwise it starts on its first frame and its sound moves with it.
+    exact_range: Option<TimeRange>,
     video: SourceVideo,
     plan: CutPlan,
 }
@@ -721,6 +738,8 @@ struct ExportJob<'a> {
     encoder_name: Option<&'a str>,
     cancel: &'a AtomicBool,
     progress: &'a dyn Fn(f32),
+    /// Whether the sources' sound comes along, or new sound will take its place.
+    keep_sound: bool,
 }
 
 fn clear_codec_tag(stream: &mut format::stream::StreamMut) {
@@ -763,7 +782,7 @@ fn open_output(job: &ExportJob) -> Result<(format::context::Output, usize), Medi
 
     let mut audio_count = 0;
     for stream in input.streams() {
-        if stream.parameters().medium() != Type::Audio {
+        if stream.parameters().medium() != Type::Audio || !job.keep_sound {
             continue;
         }
         let mut added = output.add_stream(encoder::find(Id::None))?;
@@ -870,7 +889,7 @@ fn write_group(
     // Tracks line up by their order in each file, which the join check has confirmed.
     let mut audio_tracks: HashMap<usize, SourceAudioTrack> = HashMap::new();
     for stream in input.streams() {
-        if stream.parameters().medium() == Type::Audio {
+        if stream.parameters().medium() == Type::Audio && job.keep_sound {
             let track = SourceAudioTrack {
                 output_index: audio_tracks.len() + 1,
                 time_base: stream.time_base(),
@@ -896,6 +915,7 @@ fn write_group(
         .collect();
     let time_base = to_time_base(source_video.time_base);
     let output_core_time_base = to_time_base(writer.output_time_base[0]);
+    let group_start = *cursor;
 
     for section in &group.plan.sections {
         let read_first = section
@@ -933,8 +953,11 @@ fn write_group(
             source: source_video,
             packaging: &packaging,
             encoder_name: job.encoder_name,
-            section_start: section.pts_start,
+            section_start: group
+                .exact_range
+                .map_or(section.pts_start, |range| range.start.to_pts(time_base)),
             output_start: cursor.to_pts(output_core_time_base),
+            keep_from_start: group.exact_range.is_some(),
             output_time_base: writer.output_time_base[0],
             run: None,
             restore_settings: *restore_settings,
@@ -1021,6 +1044,9 @@ fn write_group(
         let length = Ticks::from_pts(section.pts_end, time_base).0
             - Ticks::from_pts(section.pts_start, time_base).0;
         *cursor = Ticks(cursor.0 + length);
+    }
+    if let Some(range) = group.exact_range {
+        *cursor = Ticks(group_start.0 + range.duration().0);
     }
     Ok(())
 }
@@ -1147,6 +1173,19 @@ fn group_parts(parts: &[ExportPart]) -> Vec<PartGroup> {
     groups
 }
 
+/// Keeps every part apart, so each can be placed exactly on the timeline.
+fn each_part_alone(parts: &[ExportPart]) -> Vec<PartGroup> {
+    parts
+        .iter()
+        .map(|part| PartGroup {
+            input: part.input.clone(),
+            frames: part.frames.clone(),
+            ranges: vec![part.range],
+            gap_before: part.gap_before,
+        })
+        .collect()
+}
+
 /// Checks that every source can share one output, and returns why not if it can't.
 fn check_joinable(parts: &[ExportPart]) -> Result<(), MediaError> {
     let mut first = None;
@@ -1169,6 +1208,24 @@ fn check_joinable(parts: &[ExportPart]) -> Result<(), MediaError> {
 /// keyframe cuts, and the report says so.
 pub fn export(
     request: &ExportRequest,
+    cancel: &AtomicBool,
+    progress: &dyn Fn(f32),
+) -> Result<ExportReport, MediaError> {
+    run(request, true, cancel, progress)
+}
+
+/// The same, leaving all the sound behind.
+pub fn export_picture_only(
+    request: &ExportRequest,
+    cancel: &AtomicBool,
+    progress: &dyn Fn(f32),
+) -> Result<ExportReport, MediaError> {
+    run(request, false, cancel, progress)
+}
+
+fn run(
+    request: &ExportRequest,
+    keep_sound: bool,
     cancel: &AtomicBool,
     progress: &dyn Fn(f32),
 ) -> Result<ExportReport, MediaError> {
@@ -1201,6 +1258,7 @@ pub fn export(
                     input: part.input,
                     frames: part.frames,
                     gap_before: part.gap_before,
+                    exact_range: (!keep_sound).then(|| part.ranges[0]),
                     video,
                     plan,
                 })
@@ -1209,7 +1267,13 @@ pub fn export(
     };
 
     let mut mode_used = request.mode;
-    let sources = group_parts(&request.parts);
+    // With its own sound gone, the picture has to land exactly where the timeline says for other
+    // sound to line up with it, the same as in the preview.
+    let sources = if keep_sound {
+        group_parts(&request.parts)
+    } else {
+        each_part_alone(&request.parts)
+    };
     let mut groups = plan_groups(mode_used, sources.clone())?;
     let mut encoder_name = None;
     if let Some(needing) = groups
@@ -1237,6 +1301,7 @@ pub fn export(
         encoder_name: encoder_name.as_deref(),
         cancel,
         progress,
+        keep_sound,
     });
     let audio_tracks = match result {
         Ok(count) => count,

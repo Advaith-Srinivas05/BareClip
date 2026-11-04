@@ -12,14 +12,15 @@ use serde::{Deserialize, Serialize};
 use crate::{
     canvas::Canvas,
     placement::Placement,
+    sound::{ClipSound, RowSound},
     time::Ticks,
-    timeline::{MediaId, TimeRange},
+    timeline::{MediaId, TimeRange, Timeline},
     tracks::Tracks,
 };
 
 pub const EXTENSION: &str = "bareclip";
 /// Goes up whenever the format changes in a way older versions can't read.
-const CURRENT_VERSION: u32 = 3;
+const CURRENT_VERSION: u32 = 4;
 /// Files older than this had their size worked out from the largest video.
 const FIRST_VERSION_WITH_CANVAS: u32 = 3;
 pub const DEFAULT_NAME: &str = "untitled";
@@ -41,6 +42,10 @@ pub struct SavedClip {
     /// none, which means the same thing.
     #[serde(default, skip_serializing_if = "Placement::is_default")]
     pub placement: Placement,
+    /// Left out for a clip that plays as recorded. Files from before audio have none, which
+    /// means the same thing.
+    #[serde(default, skip_serializing_if = "ClipSound::is_default")]
+    pub sound: ClipSound,
 }
 
 impl SavedClip {
@@ -66,6 +71,12 @@ pub struct ProjectFile {
     pub media: Vec<SavedMedia>,
     /// Highest track first, each with its clips in order.
     pub tracks: Vec<Vec<SavedClip>>,
+    /// The rows of sound below those, from the top down.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audio_tracks: Vec<Vec<SavedClip>>,
+    /// How each row sounds, picture rows first. Left out if none are muted or on solo.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub row_sound: Vec<RowSound>,
     #[serde(default)]
     pub canvas: Canvas,
 }
@@ -105,23 +116,13 @@ impl ProjectFile {
                 .into_iter()
                 .map(|(id, path)| SavedMedia { id: id.0, path })
                 .collect(),
-            tracks: tracks
-                .tracks()
-                .iter()
-                .map(|track| {
-                    track
-                        .clips()
-                        .iter()
-                        .map(|clip| SavedClip {
-                            media: clip.media.0,
-                            start: clip.start.0,
-                            source_start: clip.source.start.0,
-                            source_end: clip.source.end.0,
-                            placement: clip.placement,
-                        })
-                        .collect()
-                })
-                .collect(),
+            tracks: saved_rows(tracks.picture_tracks()),
+            audio_tracks: saved_rows(tracks.audio_tracks()),
+            row_sound: if tracks.row_sounds().iter().all(RowSound::is_default) {
+                Vec::new()
+            } else {
+                tracks.row_sounds().to_vec()
+            },
             canvas: Canvas::default(),
         }
     }
@@ -154,6 +155,25 @@ impl ProjectFile {
     pub fn read(path: &Path) -> Result<Self, ProjectError> {
         Self::from_text(&fs::read_to_string(path).map_err(ProjectError::Io)?)
     }
+}
+
+fn saved_rows(rows: &[Timeline]) -> Vec<Vec<SavedClip>> {
+    rows.iter()
+        .map(|track| {
+            track
+                .clips()
+                .iter()
+                .map(|clip| SavedClip {
+                    media: clip.media.0,
+                    start: clip.start.0,
+                    source_start: clip.source.start.0,
+                    source_end: clip.source.end.0,
+                    placement: clip.placement,
+                    sound: clip.sound,
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// Replaces a file in one step: the new contents go in a temporary file beside it, which is
@@ -263,6 +283,7 @@ mod tests {
             source_start: 0,
             source_end,
             placement: Placement::default(),
+            sound: Default::default(),
         };
         // Out of order, overlapping, empty and starting before zero.
         let tracks = vec![vec![clip(50, 100), clip(0, 100), clip(5, 0), clip(-20, 10)]];
@@ -338,6 +359,73 @@ mod tests {
     }
 
     #[test]
+    fn sound_rows_clip_sound_and_row_sound_all_come_back() {
+        let mut tracks = Tracks::default();
+        let video = tracks.push(VIDEO, range(0, 100));
+        tracks.set_clip_sound(
+            video,
+            ClipSound {
+                volume: 750_000,
+                fade_in: 10,
+                fade_out: 20,
+                ..ClipSound::default()
+            },
+        );
+        let detached = tracks.detach_sound(video, 1)[0];
+        tracks.set_row_sound(
+            1,
+            RowSound {
+                muted: false,
+                solo: true,
+            },
+        );
+        let file = ProjectFile::capture("x", Vec::new(), &tracks);
+
+        let back = ProjectFile::from_text(&file.to_text()).expect("it can be read");
+        let restored =
+            Tracks::restore_with_sound(&back.tracks, &back.audio_tracks, &back.row_sound, |id| {
+                Some(MediaId(id))
+            });
+
+        assert_eq!(restored.picture_rows(), 1);
+        assert_eq!(restored.audio_tracks().len(), 1);
+        let row = RowSound {
+            muted: false,
+            solo: true,
+        };
+        assert_eq!(restored.row_sounds(), [RowSound::default(), row]);
+        let saved = restored.tracks()[1].clips()[0].sound;
+        assert_eq!(saved, tracks.clip(detached).expect("it is there").sound);
+        assert_eq!(saved.only_track, Some(0));
+        assert_eq!(saved.volume, 750_000);
+    }
+
+    #[test]
+    fn a_project_from_before_audio_opens_and_plays_as_it_did() {
+        let text = r#"{"version":3,"name":"old","media":[{"id":1,"path":"a.mp4"}],
+            "tracks":[[{"media":1,"start":0,"source_start":0,"source_end":100}]]}"#;
+
+        let file = ProjectFile::from_text(text).expect("it can be read");
+        let tracks =
+            Tracks::restore_with_sound(&file.tracks, &file.audio_tracks, &file.row_sound, |id| {
+                Some(MediaId(id))
+            });
+
+        assert!(tracks.audio_tracks().is_empty());
+        assert!(tracks.tracks()[0].clips()[0].sound.is_default());
+        assert_eq!(tracks.row_sounds(), [RowSound::default()]);
+    }
+
+    #[test]
+    fn a_project_with_no_sound_changes_writes_nothing_about_sound() {
+        let text = file().to_text();
+
+        for word in ["sound", "audio_tracks", "row_sound"] {
+            assert!(!text.contains(word), "{word} is in {text}");
+        }
+    }
+
+    #[test]
     fn a_clip_that_was_not_moved_writes_nothing_about_its_layout() {
         assert!(!file().to_text().contains("placement"));
     }
@@ -354,6 +442,7 @@ mod tests {
                 opacity: -5,
                 ..Placement::default()
             },
+            sound: Default::default(),
         };
 
         let tracks = Tracks::restore(&[vec![clip]], |id| Some(MediaId(id)));
@@ -371,6 +460,7 @@ mod tests {
             source_start: 100,
             source_end: 300,
             placement: Placement::default(),
+            sound: Default::default(),
         };
 
         assert_eq!(clip.fitted_to(Ticks(500)), Some(clip));

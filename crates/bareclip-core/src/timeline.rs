@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{placement::Placement, time::Ticks};
+use crate::{placement::Placement, sound::ClipSound, time::Ticks};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimeRange {
@@ -39,6 +39,8 @@ pub struct Clip {
     pub source: TimeRange,
     /// How its picture is laid out. It belongs to the whole clip.
     pub placement: Placement,
+    /// How it sounds. This belongs to the whole clip too.
+    pub sound: ClipSound,
 }
 
 impl Clip {
@@ -143,15 +145,15 @@ impl Timeline {
     /// Puts saved clips back, each with a new id. Going through the usual rules means a
     /// file edited by hand can't produce an arrangement the editor couldn't.
     pub(crate) fn restore(
-        saved: impl IntoIterator<Item = (MediaId, Ticks, TimeRange, Placement)>,
+        saved: impl IntoIterator<Item = (MediaId, Ticks, TimeRange, Placement, ClipSound)>,
     ) -> Self {
-        let mut clips: Vec<(MediaId, Ticks, TimeRange, Placement)> = saved
+        let mut clips: Vec<(MediaId, Ticks, TimeRange, Placement, ClipSound)> = saved
             .into_iter()
-            .filter(|(_, _, source, _)| source.start < source.end)
+            .filter(|(_, _, source, _, _)| source.start < source.end)
             .collect();
-        clips.sort_by_key(|(_, start, _, _)| *start);
+        clips.sort_by_key(|(_, start, _, _, _)| *start);
         let mut timeline = Self::default();
-        for (media, start, source, placement) in clips {
+        for (media, start, source, placement, sound) in clips {
             let id = next_clip_id();
             let wanted = start.max(Ticks(0));
             // Past whatever is already there, since these arrive in order.
@@ -162,6 +164,7 @@ impl Timeline {
                 start,
                 source,
                 placement: placement.clamped(),
+                sound: sound.clamped(),
             });
         }
         timeline
@@ -266,6 +269,7 @@ impl Timeline {
             start: self.duration(),
             source,
             placement: Placement::default(),
+            sound: ClipSound::default(),
         });
         id
     }
@@ -280,6 +284,7 @@ impl Timeline {
             start,
             source,
             placement: Placement::default(),
+            sound: ClipSound::default(),
         });
         id
     }
@@ -316,6 +321,8 @@ impl Timeline {
             return None;
         }
         self.clips[index].source.end = source_time;
+        // The fades stay at the ends they were made for.
+        self.clips[index].sound.fade_out = 0;
         let second = next_clip_id();
         self.clips.insert(
             index + 1,
@@ -328,6 +335,10 @@ impl Timeline {
                     end: clip.source.end,
                 },
                 placement: clip.placement,
+                sound: ClipSound {
+                    fade_in: 0,
+                    ..clip.sound
+                },
             },
         );
         Some(second)
@@ -341,6 +352,17 @@ impl Timeline {
         let placement = placement.clamped();
         let changed = self.clips[index].placement != placement;
         self.clips[index].placement = placement;
+        changed
+    }
+
+    /// Changes how a clip sounds. Returns whether that changed anything.
+    pub(crate) fn set_sound(&mut self, id: ClipId, sound: ClipSound) -> bool {
+        let Some(index) = self.index_of(id) else {
+            return false;
+        };
+        let sound = sound.clamped();
+        let changed = self.clips[index].sound != sound;
+        self.clips[index].sound = sound;
         changed
     }
 

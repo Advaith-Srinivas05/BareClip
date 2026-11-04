@@ -1,8 +1,9 @@
 //! Audio mixing and playback.
 
-mod mixer;
+mod engine;
+mod mix;
 mod output;
 
-pub use mixer::TrackMixer;
+pub use engine::SoundEngine;
+pub use mix::{Bus, MixSpan, TimelineMix, soft_limit};
 pub use output::{AudioOutput, OutputState};
-pub use rtrb::Producer;

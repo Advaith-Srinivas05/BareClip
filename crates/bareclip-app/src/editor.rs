@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use bareclip_audio::{Bus, MixSpan};
 use bareclip_core::{
     canvas::{
         BACKGROUND_SWATCHES, BLACK, Canvas, Colour, ORIGINAL_NAME, RATIOS, colour_from_hex,
@@ -18,20 +19,21 @@ use bareclip_core::{
     },
     history::History,
     project::{self, ProjectFile, write_atomic},
+    sound::ClipSound,
     splice::{CutMode, FrameIndex},
     time::{Ticks, format_timecode},
-    timeline::{ClipEdge, ClipId, MediaId, TimeRange},
+    timeline::{ClipEdge, ClipId, MediaId, TimeRange, Timeline},
     tracks::{OrderMove, TrackTarget, Tracks},
 };
 use bareclip_export::{
     FullPlan, LAYERED_REASON, LayeredClip, LayeredRequest, LayeredStretch, ProjectReport, Route,
-    copying_suits, export_layered, export_project, full_output_path, mixed_rates, route_for,
-    size_problem,
+    SoundPlan, copying_suits, export_layered, export_with_new_sound, full_output_path, mixed_rates,
+    route_for, size_problem, sound_labels,
 };
 use bareclip_media::{
-    DecodeStep, ExportPart, ExportRequest, MediaError, MediaInfo, PreviewFrame, SoundShape,
-    StripPicture, VideoPreview, picture_spacing, plan_export, probe, read_sound_shape,
-    read_strip_pictures, scan_frames,
+    DecodeStep, ExportPart, ExportRequest, MediaError, MediaInfo, PreviewFrame, SoundLabel,
+    SoundShape, StripPicture, VideoPreview, can_write_gaps, export, picture_spacing, plan_export,
+    probe, read_sound_shape, read_strip_pictures, scan_frames,
 };
 use eframe::egui::{
     self, Align, Color32, CornerRadius, FontFamily, FontId, Frame, Key, Layout, Margin, Modifiers,
@@ -169,6 +171,7 @@ fn start_strip_reader(
     want_pictures: bool,
     want_sound: bool,
 ) -> StripReader {
+    let want_pictures = want_pictures && !info.is_sound_only();
     let (sender, messages) = mpsc::sync_channel(STRIP_CHANNEL);
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = cancel.clone();
@@ -240,20 +243,26 @@ impl MediaSort {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MediaFilter {
     All,
+    Videos,
+    Audio,
     OnTimeline,
     NotOnTimeline,
 }
 
 impl MediaFilter {
-    const ALL: [(Self, &'static str); 3] = [
-        (Self::All, "All videos"),
+    const ALL: [(Self, &'static str); 5] = [
+        (Self::All, "Everything"),
+        (Self::Videos, "Videos"),
+        (Self::Audio, "Audio"),
         (Self::OnTimeline, "On the timeline"),
         (Self::NotOnTimeline, "Not on the timeline"),
     ];
 
-    fn keeps(self, used: bool) -> bool {
+    fn keeps(self, used: bool, sound_only: bool) -> bool {
         match self {
             Self::All => true,
+            Self::Videos => !sound_only,
+            Self::Audio => sound_only,
             Self::OnTimeline => used,
             Self::NotOnTimeline => !used,
         }
@@ -261,6 +270,39 @@ impl MediaFilter {
 }
 
 /// A video in the project.
+/// Why a project with nothing but sound is drawn from nothing.
+const ONLY_SOUND_REASON: &str = "This project only has sound, so the picture is its background.";
+/// Why a project whose sound outlasts its pictures can't be copied.
+const SOUND_OUTLASTS_REASON: &str =
+    "Sound carries on after the last video, so the background has to be drawn behind it.";
+/// Why a file that can't hold the new sound is made into another.
+const NEW_SOUND_REASON: &str =
+    "The sound has changed, and this kind of file can't hold the new sound, so it becomes an MP4.";
+/// Why video that can't be cut exactly is redrawn when its sound changes.
+const EXACT_CUTS_REASON: &str =
+    "The sound has changed, and this video can't be cut exactly to stay in time with it.";
+/// The kinds of file known to take the sound a mix makes alongside a copied picture.
+const CONTAINERS_FOR_NEW_SOUND: [&str; 4] = ["mp4", "m4v", "mov", "mkv"];
+
+/// Everything that can be heard, as one mix.
+fn heard_spans(media: &[MediaEntry], tracks: &Tracks) -> Vec<MixSpan> {
+    let entry = |id: MediaId| media.iter().find(|entry| entry.id == id);
+    let has_sound = |id: MediaId| entry(id).is_some_and(|entry| !entry.info.audio.is_empty());
+    tracks
+        .sound_spans(&has_sound)
+        .into_iter()
+        .filter_map(|span| {
+            Some(MixSpan {
+                path: entry(span.media)?.info.path.clone(),
+                start: span.start,
+                source: span.source,
+                sound: span.sound,
+                bus: Bus::All(0),
+            })
+        })
+        .collect()
+}
+
 /// How to join videos with different frame rates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RatePick {
@@ -356,6 +398,10 @@ pub struct Editor {
     mode: CutMode,
     /// How to join videos with different frame rates, if the user has picked for this export.
     rate_pick: Option<RatePick>,
+    /// Keep game, mic and music on tracks of their own in this export, rather than one mix.
+    keep_sound_apart: bool,
+    /// The lane for adding audio was pressed, so a file picker opens once this frame is drawn.
+    add_audio_requested: bool,
     confirm_remove: Vec<MediaId>,
     project_name: String,
     /// The file this project saves to, once it has one.
@@ -487,6 +533,8 @@ impl Editor {
             export_state: ExportState::Closed,
             mode: CutMode::FrameExact,
             rate_pick: None,
+            keep_sound_apart: false,
+            add_audio_requested: false,
             confirm_remove: Vec::new(),
             project_name: project::DEFAULT_NAME.to_owned(),
             project_path: None,
@@ -776,17 +824,22 @@ impl Editor {
                 }
             }
         }
-        let fitted: Vec<Vec<project::SavedClip>> = file
-            .tracks
-            .iter()
-            .map(|track| {
-                track
-                    .iter()
-                    .filter_map(|clip| clip.fitted_to(*durations.get(&clip.media)?))
-                    .collect()
-            })
-            .collect();
-        self.project.tracks = Tracks::restore(&fitted, |id| new_ids.get(&id).copied());
+        let fitted = |rows: &[Vec<project::SavedClip>]| -> Vec<Vec<project::SavedClip>> {
+            rows.iter()
+                .map(|track| {
+                    track
+                        .iter()
+                        .filter_map(|clip| clip.fitted_to(*durations.get(&clip.media)?))
+                        .collect()
+                })
+                .collect()
+        };
+        self.project.tracks = Tracks::restore_with_sound(
+            &fitted(&file.tracks),
+            &fitted(&file.audio_tracks),
+            &file.row_sound,
+            |id| new_ids.get(&id).copied(),
+        );
         self.project.canvas = file.canvas.checked();
         if file.predates_canvas() {
             // These were sized by their largest video, and shouldn't change just by being opened.
@@ -996,7 +1049,10 @@ impl Editor {
         let used = |entry: &MediaEntry| tracks.clips_using(entry.id) > 0;
         let mut listed: Vec<&MediaEntry> = self
             .visible_media()
-            .filter(|entry| self.media_filter.keeps(used(entry)))
+            .filter(|entry| {
+                self.media_filter
+                    .keeps(used(entry), entry.info.is_sound_only())
+            })
             .collect();
         listed.sort_by(|a, b| {
             let by_name = || text::natural_order(&a.name, &b.name);
@@ -1023,6 +1079,7 @@ impl Editor {
             media,
             ..
         } = self;
+        preview.set_project_length(project.tracks.duration());
         preview.seek(project.tracks.played(), &|id| media_info(media, id), time);
         if self.project.tracks.is_empty() {
             self.picture = None;
@@ -1094,37 +1151,37 @@ impl Editor {
             .and_then(|metadata| metadata.created())
             .ok();
 
-        let (sender, scan) = mpsc::channel();
         let progress = Arc::new(AtomicU32::new(0));
         let cancel_scan = Arc::new(AtomicBool::new(false));
-        let scan_path = path.to_owned();
-        let scan_progress = progress.clone();
-        let scan_cancel = cancel_scan.clone();
-        let repaint = ctx.clone();
-        thread::spawn(move || {
-            if let Ok(mut preview) =
-                VideoPreview::open(&scan_path, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT)
-                && let Ok(DecodeStep::Frame(frame)) = preview.next_step(None)
-            {
-                let _ = sender.send(ScanMessage::Thumbnail(frame));
-                repaint.request_repaint();
-            }
-            let outcome = scan_frames(&scan_path, &scan_cancel, |fraction| {
-                scan_progress.store(fraction.to_bits(), Ordering::Relaxed);
+        let sound_only = info.is_sound_only();
+        // Sound has no frames to find or pictures to show.
+        let scan = (!sound_only).then(|| {
+            let (sender, scan) = mpsc::channel();
+            let scan_path = path.to_owned();
+            let scan_progress = progress.clone();
+            let scan_cancel = cancel_scan.clone();
+            let repaint = ctx.clone();
+            thread::spawn(move || {
+                if let Ok(mut preview) =
+                    VideoPreview::open(&scan_path, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT)
+                    && let Ok(DecodeStep::Frame(frame)) = preview.next_step(None)
+                {
+                    let _ = sender.send(ScanMessage::Thumbnail(frame));
+                    repaint.request_repaint();
+                }
+                let outcome = scan_frames(&scan_path, &scan_cancel, |fraction| {
+                    scan_progress.store(fraction.to_bits(), Ordering::Relaxed);
+                    repaint.request_repaint();
+                });
+                let _ = sender.send(ScanMessage::Frames(outcome));
                 repaint.request_repaint();
             });
-            let _ = sender.send(ScanMessage::Frames(outcome));
-            repaint.request_repaint();
+            scan
         });
 
-        let strip_reader = (self.settings.thumbnails || self.settings.waveforms).then(|| {
-            start_strip_reader(
-                ctx,
-                &info,
-                self.settings.thumbnails,
-                self.settings.waveforms,
-            )
-        });
+        let want_pictures = self.settings.thumbnails && !sound_only;
+        let strip_reader = (want_pictures || self.settings.waveforms)
+            .then(|| start_strip_reader(ctx, &info, want_pictures, self.settings.waveforms));
         let id = MediaId(self.next_media);
         self.next_media += 1;
         Ok(MediaEntry {
@@ -1133,7 +1190,7 @@ impl Editor {
             name,
             created,
             index: None,
-            scan: Some(scan),
+            scan,
             cancel_scan,
             progress,
             thumbnail: None,
@@ -1158,9 +1215,18 @@ impl Editor {
             return;
         };
         self.record();
-        self.selected = Some(self.project.tracks.push(id, range));
+        self.selected = Some(self.push_clip(id, range));
         self.settle_canvas();
         self.after_clip_added();
+    }
+
+    /// Adds a clip to the end, on the kind of row it goes on.
+    fn push_clip(&mut self, id: MediaId, range: TimeRange) -> ClipId {
+        if self.is_sound_only(id) {
+            self.project.tracks.push_sound(id, range)
+        } else {
+            self.project.tracks.push(id, range)
+        }
     }
 
     /// Adds the ticked videos to the end of the timeline in the order they were ticked,
@@ -1176,7 +1242,7 @@ impl Editor {
         }
         self.record();
         for (id, range) in ranges {
-            self.selected = Some(self.project.tracks.push(id, range));
+            self.selected = Some(self.push_clip(id, range));
             self.settle_canvas();
             self.settle_canvas();
         }
@@ -1214,7 +1280,12 @@ impl Editor {
             return;
         };
         self.record();
-        self.selected = Some(self.project.tracks.place(id, range, time, target));
+        let placed = if self.is_sound_only(id) {
+            self.project.tracks.place_sound(id, range, time, target)
+        } else {
+            self.project.tracks.place(id, range, time, target)
+        };
+        self.selected = Some(placed);
         self.settle_canvas();
         self.after_clip_added();
     }
@@ -1350,6 +1421,7 @@ impl Editor {
     /// Starts exporting, first pointing out any dead space on the timeline.
     fn open_export(&mut self) {
         self.rate_pick = None;
+        self.keep_sound_apart = false;
         self.export_state = if self.project.tracks.gaps().is_empty() {
             ExportState::Choosing
         } else {
@@ -1489,6 +1561,10 @@ impl Editor {
                 display.forget();
             }
         }
+        preview.set_sound(
+            heard_spans(media, &project.tracks),
+            project.tracks.duration(),
+        );
         let frame = preview.update(project.tracks.played(), &lookup);
         if let (true, Some(canvas), Some(display)) = (layered, canvas, layer_display.as_mut()) {
             let size_of = |id: MediaId| {
@@ -1699,6 +1775,12 @@ impl Editor {
         })
     }
 
+    /// A clip of a file with no picture, which goes on a sound row.
+    fn is_sound_only(&self, id: MediaId) -> bool {
+        self.entry(id)
+            .is_some_and(|entry| entry.info.is_sound_only())
+    }
+
     /// The whole project as an export that draws layers.
     fn layered_stretches(&self) -> Vec<LayeredStretch> {
         let Some(canvas) = self.final_canvas() else {
@@ -1755,14 +1837,121 @@ impl Editor {
         if self.takes_layers() {
             return Route::Full(LAYERED_REASON.to_owned());
         }
-        let route = route_for(videos, !self.project.tracks.gaps().is_empty());
+        let tracks = &self.project.tracks;
+        if tracks.played().is_empty() {
+            return Route::Full(ONLY_SOUND_REASON.to_owned());
+        }
+        if tracks.sound_outlasts_pictures() {
+            return Route::Full(SOUND_OUTLASTS_REASON.to_owned());
+        }
+        let route = route_for(videos, !tracks.picture_gaps().is_empty());
         if route != Route::Fast {
             return route;
+        }
+        if !self.sound_is_plain() {
+            if !self.first_video_can_hold_new_sound() {
+                return Route::Full(NEW_SOUND_REASON.to_owned());
+            }
+            // New sound follows the timeline exactly, so the picture has to be cut exactly too.
+            if videos
+                .iter()
+                .any(|video| !can_write_gaps(&video.video.codec))
+            {
+                return Route::Full(EXACT_CUTS_REASON.to_owned());
+            }
         }
         let misfit = self
             .final_canvas()
             .and_then(|canvas| videos.iter().find_map(|video| size_problem(canvas, video)));
         misfit.map_or(Route::Fast, Route::Full)
+    }
+
+    fn has_sound(&self, id: MediaId) -> bool {
+        self.entry(id)
+            .is_some_and(|entry| !entry.info.audio.is_empty())
+    }
+
+    /// Whether the sound is just what each video recorded, so it can simply be copied.
+    fn sound_is_plain(&self) -> bool {
+        self.project.tracks.sound_is_plain(&|id| self.has_sound(id))
+    }
+
+    /// Whether the kind of file a fast export would write can take the sound a mix makes.
+    fn first_video_can_hold_new_sound(&self) -> bool {
+        self.suggested_fast_output().is_none_or(|path| {
+            path.extension().is_some_and(|extension| {
+                let extension = extension.to_string_lossy();
+                CONTAINERS_FOR_NEW_SOUND
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(&extension))
+            })
+        })
+    }
+
+    /// How many sound tracks each picture row's clips would keep if the sound stayed apart.
+    fn own_tracks_kept_apart(&self) -> Vec<SoundLabel> {
+        let tracks = &self.project.tracks;
+        let picture_videos: Vec<MediaInfo> = tracks
+            .picture_tracks()
+            .iter()
+            .flat_map(Timeline::clips)
+            .filter_map(|clip| self.entry(clip.media))
+            .map(|entry| entry.info.clone())
+            .collect();
+        sound_labels(&picture_videos)
+    }
+
+    /// Whether there is more than one track to choose between keeping apart or mixing.
+    fn can_keep_sound_apart(&self) -> bool {
+        let tracks = &self.project.tracks;
+        !self.sound_is_plain()
+            && self.own_tracks_kept_apart().len() + tracks.audio_tracks().len() > 1
+    }
+
+    /// What the finished video's sound comes from, and the tracks it goes on.
+    fn sound_plan(&self) -> SoundPlan {
+        let tracks = &self.project.tracks;
+        if self.sound_is_plain() {
+            return SoundPlan::as_recorded(
+                &self.export_parts().unwrap_or_default(),
+                &self.videos_on_timeline(),
+            );
+        }
+        let apart = self.keep_sound_apart && self.can_keep_sound_apart();
+        let own = self.own_tracks_kept_apart();
+        let spans: Vec<MixSpan> = tracks
+            .sound_spans(&|id| self.has_sound(id))
+            .into_iter()
+            .filter_map(|span| {
+                let bus = match span.sound_row {
+                    _ if !apart => Bus::All(0),
+                    Some(row) => Bus::All(own.len() + row),
+                    None => Bus::ByTrack(0),
+                };
+                Some(MixSpan {
+                    path: self.entry(span.media)?.info.path.clone(),
+                    start: span.start,
+                    source: span.source,
+                    sound: span.sound,
+                    bus,
+                })
+            })
+            .collect();
+        let labels = if apart {
+            let rows = (1..=tracks.audio_tracks().len()).map(|row| SoundLabel {
+                title: Some(format!("Audio {row}")),
+                language: None,
+            });
+            own.iter().cloned().chain(rows).collect()
+        } else if spans.is_empty() {
+            Vec::new()
+        } else {
+            vec![SoundLabel::default()]
+        };
+        SoundPlan {
+            spans,
+            tracks: labels,
+        }
     }
 
     /// Why joining these videos is a choice between copying and redrawing, if it is. Videos that
@@ -1817,16 +2006,24 @@ impl Editor {
             .map(|(width, height)| vec2(width as f32, height as f32))
     }
 
-    /// The file the export dialog starts on, or nothing if no video is on the timeline.
-    fn suggested_output(&self) -> Option<PathBuf> {
-        let first = self
-            .project
-            .tracks
+    /// The file a fast export would start on, named after the first clip's kind of file.
+    fn suggested_fast_output(&self) -> Option<PathBuf> {
+        let tracks = &self.project.tracks;
+        let first = tracks
             .played()
             .clips()
             .first()
+            .or_else(|| tracks.tracks().iter().find_map(|row| row.clips().first()))
             .and_then(|clip| self.entry(clip.media))?;
-        let suggested = text::default_output_path(&self.project_name, &first.info.path);
+        Some(text::default_output_path(
+            &self.project_name,
+            &first.info.path,
+        ))
+    }
+
+    /// The file the export dialog starts on, or nothing if nothing is on the timeline.
+    fn suggested_output(&self) -> Option<PathBuf> {
+        let suggested = self.suggested_fast_output()?;
         Some(if matches!(self.export_route(), Route::Full(_)) {
             full_output_path(&suggested)
         } else {
@@ -1859,10 +2056,12 @@ impl Editor {
             return;
         };
         // Worked out here because the project may change while the export runs.
+        let sound = self.sound_plan();
+        let copy_sound = self.sound_is_plain();
         let layered = matches!(self.export_route(), Route::Full(_)).then(|| LayeredRequest {
             output: output.clone(),
             stretches: self.layered_stretches(),
-            sound: parts.clone(),
+            sound: sound.clone(),
             canvas: self.final_canvas(),
             background: self.project.canvas.background,
         });
@@ -1881,11 +2080,16 @@ impl Editor {
             let progress = |fraction: f32| {
                 worker_progress.store(fraction.to_bits(), Ordering::Relaxed);
             };
+            // The route has already been chosen, including any pick between Copy and Redraw.
             let outcome = match &layered {
                 Some(layered) => {
                     export_layered(layered, &worker_cancel, &progress).map(ProjectReport::Full)
                 }
-                None => export_project(&request, &worker_cancel, &progress),
+                None if copy_sound => {
+                    export(&request, &worker_cancel, &progress).map(ProjectReport::Fast)
+                }
+                None => export_with_new_sound(&request, &sound, &worker_cancel, &progress)
+                    .map(ProjectReport::Fast),
             };
             let _ = sender.send(outcome);
             repaint.request_repaint();
@@ -1898,10 +2102,33 @@ impl Editor {
         });
     }
 
+    /// Asks for sound to add to the project, as the lane under the rows offers.
+    fn pick_audio(&mut self, ctx: &egui::Context) {
+        let before: Vec<MediaId> = self.media.iter().map(|entry| entry.id).collect();
+        let picked = rfd::FileDialog::new()
+            .set_title("Add audio")
+            .add_filter("Audio files", &text::AUDIO_EXTENSIONS)
+            .add_filter("All files", &["*"])
+            .pick_files();
+        let Some(paths) = picked else {
+            return;
+        };
+        self.import(ctx, &paths);
+        let added: Vec<MediaId> = self
+            .media
+            .iter()
+            .map(|entry| entry.id)
+            .filter(|id| !before.contains(id))
+            .collect();
+        for id in added {
+            self.add_to_timeline(id);
+        }
+    }
+
     fn pick_files(&mut self, ctx: &egui::Context) {
         let picked = rfd::FileDialog::new()
-            .set_title("Add videos")
-            .add_filter("Video files", &text::VIDEO_EXTENSIONS)
+            .set_title("Add videos and audio")
+            .add_filter("Video and audio files", &text::MEDIA_EXTENSIONS)
             .add_filter("All files", &["*"])
             .pick_files();
         if let Some(paths) = picked {
@@ -2051,6 +2278,9 @@ impl Editor {
 
     pub fn show(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        if std::mem::take(&mut self.add_audio_requested) {
+            self.pick_audio(&ctx);
+        }
         let palette = theme::palette(&ctx);
         // The background shows through the gaps between the panels.
         ui.painter().rect_filled(ui.max_rect(), 0.0, palette.bg_app);
@@ -2431,7 +2661,7 @@ impl Editor {
         if let Some(index) = find
             && let Some(path) = rfd::FileDialog::new()
                 .set_title("Find video")
-                .add_filter("Video files", &text::VIDEO_EXTENSIONS)
+                .add_filter("Video and audio files", &text::MEDIA_EXTENSIONS)
                 .add_filter("All files", &["*"])
                 .pick_file()
         {
@@ -2777,11 +3007,11 @@ impl Editor {
                 };
                 let clicked = ui
                     .add(
-                        ActionButton::new(palette, kind, "Add videos")
+                        ActionButton::new(palette, kind, "Add media")
                             .icon(icons::PLUS)
                             .width(width),
                     )
-                    .on_hover_text("Add videos to this project (Ctrl+O)")
+                    .on_hover_text("Add videos and audio to this project (Ctrl+O)")
                     .clicked();
                 if clicked {
                     let ctx = ui.ctx().clone();
@@ -3219,6 +3449,11 @@ impl Editor {
                     .map_or_else(String::new, |entry| entry.name.clone()),
                 media: clip.media,
                 source_start: clip.source.start,
+                has_sound: self.has_sound(clip.media),
+                muted: clip.sound.muted,
+                sound_only: self.project.tracks.is_sound_row(track),
+                fade_in: clip.sound.fade_in_on(clip.duration()),
+                fade_out: clip.sound.fade_out_on(clip.duration()),
             })
             .collect();
         let faces = self
@@ -3245,6 +3480,28 @@ impl Editor {
     }
 
     fn apply_timeline_events(&mut self, events: timeline::TimelineEvents) {
+        if let Some((row, sound)) = events.row_sound {
+            let before = self.project.clone();
+            if self.project.tracks.set_row_sound(row, sound) {
+                self.history.record(before);
+            }
+        }
+        if let Some(id) = events.toggle_clip_mute
+            && let Some(clip) = self.project.tracks.clip(id)
+        {
+            self.record();
+            let muted = !clip.sound.muted;
+            self.project.tracks.set_clip_sound(
+                id,
+                ClipSound {
+                    muted,
+                    ..clip.sound
+                },
+            );
+        }
+        if events.add_audio {
+            self.add_audio_requested = true;
+        }
         if let Some(selection) = events.select {
             self.selected = selection;
             self.selected_gap = events.select_gap;
@@ -3363,7 +3620,9 @@ impl Editor {
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             let rect = ui.available_rect_before_wrap();
             let canvas = self.canvas_size();
-            if self.preview.in_gap(self.project.tracks.played()) {
+            let played = self.project.tracks.played();
+            let only_sound = played.is_empty() && !self.project.tracks.is_empty();
+            if self.preview.in_gap(played) || only_sound {
                 if let Some(size) = canvas {
                     let [red, green, blue] = self.project.canvas.background;
                     ui.painter().rect_filled(
@@ -3447,6 +3706,35 @@ impl Editor {
     }
 
     /// The handles and toolbar on the picture, and what they ask for.
+    /// The selected clip's sound, if its file has any.
+    fn selected_sound(&self) -> Option<stage::SelectedSound> {
+        let tracks = &self.project.tracks;
+        let id = self.selected?;
+        let clip = tracks.clip(id)?;
+        self.has_sound(clip.media).then(|| stage::SelectedSound {
+            id,
+            sound: clip.sound,
+            length: clip.duration(),
+            can_detach: tracks
+                .track_of(id)
+                .is_some_and(|row| !tracks.is_sound_row(row))
+                && !clip.sound.muted,
+        })
+    }
+
+    /// Gives a clip's sound tracks clips of their own.
+    fn detach_sound(&mut self, id: ClipId) {
+        let Some(clip) = self.project.tracks.clip(id) else {
+            return;
+        };
+        let Some(count) = self.entry(clip.media).map(|entry| entry.info.audio.len()) else {
+            return;
+        };
+        self.record();
+        self.project.tracks.detach_sound(id, count as u32);
+        self.after_timeline_change();
+    }
+
     fn stage_controls(&mut self, ui: &mut egui::Ui, area: egui::Rect, palette: &Palette) {
         let canvas = self.project.canvas.size();
         let size = vec2(canvas.0 as f32, canvas.1 as f32);
@@ -3460,7 +3748,7 @@ impl Editor {
         let clips: Vec<StageClip> = self
             .project
             .tracks
-            .tracks()
+            .picture_tracks()
             .iter()
             .rev()
             .filter_map(|track| {
@@ -3495,6 +3783,7 @@ impl Editor {
                     .tracks
                     .can_move_in_order(id, OrderMove::Backward)
             }),
+            sound: self.selected_sound(),
         };
         let events = stage::show(ui, palette, &mut self.stage_state, &view);
         let pointer_down = ui.input(|input| input.pointer.any_down());
@@ -3517,6 +3806,15 @@ impl Editor {
             if self.project.tracks.set_placement(id, placement) && self.stage_before.is_none() {
                 self.stage_before = Some(before);
             }
+        }
+        if let Some((id, sound)) = events.sound {
+            let before = self.project.clone();
+            if self.project.tracks.set_clip_sound(id, sound) && self.stage_before.is_none() {
+                self.stage_before = Some(before);
+            }
+        }
+        if let Some(id) = events.detach {
+            self.detach_sound(id);
         }
         if !pointer_down
             && let Some(before) = self.stage_before.take()
@@ -3597,6 +3895,9 @@ impl Editor {
         let summary = self.plan_description();
         let rate_choice = self.rate_choice();
         let rate_pick = self.current_rate_pick();
+        let can_keep_apart = self.can_keep_sound_apart();
+        let has_solo = self.project.tracks.has_solo();
+        let plain_sound = self.sound_is_plain();
 
         egui::Modal::new(egui::Id::unique("export_dialog")).frame(dialog_frame(ctx)).show(ctx, |ui| {
             ui.set_width(440.0);
@@ -3668,6 +3969,45 @@ impl Editor {
                         }
                         ui.add_space(14.0);
                     }
+                    if can_keep_apart {
+                        ui.label(
+                            RichText::new("Sound in the finished video").font(fonts::strong(13.0)),
+                        );
+                        ui.add_space(6.0);
+                        if components::choice_card(
+                            ui,
+                            palette,
+                            &icons::VOLUME_2,
+                            "One mix",
+                            "Everything together on one track, which sounds right in every player.",
+                            !self.keep_sound_apart,
+                        )
+                        .clicked()
+                        {
+                            self.keep_sound_apart = false;
+                        }
+                        ui.add_space(8.0);
+                        if components::choice_card(
+                            ui,
+                            palette,
+                            &icons::AUDIO_LINES,
+                            "Keep separate",
+                            "Each on its own track, for editing later. Some players only play the first.",
+                            self.keep_sound_apart,
+                        )
+                        .clicked()
+                        {
+                            self.keep_sound_apart = true;
+                        }
+                        ui.add_space(14.0);
+                    }
+                    if has_solo {
+                        ui.colored_label(
+                            palette.danger,
+                            "A row is on Solo, so only its sound goes in the finished video.",
+                        );
+                        ui.add_space(10.0);
+                    }
                     if let Route::Full(reason) = &route {
                         ui.label(RichText::new("Full export").font(fonts::strong(13.0)));
                         ui.add_space(4.0);
@@ -3694,36 +4034,43 @@ impl Editor {
                     if rate_choice.is_none() {
                         ui.colored_label(
                             palette.text_muted,
-                            "These videos match, so they can be copied rather than redrawn.",
+                            if plain_sound {
+                                "These videos match, so they can be copied rather than redrawn."
+                            } else {
+                                "The picture is copied rather than redrawn. Only the sound is rebuilt."
+                            },
                         );
                     }
                     ui.add_space(10.0);
-                    if components::choice_card(
-                        ui,
-                        palette,
-                        &icons::TARGET,
-                        "Frame-exact",
-                        "Cuts land exactly where they are on the timeline. Short parts around each cut are re-encoded.",
-                        self.mode == CutMode::FrameExact,
-                    )
-                    .clicked()
-                    {
-                        self.mode = CutMode::FrameExact;
+                    // New sound follows the timeline exactly, so only exact cuts stay in time with it.
+                    if plain_sound {
+                        if components::choice_card(
+                            ui,
+                            palette,
+                            &icons::TARGET,
+                            "Frame-exact",
+                            "Cuts land exactly where they are on the timeline. Short parts around each cut are re-encoded.",
+                            self.mode == CutMode::FrameExact,
+                        )
+                        .clicked()
+                        {
+                            self.mode = CutMode::FrameExact;
+                        }
+                        ui.add_space(8.0);
+                        if components::choice_card(
+                            ui,
+                            palette,
+                            &icons::ZAP,
+                            "Fastest",
+                            "Nothing is re-encoded, but each cut moves outward to the nearest keyframe, keeping a little extra.",
+                            self.mode == CutMode::Keyframe,
+                        )
+                        .clicked()
+                        {
+                            self.mode = CutMode::Keyframe;
+                        }
+                        ui.add_space(14.0);
                     }
-                    ui.add_space(8.0);
-                    if components::choice_card(
-                        ui,
-                        palette,
-                        &icons::ZAP,
-                        "Fastest",
-                        "Nothing is re-encoded, but each cut moves outward to the nearest keyframe, keeping a little extra.",
-                        self.mode == CutMode::Keyframe,
-                    )
-                    .clicked()
-                    {
-                        self.mode = CutMode::Keyframe;
-                    }
-                    ui.add_space(14.0);
 
                     if let Some(summary) = &summary {
                         ui.label(summary);
@@ -3819,7 +4166,12 @@ impl Editor {
         for clip in self.project.tracks.played().clips() {
             let entry = self.entry(clip.media)?;
             let index = entry.index.as_ref()?;
-            let plan = plan_export(index, &[clip.source], entry.info.video.time_base, self.mode);
+            let mode = if self.sound_is_plain() {
+                self.mode
+            } else {
+                CutMode::FrameExact
+            };
+            let plan = plan_export(index, &[clip.source], entry.info.video.time_base, mode);
             copied += plan.copied_frames;
             encoded += plan.encoded_frames;
         }
@@ -3929,7 +4281,10 @@ fn card_details(entry: &MediaEntry) -> Vec<(String, bool)> {
     } else {
         text::file_size(entry.info.size_bytes)
     };
-    let mut details = vec![(first, false), (text::video_summary(&entry.info), false)];
+    let mut details = vec![(first, false)];
+    if !entry.info.is_sound_only() {
+        details.push((text::video_summary(&entry.info), false));
+    }
     for (position, track) in entry.info.audio.iter().enumerate() {
         details.push((text::audio_track_summary(position, track), false));
     }
@@ -4106,6 +4461,7 @@ fn media_card(
             let payload = MediaDrag {
                 media: entry.id,
                 length: entry.info.duration,
+                sound_only: entry.info.is_sound_only(),
             };
             ui.dnd_drag_source(drag_id, payload, |ui| {
                 let width = ui.available_width();
@@ -4122,6 +4478,14 @@ fn media_card(
                         egui::Rect::from_center_size(rect.center(), image * scale),
                         egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
                         Color32::WHITE,
+                    );
+                } else if entry.info.is_sound_only() {
+                    let size = rect.height() * 0.4;
+                    icons::paint(
+                        &painter,
+                        icons::square_at(rect.center(), size),
+                        &icons::MUSIC,
+                        palette.clip_video_text,
                     );
                 }
                 // The stage colour stays dark in both themes, so this label reads the same.
@@ -5451,6 +5815,20 @@ mod tests {
             .collect()
     }
 
+    /// Whether a piece of text is on screen. Plain text is reported as a value, not a name.
+    fn says(ctx: &egui::Context, editor: &mut Editor, text: &str) -> bool {
+        ctx.enable_accesskit();
+        let output = run_frame(ctx, editor, vec![]);
+        let update = output
+            .platform_output
+            .accesskit_update
+            .expect("the tree is reported");
+        update
+            .nodes
+            .iter()
+            .any(|(_, node)| node.value() == Some(text) || node.label() == Some(text))
+    }
+
     /// Where the control with this name is, so a test presses it the way a person would.
     fn named_rect(ctx: &egui::Context, editor: &mut Editor, name: &str) -> egui::Rect {
         named_nodes(ctx, editor)
@@ -5643,7 +6021,7 @@ mod tests {
         assert!(!editor.media_panel_open);
         assert_eq!(editor.media_panel_rect, egui::Rect::NOTHING);
         let names = named_nodes(&ctx, &mut editor);
-        assert!(!names.iter().any(|(label, ..)| label == "Add videos"));
+        assert!(!names.iter().any(|(label, ..)| label == "Add media"));
         assert!(editor.timeline_state.track.width() > wide_before + 200.0);
         assert!((pixels_per_second(&editor) - zoom).abs() < 0.05, "{zoom}");
         assert_eq!(editor.position(), position);
@@ -6625,7 +7003,7 @@ mod tests {
 
         let nodes = named_nodes(&ctx, &mut editor);
 
-        for name in ["Export", "Add videos", "Split", "Delete"] {
+        for name in ["Export", "Add media", "Split", "Delete"] {
             assert!(
                 nodes.iter().any(|(label, ..)| label == name),
                 "nothing is named {name}"
@@ -9930,6 +10308,617 @@ mod tests {
         assert_eq!(editor.rate_choice(), None);
     }
 
+    /// A sound file with no picture: a steady tone twelve seconds long.
+    fn song_file() -> &'static Path {
+        static FILE: OnceLock<PathBuf> = OnceLock::new();
+        FILE.get_or_init(|| {
+            let folder = std::env::temp_dir().join("bareclip-app-tests");
+            std::fs::create_dir_all(&folder).expect("the folder can be created");
+            let path = folder.join(format!("song-{}.wav", std::process::id()));
+            let status = Command::new("ffmpeg")
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                ])
+                .arg("sine=f=1000:r=48000:d=12")
+                .arg(&path)
+                .status()
+                .expect("ffmpeg is on PATH");
+            assert!(status.success());
+            path
+        })
+    }
+
+    fn sound_row_clip(editor: &Editor) -> bareclip_core::timeline::Clip {
+        editor.project.tracks.audio_tracks()[0].clips()[0]
+    }
+
+    fn picture_clip(editor: &Editor) -> bareclip_core::timeline::Clip {
+        editor.project.tracks.picture_tracks()[0].clips()[0]
+    }
+
+    fn output_called(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("bareclip-{name}-{}.mp4", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn exported_report(ctx: &egui::Context, editor: &mut Editor, output: &Path) -> ProjectReport {
+        editor.start_export_to(ctx, output.to_path_buf());
+        wait_for_export(ctx, editor);
+        match &editor.export_state {
+            ExportState::Done { report, .. } => report.clone(),
+            _ => panic!("the export did not finish"),
+        }
+    }
+
+    #[test]
+    fn a_sound_file_is_added_without_looking_for_frames_or_pictures() {
+        let ctx = context();
+        let editor = in_panel_only(&ctx, &[song_file()]);
+
+        let entry = &editor.media[0];
+        assert!(entry.info.is_sound_only());
+        assert!(entry.scan.is_none());
+        assert!(
+            !card_details(entry)
+                .iter()
+                .any(|(line, _)| line.contains("fps"))
+        );
+    }
+
+    #[test]
+    fn sound_goes_on_its_own_row_with_videos_above_it() {
+        let ctx = context();
+        let editor = with_videos(&ctx, &[song_file(), &clip_with_sound()]);
+
+        let tracks = &editor.project.tracks;
+        assert_eq!(tracks.picture_rows(), 1);
+        assert_eq!(tracks.audio_tracks().len(), 1);
+        assert_eq!(picture_clip(&editor).start, Ticks(0));
+        assert_eq!(sound_row_clip(&editor).start, Ticks(0));
+    }
+
+    #[test]
+    fn sound_never_changes_the_projects_size() {
+        let ctx = context();
+        let editor = with_videos(&ctx, &[song_file(), test_clip()]);
+
+        assert_eq!(editor.project.canvas.size(), (320, 180));
+    }
+
+    #[test]
+    fn a_sound_file_dropped_on_a_video_row_lands_on_a_sound_row() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        editor.import(&ctx, &[song_file().to_path_buf()]);
+        let song = editor.media.last().expect("it was added").id;
+
+        editor.drop_on_timeline(song, Ticks(0), TrackTarget::Existing(0));
+
+        assert_eq!(editor.project.tracks.audio_tracks().len(), 1);
+        assert_eq!(editor.project.tracks.picture_rows(), 1);
+    }
+
+    #[test]
+    fn the_filter_can_show_only_videos_or_only_audio() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip(), song_file()]);
+        let names = |editor: &Editor| -> Vec<bool> {
+            editor
+                .listed_media()
+                .iter()
+                .map(|entry| entry.info.is_sound_only())
+                .collect()
+        };
+        assert_eq!(names(&editor).len(), 2);
+
+        editor.media_filter = MediaFilter::Audio;
+        assert_eq!(names(&editor), [true]);
+
+        editor.media_filter = MediaFilter::Videos;
+        assert_eq!(names(&editor), [false]);
+    }
+
+    #[test]
+    fn pressing_a_clips_speaker_mutes_it_and_one_undo_brings_it_back() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        click_named(&ctx, &mut editor, "Mute clip");
+        assert!(picture_clip(&editor).sound.muted);
+
+        editor.undo();
+        assert!(!picture_clip(&editor).sound.muted);
+    }
+
+    #[test]
+    fn a_clip_with_no_sound_has_no_speaker() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+
+        assert!(!is_named(&ctx, &mut editor, "Mute clip"));
+    }
+
+    #[test]
+    fn pressing_a_rows_buttons_mutes_and_soloes_it_with_undo() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound, song_file()]);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        click_named(&ctx, &mut editor, "Mute row 1");
+        assert!(editor.project.tracks.row_sounds()[0].muted);
+        assert!(is_named(&ctx, &mut editor, "Unmute row 1"));
+        editor.undo();
+        assert!(!editor.project.tracks.row_sounds()[0].muted);
+
+        click_named(&ctx, &mut editor, "Solo row 2");
+        assert!(editor.project.tracks.has_solo());
+        let spans = heard_spans(&editor.media, &editor.project.tracks);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].path, song_file());
+    }
+
+    #[test]
+    fn what_is_heard_follows_mute_and_solo_with_every_clip_otherwise_playing() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let editor = with_videos(&ctx, &[&sound, song_file()]);
+
+        let spans = heard_spans(&editor.media, &editor.project.tracks);
+
+        assert_eq!(spans.len(), 2);
+        assert!(spans.iter().all(|span| span.bus == Bus::All(0)));
+    }
+
+    #[test]
+    fn the_export_window_warns_when_a_row_is_on_solo() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound, song_file()]);
+        let warning = "A row is on Solo, so only its sound goes in the finished video.";
+        editor.export_state = ExportState::Choosing;
+        let_dialog_open(&ctx, &mut editor);
+        assert!(!says(&ctx, &mut editor, warning));
+
+        editor.project.tracks.set_row_sound(
+            1,
+            bareclip_core::sound::RowSound {
+                muted: false,
+                solo: true,
+            },
+        );
+        let_dialog_open(&ctx, &mut editor);
+
+        assert!(says(&ctx, &mut editor, warning));
+    }
+
+    #[test]
+    fn adding_music_keeps_the_picture_copied_and_only_rebuilds_the_sound() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound, song_file()]);
+        let clip = picture_clip(&editor);
+        let song = sound_row_clip(&editor);
+        editor.project.tracks.trim(
+            song.id,
+            ClipEdge::End,
+            clip.end(),
+            Ticks::from_seconds(12.0),
+            Ticks(1),
+        );
+        assert!(!editor.sound_is_plain());
+        assert_eq!(editor.export_route(), Route::Fast);
+
+        let output = output_called("music");
+        let report = exported_report(&ctx, &mut editor, &output);
+
+        let ProjectReport::Fast(report) = report else {
+            panic!("it should have copied the picture");
+        };
+        assert_eq!(report.encoded_frames, 0);
+        assert_eq!(report.audio_tracks, 1);
+        let info = probe(&output).expect("the export can be read");
+        assert_eq!(info.audio.len(), 1);
+        assert_eq!(info.audio[0].codec, "aac");
+        assert!((info.duration.as_seconds() - 8.0).abs() < 0.2);
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn new_sound_only_offers_exact_cuts_and_uses_them_whatever_was_picked_before() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound, song_file()]);
+        editor.mode = CutMode::Keyframe;
+        let clip = picture_clip(&editor);
+        // A cut away from any keyframe, which Fastest would have moved.
+        editor.project.tracks.trim(
+            clip.id,
+            ClipEdge::End,
+            Ticks::from_seconds(4.3),
+            Ticks::from_seconds(8.0),
+            Ticks(1),
+        );
+        let song = sound_row_clip(&editor);
+        editor.project.tracks.trim(
+            song.id,
+            ClipEdge::End,
+            Ticks::from_seconds(4.3),
+            Ticks::from_seconds(12.0),
+            Ticks(1),
+        );
+        editor.export_state = ExportState::Choosing;
+        let_dialog_open(&ctx, &mut editor);
+        assert!(!is_named(&ctx, &mut editor, "Fastest"));
+        assert!(!is_named(&ctx, &mut editor, "Frame-exact"));
+
+        let output = output_called("exact-for-new-sound");
+        let report = exported_report(&ctx, &mut editor, &output);
+
+        let ProjectReport::Fast(report) = report else {
+            panic!("it should have copied the picture");
+        };
+        assert_eq!(report.mode_used, CutMode::FrameExact);
+        assert!(report.encoded_frames > 0, "the cut was made exactly");
+        let info = probe(&output).expect("it can be read");
+        assert!(
+            (info.duration.as_seconds() - 4.3).abs() < 0.1,
+            "{}",
+            info.duration.as_seconds()
+        );
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn sound_nobody_changed_still_offers_fastest() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        editor.export_state = ExportState::Choosing;
+        let_dialog_open(&ctx, &mut editor);
+
+        assert!(is_named(&ctx, &mut editor, "Fastest"));
+    }
+
+    #[test]
+    fn sound_kept_apart_comes_out_on_tracks_of_its_own() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound, song_file()]);
+        let clip = picture_clip(&editor);
+        let song = sound_row_clip(&editor);
+        editor.project.tracks.trim(
+            song.id,
+            ClipEdge::End,
+            clip.end(),
+            Ticks::from_seconds(12.0),
+            Ticks(1),
+        );
+        assert!(editor.can_keep_sound_apart());
+        assert_eq!(editor.sound_plan().tracks.len(), 1, "one mix by default");
+        editor.keep_sound_apart = true;
+        assert_eq!(editor.sound_plan().tracks.len(), 2);
+
+        let output = output_called("apart");
+        exported_report(&ctx, &mut editor, &output);
+
+        assert_eq!(probe(&output).expect("it can be read").audio.len(), 2);
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn the_export_window_only_offers_keeping_sound_apart_when_there_is_something_to_keep_apart() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut mixed = with_videos(&ctx, &[&sound, song_file()]);
+        mixed.export_state = ExportState::Choosing;
+        let_dialog_open(&ctx, &mut mixed);
+        assert!(is_named(&ctx, &mut mixed, "One mix"));
+        assert!(is_named(&ctx, &mut mixed, "Keep separate"));
+
+        let mut plain = with_videos(&ctx, &[&sound]);
+        plain.export_state = ExportState::Choosing;
+        let_dialog_open(&ctx, &mut plain);
+        assert!(!is_named(&ctx, &mut plain, "Keep separate"));
+    }
+
+    #[test]
+    fn opening_the_export_window_goes_back_to_one_mix() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        editor.keep_sound_apart = true;
+
+        editor.open_export();
+
+        assert!(!editor.keep_sound_apart);
+    }
+
+    #[test]
+    fn sound_nobody_changed_is_still_copied_exactly() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        assert!(editor.sound_is_plain());
+        assert_eq!(editor.export_route(), Route::Fast);
+
+        let output = output_called("plain-sound");
+        let report = exported_report(&ctx, &mut editor, &output);
+
+        assert!(matches!(report, ProjectReport::Fast(_)));
+        assert_eq!(probe(&output).expect("it can be read").audio.len(), 1);
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn picking_copy_really_copies_videos_at_different_rates() {
+        let ctx = context();
+        let slow = clip_at_rate("really-24", 24);
+        let fast = clip_at_rate("really-60", 60);
+        let mut editor = with_videos(&ctx, &[&slow, &fast]);
+        editor.rate_pick = Some(RatePick::Copy);
+
+        let output = output_called("really-copied");
+        let report = exported_report(&ctx, &mut editor, &output);
+
+        assert!(matches!(report, ProjectReport::Fast(_)), "{report:?}");
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn music_that_outlasts_the_video_takes_the_full_route_and_says_why() {
+        let ctx = context();
+        let editor = with_videos(&ctx, &[test_clip(), song_file()]);
+
+        assert_eq!(
+            editor.export_route(),
+            Route::Full(SOUND_OUTLASTS_REASON.to_owned())
+        );
+    }
+
+    #[test]
+    fn a_project_of_nothing_but_sound_exports_as_its_background() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[song_file()]);
+        let song = sound_row_clip(&editor);
+        editor.project.tracks.trim(
+            song.id,
+            ClipEdge::End,
+            Ticks::from_seconds(1.0),
+            Ticks::from_seconds(12.0),
+            Ticks(1),
+        );
+        assert_eq!(
+            editor.export_route(),
+            Route::Full(ONLY_SOUND_REASON.to_owned())
+        );
+
+        let output = output_called("only-sound");
+        let report = exported_report(&ctx, &mut editor, &output);
+
+        assert!(matches!(report, ProjectReport::Full(_)));
+        let info = probe(&output).expect("it can be read");
+        assert!((info.duration.as_seconds() - 1.0).abs() < 0.2);
+        assert_eq!(info.audio.len(), 1);
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn a_kind_of_file_that_cant_hold_new_sound_becomes_an_mp4() {
+        assert!(CONTAINERS_FOR_NEW_SOUND.contains(&"mkv"));
+        assert!(!CONTAINERS_FOR_NEW_SOUND.contains(&"webm"));
+    }
+
+    #[test]
+    fn the_toolbar_offers_sound_only_for_a_clip_that_has_some() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut with_sound = with_videos(&ctx, &[&sound]);
+        run_frame(&ctx, &mut with_sound, vec![]);
+        assert!(is_named(&ctx, &mut with_sound, "Sound"));
+
+        let mut silent = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut silent, vec![]);
+        assert!(!is_named(&ctx, &mut silent, "Sound"));
+    }
+
+    #[test]
+    fn a_clip_of_nothing_but_sound_gets_a_toolbar_too() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[song_file()]);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert!(is_named(&ctx, &mut editor, "Sound"));
+    }
+
+    #[test]
+    fn dragging_volume_is_one_undo_step_for_as_long_as_the_pointer_is_held() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        let id = picture_clip(&editor).id;
+        let level = |volume: u32| stage::StageEvents {
+            sound: Some((
+                id,
+                ClipSound {
+                    volume,
+                    ..ClipSound::default()
+                },
+            )),
+            ..Default::default()
+        };
+
+        editor.apply_stage_events(level(800_000), true);
+        editor.apply_stage_events(level(400_000), true);
+        editor.apply_stage_events(stage::StageEvents::default(), false);
+        assert_eq!(picture_clip(&editor).sound.volume, 400_000);
+
+        editor.undo();
+        assert!(picture_clip(&editor).sound.is_default());
+    }
+
+    #[test]
+    fn detach_sound_from_the_toolbar_makes_a_clip_in_time_and_one_undo_puts_it_back() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        click_named(&ctx, &mut editor, "Sound");
+        let_dialog_open(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Detach sound");
+
+        let clip = picture_clip(&editor);
+        let detached = sound_row_clip(&editor);
+        assert!(clip.sound.muted);
+        assert_eq!(detached.start, clip.start);
+        assert_eq!(detached.source, clip.source);
+        assert_eq!(detached.sound.only_track, Some(0));
+        assert_eq!(editor.project.tracks.sound_spans(&|_| true).len(), 1);
+
+        editor.undo();
+        assert!(editor.project.tracks.audio_tracks().is_empty());
+        assert!(!picture_clip(&editor).sound.muted);
+    }
+
+    #[test]
+    fn a_clip_already_detached_has_nothing_left_to_detach() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        let id = picture_clip(&editor).id;
+        assert!(
+            editor
+                .selected_sound()
+                .is_some_and(|sound| sound.can_detach)
+        );
+
+        editor.detach_sound(id);
+
+        editor.selected = Some(id);
+        assert!(
+            !editor
+                .selected_sound()
+                .is_some_and(|sound| sound.can_detach)
+        );
+        editor.selected = Some(sound_row_clip(&editor).id);
+        assert!(
+            !editor
+                .selected_sound()
+                .is_some_and(|sound| sound.can_detach)
+        );
+    }
+
+    #[test]
+    fn a_sound_clip_can_be_split_and_trimmed_like_any_other() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[song_file()]);
+        editor.selected = Some(sound_row_clip(&editor).id);
+        editor.seek(Ticks::from_seconds(5.0));
+
+        editor.split_at_playhead();
+
+        let row = &editor.project.tracks.audio_tracks()[0];
+        assert_eq!(row.clips().len(), 2);
+        assert_eq!(row.clips()[1].start, Ticks::from_seconds(5.0));
+    }
+
+    #[test]
+    fn sound_and_its_settings_survive_saving_and_opening() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound, song_file()]);
+        let song = sound_row_clip(&editor);
+        let changed = ClipSound {
+            volume: 600_000,
+            fade_in: Ticks::from_seconds(1.0).0,
+            ..ClipSound::default()
+        };
+        editor.project.tracks.set_clip_sound(song.id, changed);
+        editor.project.tracks.set_row_sound(
+            0,
+            bareclip_core::sound::RowSound {
+                muted: true,
+                solo: false,
+            },
+        );
+
+        let folder = project_folder("sound-settings");
+        let path = folder.join("sound.bareclip");
+        assert!(editor.save_to(&path));
+        let mut reopened = Editor::new(&ctx, false);
+        reopened.open_project(&ctx, &path);
+        settle(&ctx, &mut reopened);
+
+        assert_eq!(reopened.project.tracks.audio_tracks().len(), 1);
+        assert_eq!(sound_row_clip(&reopened).sound, changed);
+        assert!(reopened.project.tracks.row_sounds()[0].muted);
+    }
+
+    /// Draws sound on the real screen, with no window. Run with
+    /// `$env:BARECLIP_SCREENS = '<folder>'; ./scripts/cargo.ps1 test -p bareclip-app draw_the_sound_screens '--' --ignored`
+    #[test]
+    #[ignore = "needs a real GPU, and draws pictures to look at rather than checking anything"]
+    fn draw_the_sound_screens() {
+        let folder = std::env::var_os("BARECLIP_SCREENS").map_or_else(
+            || std::env::temp_dir().join("bareclip-screens"),
+            PathBuf::from,
+        );
+        let ctx = context();
+        let mut camera = Camera::new(folder);
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound, &sound, song_file()]);
+        for _ in 0..60 {
+            run_frame(&ctx, &mut editor, vec![]);
+            thread::sleep(Duration::from_millis(10));
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "sound-01-rows");
+
+        let first = picture_clip(&editor);
+        editor.project.tracks.set_clip_sound(
+            first.id,
+            ClipSound {
+                fade_in: Ticks::from_seconds(1.5).0,
+                fade_out: Ticks::from_seconds(1.0).0,
+                ..ClipSound::default()
+            },
+        );
+        editor.selected = Some(first.id);
+        editor.project.tracks.set_row_sound(
+            1,
+            bareclip_core::sound::RowSound {
+                muted: true,
+                solo: false,
+            },
+        );
+        run_frame(&ctx, &mut editor, vec![]);
+        camera.shoot(&ctx, &mut editor, vec![], "sound-02-fades-and-muted-row");
+
+        click_named(&ctx, &mut editor, "Sound");
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "sound-03-controls");
+
+        click_named(&ctx, &mut editor, "Detach sound");
+        run_frame(&ctx, &mut editor, vec![]);
+        camera.shoot(&ctx, &mut editor, vec![], "sound-04-detached");
+
+        editor.selected = Some(sound_row_clip(&editor).id);
+        run_frame(&ctx, &mut editor, vec![]);
+        camera.shoot(&ctx, &mut editor, vec![], "sound-05-sound-clip-selected");
+
+        editor.export_state = ExportState::Choosing;
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "sound-06-export-window");
+    }
+
     #[test]
     fn videos_in_different_formats_say_why_they_take_the_full_route() {
         let ctx = context();
@@ -10732,8 +11721,11 @@ mod tests {
             source_start: 0,
             source_end: Ticks::from_seconds(1.0).0,
             placement: Placement::default(),
+            sound: Default::default(),
         };
         let mut file = ProjectFile {
+            audio_tracks: Vec::new(),
+            row_sound: Vec::new(),
             version: 2,
             name: "old".to_owned(),
             media: vec![

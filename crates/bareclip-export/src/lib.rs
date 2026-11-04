@@ -2,6 +2,7 @@
 
 mod full;
 mod layered;
+mod mixed;
 mod plan;
 mod sink;
 mod sound;
@@ -11,9 +12,10 @@ use std::{path::Path, sync::atomic::AtomicBool, time::Duration};
 use bareclip_media::{ExportReport, ExportRequest, MediaError, MediaInfo, export, probe};
 
 pub use layered::{LayeredClip, LayeredRequest, LayeredStretch, export_layered};
+pub use mixed::{SoundPlan, export_with_new_sound};
 pub use plan::{
     FullPlan, LAYERED_REASON, Route, copying_suits, final_size, frame_rate_for, mixed_rates,
-    route_for, size_problem,
+    route_for, size_problem, sound_labels,
 };
 pub use sink::VideoSink;
 

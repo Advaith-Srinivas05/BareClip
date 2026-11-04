@@ -1,6 +1,7 @@
 //! Converts between timeline time and screen position, and draws the timeline.
 
 use bareclip_core::{
+    sound::RowSound,
     time::{Ticks, format_timecode},
     timeline::{ClipEdge, ClipId, MediaId, TimeRange},
     tracks::{TrackTarget, Tracks},
@@ -92,6 +93,19 @@ const ZOOM_CARD_RADIUS: f32 = 8.0;
 const SNAP_LINE_WIDTH: f32 = 1.5;
 const HATCH_SPACING: f32 = 8.0;
 const NEW_TRACK_HINT: &str = "Drag a clip here for a new track";
+const ADD_AUDIO_HINT: &str = "Add audio";
+/// The narrow column left of the rows that holds their mute and solo buttons.
+const ROW_HEADER_WIDTH: f32 = 34.0;
+const ROW_BUTTON_SIZE: f32 = 24.0;
+const ROW_BUTTON_ICON: f32 = 14.0;
+/// A clip this narrow has no room for its speaker.
+const SPEAKER_MIN_WIDTH: f32 = 72.0;
+const SPEAKER_SIZE: f32 = 22.0;
+const SPEAKER_ICON: f32 = 13.0;
+/// How much of a clip of nothing but sound its shape can fill.
+const SOUND_CLIP_BAND_SHARE: f32 = 0.6;
+const MUTED_SOUND_SHAPE: f32 = 0.35;
+const FADE_SHADE: f32 = 0.55;
 
 /// Maps a stretch of the timeline onto a stretch of the screen.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -159,6 +173,14 @@ pub struct ClipView {
     pub media: MediaId,
     /// The moment in its video that the clip starts from.
     pub source_start: Ticks,
+    /// Whether its file has sound at all, and so a speaker to press.
+    pub has_sound: bool,
+    pub muted: bool,
+    /// Whether it is on a row of sound, with no picture.
+    pub sound_only: bool,
+    /// How long its fades really are.
+    pub fade_in: Ticks,
+    pub fade_out: Ticks,
 }
 
 /// What a video has to show on its clips so far. Each picture is paired with where it is in
@@ -198,6 +220,8 @@ pub struct TimelineView<'a> {
 pub struct MediaDrag {
     pub media: MediaId,
     pub length: Ticks,
+    /// A file with no picture, which can only go on a row of sound.
+    pub sound_only: bool,
 }
 
 /// The part of a clip under the pointer.
@@ -621,6 +645,12 @@ impl TimelineState {
 /// Changes the user made on the timeline this frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TimelineEvents {
+    /// A row's mute or solo was pressed.
+    pub row_sound: Option<(usize, RowSound)>,
+    /// A clip's speaker was pressed.
+    pub toggle_clip_mute: Option<ClipId>,
+    /// The lane for adding audio was pressed.
+    pub add_audio: bool,
     pub seek: Option<Ticks>,
     pub select: Option<Option<ClipId>>,
     /// Comes with `select`: the dead space that was clicked on, if any.
@@ -830,7 +860,7 @@ fn draw_face(
         return;
     }
     let shown = painter.with_clip_rect(visible);
-    if let Some((_, first)) = face.pictures.first() {
+    if let Some((_, first)) = face.pictures.first().filter(|_| !clip.sound_only) {
         let size = first.size_vec2();
         let tile = (rect.height() * size.x / size.y).max(1.0);
         let whole = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
@@ -866,9 +896,19 @@ fn draw_face(
     let Some(sound) = face.sound.filter(|sound| !sound.peaks.is_empty()) else {
         return;
     };
-    let band_height = rect.height() * SOUND_BAND_SHARE;
+    let share = if clip.sound_only {
+        SOUND_CLIP_BAND_SHARE
+    } else {
+        SOUND_BAND_SHARE
+    };
+    let band_height = rect.height() * share;
     let band = rect.with_min_y(rect.bottom() - band_height);
     shown.rect_filled(band, 0.0, palette.stage.gamma_multiply(SOUND_BAND_BACKING));
+    let shape_colour = if clip.muted {
+        palette.clip_video_text.gamma_multiply(MUTED_SOUND_SHAPE)
+    } else {
+        palette.clip_video_text
+    };
     let mut mesh = Mesh::default();
     let mut x = visible.left();
     while x < visible.right() {
@@ -881,12 +921,49 @@ fn draw_face(
                     pos2(x, band.bottom() - height),
                     pos2(x + SOUND_COLUMN_WIDTH - 0.5, band.bottom()),
                 ),
-                palette.clip_video_text,
+                shape_colour,
             );
         }
         x += SOUND_COLUMN_WIDTH;
     }
     shown.add(Shape::mesh(mesh));
+}
+
+/// Shades what a fade takes away, so its length and direction can be seen on the clip.
+fn draw_fades(
+    painter: &egui::Painter,
+    palette: &Palette,
+    rect: Rect,
+    clip: &ClipView,
+    scale: &TimeScale,
+) {
+    let shade = palette.stage.gamma_multiply(FADE_SHADE);
+    let one_pixel = scale.time_of_pixels(1.0).0.max(1) as f32;
+    let fade_in = clip.fade_in.0 as f32 / one_pixel;
+    let fade_out = clip.fade_out.0 as f32 / one_pixel;
+    let clipped = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
+    if fade_in >= 1.0 {
+        clipped.add(Shape::convex_polygon(
+            vec![
+                rect.left_top(),
+                pos2(rect.left() + fade_in, rect.top()),
+                rect.left_bottom(),
+            ],
+            shade,
+            Stroke::NONE,
+        ));
+    }
+    if fade_out >= 1.0 {
+        clipped.add(Shape::convex_polygon(
+            vec![
+                pos2(rect.right() - fade_out, rect.top()),
+                rect.right_top(),
+                rect.right_bottom(),
+            ],
+            shade,
+            Stroke::NONE,
+        ));
+    }
 }
 
 fn draw_clip(
@@ -897,10 +974,16 @@ fn draw_clip(
     (face, scale): (Option<&ClipFace>, &TimeScale),
     look: ClipLook,
 ) {
-    painter.add(clip_shape(rect, palette.clip_video, Stroke::NONE));
+    let fill = if clip.sound_only {
+        palette.clip_audio
+    } else {
+        palette.clip_video
+    };
+    painter.add(clip_shape(rect, fill, Stroke::NONE));
     if let Some(face) = face {
         draw_face(painter, palette, rect, clip, face, scale);
     }
+    draw_fades(painter, palette, rect, clip, scale);
 
     // Handles only appear on a clip being pointed at or worked on, to keep the rest calm.
     let handle_colors = match look {
@@ -958,7 +1041,11 @@ fn draw_clip(
                     pos2(left + CLIP_ICON_SIZE / 2.0, label.center().y),
                     CLIP_ICON_SIZE,
                 ),
-                &icons::FILM,
+                if clip.sound_only {
+                    &icons::MUSIC
+                } else {
+                    &icons::FILM
+                },
                 palette.clip_video_text,
             );
             left += icon_room;
@@ -990,7 +1077,7 @@ fn dashed_outline(painter: &egui::Painter, rect: Rect, stroke: Stroke) {
 
 /// A dashed lane that says a clip can be dropped here to make a new track. It only ever
 /// offers what works, so it names text and audio once those tracks exist.
-fn draw_new_track_lane(painter: &egui::Painter, palette: &Palette, lane: Rect) {
+fn draw_new_track_lane(painter: &egui::Painter, palette: &Palette, lane: Rect, hint: &str) {
     dashed_outline(painter, lane, Stroke::new(1.0, palette.border_strong));
     let left = lane.left() + 10.0;
     let middle = lane.center().y;
@@ -1003,7 +1090,7 @@ fn draw_new_track_lane(painter: &egui::Painter, palette: &Palette, lane: Rect) {
     painter.text(
         pos2(left + 18.0, middle),
         Align2::LEFT_CENTER,
-        NEW_TRACK_HINT,
+        hint,
         FontId::proportional(12.0),
         palette.text_muted,
     );
@@ -1319,6 +1406,129 @@ fn bottom_strip(
     collapse
 }
 
+/// The mute and solo buttons beside each row.
+fn row_headers(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    view: &TimelineView,
+    layout: &TrackLayout,
+    rect: Rect,
+    events: &mut TimelineEvents,
+) {
+    for (row, sound) in view.tracks.row_sounds().iter().enumerate() {
+        let track = layout.track(row);
+        // Half a row showing has no room for two buttons, and they would land on what is above.
+        if track.top() < layout.area.top() || track.bottom() > layout.area.bottom() {
+            continue;
+        }
+        let x = rect.left() + (ROW_HEADER_WIDTH - ROW_BUTTON_SIZE) / 2.0 - 2.0;
+        let place =
+            |y: f32| Rect::from_min_size(pos2(x, y), vec2(ROW_BUTTON_SIZE, ROW_BUTTON_SIZE));
+        let number = row + 1;
+        let id = ui.scope_id().with(("row-sound", row));
+
+        let mute_name = if sound.muted {
+            format!("Unmute row {number}")
+        } else {
+            format!("Mute row {number}")
+        };
+        let (kind, icon) = if sound.muted {
+            (Kind::Chosen, icons::VOLUME_X)
+        } else {
+            (Kind::Ghost, icons::VOLUME_2)
+        };
+        let mute = IconButton::new(palette, kind, icon, &mute_name)
+            .size(ROW_BUTTON_SIZE, ROW_BUTTON_ICON)
+            .show_at(ui, id.with("mute"), place(track.top() + 3.0))
+            .on_hover_text(if sound.muted {
+                "Unmute this row"
+            } else {
+                "Mute this row"
+            });
+        if mute.clicked() {
+            events.row_sound = Some((
+                row,
+                RowSound {
+                    muted: !sound.muted,
+                    ..*sound
+                },
+            ));
+        }
+
+        let solo_name = if sound.solo {
+            format!("Stop solo on row {number}")
+        } else {
+            format!("Solo row {number}")
+        };
+        let kind = if sound.solo {
+            Kind::Chosen
+        } else {
+            Kind::Ghost
+        };
+        let solo = IconButton::new(palette, kind, icons::HEADPHONES, &solo_name)
+            .size(ROW_BUTTON_SIZE, ROW_BUTTON_ICON)
+            .show_at(
+                ui,
+                id.with("solo"),
+                place(track.bottom() - ROW_BUTTON_SIZE - 3.0),
+            )
+            .on_hover_text("Hear only this row, in the preview and the finished video");
+        if solo.clicked() {
+            events.row_sound = Some((
+                row,
+                RowSound {
+                    solo: !sound.solo,
+                    ..*sound
+                },
+            ));
+        }
+    }
+}
+
+/// The speaker on each clip with sound, which mutes it.
+fn speakers(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    state: &TimelineState,
+    clips: &[ClipView],
+    layout: &TrackLayout,
+    scale: &TimeScale,
+    events: &mut TimelineEvents,
+) {
+    if state.drag != TimelineDrag::None {
+        return;
+    }
+    for clip in clips.iter().filter(|clip| clip.has_sound) {
+        let shape = clip_rect(scale, layout.track(clip.track), clip.start, clip.end);
+        let visible = shape.intersect(layout.area);
+        if visible.width() < SPEAKER_MIN_WIDTH || visible.height() < shape.height() {
+            continue;
+        }
+        let place = Rect::from_center_size(
+            pos2(
+                visible.left() + HANDLE_WIDTH + 4.0 + SPEAKER_SIZE / 2.0,
+                shape.bottom() - SPEAKER_SIZE / 2.0 - 3.0,
+            ),
+            vec2(SPEAKER_SIZE, SPEAKER_SIZE),
+        );
+        // On its own backing, because it can be sitting on any picture.
+        ui.painter()
+            .rect_filled(place, 4.0, palette.stage.gamma_multiply(CLIP_LABEL_BACKING));
+        let (icon, name) = if clip.muted {
+            (icons::VOLUME_X, "Unmute clip")
+        } else {
+            (icons::VOLUME_2, "Mute clip")
+        };
+        let button = IconButton::new(palette, Kind::Ghost, icon, name)
+            .size(SPEAKER_SIZE, SPEAKER_ICON)
+            .show_at(ui, ui.scope_id().with(("clip-speaker", clip.id.0)), place)
+            .on_hover_text(name);
+        if button.clicked() {
+            events.toggle_clip_mute = Some(clip.id);
+        }
+    }
+}
+
 /// Draws the timeline and reports what the user did with it.
 pub fn timeline(
     ui: &mut egui::Ui,
@@ -1336,8 +1546,8 @@ pub fn timeline(
     let painter = ui.painter_at(rect);
     let mut events = TimelineEvents::default();
     let inset = 8.0;
-    let left = rect.left() + inset;
-    let track_width = (rect.width() - inset * 2.0).max(1.0);
+    let left = rect.left() + ROW_HEADER_WIDTH;
+    let track_width = (rect.width() - ROW_HEADER_WIDTH - inset).max(1.0);
 
     let view_total = state.frozen_total.unwrap_or(total);
     if state.scale.width > 0.0 && (state.scale.width - track_width).abs() > 0.01 {
@@ -1504,7 +1714,10 @@ pub fn timeline(
                     let wanted = Ticks((time.0 - grab.0).max(0));
                     let targets = snap_targets(view, Some(id));
                     let snapped = snap_start(wanted, length, &targets, tolerance);
-                    let target = layout.move_target_at(pointer.y, clip.track);
+                    let target = view.tracks.target_for(
+                        layout.move_target_at(pointer.y, clip.track),
+                        clip.sound_only,
+                    );
                     let landing = view.tracks.landing(target, Some(id), snapped, length);
                     move_landing = Some((id, landing, Ticks(landing.0 + length.0), target));
                     state.snap_line = snap_target(landing, length, &targets);
@@ -1517,7 +1730,9 @@ pub fn timeline(
             }
             _ => {}
         }
-        if response.clicked() {
+        if response.clicked() && track_count > 0 && layout.new_lane_below().contains(pointer) {
+            events.add_audio = true;
+        } else if response.clicked() {
             events.seek = Some(Ticks(time.0.clamp(0, total.0)));
             let in_area = area.contains(pointer);
             let clicked_clip = in_area
@@ -1632,8 +1847,16 @@ pub fn timeline(
         );
     }
     if track_count > 0 {
-        for lane in [layout.new_lane_above(), layout.new_lane_below()] {
-            draw_new_track_lane(&area_painter, palette, lane);
+        draw_new_track_lane(
+            &area_painter,
+            palette,
+            layout.new_lane_above(),
+            NEW_TRACK_HINT,
+        );
+        let below = layout.new_lane_below();
+        draw_new_track_lane(&area_painter, palette, below, ADD_AUDIO_HINT);
+        if pointer_over.is_some_and(|pointer| below.contains(pointer)) {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
     }
 
@@ -1676,6 +1899,8 @@ pub fn timeline(
             ),
         );
     }
+    row_headers(ui, palette, view, &layout, rect, &mut events);
+    speakers(ui, palette, state, clips, &layout, &scale, &mut events);
     if let Some((_, start, end, target)) = move_landing {
         draw_drop(
             &area_painter,
@@ -1690,7 +1915,7 @@ pub fn timeline(
         painter.text(
             area.center(),
             Align2::CENTER_CENTER,
-            "Drag a video here, or press + on it",
+            "Drag a video or sound here, or press + on it",
             FontId::proportional(13.0),
             palette.text_muted,
         );
@@ -1706,7 +1931,9 @@ pub fn timeline(
         hover_time,
         dragged_pointer,
     ) {
-        let target = layout.target_at(pointer.y);
+        let target = view
+            .tracks
+            .target_for(layout.target_at(pointer.y), drag.sound_only);
         let start = view
             .tracks
             .landing(target, None, drop_at(&drag, time), drag.length);
@@ -1980,6 +2207,11 @@ mod tests {
             label: String::new(),
             media: MediaId(1),
             source_start: Ticks(0),
+            has_sound: false,
+            muted: false,
+            sound_only: false,
+            fade_in: Ticks(0),
+            fade_out: Ticks(0),
         }
     }
 

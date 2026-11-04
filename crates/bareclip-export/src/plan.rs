@@ -108,6 +108,25 @@ pub fn frame_rate_for(rates: &[f64]) -> (i32, i32) {
     (fastest.ceil() as i32, 1)
 }
 
+/// The sound tracks videos need kept apart, as many as the video with the most. A track's name
+/// comes from the first video that gives it one.
+pub fn sound_labels(videos: &[MediaInfo]) -> Vec<SoundLabel> {
+    let track_count = videos
+        .iter()
+        .map(|info| info.audio.len())
+        .max()
+        .unwrap_or(0);
+    (0..track_count)
+        .map(|track| {
+            let tracks = || videos.iter().filter_map(|info| info.audio.get(track));
+            SoundLabel {
+                title: tracks().find_map(|audio| audio.title.clone()),
+                language: tracks().find_map(|audio| audio.language.clone()),
+            }
+        })
+        .collect()
+}
+
 /// What a full export will write, chosen so that it matches the sources with no questions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FullPlan {
@@ -128,21 +147,7 @@ impl FullPlan {
     pub fn on_canvas(videos: &[MediaInfo], (width, height): (u32, u32)) -> Self {
         let rates: Vec<f64> = videos.iter().map(|info| info.video.frame_rate).collect();
 
-        let track_count = videos
-            .iter()
-            .map(|info| info.audio.len())
-            .max()
-            .unwrap_or(0);
-        // A track's name comes from the first video that gives it one.
-        let sound_tracks = (0..track_count)
-            .map(|track| {
-                let tracks = || videos.iter().filter_map(|info| info.audio.get(track));
-                SoundLabel {
-                    title: tracks().find_map(|audio| audio.title.clone()),
-                    language: tracks().find_map(|audio| audio.language.clone()),
-                }
-            })
-            .collect();
+        let sound_tracks = sound_labels(videos);
 
         // Only for encoders with no quality setting: as much as the busiest video uses for
         // each pixel, with a margin, at the finished size.

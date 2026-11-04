@@ -21,7 +21,7 @@ impl fmt::Display for MediaError {
         match self {
             Self::Ffmpeg(error) => write!(f, "FFmpeg reported an error: {error}"),
             Self::Io(error) => write!(f, "The file could not be read or written: {error}"),
-            Self::NoVideoStream => f.write_str("This file has no video track."),
+            Self::NoVideoStream => f.write_str("This file has no video or sound."),
             Self::NoFrames => f.write_str("No video frames could be read from this file."),
             Self::NothingToExport => f.write_str("Add a video to the timeline before exporting."),
             Self::SameInputAndOutput => {

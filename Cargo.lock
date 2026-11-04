@@ -423,6 +423,8 @@ dependencies = [
 name = "bareclip-audio"
 version = "0.1.0"
 dependencies = [
+ "bareclip-core",
+ "bareclip-media",
  "cpal",
  "rtrb",
 ]
@@ -439,6 +441,7 @@ dependencies = [
 name = "bareclip-export"
 version = "0.1.0"
 dependencies = [
+ "bareclip-audio",
  "bareclip-core",
  "bareclip-media",
  "bareclip-render",

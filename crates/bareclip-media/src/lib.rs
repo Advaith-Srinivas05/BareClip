@@ -7,11 +7,13 @@ mod media_foundation;
 mod nal;
 mod preview;
 mod probe;
+mod remux;
 mod strip;
 
 pub use error::MediaError;
 pub use export::{
-    ExportPart, ExportReport, ExportRequest, can_write_gaps, export, plan_export, same_file,
+    ExportPart, ExportReport, ExportRequest, can_write_gaps, export, export_picture_only,
+    plan_export, same_file,
 };
 pub use full::{
     DecodedPicture, PictureReader, SOUND_CHANNELS, SOUND_RATE, SoundLabel, VideoSettings,
@@ -22,6 +24,7 @@ pub use preview::{
     fit_preview_size,
 };
 pub use probe::{AudioInfo, MediaInfo, VideoInfo, join_problem, probe, scan_frames};
+pub use remux::{SoundFile, join_picture_and_sound};
 pub use strip::{SoundShape, StripPicture, picture_spacing, read_sound_shape, read_strip_pictures};
 
 use ffmpeg_next as ffmpeg;

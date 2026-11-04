@@ -50,6 +50,29 @@ pub struct MediaInfo {
     pub audio: Vec<AudioInfo>,
 }
 
+impl VideoInfo {
+    /// What stands in for the picture of a file that only has sound.
+    fn no_picture() -> Self {
+        Self {
+            stream_index: 0,
+            codec: String::new(),
+            width: 0,
+            height: 0,
+            pixel_format: String::new(),
+            time_base: TimeBase { num: 1, den: 1000 },
+            frame_rate: 0.0,
+            is_hdr: false,
+        }
+    }
+}
+
+impl MediaInfo {
+    /// Whether this file only has sound, like an MP3.
+    pub fn is_sound_only(&self) -> bool {
+        self.video.codec.is_empty()
+    }
+}
+
 /// Why two videos cannot be joined by copying, in words for the user. They must share
 /// a picture format and matching audio tracks, or a player could not read the result.
 pub fn join_problem(first: &MediaInfo, other: &MediaInfo) -> Option<String> {
@@ -98,35 +121,49 @@ pub(crate) fn to_time_base(rational: Rational) -> TimeBase {
     }
 }
 
+/// The real video in a file. An MP3's cover art is stored as a one-picture video, but it isn't one.
+fn video_stream_of(
+    input: &ffmpeg::format::context::Input,
+) -> Option<ffmpeg::format::stream::Stream<'_>> {
+    input.streams().find(|stream| {
+        stream.parameters().medium() == Type::Video
+            && !stream
+                .disposition()
+                .contains(ffmpeg::format::stream::Disposition::ATTACHED_PIC)
+    })
+}
+
 pub fn probe(path: &Path) -> Result<MediaInfo, MediaError> {
     crate::init()?;
     let size_bytes = std::fs::metadata(path)?.len();
     let input = ffmpeg::format::input(path)?;
 
-    let video_stream = input
-        .streams()
-        .best(Type::Video)
-        .ok_or(MediaError::NoVideoStream)?;
-    let context = ffmpeg::codec::context::Context::from_parameters(video_stream.parameters())?;
-    let codec = context.id();
-    let decoder = context.decoder().video()?;
-    let rate = video_stream.avg_frame_rate();
-    let video = VideoInfo {
-        stream_index: video_stream.index(),
-        codec: codec.name().to_owned(),
-        width: decoder.width(),
-        height: decoder.height(),
-        pixel_format: format!("{:?}", decoder.format()),
-        time_base: to_time_base(video_stream.time_base()),
-        frame_rate: if rate.denominator() == 0 {
-            0.0
-        } else {
-            f64::from(rate.numerator()) / f64::from(rate.denominator())
-        },
-        is_hdr: matches!(
-            decoder.color_transfer_characteristic(),
-            TransferCharacteristic::SMPTE2084 | TransferCharacteristic::ARIB_STD_B67
-        ),
+    let video = match video_stream_of(&input) {
+        Some(video_stream) => {
+            let context =
+                ffmpeg::codec::context::Context::from_parameters(video_stream.parameters())?;
+            let codec = context.id();
+            let decoder = context.decoder().video()?;
+            let rate = video_stream.avg_frame_rate();
+            VideoInfo {
+                stream_index: video_stream.index(),
+                codec: codec.name().to_owned(),
+                width: decoder.width(),
+                height: decoder.height(),
+                pixel_format: format!("{:?}", decoder.format()),
+                time_base: to_time_base(video_stream.time_base()),
+                frame_rate: if rate.denominator() == 0 {
+                    0.0
+                } else {
+                    f64::from(rate.numerator()) / f64::from(rate.denominator())
+                },
+                is_hdr: matches!(
+                    decoder.color_transfer_characteristic(),
+                    TransferCharacteristic::SMPTE2084 | TransferCharacteristic::ARIB_STD_B67
+                ),
+            }
+        }
+        None => VideoInfo::no_picture(),
     };
 
     let mut audio = Vec::new();
@@ -146,6 +183,10 @@ pub fn probe(path: &Path) -> Result<MediaInfo, MediaError> {
             title: metadata.get("title").map(str::to_owned),
             language: metadata.get("language").map(str::to_owned),
         });
+    }
+
+    if video.codec.is_empty() && audio.is_empty() {
+        return Err(MediaError::NoVideoStream);
     }
 
     Ok(MediaInfo {
