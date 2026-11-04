@@ -172,9 +172,10 @@ try {
             Assert-That (-not (Test-Path $StartMenu)) 'there is no separate shortcut for this user'
 
             # The wizard works out for itself that an upgrade is for everyone, and skips the choice.
+            # The version only has to stay above whatever is being released.
             $Work = Join-Path $Root 'target\msi\everyone-pages'
-            [void](& (Join-Path $PSScriptRoot 'build-msi.ps1') -Version '0.1.1' -OutDir $Work -SkipBuild)
-            $Newer = Join-Path $Work 'BareClip-0.1.1.msi'
+            [void](& (Join-Path $PSScriptRoot 'build-msi.ps1') -Version '9.9.9' -OutDir $Work -SkipBuild)
+            $Newer = Join-Path $Work 'BareClip-9.9.9.msi'
             $UpgradeLog = Join-Path $env:TEMP 'bareclip-msi-everyone-upgrade.log'
             $Installer = Start-Process msiexec.exe -ArgumentList @('/i', "`"$Newer`"", '/l*v', "`"$UpgradeLog`"") -PassThru
             [void](Wait-Control 'I accept the terms in the License Agreement')
@@ -193,7 +194,7 @@ try {
             $Windows = New-Object -ComObject WindowsInstaller.Installer
             $Installed = @($Windows.RelatedProducts('{6F2B7C1E-3A94-4D58-9E21-7C0D5A8B4F13}'))
             Assert-That ($Installed.Count -eq 1) 'there is still only one copy'
-            Assert-That ($Windows.ProductInfo($Installed[0], 'VersionString') -like '0.1.1*') 'and it is the newer one'
+            Assert-That ($Windows.ProductInfo($Installed[0], 'VersionString') -like '9.9.9*') 'and it is the newer one'
             Assert-That (Test-Path (Join-Path $ProgramFilesDir 'bareclip.exe')) 'it stayed in Program Files'
             Assert-That (-not (Test-Path 'HKCU:\Software\BareClip')) 'and did not also install for this user'
         }
@@ -257,6 +258,16 @@ try {
     $Text = Get-AllText (Get-Page)
     Assert-That ($Text -like "*$env:LOCALAPPDATA\Programs\BareClip\*") 'the folder starts in your own Programs folder'
     Save-Picture '3-options'
+    $Boxes = @((Get-Page).FindAll($Tree::Descendants, [Windows.Automation.Condition]::TrueCondition) | Where-Object { $_.Current.ClassName -match 'Edit' })
+    Assert-That ($Boxes.Count -eq 1) 'the page has one folder box'
+
+    # A path typed without BareClip on the end gets it, with or without a final slash.
+    Set-FolderText "$Parent\typed"
+    Invoke-Button 'Next'
+    [void](Wait-Control 'Install')
+    Assert-That ((Get-AllText (Get-Page)) -like "*$Parent\typed\BareClip\*") 'a typed folder gets BareClip on the end'
+    Invoke-Button 'Back'
+    [void](Wait-Control 'Add to the Start menu')
 
     # A protected folder is refused before anything is installed.
     Set-FolderText "$env:ProgramW6432\"
@@ -277,6 +288,17 @@ try {
     $Text = Get-AllText (Get-Page)
     Assert-That ($Text -like "*$InstallDir\*") 'the page shows a BareClip folder inside the chosen one'
     Save-Picture '5-browsed'
+
+    # A folder already called BareClip isn't given another one.
+    Invoke-Button 'Browse...'
+    [void](Wait-Control 'OK')
+    Set-FolderText "$InstallDir\"
+    Invoke-Button 'OK'
+    [void](Wait-Control 'Add to the Start menu')
+    Start-Sleep -Milliseconds 500
+    $Text = Get-AllText (Get-Page)
+    Assert-That ($Text -like "*$InstallDir\*") 'a folder called BareClip stays as it is'
+    Assert-That ($Text -notlike '*BareClip\BareClip*') 'and has no second BareClip added'
 
     Set-Tick 'Add a desktop shortcut' $false
     Invoke-Button 'Next'

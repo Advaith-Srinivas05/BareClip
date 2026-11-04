@@ -33,7 +33,7 @@
     <Property Id="ADD_DESKTOP" Value="1" Secure="yes" />
     <Property Id="INSTALL_SCOPE" Value="user" Secure="yes" />
     <Property Id="LAST_SCOPE" Value="user" Secure="yes" />
-    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLPARENT" />
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
 
     <!-- An upgrade keeps the earlier choices, and stays in the same place so there is only
          ever one copy. Windows only finds an earlier copy installed the same way. -->
@@ -42,6 +42,13 @@
     </Property>
     <Property Id="SAVED_PARENT_EVERYONE" Secure="yes">
       <RegistrySearch Id="SavedParentEveryone" Root="HKLM" Key="Software\BareClip" Name="InstallParent" Type="raw" Win64="yes" />
+    </Property>
+    <!-- The whole path, which can be anywhere. Versions before 0.2.0 only saved the parent. -->
+    <Property Id="SAVED_FOLDER_USER" Secure="yes">
+      <RegistrySearch Id="SavedFolderUser" Root="HKCU" Key="Software\BareClip" Name="InstallFolder" Type="raw" Win64="yes" />
+    </Property>
+    <Property Id="SAVED_FOLDER_EVERYONE" Secure="yes">
+      <RegistrySearch Id="SavedFolderEveryone" Root="HKLM" Key="Software\BareClip" Name="InstallFolder" Type="raw" Win64="yes" />
     </Property>
     <Property Id="SAVED_START_MENU" Secure="yes">
       <RegistrySearch Id="SavedStartMenuUser" Root="HKCU" Key="Software\BareClip" Name="StartMenu" Type="raw" Win64="yes" />
@@ -62,7 +69,10 @@
     <SetProperty Action="RestoreEveryone" Id="MSIINSTALLPERUSER" Value="[NOTHING]" After="FindProgramFilesX86" Sequence="both">SAVED_PARENT_EVERYONE AND NOT Installed</SetProperty>
     <SetProperty Action="RestoreEveryoneAllUsers" Id="ALLUSERS" Value="1" After="RestoreEveryone" Sequence="both">SAVED_PARENT_EVERYONE AND NOT Installed</SetProperty>
     <SetProperty Action="RestoreEveryoneScope" Id="INSTALL_SCOPE" Value="everyone" After="RestoreEveryoneAllUsers" Sequence="both">SAVED_PARENT_EVERYONE AND NOT Installed</SetProperty>
-    <SetProperty Action="RestoreParentEveryone" Id="INSTALLPARENT" Value="[SAVED_PARENT_EVERYONE]" After="RestoreEveryoneScope" Sequence="both">SAVED_PARENT_EVERYONE AND NOT INSTALLPARENT</SetProperty>
+    <!-- A parent given on the command line wins over the saved folder. -->
+    <SetProperty Action="RestoreFolderEveryone" Id="INSTALLFOLDER" Value="[SAVED_FOLDER_EVERYONE]" After="RestoreEveryoneScope" Sequence="both">SAVED_FOLDER_EVERYONE AND NOT INSTALLFOLDER AND NOT INSTALLPARENT AND NOT Installed</SetProperty>
+    <SetProperty Action="RestoreFolderUser" Id="INSTALLFOLDER" Value="[SAVED_FOLDER_USER]" After="RestoreFolderEveryone" Sequence="both">SAVED_FOLDER_USER AND NOT INSTALLFOLDER AND NOT INSTALLPARENT AND NOT Installed</SetProperty>
+    <SetProperty Action="RestoreParentEveryone" Id="INSTALLPARENT" Value="[SAVED_PARENT_EVERYONE]" After="RestoreFolderUser" Sequence="both">SAVED_PARENT_EVERYONE AND NOT INSTALLPARENT</SetProperty>
     <SetProperty Action="RestoreParentUser" Id="INSTALLPARENT" Value="[SAVED_PARENT_USER]" After="RestoreParentEveryone" Sequence="both">SAVED_PARENT_USER AND NOT INSTALLPARENT</SetProperty>
     <SetProperty Action="DefaultParentEveryone" Id="INSTALLPARENT" Value="[REAL_PROGRAM_FILES]" After="RestoreParentUser" Sequence="both">NOT INSTALLPARENT AND NOT MSIINSTALLPERUSER</SetProperty>
     <SetProperty Action="DefaultParent" Id="INSTALLPARENT" Value="[LocalAppDataFolder]Programs\" After="DefaultParentEveryone" Sequence="both">NOT INSTALLPARENT</SetProperty>
@@ -147,8 +157,11 @@
           <Publish Property="INSTALLPARENT" Value="[LocalAppDataFolder]Programs\" Order="5"><![CDATA[INSTALL_SCOPE = "user" AND LAST_SCOPE <> INSTALL_SCOPE]]></Publish>
           <Publish Property="INSTALLPARENT" Value="[REAL_PROGRAM_FILES]" Order="6"><![CDATA[INSTALL_SCOPE = "everyone" AND LAST_SCOPE <> INSTALL_SCOPE]]></Publish>
           <Publish Event="SetTargetPath" Value="INSTALLPARENT" Order="7"><![CDATA[LAST_SCOPE <> INSTALL_SCOPE]]></Publish>
-          <Publish Property="LAST_SCOPE" Value="[INSTALL_SCOPE]" Order="8">1</Publish>
-          <Publish Event="NewDialog" Value="OptionsDlg" Order="9">1</Publish>
+          <Publish Property="INSTALLFOLDER" Value="[LocalAppDataFolder]Programs\BareClip\" Order="8"><![CDATA[INSTALL_SCOPE = "user" AND LAST_SCOPE <> INSTALL_SCOPE]]></Publish>
+          <Publish Property="INSTALLFOLDER" Value="[REAL_PROGRAM_FILES]BareClip\" Order="9"><![CDATA[INSTALL_SCOPE = "everyone" AND LAST_SCOPE <> INSTALL_SCOPE]]></Publish>
+          <Publish Event="SetTargetPath" Value="INSTALLFOLDER" Order="10"><![CDATA[LAST_SCOPE <> INSTALL_SCOPE]]></Publish>
+          <Publish Property="LAST_SCOPE" Value="[INSTALL_SCOPE]" Order="11">1</Publish>
+          <Publish Event="NewDialog" Value="OptionsDlg" Order="12">1</Publish>
         </Control>
         <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
           <Publish Event="SpawnDialog" Value="CancelDlg">1</Publish>
@@ -161,25 +174,26 @@
         <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
         <Control Id="Title" Type="Text" X="15" Y="6" Width="280" Height="15" Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}Install location and shortcuts" />
         <Control Id="Description" Type="Text" X="25" Y="23" Width="280" Height="15" Transparent="yes" NoPrefix="yes" Text="Choose where [ProductName] goes and how you open it." />
-        <Control Id="FolderLabel" Type="Text" X="20" Y="58" Width="330" Height="12" NoPrefix="yes" Text="Install in this folder. A [ProductName] folder is created inside it." />
+        <Control Id="FolderLabel" Type="Text" X="20" Y="58" Width="330" Height="12" NoPrefix="yes" Text="Install in this folder:" />
         <Control Id="Folder" Type="PathEdit" X="20" Y="73" Width="264" Height="18" Property="WIXUI_INSTALLDIR" Indirect="yes" />
         <Control Id="ChangeFolder" Type="PushButton" X="290" Y="72" Width="60" Height="19" Text="&amp;Browse...">
           <Publish Property="_BrowseProperty" Value="[WIXUI_INSTALLDIR]" Order="1">1</Publish>
           <Publish Event="SpawnDialog" Value="BrowseDlg" Order="2">1</Publish>
         </Control>
-        <Control Id="FinalLabel" Type="Text" X="20" Y="97" Width="330" Height="12" NoPrefix="yes" Text="[ProductName] will be installed in:" />
-        <Control Id="FinalFolder" Type="PathEdit" X="20" Y="110" Width="330" Height="18" Disabled="yes" Property="INSTALLFOLDER" />
-        <Control Id="ShortcutLabel" Type="Text" X="20" Y="140" Width="330" Height="12" NoPrefix="yes" Text="Shortcuts" />
-        <Control Id="StartMenu" Type="CheckBox" X="20" Y="156" Width="330" Height="16" CheckBoxValue="1" Property="ADD_START_MENU" Text="Add to the &amp;Start menu" />
-        <Control Id="Desktop" Type="CheckBox" X="20" Y="176" Width="330" Height="16" CheckBoxValue="1" Property="ADD_DESKTOP" Text="Add a &amp;desktop shortcut" />
+        <Control Id="ShortcutLabel" Type="Text" X="20" Y="106" Width="330" Height="12" NoPrefix="yes" Text="Shortcuts" />
+        <Control Id="StartMenu" Type="CheckBox" X="20" Y="122" Width="330" Height="16" CheckBoxValue="1" Property="ADD_START_MENU" Text="Add to the &amp;Start menu" />
+        <Control Id="Desktop" Type="CheckBox" X="20" Y="142" Width="330" Height="16" CheckBoxValue="1" Property="ADD_DESKTOP" Text="Add a &amp;desktop shortcut" />
         <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)">
           <Publish Event="NewDialog" Value="ScopeDlg" Order="1"><![CDATA[NOT (SAVED_PARENT_USER OR SAVED_PARENT_EVERYONE)]]></Publish>
           <Publish Event="NewDialog" Value="AgreementDlg" Order="2">SAVED_PARENT_USER OR SAVED_PARENT_EVERYONE</Publish>
         </Control>
         <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)">
-          <Publish Event="SetTargetPath" Value="[WIXUI_INSTALLDIR]" Order="1">1</Publish>
-          <Publish Event="SpawnDialog" Value="NeedsAdminDlg" Order="2"><![CDATA[MSIINSTALLPERUSER AND (INSTALLFOLDER ~<< REAL_PROGRAM_FILES OR INSTALLFOLDER ~<< REAL_PROGRAM_FILES_X86 OR INSTALLFOLDER ~<< WindowsFolder)]]></Publish>
-          <Publish Event="NewDialog" Value="ReadyDlg" Order="3"><![CDATA[NOT MSIINSTALLPERUSER OR NOT (INSTALLFOLDER ~<< REAL_PROGRAM_FILES OR INSTALLFOLDER ~<< REAL_PROGRAM_FILES_X86 OR INSTALLFOLDER ~<< WindowsFolder)]]></Publish>
+          <!-- The same for a path typed into the box. -->
+          <Publish Event="SetTargetPath" Value="INSTALLFOLDER" Order="1">1</Publish>
+          <Publish Property="INSTALLFOLDER" Value="[INSTALLFOLDER]BareClip\" Order="2"><![CDATA[NOT (INSTALLFOLDER ~>> "\BareClip\")]]></Publish>
+          <Publish Event="SetTargetPath" Value="INSTALLFOLDER" Order="3">INSTALLFOLDER</Publish>
+          <Publish Event="SpawnDialog" Value="NeedsAdminDlg" Order="4"><![CDATA[MSIINSTALLPERUSER AND (INSTALLFOLDER ~<< REAL_PROGRAM_FILES OR INSTALLFOLDER ~<< REAL_PROGRAM_FILES_X86 OR INSTALLFOLDER ~<< WindowsFolder)]]></Publish>
+          <Publish Event="NewDialog" Value="ReadyDlg" Order="5"><![CDATA[NOT MSIINSTALLPERUSER OR NOT (INSTALLFOLDER ~<< REAL_PROGRAM_FILES OR INSTALLFOLDER ~<< REAL_PROGRAM_FILES_X86 OR INSTALLFOLDER ~<< WindowsFolder)]]></Publish>
         </Control>
         <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
           <Publish Event="SpawnDialog" Value="CancelDlg">1</Publish>
@@ -237,6 +251,11 @@
         <Show Dialog="WelcomeDlg" Before="AgreementDlg">Installed AND PATCH</Show>
       </InstallUISequence>
 
+      <!-- Whatever Browse picked gets a BareClip folder, unless it already is one. WiX's own steps on
+           this button are 1 and 2, and these still run before the window closes. -->
+      <Publish Dialog="BrowseDlg" Control="OK" Property="INSTALLFOLDER" Value="[INSTALLFOLDER]BareClip\" Order="3"><![CDATA[NOT (INSTALLFOLDER ~>> "\BareClip\")]]></Publish>
+      <Publish Dialog="BrowseDlg" Control="OK" Event="SetTargetPath" Value="INSTALLFOLDER" Order="4">1</Publish>
+
       <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="PrepareDlg">1</Publish>
       <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999">1</Publish>
       <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg">1</Publish>
@@ -272,6 +291,7 @@
       <Component Id="Choices" Guid="D7F2A614-90BE-4C3D-A1E8-5B06C94F7E21">
         <RegistryKey Root="HKMU" Key="Software\BareClip">
           <RegistryValue Name="InstallParent" Type="string" Value="[INSTALLPARENT]" KeyPath="yes" />
+          <RegistryValue Name="InstallFolder" Type="string" Value="[INSTALLFOLDER]" />
         </RegistryKey>
       </Component>
       <Component Id="StartMenuChosen" Guid="1E6B8C39-74AD-42F0-9D17-C2A85E30F6B4">
