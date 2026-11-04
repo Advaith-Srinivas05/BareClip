@@ -10,6 +10,12 @@ use bareclip_export::{FullPlan, FullReport, ProjectReport};
 use bareclip_media::{AudioInfo, ExportReport, MediaInfo};
 
 pub const VIDEO_EXTENSIONS: [&str; 6] = ["mp4", "mkv", "mov", "webm", "avi", "ts"];
+/// Sound with no picture.
+pub const AUDIO_EXTENSIONS: [&str; 7] = ["mp3", "wav", "flac", "m4a", "aac", "ogg", "opus"];
+/// Everything that can be added to a project: videos, and sound on its own.
+pub const MEDIA_EXTENSIONS: [&str; 13] = [
+    "mp4", "mkv", "mov", "webm", "avi", "ts", "mp3", "wav", "flac", "m4a", "aac", "ogg", "opus",
+];
 
 /// A project's name as Windows will accept it for a file.
 pub fn safe_file_name(name: &str) -> String {

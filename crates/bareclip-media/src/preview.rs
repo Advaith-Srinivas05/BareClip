@@ -502,13 +502,14 @@ impl AudioPreview {
             return Ok(None);
         }
 
+        // Every block needs labelling, or one with no layout of its own stops matching the first.
+        let layout = if decoded.channel_layout().is_empty() {
+            ChannelLayout::default(i32::from(decoded.channels()))
+        } else {
+            decoded.channel_layout()
+        };
+        decoded.set_channel_layout(layout);
         if track.resampler.is_none() {
-            let layout = if decoded.channel_layout().is_empty() {
-                ChannelLayout::default(i32::from(decoded.channels()))
-            } else {
-                decoded.channel_layout()
-            };
-            decoded.set_channel_layout(layout);
             track.resampler = Some(resampling::Context::get(
                 decoded.format(),
                 layout,

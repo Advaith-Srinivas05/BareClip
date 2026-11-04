@@ -12,18 +12,22 @@ use std::{
     },
 };
 
+use bareclip_audio::{Bus, MixSpan};
 use bareclip_core::{
     picture::Yuv420,
     placement::{Placement, WHOLE},
+    sound::{ClipSound, FULL_VOLUME},
     splice::CutMode,
     time::Ticks,
     timeline::TimeRange,
 };
 use bareclip_export::{
-    FullReport, LayeredClip, LayeredRequest, LayeredStretch, ProjectReport, export_layered,
-    export_project,
+    FullReport, LayeredClip, LayeredRequest, LayeredStretch, ProjectReport, SoundPlan,
+    export_layered, export_project, export_with_new_sound,
 };
-use bareclip_media::{ExportPart, ExportRequest, MediaError, PictureReader, probe};
+use bareclip_media::{
+    ExportPart, ExportReport, ExportRequest, MediaError, PictureReader, SoundLabel, probe,
+};
 use common::*;
 
 /// Colours are labelled, so frames of the canvas's size can skip the GPU.
@@ -802,10 +806,14 @@ fn layered_request(
     stretches: Vec<LayeredStretch>,
     sound: Vec<ExportPart>,
 ) -> LayeredRequest {
+    let videos: Vec<_> = sound
+        .iter()
+        .map(|part| probe(&part.input).expect("the video can be read"))
+        .collect();
     LayeredRequest {
         output: output_path(name, "mp4"),
         stretches,
-        sound,
+        sound: SoundPlan::as_recorded(&sound, &videos),
         canvas: None,
         background: [0, 0, 0],
     }
@@ -1152,7 +1160,7 @@ fn a_layered_export_over_one_of_its_videos_is_refused() {
             1.0,
             vec![whole(&red_clip(), 1, 0.0, 1.0, top_left_quarter())],
         )],
-        sound: Vec::new(),
+        sound: SoundPlan::default(),
         canvas: None,
         background: [0, 0, 0],
     };
@@ -1397,4 +1405,453 @@ fn a_flipped_clip_comes_out_mirrored() {
     let view = picture.view();
     assert!(is_blue(colour_at(&view, 80, 90)), "blue is now on the left");
     assert!(is_red(colour_at(&view, 240, 90)), "red is now on the right");
+}
+
+/// A song: a steady tone with no picture.
+fn song() -> PathBuf {
+    let mut args = to_strings(&["-f", "lavfi", "-i"]);
+    args.push(tone(1000, 6));
+    args.extend(to_strings(&["-c:a", "aac", "-b:a", "128k"]));
+    clip("song.m4a", &args)
+}
+
+/// A steady tone played at a place on the timeline.
+fn song_span(start: f64, length: f64, bus: Bus) -> MixSpan {
+    MixSpan {
+        path: song(),
+        start: seconds(start),
+        source: range(0.0, length),
+        sound: ClipSound::default(),
+        bus,
+    }
+}
+
+/// How loud a track is over a stretch of it.
+fn level_between(track: &AudioTrackInfo, from: f64, to: f64) -> f32 {
+    let rate = f64::from(track.rate);
+    let first = (from * rate) as usize;
+    let last = ((to * rate) as usize).min(track.samples.len());
+    let stretch = &track.samples[first..last];
+    (stretch.iter().map(|sample| sample * sample).sum::<f32>() / stretch.len() as f32).sqrt()
+}
+
+fn copy_with_new_sound(
+    name: &str,
+    parts: Vec<ExportPart>,
+    plan: &SoundPlan,
+) -> (PathBuf, ExportReport) {
+    let job = ExportRequest {
+        output: output_path(name, "mp4"),
+        parts,
+        mode: CutMode::Keyframe,
+    };
+    let report = export_with_new_sound(&job, plan, &AtomicBool::new(false), &|_| {})
+        .expect("the export succeeds");
+    (job.output, report)
+}
+
+fn one_mix(spans: Vec<MixSpan>) -> SoundPlan {
+    SoundPlan {
+        spans,
+        tracks: vec![SoundLabel::default()],
+    }
+}
+
+fn clip_span(path: &Path, start: f64, source_start: f64, length: f64, bus: Bus) -> MixSpan {
+    MixSpan {
+        path: path.to_owned(),
+        start: seconds(start),
+        source: range(source_start, source_start + length),
+        sound: ClipSound::default(),
+        bus,
+    }
+}
+
+#[test]
+fn music_added_to_a_video_is_heard_and_the_picture_is_only_copied() {
+    let video = large_clip();
+    let plan = one_mix(vec![
+        clip_span(&video, 0.0, 0.0, 4.0, Bus::All(0)),
+        song_span(0.0, 4.0, Bus::All(0)),
+    ]);
+
+    let (output, report) =
+        copy_with_new_sound("new-sound", vec![part(&video, 0.0, 4.0, 0.0)], &plan);
+
+    assert_eq!(report.encoded_frames, 0, "nothing was redrawn: {report:?}");
+    assert_eq!(report.copied_frames, 120);
+    assert_eq!(report.audio_tracks, 1);
+    assert_eq!(
+        pictures_of(&output)
+            .iter()
+            .map(|seen| seen.number)
+            .collect::<Vec<_>>(),
+        (0..120).collect::<Vec<_>>()
+    );
+    let sound = decode_audio(&output);
+    assert_eq!(sound.len(), 1);
+    assert!((sound[0].seconds - 4.0).abs() < 0.1, "{}", sound[0].seconds);
+    // Between the beeps, only the music is left.
+    assert!(
+        level_between(&sound[0], 0.4, 0.8) > 0.05,
+        "the music is missing"
+    );
+}
+
+#[test]
+fn new_sound_stays_in_sync_with_a_copied_picture() {
+    let video = large_clip();
+    let plan = one_mix(vec![clip_span(&video, 0.0, 0.0, 4.0, Bus::All(0))]);
+
+    let (output, _) =
+        copy_with_new_sound("new-sound-sync", vec![part(&video, 0.0, 4.0, 0.0)], &plan);
+
+    let sound = decode_audio(&output);
+    let starts = beep_times(&sound[0]);
+    assert_eq!(starts.len(), 4, "{starts:?}");
+    for (found, wanted) in starts.iter().zip([0.0, 1.0, 2.0, 3.0]) {
+        assert!((found - wanted).abs() < 0.05, "{starts:?}");
+    }
+    // The first picture has to start with the sound, or everything is out by the difference.
+    let pictures = pictures_of(&output);
+    assert!(pictures[0].seconds.abs() < 0.04, "{}", pictures[0].seconds);
+    assert!(
+        sound[0].first_sample_seconds.abs() < 0.05,
+        "{}",
+        sound[0].first_sample_seconds
+    );
+}
+
+#[test]
+fn a_cut_and_dead_space_keep_new_sound_in_time_with_the_picture() {
+    let video = large_clip();
+    // A second of dead space, then footage cut so that a beep falls at its very start.
+    let plan = one_mix(vec![clip_span(&video, 1.0, 1.0, 2.0, Bus::All(0))]);
+    let job = ExportRequest {
+        output: output_path("new-sound-gap", "mp4"),
+        parts: vec![part(&video, 1.0, 3.0, 1.0)],
+        mode: CutMode::FrameExact,
+    };
+
+    export_with_new_sound(&job, &plan, &AtomicBool::new(false), &|_| {}).expect("it exports");
+
+    let sound = decode_audio(&job.output);
+    let starts = beep_times(&sound[0]);
+    assert_eq!(starts.len(), 2, "{starts:?}");
+    for (found, wanted) in starts.iter().zip([1.0, 2.0]) {
+        assert!((found - wanted).abs() < 0.05, "{starts:?}");
+    }
+    assert!((sound[0].seconds - 3.0).abs() < 0.1, "{}", sound[0].seconds);
+}
+
+/// Like some recorders' files: the first picture comes a little after the sound starts.
+fn late_picture_clip(name: &str, first: u32) -> PathBuf {
+    let mut args = to_strings(&["-itsoffset", "0.1", "-f", "lavfi", "-i"]);
+    args.push(numbered_video((320, 180), 30, 4, first));
+    args.extend(to_strings(&["-f", "lavfi", "-i"]));
+    args.push(beeps(4));
+    args.extend(to_strings(&[
+        "-map",
+        "0",
+        "-map",
+        "1",
+        "-c:v",
+        "libopenh264",
+        "-b:v",
+        "4M",
+        "-g",
+        "30",
+        "-c:a",
+        "aac",
+    ]));
+    clip(name, &args)
+}
+
+#[test]
+fn a_picture_that_starts_late_keeps_its_place_against_new_sound() {
+    let video = late_picture_clip("late-picture.mp4", 0);
+    let plan = one_mix(vec![clip_span(&video, 0.0, 0.0, 3.0, Bus::All(0))]);
+
+    let (output, _) =
+        copy_with_new_sound("late-picture-out", vec![part(&video, 0.0, 3.0, 0.0)], &plan);
+
+    let pictures = pictures_of(&output);
+    assert!(
+        (pictures[0].seconds - 0.1).abs() < 0.01,
+        "{}",
+        pictures[0].seconds
+    );
+    let starts = beep_times(&decode_audio(&output)[0]);
+    assert!(starts[0].abs() < 0.05, "{starts:?}");
+}
+
+#[test]
+fn clips_joined_under_new_sound_each_land_exactly_where_the_timeline_says() {
+    let first = late_picture_clip("late-first.mp4", 0);
+    let second = late_picture_clip("late-second.mp4", 3000);
+    // Short clips that would each come up a little short if they followed their own footage.
+    let parts = vec![
+        part(&first, 0.0, 1.0, 0.0),
+        part(&second, 0.0, 1.0, 0.0),
+        part(&first, 2.0, 3.0, 0.0),
+        part(&second, 2.0, 3.0, 0.0),
+    ];
+    let plan = one_mix(vec![song_span(0.0, 4.0, Bus::All(0))]);
+
+    let (output, _) = copy_with_new_sound("late-joined", parts, &plan);
+
+    let pictures = pictures_of(&output);
+    // Each number was at its own time in its source, and that has to stay true on the timeline.
+    let place_of = |number: u32| {
+        pictures
+            .iter()
+            .find(|seen| seen.number == number)
+            .map(|seen| seen.seconds)
+            .unwrap_or_else(|| panic!("frame {number} is missing"))
+    };
+    for (number, wanted) in [(0, 0.1), (3000, 1.1), (57, 2.0), (3057, 3.0)] {
+        let found = place_of(number);
+        assert!(
+            (found - wanted).abs() < 0.02,
+            "frame {number} is at {found}, not {wanted}"
+        );
+    }
+    assert!(
+        pictures
+            .windows(2)
+            .all(|pair| pair[0].seconds < pair[1].seconds)
+    );
+}
+
+#[test]
+fn a_cut_between_frames_doesnt_show_anything_before_the_clip_starts() {
+    let video = large_clip();
+    // Partway through a frame, whose picture is what shows at that moment.
+    let plan = one_mix(vec![clip_span(&video, 0.0, 1.01, 1.0, Bus::All(0))]);
+
+    let (output, _) =
+        copy_with_new_sound("between-frames", vec![part(&video, 1.01, 2.01, 0.0)], &plan);
+
+    let pictures = pictures_of(&output);
+    assert_eq!(pictures[0].number, 30);
+    assert!(pictures[0].seconds.abs() < 0.001, "{}", pictures[0].seconds);
+    assert!(
+        (pictures[1].seconds - (1.0 / 30.0 - 0.01)).abs() < 0.005,
+        "the next one is exactly on time: {}",
+        pictures[1].seconds
+    );
+}
+
+#[test]
+fn asking_for_keyframe_cuts_still_cuts_exactly_when_the_sound_is_new() {
+    let video = large_clip();
+    // Between keyframes, so keyframe cuts would have kept extra picture and run long.
+    let plan = one_mix(vec![clip_span(&video, 0.0, 0.5, 1.0, Bus::All(0))]);
+
+    let (output, report) =
+        copy_with_new_sound("new-sound-exact", vec![part(&video, 0.5, 1.5, 0.0)], &plan);
+
+    assert_eq!(report.mode_used, CutMode::FrameExact);
+    let pictures = pictures_of(&output);
+    assert_eq!(pictures.len(), 30);
+    assert_eq!(pictures[0].number, 15, "the very frame the cut is on");
+    let sound = decode_audio(&output);
+    assert!((sound[0].seconds - 1.0).abs() < 0.1, "{}", sound[0].seconds);
+}
+
+#[test]
+fn sound_can_be_kept_on_separate_tracks_under_a_copied_picture() {
+    let video = large_clip();
+    let plan = SoundPlan {
+        spans: vec![
+            clip_span(&video, 0.0, 0.0, 2.0, Bus::ByTrack(0)),
+            song_span(0.0, 2.0, Bus::All(1)),
+        ],
+        tracks: vec![
+            SoundLabel {
+                title: Some("Game".to_owned()),
+                language: None,
+            },
+            SoundLabel {
+                title: Some("Audio 1".to_owned()),
+                language: None,
+            },
+        ],
+    };
+
+    let (output, report) =
+        copy_with_new_sound("new-sound-apart", vec![part(&video, 0.0, 2.0, 0.0)], &plan);
+
+    assert_eq!(report.audio_tracks, 2);
+    let sound = decode_audio(&output);
+    assert_eq!(sound.len(), 2);
+    assert_eq!(track_names(&output), ["Game", "Audio 1"]);
+    assert!(
+        level_between(&sound[0], 0.4, 0.8) < 0.01,
+        "only beeps on the first"
+    );
+    assert!(
+        level_between(&sound[1], 0.4, 0.8) > 0.05,
+        "the music is on the second"
+    );
+}
+
+#[test]
+fn with_everything_muted_a_copied_picture_has_no_sound_at_all() {
+    let video = large_clip();
+    let plan = SoundPlan::default();
+
+    let (output, report) =
+        copy_with_new_sound("new-sound-none", vec![part(&video, 0.0, 2.0, 0.0)], &plan);
+
+    assert_eq!(report.audio_tracks, 0);
+    assert!(decode_audio(&output).is_empty());
+    assert_eq!(pictures_of(&output).len(), 60);
+}
+
+#[test]
+fn volume_and_fades_reach_the_file() {
+    let video = large_clip();
+    let quiet = {
+        let mut span = song_span(0.0, 2.0, Bus::All(0));
+        span.sound.volume = FULL_VOLUME / 4;
+        span
+    };
+    let fading = {
+        let mut span = song_span(0.0, 2.0, Bus::All(0));
+        span.sound.fade_in = seconds(0.8).0;
+        span
+    };
+    let parts = || vec![part(&video, 0.0, 2.0, 0.0)];
+
+    let (full, _) = copy_with_new_sound(
+        "volume-full",
+        parts(),
+        &one_mix(vec![song_span(0.0, 2.0, Bus::All(0))]),
+    );
+    let (lower, _) = copy_with_new_sound("volume-low", parts(), &one_mix(vec![quiet]));
+    let (faded, _) = copy_with_new_sound("volume-fade", parts(), &one_mix(vec![fading]));
+
+    let full = decode_audio(&full);
+    let lower = decode_audio(&lower);
+    let faded = decode_audio(&faded);
+    let ratio = level_between(&lower[0], 0.5, 1.5) / level_between(&full[0], 0.5, 1.5);
+    assert!((ratio - 0.25).abs() < 0.03, "{ratio}");
+    assert!(level_between(&faded[0], 0.0, 0.1) < 0.05, "it starts quiet");
+    let rising = level_between(&faded[0], 0.1, 0.3);
+    let later = level_between(&faded[0], 1.2, 1.8);
+    assert!(rising < later * 0.7, "{rising} then {later}");
+}
+
+#[test]
+fn a_new_sound_export_leaves_no_working_files_behind() {
+    let video = large_clip();
+    let plan = one_mix(vec![clip_span(&video, 0.0, 0.0, 1.0, Bus::All(0))]);
+
+    let (output, _) =
+        copy_with_new_sound("new-sound-tidy", vec![part(&video, 0.0, 1.0, 0.0)], &plan);
+
+    let folder = output.parent().expect("it has a folder");
+    let name = output
+        .file_name()
+        .expect("it has a name")
+        .to_string_lossy()
+        .into_owned();
+    let left: Vec<_> = std::fs::read_dir(folder)
+        .expect("the folder can be read")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|found| found.starts_with(&format!(".{name}")))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+fn cancelling_a_new_sound_export_leaves_nothing_behind() {
+    let video = large_clip();
+    let job = ExportRequest {
+        output: output_path("new-sound-cancel", "mp4"),
+        parts: vec![part(&video, 0.0, 2.0, 0.0)],
+        mode: CutMode::Keyframe,
+    };
+    let plan = one_mix(vec![clip_span(&video, 0.0, 0.0, 2.0, Bus::All(0))]);
+
+    let result = export_with_new_sound(&job, &plan, &AtomicBool::new(true), &|_| {});
+
+    assert!(matches!(result, Err(MediaError::Cancelled)));
+    assert!(!job.output.exists());
+}
+
+#[test]
+fn a_clip_hidden_under_another_is_heard_in_a_layered_export() {
+    let job = LayeredRequest {
+        output: output_path("layer-mix", "mp4"),
+        stretches: vec![stretch(
+            0.0,
+            2.0,
+            vec![whole(&red_clip(), 1, 0.0, 2.0, top_left_quarter())],
+        )],
+        sound: one_mix(vec![
+            clip_span(&large_clip(), 0.0, 0.0, 2.0, Bus::All(0)),
+            song_span(0.0, 2.0, Bus::All(0)),
+        ]),
+        canvas: Some((320, 180)),
+        background: [0, 0, 0],
+    };
+
+    let report = run_layered(&job);
+
+    assert_eq!(report.audio_tracks, 1);
+    let sound = decode_audio(&job.output);
+    assert!(
+        level_between(&sound[0], 0.4, 0.8) > 0.05,
+        "the song is there"
+    );
+    assert!(
+        level_between(&sound[0], 0.0, 0.08) > level_between(&sound[0], 0.4, 0.8),
+        "and so is the beep on top of it"
+    );
+}
+
+#[test]
+fn music_that_outlasts_the_pictures_makes_the_video_longer_showing_the_background() {
+    let job = LayeredRequest {
+        output: output_path("layer-long-music", "mp4"),
+        stretches: vec![stretch(
+            0.0,
+            1.0,
+            vec![whole(&red_clip(), 1, 0.0, 1.0, Placement::default())],
+        )],
+        sound: one_mix(vec![song_span(0.0, 3.0, Bus::All(0))]),
+        canvas: Some((320, 180)),
+        background: [40, 200, 90],
+    };
+
+    let report = run_layered(&job);
+
+    assert_eq!(report.frames, 90, "three seconds at 30 fps");
+    let sound = decode_audio(&job.output);
+    assert!((sound[0].seconds - 3.0).abs() < 0.1, "{}", sound[0].seconds);
+    assert!(
+        level_between(&sound[0], 2.0, 2.9) > 0.05,
+        "the music plays to the end"
+    );
+    assert_eq!(pictures_of(&job.output).len(), 90);
+}
+
+#[test]
+fn a_project_with_only_sound_exports_as_its_background_with_the_sound() {
+    let job = LayeredRequest {
+        output: output_path("layer-only-sound", "mp4"),
+        stretches: Vec::new(),
+        sound: one_mix(vec![song_span(0.0, 2.0, Bus::All(0))]),
+        canvas: Some((320, 180)),
+        background: [40, 200, 90],
+    };
+
+    let report = run_layered(&job);
+
+    assert_eq!(report.frames, 60);
+    assert_eq!(report.black_frames, 60);
+    assert!(level_between(&decode_audio(&job.output)[0], 0.5, 1.5) > 0.05);
 }

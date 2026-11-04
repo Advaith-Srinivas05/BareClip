@@ -1,9 +1,11 @@
-//! Tracks of clips stacked over each other. Where clips overlap, the highest track's
-//! picture and sound win, so the whole stack plays as one sequence of clips.
+//! Tracks of clips stacked over each other. Where clips overlap, the highest track's picture wins,
+//! so the pictures play as one sequence of clips. Below those are rows that only hold sound.
+//! Everything on every row can be heard at once.
 
 use crate::{
     placement::{Placement, final_size},
     project::SavedClip,
+    sound::{ClipSound, RowSound},
     time::Ticks,
     timeline::{Clip, ClipEdge, ClipId, MediaId, TimeRange, Timeline},
 };
@@ -35,40 +37,160 @@ pub enum OrderMove {
 pub struct Stretch {
     pub start: Ticks,
     pub end: Ticks,
-    /// What to draw, lowest first. The last one's sound is the one that plays.
+    /// What to draw, lowest first.
     pub stack: Vec<Clip>,
 }
 
-/// The project's tracks, highest first. A track with no clips on it disappears.
+/// What kind of clip a row takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowKind {
+    Picture,
+    Sound,
+}
+
+/// A stretch of a file to hear. Joins that carry straight on through the same footage are already
+/// made into one, so nothing has to reopen the file or risk a click there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SoundSpan {
+    pub media: MediaId,
+    pub start: Ticks,
+    pub source: TimeRange,
+    pub sound: ClipSound,
+    /// Which sound row it is on, counted from the top. Picture rows have none.
+    pub sound_row: Option<usize>,
+}
+
+impl SoundSpan {
+    pub fn length(&self) -> Ticks {
+        self.source.duration()
+    }
+
+    pub fn end(&self) -> Ticks {
+        Ticks(self.start.0 + self.length().0)
+    }
+
+    fn carries_on_from(&self, earlier: &Self) -> bool {
+        self.media == earlier.media
+            && self.sound_row == earlier.sound_row
+            && self.start == earlier.end()
+            && self.source.start == earlier.source.end
+            && self.sound.volume == earlier.sound.volume
+            && self.sound.only_track == earlier.sound.only_track
+            && self.sound.fade_in == 0
+            && earlier.sound.fade_out == 0
+    }
+}
+
+/// The project's rows from the top down: pictures, highest first, and then sound. A row with no
+/// clips on it disappears.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Tracks {
     tracks: Vec<Timeline>,
+    /// How many of the rows, from the top, hold pictures.
+    picture_rows: usize,
+    /// One for each row, in the same order.
+    row_sounds: Vec<RowSound>,
     played: Timeline,
+    /// Where nothing plays on any row.
+    gaps: Vec<TimeRange>,
 }
 
 impl Tracks {
-    /// Puts saved tracks back. Clips of a video `media` doesn't recognise are left out.
+    /// Puts saved picture rows back. Clips of a video `media` doesn't recognise are left out.
     pub fn restore(saved: &[Vec<SavedClip>], media: impl Fn(u64) -> Option<MediaId>) -> Self {
-        let tracks = saved.iter().map(|track| {
-            Timeline::restore(track.iter().filter_map(|clip| {
-                Some((
-                    media(clip.media)?,
-                    Ticks(clip.start),
-                    clip.source(),
-                    clip.placement,
-                ))
-            }))
-        });
+        Self::restore_with_sound(saved, &[], &[], media)
+    }
+
+    /// Puts saved rows back, picture rows and then sound rows.
+    pub fn restore_with_sound(
+        pictures: &[Vec<SavedClip>],
+        sounds: &[Vec<SavedClip>],
+        row_sounds: &[RowSound],
+        media: impl Fn(u64) -> Option<MediaId>,
+    ) -> Self {
+        let tracks: Vec<Timeline> = pictures
+            .iter()
+            .chain(sounds)
+            .map(|track| {
+                Timeline::restore(track.iter().filter_map(|clip| {
+                    Some((
+                        media(clip.media)?,
+                        Ticks(clip.start),
+                        clip.source(),
+                        clip.placement,
+                        clip.sound,
+                    ))
+                }))
+            })
+            .collect();
+        let row_sounds = (0..tracks.len())
+            .map(|row| row_sounds.get(row).copied().unwrap_or_default())
+            .collect();
         let mut restored = Self {
-            tracks: tracks.collect(),
+            tracks,
+            picture_rows: pictures.len(),
+            row_sounds,
             played: Timeline::default(),
+            gaps: Vec::new(),
         };
         restored.refresh();
         restored
     }
 
+    /// Every row, from the top down.
     pub fn tracks(&self) -> &[Timeline] {
         &self.tracks
+    }
+
+    /// The rows that hold pictures, highest first.
+    pub fn picture_tracks(&self) -> &[Timeline] {
+        &self.tracks[..self.picture_rows]
+    }
+
+    /// The rows that only hold sound, from the top down.
+    pub fn audio_tracks(&self) -> &[Timeline] {
+        &self.tracks[self.picture_rows..]
+    }
+
+    /// How many rows, from the top, hold pictures.
+    pub fn picture_rows(&self) -> usize {
+        self.picture_rows
+    }
+
+    /// Where a drop on this target really lands for a clip of one kind or the other.
+    pub fn target_for(&self, target: TrackTarget, sound_only: bool) -> TrackTarget {
+        let kind = if sound_only {
+            RowKind::Sound
+        } else {
+            RowKind::Picture
+        };
+        self.fitted_target(target, kind)
+    }
+
+    /// Whether a row only holds sound.
+    pub fn is_sound_row(&self, row: usize) -> bool {
+        row >= self.picture_rows
+    }
+
+    /// How each row sounds, in the same order as `tracks`.
+    pub fn row_sounds(&self) -> &[RowSound] {
+        &self.row_sounds
+    }
+
+    /// Changes how a row sounds. Returns whether that changed anything.
+    pub fn set_row_sound(&mut self, row: usize, sound: RowSound) -> bool {
+        match self.row_sounds.get_mut(row) {
+            Some(current) if *current != sound => {
+                *current = sound;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether any row is on solo, which leaves the others out of what is heard and exported.
+    pub fn has_solo(&self) -> bool {
+        self.row_sounds.iter().any(|row| row.solo)
     }
 
     /// What actually plays and exports: the visible stretch of every clip, in order.
@@ -80,9 +202,13 @@ impl Tracks {
         self.tracks.is_empty()
     }
 
-    /// Where the last clip on any track ends.
+    /// Where the last clip on any row ends.
     pub fn duration(&self) -> Ticks {
-        self.played.duration()
+        self.tracks
+            .iter()
+            .map(Timeline::duration)
+            .max()
+            .unwrap_or(Ticks(0))
     }
 
     pub fn clip(&self, id: ClipId) -> Option<Clip> {
@@ -104,7 +230,7 @@ impl Tracks {
 
     /// The highest clip at a moment, which is the one on screen.
     pub fn topmost_at(&self, time: Ticks) -> Option<Clip> {
-        self.tracks.iter().find_map(|track| {
+        self.picture_tracks().iter().find_map(|track| {
             track
                 .clips()
                 .iter()
@@ -120,15 +246,40 @@ impl Tracks {
             .and_then(|id| self.clip(id))
             .filter(|clip| time >= clip.start && time < clip.end())
             .or_else(|| self.topmost_at(time))
+            .or_else(|| self.heard_only_at(time))
     }
 
-    /// Dead space: stretches where nothing plays on any track.
+    /// The highest clip on a sound row at a moment.
+    fn heard_only_at(&self, time: Ticks) -> Option<Clip> {
+        self.audio_tracks().iter().find_map(|track| {
+            track
+                .clips()
+                .iter()
+                .find(|clip| time >= clip.start && time < clip.end())
+                .copied()
+        })
+    }
+
+    /// Dead space: stretches where nothing plays on any row. Sound on its own isn't dead space.
     pub fn gaps(&self) -> Vec<TimeRange> {
-        self.played.gaps()
+        self.gaps.clone()
     }
 
     pub fn gap_at(&self, time: Ticks) -> Option<TimeRange> {
-        self.played.gap_at(time)
+        self.gaps
+            .iter()
+            .copied()
+            .find(|gap| time >= gap.start && time < gap.end)
+    }
+
+    /// Stretches with no picture, including those with sound. They show the background.
+    pub fn picture_gaps(&self) -> Vec<TimeRange> {
+        self.played.gaps()
+    }
+
+    /// Whether sound carries on past the last picture.
+    pub fn sound_outlasts_pictures(&self) -> bool {
+        self.duration() > self.played.duration()
     }
 
     /// Where something of a given length would end up if dropped on a target.
@@ -148,10 +299,10 @@ impl Tracks {
         }
     }
 
-    /// Adds a clip after everything else, on the top track, so nothing covers it and
+    /// Adds a clip after every other picture, on the top row, so nothing covers it and
     /// nothing has to move for it.
     pub fn push(&mut self, media: MediaId, source: TimeRange) -> ClipId {
-        let end = self.duration();
+        let end = self.played.duration();
         self.place(media, source, end, TrackTarget::Existing(0))
     }
 
@@ -163,17 +314,155 @@ impl Tracks {
         wanted: Ticks,
         target: TrackTarget,
     ) -> ClipId {
-        let index = self.make_room(target);
+        let index = self.make_room(target, RowKind::Picture);
         let id = self.tracks[index].place(media, source, wanted);
         self.refresh();
         id
     }
 
-    /// Moves a clip as close as it can get to a moment on a target.
+    /// Adds sound after whatever is on the top sound row.
+    pub fn push_sound(&mut self, media: MediaId, source: TimeRange) -> ClipId {
+        let end = self
+            .audio_tracks()
+            .first()
+            .map_or(Ticks(0), Timeline::duration);
+        self.place_sound(media, source, end, TrackTarget::Existing(self.picture_rows))
+    }
+
+    /// Adds sound as close as it can get to a moment on a target. It can only go on a sound row,
+    /// so a target among the pictures means the top sound row.
+    pub fn place_sound(
+        &mut self,
+        media: MediaId,
+        source: TimeRange,
+        wanted: Ticks,
+        target: TrackTarget,
+    ) -> ClipId {
+        let index = self.make_room(target, RowKind::Sound);
+        let id = self.tracks[index].place(media, source, wanted);
+        self.refresh();
+        id
+    }
+
+    /// Gives a clip's sound tracks clips of their own, one per track on sound rows, each in time
+    /// with the clip. The clip itself goes quiet. Returns the new clips.
+    pub fn detach_sound(&mut self, id: ClipId, sound_tracks: u32) -> Vec<ClipId> {
+        let Some(clip) = self.clip(id) else {
+            return Vec::new();
+        };
+        if self.track_of(id).is_none_or(|row| self.is_sound_row(row)) || sound_tracks == 0 {
+            return Vec::new();
+        }
+        let tracks = (0..sound_tracks).map(|track| {
+            let row = self.row_for_sound_at(clip.start, clip.end());
+            let target = row.map_or(TrackTarget::New(self.tracks.len()), TrackTarget::Existing);
+            let index = self.make_room(target, RowKind::Sound);
+            let detached = self.tracks[index].place(clip.media, clip.source, clip.start);
+            self.tracks[index].set_sound(
+                detached,
+                ClipSound {
+                    only_track: Some(track),
+                    ..clip.sound
+                },
+            );
+            detached
+        });
+        let detached: Vec<ClipId> = tracks.collect();
+        if let Some(row) = self.track_of(id) {
+            self.tracks[row].set_sound(
+                id,
+                ClipSound {
+                    muted: true,
+                    ..clip.sound
+                },
+            );
+        }
+        self.refresh();
+        detached
+    }
+
+    /// The highest sound row with nothing on it between two moments.
+    fn row_for_sound_at(&self, start: Ticks, end: Ticks) -> Option<usize> {
+        (self.picture_rows..self.tracks.len()).find(|row| {
+            self.tracks[*row]
+                .clips()
+                .iter()
+                .all(|other| other.end() <= start || other.start >= end)
+        })
+    }
+
+    /// Changes how a clip sounds. Returns whether that changed anything.
+    pub fn set_clip_sound(&mut self, id: ClipId, sound: ClipSound) -> bool {
+        let Some(track) = self.track_of(id) else {
+            return false;
+        };
+        let changed = self.tracks[track].set_sound(id, sound);
+        self.refresh();
+        changed
+    }
+
+    /// Everything that can be heard, in order of time. Muted clips and rows are left out, and so
+    /// is every row but those on solo when any is. `has_sound` says which files have any.
+    pub fn sound_spans(&self, has_sound: &dyn Fn(MediaId) -> bool) -> Vec<SoundSpan> {
+        let solo = self.has_solo();
+        let mut spans: Vec<SoundSpan> = Vec::new();
+        for (row, track) in self.tracks.iter().enumerate() {
+            let row_sound = self.row_sounds[row];
+            if row_sound.muted || (solo && !row_sound.solo) {
+                continue;
+            }
+            let sound_row = self.is_sound_row(row).then(|| row - self.picture_rows);
+            let mut last: Option<SoundSpan> = None;
+            for clip in track.clips() {
+                if clip.sound.muted || clip.sound.volume == 0 || !has_sound(clip.media) {
+                    continue;
+                }
+                let span = SoundSpan {
+                    media: clip.media,
+                    start: clip.start,
+                    source: clip.source,
+                    sound: clip.sound,
+                    sound_row,
+                };
+                match &mut last {
+                    Some(earlier) if span.carries_on_from(earlier) => {
+                        earlier.source.end = span.source.end;
+                        earlier.sound.fade_out = span.sound.fade_out;
+                    }
+                    _ => spans.extend(last.replace(span)),
+                }
+            }
+            spans.extend(last);
+        }
+        spans.sort_by_key(|span| span.start);
+        spans
+    }
+
+    /// Whether the sound is just what each video recorded, one at a time, with nothing to mix. Then
+    /// it can be copied, every track of it.
+    pub fn sound_is_plain(&self, has_sound: &dyn Fn(MediaId) -> bool) -> bool {
+        if !self.audio_tracks().is_empty() || self.row_sounds.iter().any(|row| !row.is_default()) {
+            return false;
+        }
+        let mut heard: Vec<&Clip> = self
+            .tracks
+            .iter()
+            .flat_map(Timeline::clips)
+            .filter(|clip| has_sound(clip.media))
+            .collect();
+        heard.sort_by_key(|clip| clip.start);
+        heard.iter().all(|clip| clip.sound.is_default())
+            && heard.windows(2).all(|pair| pair[0].end() <= pair[1].start)
+    }
+
+    /// Moves a clip as close as it can get to a moment on a target. A clip stays among its own
+    /// kind of row, so a target among the other kind means the closest row of its own.
     pub fn move_clip(&mut self, id: ClipId, wanted: Ticks, target: TrackTarget) {
         let Some(from) = self.track_of(id) else {
             return;
         };
+        let kind = self.kind_of_row(from);
+        let target = self.fitted_target(target, kind);
         if target == TrackTarget::Existing(from) {
             self.tracks[from].move_clip(id, wanted);
             self.refresh();
@@ -182,7 +471,7 @@ impl Tracks {
         let Some(clip) = self.tracks[from].clip(id) else {
             return;
         };
-        let index = self.make_room(target);
+        let index = self.make_room(target, kind);
         // A new track above pushes the clip's own track one further down.
         let from = if index <= from && matches!(target, TrackTarget::New(_)) {
             from + 1
@@ -194,9 +483,9 @@ impl Tracks {
         self.refresh();
     }
 
-    /// The tracks, by position, with a clip overlapping this one in time.
+    /// The picture rows, by position, with a clip overlapping this one in time.
     fn overlapping_tracks(&self, clip: Clip) -> Vec<usize> {
-        self.tracks
+        self.picture_tracks()
             .iter()
             .enumerate()
             .filter(|(_, track)| {
@@ -214,6 +503,9 @@ impl Tracks {
         let (Some(clip), Some(own)) = (self.clip(id), self.track_of(id)) else {
             return false;
         };
+        if self.is_sound_row(own) {
+            return false;
+        }
         let overlapping = self.overlapping_tracks(clip);
         match order {
             OrderMove::Forward | OrderMove::ToFront => overlapping.iter().any(|index| *index < own),
@@ -256,7 +548,7 @@ impl Tracks {
                     below.max()
                 };
                 let past = past.unwrap_or(own);
-                if past + 1 < self.tracks.len() && is_free(past + 1) {
+                if past + 1 < self.picture_rows && is_free(past + 1) {
                     TrackTarget::Existing(past + 1)
                 } else {
                     TrackTarget::New(past + 1)
@@ -287,7 +579,7 @@ impl Tracks {
         size_of: &dyn Fn(MediaId) -> Option<(u32, u32)>,
     ) -> Vec<Clip> {
         let mut stack = Vec::new();
-        for track in &self.tracks {
+        for track in self.picture_tracks() {
             let found = track
                 .clips()
                 .iter()
@@ -319,7 +611,7 @@ impl Tracks {
     ) -> Option<(Ticks, Vec<Clip>)> {
         let now = self.stack_at(time, canvas, size_of);
         let mut moments: Vec<Ticks> = self
-            .tracks
+            .picture_tracks()
             .iter()
             .flat_map(|track| track.clips())
             .flat_map(|clip| [clip.start, clip.end()])
@@ -340,7 +632,7 @@ impl Tracks {
         size_of: &dyn Fn(MediaId) -> Option<(u32, u32)>,
     ) -> Vec<Stretch> {
         let mut moments: Vec<Ticks> = self
-            .tracks
+            .picture_tracks()
             .iter()
             .flat_map(|track| track.clips())
             .flat_map(|clip| [clip.start, clip.end()])
@@ -378,7 +670,11 @@ impl Tracks {
             .collect();
         let mut canvas = final_size(&on_top)?;
         // It only ever grows, so it can't change more times than there are clips.
-        let clips: usize = self.tracks.iter().map(|track| track.clips().len()).sum();
+        let clips: usize = self
+            .picture_tracks()
+            .iter()
+            .map(|track| track.clips().len())
+            .sum();
         for _ in 0..=clips {
             let showing: Vec<(u32, u32)> = self
                 .stretches(canvas, size_of)
@@ -418,7 +714,7 @@ impl Tracks {
         canvas: (u32, u32),
         size_of: &dyn Fn(MediaId) -> Option<(u32, u32)>,
     ) -> bool {
-        if !self.gaps().is_empty() {
+        if !self.picture_gaps().is_empty() || self.sound_outlasts_pictures() {
             return true;
         }
         self.stretches(canvas, size_of).iter().any(|stretch| {
@@ -512,21 +808,88 @@ impl Tracks {
         !gaps.is_empty()
     }
 
-    /// The position of the track a target refers to, making a new one if it needs to.
-    fn make_room(&mut self, target: TrackTarget) -> usize {
-        let new_at = match target {
-            TrackTarget::Existing(index) if index < self.tracks.len() => return index,
-            TrackTarget::Existing(_) => self.tracks.len(),
-            TrackTarget::New(index) => index.min(self.tracks.len()),
+    fn kind_of_row(&self, row: usize) -> RowKind {
+        if self.is_sound_row(row) {
+            RowKind::Sound
+        } else {
+            RowKind::Picture
+        }
+    }
+
+    /// The nearest target to this one that a kind of clip can go on.
+    fn fitted_target(&self, target: TrackTarget, kind: RowKind) -> TrackTarget {
+        let rows = match kind {
+            RowKind::Picture => 0..self.picture_rows,
+            RowKind::Sound => self.picture_rows..self.tracks.len(),
+        };
+        match target {
+            TrackTarget::Existing(row) if rows.contains(&row) => target,
+            // The two kinds meet in the middle, so that is the nearest row of the other kind.
+            TrackTarget::Existing(_) if rows.is_empty() => TrackTarget::New(self.picture_rows),
+            TrackTarget::Existing(_) => TrackTarget::Existing(match kind {
+                RowKind::Picture => self.picture_rows - 1,
+                RowKind::Sound => self.picture_rows,
+            }),
+            TrackTarget::New(row) => TrackTarget::New(row.clamp(rows.start, rows.end)),
+        }
+    }
+
+    /// The position of the row a target refers to, making a new one if it needs to.
+    fn make_room(&mut self, target: TrackTarget, kind: RowKind) -> usize {
+        let new_at = match self.fitted_target(target, kind) {
+            TrackTarget::Existing(index) => return index,
+            TrackTarget::New(index) => index,
         };
         self.tracks.insert(new_at, Timeline::default());
+        self.row_sounds.insert(new_at, RowSound::default());
+        if kind == RowKind::Picture {
+            self.picture_rows += 1;
+        }
         new_at
     }
 
     fn refresh(&mut self) {
+        let mut row = 0;
+        let mut picture_rows = self.picture_rows;
+        let tracks = &self.tracks;
+        self.row_sounds.retain(|_| {
+            let keep = !tracks[row].is_empty();
+            if !keep && row < self.picture_rows {
+                picture_rows -= 1;
+            }
+            row += 1;
+            keep
+        });
+        self.picture_rows = picture_rows;
         self.tracks.retain(|track| !track.is_empty());
-        self.played = flatten(&self.tracks);
+        self.played = flatten(self.picture_tracks());
+        self.gaps = gaps_between(&self.tracks);
     }
+}
+
+/// The stretches with nothing on any of these rows, up to the last clip.
+fn gaps_between(rows: &[Timeline]) -> Vec<TimeRange> {
+    let mut filled: Vec<TimeRange> = rows
+        .iter()
+        .flat_map(Timeline::clips)
+        .map(|clip| TimeRange {
+            start: clip.start,
+            end: clip.end(),
+        })
+        .collect();
+    filled.sort_by_key(|range| range.start);
+    let mut gaps = Vec::new();
+    let mut reached = Ticks(0);
+    for range in filled {
+        if range.start > reached {
+            gaps.push(TimeRange {
+                start: reached,
+                end: range.start,
+            });
+        }
+        reached = reached.max(range.end);
+    }
+    gaps
 }
 
 /// What can be seen of a stack of tracks, highest first.
@@ -625,6 +988,454 @@ mod tests {
             scale: WHOLE / 2,
             ..Placement::default()
         }
+    }
+
+    const SONG: MediaId = MediaId(3);
+
+    fn with_sound(_: MediaId) -> bool {
+        true
+    }
+
+    fn sound_of(tracks: &Tracks, id: ClipId) -> ClipSound {
+        tracks.clip(id).expect("the clip is there").sound
+    }
+
+    #[test]
+    fn sound_goes_on_rows_of_its_own_below_the_pictures() {
+        let mut tracks = Tracks::default();
+        tracks.push(VIDEO, range(0, 100));
+        let song = tracks.push_sound(SONG, range(0, 50));
+
+        assert_eq!(tracks.picture_rows(), 1);
+        assert_eq!(tracks.tracks().len(), 2);
+        assert_eq!(tracks.track_of(song), Some(1));
+        assert!(tracks.is_sound_row(1));
+        assert!(!tracks.is_sound_row(0));
+    }
+
+    #[test]
+    fn a_new_video_goes_above_rows_of_sound_and_after_the_other_pictures() {
+        let mut tracks = Tracks::default();
+        let song = tracks.push_sound(SONG, range(0, 500));
+        let first = tracks.push(VIDEO, range(0, 100));
+        let second = tracks.push(VIDEO, range(0, 100));
+
+        assert_eq!(tracks.track_of(first), Some(0));
+        assert_eq!(tracks.track_of(song), Some(1));
+        assert_eq!(tracks.clip(second).map(|clip| clip.start), Some(Ticks(100)));
+    }
+
+    #[test]
+    fn more_sound_goes_after_what_is_on_the_top_sound_row() {
+        let mut tracks = Tracks::default();
+        tracks.push(VIDEO, range(0, 500));
+        tracks.push_sound(SONG, range(0, 50));
+        let next = tracks.push_sound(SONG, range(0, 50));
+
+        assert_eq!(tracks.clip(next).map(|clip| clip.start), Some(Ticks(50)));
+        assert_eq!(tracks.audio_tracks().len(), 1);
+    }
+
+    #[test]
+    fn a_video_cant_go_on_a_sound_row_nor_sound_on_a_picture_row() {
+        let mut tracks = Tracks::default();
+        let video = tracks.push(VIDEO, range(0, 100));
+        let song = tracks.push_sound(SONG, range(200, 300));
+
+        tracks.move_clip(video, Ticks(0), TrackTarget::Existing(1));
+        assert_eq!(tracks.track_of(video), Some(0));
+
+        tracks.move_clip(song, Ticks(200), TrackTarget::Existing(0));
+        assert_eq!(tracks.track_of(song), Some(1));
+
+        tracks.move_clip(video, Ticks(0), TrackTarget::New(2));
+        assert!(!tracks.is_sound_row(tracks.track_of(video).expect("it is there")));
+        tracks.move_clip(song, Ticks(200), TrackTarget::New(0));
+        assert!(tracks.is_sound_row(tracks.track_of(song).expect("it is there")));
+    }
+
+    #[test]
+    fn sound_on_a_picture_target_with_no_sound_rows_makes_one() {
+        let mut tracks = Tracks::default();
+        tracks.push(VIDEO, range(0, 100));
+
+        let song = tracks.place_sound(SONG, range(0, 50), Ticks(0), TrackTarget::Existing(0));
+
+        assert_eq!(tracks.track_of(song), Some(1));
+        assert_eq!(tracks.picture_rows(), 1);
+    }
+
+    #[test]
+    fn sound_never_changes_what_shows() {
+        let mut tracks = Tracks::default();
+        let video = tracks.push(VIDEO, range(0, 100));
+        tracks.push_sound(SONG, range(0, 50));
+
+        assert_eq!(tracks.played().clips().len(), 1);
+        assert_eq!(ids(&tracks.stack_at(Ticks(10), WIDE, &all_wide)), [video]);
+        assert!(!tracks.needs_layers(WIDE, &all_wide));
+    }
+
+    #[test]
+    fn music_that_outlasts_the_pictures_makes_the_project_longer() {
+        let mut tracks = Tracks::default();
+        tracks.push(VIDEO, range(0, 100));
+        assert!(!tracks.sound_outlasts_pictures());
+
+        tracks.push_sound(SONG, range(0, 300));
+
+        assert_eq!(tracks.duration(), Ticks(300));
+        assert!(tracks.sound_outlasts_pictures());
+        assert!(tracks.shows_canvas(WIDE, &all_wide));
+    }
+
+    #[test]
+    fn a_stretch_with_only_sound_isnt_dead_space_but_has_no_picture() {
+        let mut tracks = Tracks::default();
+        tracks.place(VIDEO, range(0, 100), Ticks(200), TrackTarget::New(0));
+        tracks.place_sound(SONG, range(0, 100), Ticks(50), TrackTarget::New(1));
+
+        assert_eq!(
+            tracks.gaps(),
+            [
+                TimeRange {
+                    start: Ticks(0),
+                    end: Ticks(50)
+                },
+                TimeRange {
+                    start: Ticks(150),
+                    end: Ticks(200)
+                }
+            ]
+        );
+        assert_eq!(tracks.picture_gaps().len(), 1);
+    }
+
+    #[test]
+    fn removing_dead_space_moves_sound_along_with_the_pictures() {
+        let mut tracks = Tracks::default();
+        let video = tracks.place(VIDEO, range(0, 100), Ticks(50), TrackTarget::New(0));
+        let song = tracks.place_sound(SONG, range(0, 100), Ticks(50), TrackTarget::New(1));
+
+        assert!(tracks.remove_all_gaps());
+
+        assert_eq!(tracks.clip(video).map(|clip| clip.start), Some(Ticks(0)));
+        assert_eq!(tracks.clip(song).map(|clip| clip.start), Some(Ticks(0)));
+    }
+
+    #[test]
+    fn row_sound_stays_with_its_row_as_others_come_and_go() {
+        let mut tracks = Tracks::default();
+        let lower = tracks.place(VIDEO, range(0, 100), Ticks(0), TrackTarget::New(0));
+        let song = tracks.push_sound(SONG, range(0, 100));
+        let muted = RowSound {
+            muted: true,
+            solo: false,
+        };
+        assert!(tracks.set_row_sound(1, muted));
+        assert!(!tracks.set_row_sound(1, muted));
+
+        let upper = tracks.place(OTHER, range(0, 100), Ticks(0), TrackTarget::New(0));
+        assert_eq!(tracks.row_sounds()[2], muted);
+
+        tracks.remove(upper);
+        assert_eq!(tracks.row_sounds(), [RowSound::default(), muted]);
+
+        tracks.remove(lower);
+        assert_eq!(tracks.picture_rows(), 0);
+        assert_eq!(tracks.row_sounds(), [muted]);
+        assert_eq!(tracks.track_of(song), Some(0));
+    }
+
+    #[test]
+    fn everything_on_every_row_is_heard_even_what_is_hidden() {
+        let (tracks, above, below) = two_tracks();
+
+        let spans = tracks.sound_spans(&with_sound);
+
+        assert_eq!(spans.len(), 2);
+        assert_eq!(tracks.played().clips().len(), 1);
+        assert_eq!(tracks.played().clips()[0].id, above);
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.media == tracks.clip(below).unwrap().media)
+        );
+    }
+
+    #[test]
+    fn a_muted_clip_or_row_isnt_heard() {
+        let (mut tracks, above, _) = two_tracks();
+        tracks.set_clip_sound(
+            above,
+            ClipSound {
+                muted: true,
+                ..ClipSound::default()
+            },
+        );
+        assert_eq!(tracks.sound_spans(&with_sound).len(), 1);
+
+        tracks.set_row_sound(
+            1,
+            RowSound {
+                muted: true,
+                solo: false,
+            },
+        );
+        assert!(tracks.sound_spans(&with_sound).is_empty());
+    }
+
+    #[test]
+    fn solo_leaves_out_every_other_row_and_mute_beats_solo() {
+        let (mut tracks, _, _) = two_tracks();
+        tracks.push_sound(SONG, range(0, 100));
+        tracks.set_row_sound(
+            2,
+            RowSound {
+                muted: false,
+                solo: true,
+            },
+        );
+        assert!(tracks.has_solo());
+
+        let spans = tracks.sound_spans(&with_sound);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].media, SONG);
+        assert_eq!(spans[0].sound_row, Some(0));
+
+        tracks.set_row_sound(
+            2,
+            RowSound {
+                muted: true,
+                solo: true,
+            },
+        );
+        assert!(tracks.sound_spans(&with_sound).is_empty());
+    }
+
+    #[test]
+    fn files_with_no_sound_arent_listed() {
+        let (tracks, _, _) = two_tracks();
+
+        let spans = tracks.sound_spans(&|media| media == VIDEO);
+
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].media, VIDEO);
+    }
+
+    #[test]
+    fn a_split_that_carries_straight_on_is_heard_as_one() {
+        let mut tracks = Tracks::default();
+        let first = tracks.push(VIDEO, range(0, 100));
+        tracks.split(first, Ticks(40));
+
+        let spans = tracks.sound_spans(&with_sound);
+
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].source, range(0, 100));
+    }
+
+    #[test]
+    fn clips_that_dont_carry_straight_on_stay_apart() {
+        let mut tracks = Tracks::default();
+        let first = tracks.push(VIDEO, range(0, 100));
+        let second = tracks.split(first, Ticks(40)).expect("it splits");
+
+        // Moved in time, leaving a hole.
+        tracks.move_clip(second, Ticks(60), TrackTarget::Existing(0));
+        assert_eq!(tracks.sound_spans(&with_sound).len(), 2);
+
+        // Back in place, but at another volume.
+        tracks.move_clip(second, Ticks(40), TrackTarget::Existing(0));
+        assert_eq!(tracks.sound_spans(&with_sound).len(), 1);
+        tracks.set_clip_sound(
+            second,
+            ClipSound {
+                volume: 500_000,
+                ..ClipSound::default()
+            },
+        );
+        assert_eq!(tracks.sound_spans(&with_sound).len(), 2);
+    }
+
+    #[test]
+    fn a_split_keeps_the_fades_at_the_ends_they_were_for_and_the_volume_on_both() {
+        let mut tracks = Tracks::default();
+        let first = tracks.push(VIDEO, range(0, 100));
+        let sound = ClipSound {
+            volume: 500_000,
+            fade_in: 10,
+            fade_out: 20,
+            ..ClipSound::default()
+        };
+        tracks.set_clip_sound(first, sound);
+
+        let second = tracks.split(first, Ticks(40)).expect("it splits");
+
+        let (one, two) = (sound_of(&tracks, first), sound_of(&tracks, second));
+        assert_eq!((one.volume, two.volume), (500_000, 500_000));
+        assert_eq!((one.fade_in, one.fade_out), (10, 0));
+        assert_eq!((two.fade_in, two.fade_out), (0, 20));
+    }
+
+    #[test]
+    fn a_duplicate_sounds_the_same_and_moving_keeps_it() {
+        let mut tracks = Tracks::default();
+        let first = tracks.push(VIDEO, range(0, 100));
+        let sound = ClipSound {
+            volume: 1_500_000,
+            ..ClipSound::default()
+        };
+        tracks.set_clip_sound(first, sound);
+
+        let copy = tracks.duplicate(first).expect("it copies");
+        tracks.move_clip(copy, Ticks(500), TrackTarget::New(0));
+
+        assert_eq!(sound_of(&tracks, copy), sound);
+    }
+
+    #[test]
+    fn detaching_gives_each_sound_track_a_row_in_time_with_the_clip_and_quiets_the_clip() {
+        let mut tracks = Tracks::default();
+        let video = tracks.place(VIDEO, range(30, 130), Ticks(50), TrackTarget::New(0));
+
+        let detached = tracks.detach_sound(video, 2);
+
+        assert_eq!(detached.len(), 2);
+        assert_eq!(tracks.audio_tracks().len(), 2);
+        for (track, id) in detached.iter().enumerate() {
+            let clip = tracks.clip(*id).expect("it is there");
+            assert_eq!(clip.start, Ticks(50));
+            assert_eq!(clip.source, range(30, 130));
+            assert_eq!(clip.sound.only_track, Some(track as u32));
+        }
+        assert!(sound_of(&tracks, video).muted);
+        assert_eq!(tracks.sound_spans(&with_sound).len(), 2);
+    }
+
+    #[test]
+    fn detached_sound_keeps_the_clips_volume_and_fades() {
+        let mut tracks = Tracks::default();
+        let video = tracks.push(VIDEO, range(0, 100));
+        tracks.set_clip_sound(
+            video,
+            ClipSound {
+                volume: 700_000,
+                fade_in: 5,
+                ..ClipSound::default()
+            },
+        );
+
+        let detached = tracks.detach_sound(video, 1)[0];
+
+        let sound = sound_of(&tracks, detached);
+        assert_eq!(
+            (sound.volume, sound.fade_in, sound.muted),
+            (700_000, 5, false)
+        );
+    }
+
+    #[test]
+    fn detached_sound_shares_a_sound_row_that_has_room_and_makes_one_that_doesnt() {
+        let mut tracks = Tracks::default();
+        let video = tracks.push(VIDEO, range(0, 100));
+        tracks.place_sound(SONG, range(0, 50), Ticks(500), TrackTarget::New(1));
+        assert_eq!(tracks.detach_sound(video, 1).len(), 1);
+        assert_eq!(tracks.audio_tracks().len(), 1);
+
+        let later = tracks.push(OTHER, range(0, 100));
+        tracks.move_clip(later, Ticks(0), TrackTarget::New(0));
+        tracks.detach_sound(later, 1);
+        assert_eq!(tracks.audio_tracks().len(), 2);
+    }
+
+    #[test]
+    fn sound_clips_and_silent_videos_have_nothing_to_detach() {
+        let mut tracks = Tracks::default();
+        let video = tracks.push(VIDEO, range(0, 100));
+        let song = tracks.push_sound(SONG, range(0, 100));
+
+        assert!(tracks.detach_sound(song, 2).is_empty());
+        assert!(tracks.detach_sound(video, 0).is_empty());
+        assert!(!sound_of(&tracks, video).muted);
+    }
+
+    #[test]
+    fn sound_rows_have_no_order_to_change() {
+        let mut tracks = Tracks::default();
+        let lower = tracks.push_sound(SONG, range(0, 100));
+        tracks.place_sound(SONG, range(0, 100), Ticks(0), TrackTarget::New(0));
+
+        assert!(!tracks.can_move_in_order(lower, OrderMove::ToFront));
+        assert!(!tracks.can_move_in_order(lower, OrderMove::ToBack));
+    }
+
+    #[test]
+    fn order_moves_stay_among_the_pictures() {
+        let (mut tracks, above, below) = two_tracks();
+        tracks.push_sound(SONG, range(0, 100));
+
+        assert!(tracks.move_in_order(above, OrderMove::ToBack));
+
+        assert!(!tracks.is_sound_row(tracks.track_of(above).expect("it is there")));
+        assert_eq!(tracks.track_of(below), Some(0));
+    }
+
+    #[test]
+    fn sound_is_plain_only_when_each_video_plays_as_recorded_one_at_a_time() {
+        let mut tracks = Tracks::default();
+        let first = tracks.push(VIDEO, range(0, 100));
+        tracks.push(OTHER, range(0, 100));
+        assert!(tracks.sound_is_plain(&with_sound));
+
+        tracks.set_clip_sound(
+            first,
+            ClipSound {
+                fade_out: 10,
+                ..ClipSound::default()
+            },
+        );
+        assert!(!tracks.sound_is_plain(&with_sound));
+    }
+
+    #[test]
+    fn sound_rows_overlaps_and_row_settings_all_stop_sound_being_plain() {
+        let (overlapping, _, _) = two_tracks();
+        assert!(!overlapping.sound_is_plain(&with_sound));
+
+        let mut with_music = Tracks::default();
+        with_music.push(VIDEO, range(0, 100));
+        with_music.push_sound(SONG, range(0, 100));
+        assert!(!with_music.sound_is_plain(&with_sound));
+
+        let mut muted_row = Tracks::default();
+        muted_row.push(VIDEO, range(0, 100));
+        muted_row.set_row_sound(
+            0,
+            RowSound {
+                muted: true,
+                solo: false,
+            },
+        );
+        assert!(!muted_row.sound_is_plain(&with_sound));
+    }
+
+    #[test]
+    fn a_silent_clip_overlapping_another_leaves_the_sound_plain() {
+        let (tracks, _, _) = two_tracks();
+
+        assert!(tracks.sound_is_plain(&|media| media == VIDEO));
+    }
+
+    #[test]
+    fn splitting_with_nothing_showing_finds_the_sound_on_its_own() {
+        let mut tracks = Tracks::default();
+        let song = tracks.push_sound(SONG, range(0, 100));
+
+        assert_eq!(
+            tracks.clip_to_split(None, Ticks(50)).map(|clip| clip.id),
+            Some(song)
+        );
     }
 
     /// One clip on a track above another, both from 0 to 100.

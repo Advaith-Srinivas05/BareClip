@@ -6,6 +6,7 @@ pub mod picture;
 pub mod placement;
 pub mod playback;
 pub mod project;
+pub mod sound;
 pub mod splice;
 pub mod time;
 pub mod timeline;

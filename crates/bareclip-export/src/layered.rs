@@ -1,5 +1,5 @@
 //! The full export for projects where clips are resized, moved or see-through, or show together.
-//! Pictures come from every clip that shows, and sound from whichever one is on top.
+//! Pictures come from every clip that shows, and sound from everything that can be heard.
 
 use std::{
     collections::{HashMap, hash_map::Entry},
@@ -15,14 +15,15 @@ use bareclip_core::{
     time::Ticks,
     timeline::TimeRange,
 };
-use bareclip_media::{ExportPart, MediaError, MediaInfo, probe, same_file};
+use bareclip_media::{MediaError, MediaInfo, probe, same_file};
 use bareclip_render::{Compositor, Layer, needs_compositor};
 
 use crate::{
     FullPlan, FullReport,
-    full::{PictureFeed, Span, frame_count, frame_time, pick_pictures_before, span_at, spans_of},
+    full::{PictureFeed, Span, frame_count, frame_time, pick_pictures_before},
+    mixed::{SoundFeed, SoundPlan},
     sink::VideoSink,
-    sound::{ClipSound, SoundTracks, sound_frame_at},
+    sound::sound_frame_at,
 };
 
 /// One clip showing during a stretch of the finished video.
@@ -56,20 +57,23 @@ pub struct LayeredStretch {
 pub struct LayeredRequest {
     pub output: PathBuf,
     pub stretches: Vec<LayeredStretch>,
-    /// What the sound comes from: the top clip at each moment, as a fast export would see it.
-    pub sound: Vec<ExportPart>,
+    /// What can be heard, which can carry on past the last picture.
+    pub sound: SoundPlan,
     /// The finished video's size, or the largest video's if the project hasn't chosen one.
     pub canvas: Option<(u32, u32)>,
     /// What shows wherever no picture covers the canvas.
     pub background: Colour,
 }
 
-/// Which stretch a moment falls in. Rounding can put the very last frame just past the end, and
-/// that one still belongs to the last stretch.
-fn stretch_at(stretches: &[LayeredStretch], time: Ticks) -> Option<usize> {
+/// Which stretch a moment falls in. Rounding can put the very last frame just past the end by
+/// up to `slack`, and that one still belongs to the last stretch.
+fn stretch_at(stretches: &[LayeredStretch], time: Ticks, slack: Ticks) -> Option<usize> {
     match stretches.iter().position(|stretch| time < stretch.end) {
         Some(index) => (time >= stretches[index].start).then_some(index),
-        None => stretches.len().checked_sub(1),
+        None => {
+            let last = stretches.len().checked_sub(1)?;
+            (time.0 - stretches[last].end.0 < slack.0).then_some(last)
+        }
     }
 }
 
@@ -115,13 +119,15 @@ pub fn export_layered(
     bareclip_media::init()?;
     let started = Instant::now();
     let stretches = &request.stretches;
-    if stretches.is_empty() {
+    if stretches.is_empty() && request.sound.spans.is_empty() {
         return Err(MediaError::NothingToExport);
     }
     let writes_over_a_source = stretches
         .iter()
         .flat_map(|stretch| &stretch.stack)
-        .any(|clip| same_file(&clip.input, &request.output));
+        .map(|clip| &clip.input)
+        .chain(request.sound.spans.iter().map(|span| &span.path))
+        .any(|input| same_file(input, &request.output));
     if writes_over_a_source {
         return Err(MediaError::SameInputAndOutput);
     }
@@ -131,14 +137,18 @@ pub fn export_layered(
         .iter()
         .map(|info| (info.path.clone(), (info.video.width, info.video.height)))
         .collect();
-    let plan = match request.canvas {
+    let mut plan = match request.canvas {
         Some(canvas) => FullPlan::on_canvas(&videos, canvas),
         None => FullPlan::for_videos(&videos),
     };
+    plan.settings.sound_tracks = request.sound.tracks.clone();
     let settings = &plan.settings;
     let canvas = (settings.width, settings.height);
     let rate = settings.frame_rate;
-    let length = stretches.last().map_or(Ticks(0), |stretch| stretch.end);
+    let length = stretches
+        .last()
+        .map_or(Ticks(0), |stretch| stretch.end)
+        .max(request.sound.end());
     let frames = frame_count(length, rate);
     if frames == 0 {
         return Err(MediaError::NothingToExport);
@@ -148,12 +158,9 @@ pub fn export_layered(
     let encoder = writer.encoder_name().to_owned();
     let mut compositor: Option<Compositor> = None;
     let black = BlackPicture::new(settings.width, settings.height);
-    let mut sound_tracks = SoundTracks::new(settings.sound_tracks.len());
-    let sound_spans = spans_of(&request.sound);
+    let mut sound = SoundFeed::new(&request.sound);
 
     let mut feeds: HashMap<u64, PictureFeed> = HashMap::new();
-    let mut sound: Option<ClipSound> = None;
-    let mut current_sound = None;
     let mut current_stretch = None;
     // Whether the last frame written was dead space, or else came from the current stretch.
     let mut wrote_black = false;
@@ -180,27 +187,7 @@ pub fn export_layered(
         }
         let time = frame_time(number, rate);
 
-        let sound_index = span_at(&sound_spans, time);
-        if sound_index != current_sound {
-            if let Some(mut finished) = sound.take() {
-                finished.finish(&mut sound_tracks, &mut writer)?;
-            }
-            if let Some(index) = sound_index
-                && sound_tracks.count() > 0
-            {
-                let span = sound_spans[index];
-                sound_tracks.pad_to(sound_frame_at(span.start), &mut writer)?;
-                sound = Some(ClipSound::open(
-                    &request.sound[index].input,
-                    span.source.start,
-                    span.start,
-                    span.end,
-                )?);
-            }
-            current_sound = sound_index;
-        }
-
-        let stretch_index = stretch_at(stretches, time);
+        let stretch_index = stretch_at(stretches, time, frame_time(1, rate));
         let mut stack_changed = stretch_index != current_stretch;
         if stack_changed {
             // A clip that carries on keeps its decoder, so it doesn't have to find its place again.
@@ -286,20 +273,15 @@ pub fn export_layered(
         }
         wrote_anything = true;
 
-        if let Some(sound) = sound.as_mut() {
-            let lead = Ticks(time.0 + Ticks::from_seconds(crate::full::SOUND_LEAD_SECONDS).0);
-            sound.write_until(sound_frame_at(lead), &mut sound_tracks, &mut writer)?;
-        }
+        let lead = Ticks(time.0 + Ticks::from_seconds(crate::full::SOUND_LEAD_SECONDS).0);
+        sound.write_until(sound_frame_at(lead.min(length)), &mut writer)?;
         if number.is_multiple_of(crate::full::PROGRESS_EVERY) {
             progress(number as f32 / frames as f32);
         }
     }
 
-    if let Some(mut finished) = sound.take() {
-        finished.finish(&mut sound_tracks, &mut writer)?;
-    }
     let video_length = frame_time(frames, rate);
-    sound_tracks.pad_to(sound_frame_at(video_length), &mut writer)?;
+    sound.write_until(sound_frame_at(video_length), &mut writer)?;
     writer.finish()?;
     progress(1.0);
     report.elapsed = started.elapsed();
@@ -326,15 +308,27 @@ mod tests {
     fn a_moment_is_in_its_stretch_or_in_dead_space() {
         let stretches = [stretch(1.0, 2.0), stretch(3.0, 4.0)];
 
-        assert_eq!(stretch_at(&stretches, seconds(0.5)), None);
-        assert_eq!(stretch_at(&stretches, seconds(1.0)), Some(0));
-        assert_eq!(stretch_at(&stretches, seconds(2.0)), None);
-        assert_eq!(stretch_at(&stretches, seconds(3.5)), Some(1));
+        assert_eq!(stretch_at(&stretches, seconds(0.5), seconds(0.1)), None);
+        assert_eq!(stretch_at(&stretches, seconds(1.0), seconds(0.1)), Some(0));
+        assert_eq!(stretch_at(&stretches, seconds(2.0), seconds(0.1)), None);
+        assert_eq!(stretch_at(&stretches, seconds(3.5), seconds(0.1)), Some(1));
     }
 
     #[test]
     fn a_frame_rounded_past_the_end_stays_with_the_last_stretch() {
-        assert_eq!(stretch_at(&[stretch(0.0, 1.0)], seconds(1.01)), Some(0));
+        assert_eq!(
+            stretch_at(&[stretch(0.0, 1.0)], seconds(1.01), seconds(0.1)),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn a_moment_well_past_the_last_stretch_shows_nothing_because_only_sound_goes_on_there() {
+        assert_eq!(
+            stretch_at(&[stretch(0.0, 1.0)], seconds(2.0), seconds(0.1)),
+            None
+        );
+        assert_eq!(stretch_at(&[], seconds(2.0), seconds(0.1)), None);
     }
 
     #[test]
@@ -358,7 +352,7 @@ mod tests {
         let request = LayeredRequest {
             output: PathBuf::from("out.mp4"),
             stretches: Vec::new(),
-            sound: Vec::new(),
+            sound: SoundPlan::default(),
             canvas: None,
             background: BLACK,
         };

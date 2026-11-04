@@ -1,26 +1,22 @@
-//! Plays a video using a thread each for picture and sound, with the picture
-//! following the sound card's clock.
+//! Plays a video's pictures on a thread of its own. Sound comes from the timeline's mix, and the
+//! picture follows its clock.
 
 use std::{
     collections::VecDeque,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError},
+        mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
-use bareclip_audio::{AudioOutput, OutputState, Producer, TrackMixer};
 use bareclip_core::{
-    playback::{FrameQueue, advance_from_audio, advance_from_time},
+    playback::{FrameQueue, advance_from_time},
     time::{Ticks, TimeBase},
 };
-use bareclip_media::{
-    AudioPreview, AudioStep, DecodeStep, MediaError, MediaInfo, PreviewFrame, VideoPreview,
-};
+use bareclip_media::{DecodeStep, MediaInfo, PreviewFrame, VideoPreview};
 
 /// Preview pictures are reduced to this size, which is enough for the stage and
 /// keeps each frame cheap to convert and upload.
@@ -29,11 +25,6 @@ pub const PREVIEW_HEIGHT: u32 = 720;
 /// Decoded frames waiting between the decoder and the screen.
 const FRAME_CHANNEL: usize = 6;
 const QUEUE_LIMIT: usize = 6;
-/// How long playback waits for sound before starting without it.
-const START_TIMEOUT: Duration = Duration::from_millis(400);
-/// A chunk of mixed sound, in audio frames.
-const MIX_FRAMES: usize = 1024;
-const FLUSH_TIMEOUT: Duration = Duration::from_millis(200);
 
 enum VideoCommand {
     Seek { pts: i64, generation: u64 },
@@ -189,180 +180,6 @@ fn video_worker(
     }
 }
 
-enum AudioCommand {
-    Seek(f64),
-    Quit,
-}
-
-struct AudioWorker {
-    audio: AudioPreview,
-    mixer: TrackMixer,
-    producer: Producer<f32>,
-    state: Arc<OutputState>,
-    ready: Arc<AtomicBool>,
-    sample_rate: u32,
-    mixed: Vec<f32>,
-    buffered_frames: usize,
-    decoded_to_end: bool,
-    active: bool,
-}
-
-impl AudioWorker {
-    fn seek(&mut self, seconds: f64) -> Result<(), MediaError> {
-        self.state.request_flush();
-        let started = Instant::now();
-        while self.state.is_flushing() && started.elapsed() < FLUSH_TIMEOUT {
-            thread::sleep(Duration::from_millis(1));
-        }
-        self.audio.seek(seconds)?;
-        let position = (seconds * f64::from(self.sample_rate)).round() as i64;
-        self.mixer = TrackMixer::new(self.audio.track_count(), position);
-        self.mixed.clear();
-        self.buffered_frames = 0;
-        self.decoded_to_end = false;
-        self.active = true;
-        Ok(())
-    }
-
-    /// Does one small piece of work. Returns false when there is nothing to do yet.
-    fn step(&mut self) -> bool {
-        if !self.mixed.is_empty() {
-            let room = self.producer.slots() / 2 * 2;
-            if room == 0 {
-                return false;
-            }
-            let count = room.min(self.mixed.len());
-            for sample in self.mixed.drain(..count) {
-                let _ = self.producer.push(sample);
-            }
-            self.buffered_frames += count / 2;
-            // A tenth of a second of sound is enough to start without a stutter.
-            if self.buffered_frames >= self.sample_rate as usize / 10 {
-                self.ready.store(true, Ordering::Release);
-            }
-            return true;
-        }
-
-        if self.mixer.available() > 0 {
-            self.mixer.pull(MIX_FRAMES, &mut self.mixed);
-            return true;
-        }
-
-        if self.mixer.is_finished() {
-            self.ready.store(true, Ordering::Release);
-            return false;
-        }
-
-        if self.decoded_to_end {
-            for track in 0..self.audio.track_count() {
-                self.mixer.finish(track);
-            }
-            return true;
-        }
-
-        match self.audio.next_step() {
-            Ok(AudioStep::Chunk(chunk)) => {
-                self.mixer
-                    .push(chunk.track, chunk.start_frame, &chunk.samples);
-            }
-            Ok(AudioStep::Pending) => {}
-            Ok(AudioStep::End) | Err(_) => self.decoded_to_end = true,
-        }
-        true
-    }
-}
-
-fn audio_worker(mut worker: AudioWorker, commands: &Receiver<AudioCommand>) {
-    loop {
-        let command = if worker.active {
-            match commands.try_recv() {
-                Ok(command) => Some(command),
-                Err(mpsc::TryRecvError::Empty) => None,
-                Err(mpsc::TryRecvError::Disconnected) => return,
-            }
-        } else {
-            match commands.recv() {
-                Ok(command) => Some(command),
-                Err(_) => return,
-            }
-        };
-
-        // Only the newest seek matters.
-        let mut newest = command;
-        while let Ok(next) = commands.try_recv() {
-            newest = Some(next);
-        }
-        match newest {
-            Some(AudioCommand::Quit) => return,
-            Some(AudioCommand::Seek(seconds)) if worker.seek(seconds).is_err() => {
-                worker.decoded_to_end = true;
-            }
-            _ => {}
-        }
-
-        if worker.active && !worker.step() {
-            match commands.recv_timeout(Duration::from_millis(5)) {
-                Ok(AudioCommand::Quit) | Err(RecvTimeoutError::Disconnected) => return,
-                Ok(AudioCommand::Seek(seconds)) => {
-                    if worker.seek(seconds).is_err() {
-                        worker.decoded_to_end = true;
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-            }
-        }
-    }
-}
-
-struct AudioLink {
-    // Keeps the sound card connection open.
-    _output: AudioOutput,
-    state: Arc<OutputState>,
-    commands: Sender<AudioCommand>,
-    ready: Arc<AtomicBool>,
-    sample_rate: u32,
-    worker: Option<JoinHandle<()>>,
-}
-
-fn connect_audio(path: PathBuf) -> Option<AudioLink> {
-    let mut output = AudioOutput::open().ok()?;
-    let sample_rate = output.sample_rate();
-    let audio = AudioPreview::open(&path, sample_rate).ok()?;
-    if audio.track_count() == 0 {
-        return None;
-    }
-    let producer = output.take_producer()?;
-    let state = output.state();
-    let ready = Arc::new(AtomicBool::new(false));
-    let (commands, receiver) = mpsc::channel();
-
-    let worker_state = AudioWorker {
-        mixer: TrackMixer::new(audio.track_count(), 0),
-        audio,
-        producer,
-        state: state.clone(),
-        ready: ready.clone(),
-        sample_rate,
-        mixed: Vec::new(),
-        buffered_frames: 0,
-        decoded_to_end: false,
-        active: false,
-    };
-    let worker = thread::Builder::new()
-        .name("bareclip-audio".to_owned())
-        .spawn(move || audio_worker(worker_state, &receiver))
-        .ok()?;
-
-    Some(AudioLink {
-        _output: output,
-        state,
-        commands,
-        ready,
-        sample_rate,
-        worker: Some(worker),
-    })
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PlayState {
     Paused,
@@ -377,7 +194,6 @@ pub struct Player {
     commands: Sender<VideoCommand>,
     events: Receiver<VideoEvent>,
     worker: Option<JoinHandle<()>>,
-    audio: Option<AudioLink>,
     queue: FrameQueue<PreviewFrame>,
     time_base: TimeBase,
     duration: Ticks,
@@ -389,26 +205,19 @@ pub struct Player {
     state: PlayState,
     exact_frame_ready: bool,
     video_ended: bool,
-    start_requested: Instant,
-    silent_clock_start: Option<Instant>,
+    clock_start: Option<Instant>,
     error: Option<String>,
-    wanted_sound: bool,
 }
 
 impl Player {
-    /// Opens a video for playback. `use_sound` can be off where no sound is wanted.
+    /// Opens a video for playback.
     #[cfg(test)]
-    pub fn open(info: &MediaInfo, use_sound: bool, notify: Notify) -> Result<Self, String> {
-        Self::open_as(info, use_sound, false, notify)
+    pub fn open(info: &MediaInfo, notify: Notify) -> Result<Self, String> {
+        Self::open_as(info, false, notify)
     }
 
     /// Opens a video, with `planes` asking for pictures the GPU compositor can draw.
-    pub fn open_as(
-        info: &MediaInfo,
-        use_sound: bool,
-        planes: bool,
-        notify: Notify,
-    ) -> Result<Self, String> {
+    pub fn open_as(info: &MediaInfo, planes: bool, notify: Notify) -> Result<Self, String> {
         let path = info.path.clone();
         let (commands, command_receiver) = mpsc::channel();
         let (event_sender, events) = mpsc::sync_channel(FRAME_CHANNEL);
@@ -426,18 +235,10 @@ impl Player {
             })
             .map_err(|error| format!("The video decoder could not start: {error}"))?;
 
-        let wanted_sound = use_sound && !info.audio.is_empty();
-        let audio = if wanted_sound {
-            connect_audio(path)
-        } else {
-            None
-        };
-
         Ok(Self {
             commands,
             events,
             worker: Some(worker),
-            audio,
             queue: FrameQueue::default(),
             time_base: info.video.time_base,
             duration: info.duration,
@@ -447,10 +248,8 @@ impl Player {
             state: PlayState::Paused,
             exact_frame_ready: false,
             video_ended: false,
-            start_requested: Instant::now(),
-            silent_clock_start: None,
+            clock_start: None,
             error: None,
-            wanted_sound,
         })
     }
 
@@ -458,14 +257,9 @@ impl Player {
         self.state != PlayState::Paused
     }
 
-    /// Whether sound is going to the sound card.
-    pub fn has_sound(&self) -> bool {
-        self.audio.is_some()
-    }
-
-    /// Whether this video has sound that should be playing, were it possible.
-    pub fn expects_sound(&self) -> bool {
-        self.wanted_sound
+    /// Whether the picture for where it was last told to go has arrived.
+    pub fn has_first_picture(&self) -> bool {
+        self.exact_frame_ready
     }
 
     /// The most recent problem, once. Playback continues as far as it can.
@@ -478,12 +272,9 @@ impl Player {
         if self.state != PlayState::Playing {
             return self.base;
         }
-        let advance = match &self.audio {
-            Some(audio) => advance_from_audio(audio.state.played_frames(), audio.sample_rate),
-            None => self
-                .silent_clock_start
-                .map_or(Ticks(0), |start| advance_from_time(start.elapsed())),
-        };
+        let advance = self
+            .clock_start
+            .map_or(Ticks(0), |start| advance_from_time(start.elapsed()));
         Ticks((self.base.0 + advance.0).min(self.duration.0))
     }
 
@@ -496,16 +287,6 @@ impl Player {
             pts: self.base.to_pts(self.time_base),
             generation: self.generation,
         });
-    }
-
-    fn start_sound_from_base(&mut self) {
-        if let Some(audio) = &self.audio {
-            audio.state.set_paused(true);
-            audio.ready.store(false, Ordering::Release);
-            let _ = audio
-                .commands
-                .send(AudioCommand::Seek(self.base.as_seconds()));
-        }
     }
 
     /// Ignores pictures still on their way, because the preview has been showing another video
@@ -525,9 +306,7 @@ impl Player {
         self.send_seek();
         if self.is_playing() {
             self.state = PlayState::Starting;
-            self.start_requested = Instant::now();
-            self.silent_clock_start = None;
-            self.start_sound_from_base();
+            self.clock_start = None;
         }
     }
 
@@ -539,28 +318,24 @@ impl Player {
             self.base = Ticks(0);
         }
         self.state = PlayState::Starting;
-        self.start_requested = Instant::now();
-        self.silent_clock_start = None;
+        self.clock_start = None;
         self.send_seek();
         let _ = self.commands.send(VideoCommand::Play);
-        self.start_sound_from_base();
     }
 
     /// Gets ready to play from a time without starting, so that `begin` can be instant.
     pub fn prepare(&mut self, time: Ticks) {
         self.base = time.clamp(Ticks(0), self.duration);
         self.state = PlayState::Prepared;
-        self.silent_clock_start = None;
+        self.clock_start = None;
         self.send_seek();
         let _ = self.commands.send(VideoCommand::Play);
-        self.start_sound_from_base();
     }
 
     /// Starts playing from where `prepare` got ready.
     pub fn begin(&mut self) {
         if self.state == PlayState::Prepared {
             self.state = PlayState::Starting;
-            self.start_requested = Instant::now();
         }
     }
 
@@ -572,7 +347,7 @@ impl Player {
     /// Whether a prepared player could start this instant.
     #[cfg(test)]
     pub fn is_ready_to_begin(&self) -> bool {
-        self.state == PlayState::Prepared && self.exact_frame_ready && self.sound_is_ready()
+        self.state == PlayState::Prepared && self.exact_frame_ready
     }
 
     pub fn pause(&mut self) {
@@ -583,15 +358,6 @@ impl Player {
         self.state = PlayState::Paused;
         self.queue.clear();
         let _ = self.commands.send(VideoCommand::Pause);
-        if let Some(audio) = &self.audio {
-            audio.state.set_paused(true);
-        }
-    }
-
-    fn sound_is_ready(&self) -> bool {
-        self.audio
-            .as_ref()
-            .is_none_or(|audio| audio.ready.load(Ordering::Acquire))
     }
 
     /// Takes in decoded frames and returns the picture to show now, if it changed.
@@ -600,7 +366,7 @@ impl Player {
     }
 
     /// The same, for a player following another clock, which has reached `now` in this video.
-    /// It has no sound to wait for, and it doesn't stop by itself.
+    /// It doesn't stop by itself.
     pub fn update_following(&mut self, now: Ticks) -> Option<PreviewFrame> {
         self.update_on(Some(now))
     }
@@ -639,17 +405,9 @@ impl Player {
             }
         }
 
-        if self.state == PlayState::Starting
-            && self.exact_frame_ready
-            && (following.is_some()
-                || self.sound_is_ready()
-                || self.start_requested.elapsed() >= START_TIMEOUT)
-        {
+        if self.state == PlayState::Starting && self.exact_frame_ready {
             self.state = PlayState::Playing;
-            match &self.audio {
-                Some(audio) => audio.state.set_paused(false),
-                None => self.silent_clock_start = Some(Instant::now()),
-            }
+            self.clock_start = Some(Instant::now());
         }
 
         if self.state != PlayState::Playing {
@@ -663,7 +421,7 @@ impl Player {
         let now = self.position();
         let shown = self.queue.take_due(now);
         let ran_out = self.video_ended && self.queue.is_empty();
-        if now >= self.duration || (ran_out && shown.is_none() && self.audio.is_none()) {
+        if now >= self.duration || (ran_out && shown.is_none()) {
             self.base = now;
             self.pause();
         }
@@ -674,12 +432,6 @@ impl Player {
 impl Drop for Player {
     fn drop(&mut self) {
         let _ = self.commands.send(VideoCommand::Quit);
-        if let Some(audio) = &mut self.audio {
-            let _ = audio.commands.send(AudioCommand::Quit);
-            if let Some(worker) = audio.worker.take() {
-                let _ = worker.join();
-            }
-        }
         // The decoder may be waiting to hand over a frame, so clear the way first.
         while self.events.try_recv().is_ok() {}
         if let Some(worker) = self.worker.take() {
@@ -691,14 +443,14 @@ impl Drop for Player {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{process::Command, sync::OnceLock};
+    use std::{path::PathBuf, process::Command, sync::OnceLock};
 
     use bareclip_media::probe;
 
     #[test]
     fn a_prepared_player_fills_up_without_starting_and_begins_straight_away() {
         let info = probe(test_clip()).expect("the clip can be read");
-        let mut player = Player::open(&info, false, Arc::new(|| {})).expect("it opens");
+        let mut player = Player::open(&info, Arc::new(|| {})).expect("it opens");
 
         player.prepare(Ticks::from_seconds(1.0));
         let started = Instant::now();
@@ -735,20 +487,6 @@ mod tests {
             began.elapsed()
         );
         assert!(player.position() >= Ticks::from_seconds(1.0));
-    }
-
-    /// How long getting a clip ready holds up the interface. Nothing is ever heard, because it
-    /// never starts. `cargo test --release -p bareclip-app opening_with_sound -- --ignored --nocapture`
-    #[test]
-    #[ignore = "uses the real sound output and is only meaningful in a release build"]
-    fn opening_with_sound_is_quick_enough_for_the_interface() {
-        let info = probe(test_clip()).expect("the clip can be read");
-        for _ in 0..5 {
-            let started = Instant::now();
-            let mut player = Player::open(&info, true, Arc::new(|| {})).expect("it opens");
-            player.prepare(Ticks::from_seconds(1.0));
-            println!("opening and preparing took {:?}", started.elapsed());
-        }
     }
 
     /// A clip whose frames show their own number as blocks, with a little sound.
@@ -799,7 +537,7 @@ mod tests {
 
     fn silent_player() -> Player {
         let info = probe(test_clip()).expect("the clip can be read");
-        Player::open(&info, false, Arc::new(|| {})).expect("the player opens")
+        Player::open(&info, Arc::new(|| {})).expect("the player opens")
     }
 
     fn number_of(frame: &PreviewFrame) -> u32 {
@@ -963,7 +701,7 @@ mod tests {
     fn a_missing_file_reports_an_error() {
         let mut info = probe(test_clip()).expect("the clip can be read");
         info.path = PathBuf::from("this-file-does-not-exist.mp4");
-        let mut player = Player::open(&info, false, Arc::new(|| {})).expect("the player opens");
+        let mut player = Player::open(&info, Arc::new(|| {})).expect("the player opens");
 
         let started = Instant::now();
         while started.elapsed() < Duration::from_secs(5) {

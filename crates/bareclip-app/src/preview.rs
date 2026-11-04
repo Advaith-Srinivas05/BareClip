@@ -1,8 +1,12 @@
-//! Plays the timeline by following its clips, using one player per source video.
+//! Plays the timeline. Its sound is one mix of everything that can be heard, and how much of that
+//! the sound card has played is the clock. Each video's pictures follow that clock, so the sound
+//! doesn't stop or restart when one clip gives way to the next, even in dead space.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use bareclip_audio::{MixSpan, SoundEngine};
 use bareclip_core::{
+    playback::advance_from_time,
     time::Ticks,
     timeline::{Clip, ClipId, MediaId, Timeline},
 };
@@ -10,11 +14,13 @@ use bareclip_media::{MediaInfo, PreviewFrame};
 
 use crate::player::{Notify, Player};
 
-/// Open players hold decoders and a sound connection, so only a few stay open.
+/// Open players hold decoders, so only a few stay open.
 const MAX_OPEN_PLAYERS: usize = 4;
-/// How long before it is needed the next clip gets its pictures and sound ready, so moving on to
-/// it needs no pause. Longer than the slowest seek.
+/// How long before it is needed the next clip gets its pictures ready, so moving on to it needs no
+/// pause. Longer than the slowest seek.
 pub const PREPARE_AHEAD_SECONDS: f64 = 1.0;
+/// How long playback waits for its first picture and sound before starting anyway.
+const START_TIMEOUT: Duration = Duration::from_millis(400);
 
 struct Slot {
     media: MediaId,
@@ -28,6 +34,19 @@ struct Prepared {
     player: Player,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Clock {
+    Stopped,
+    /// Waiting for the first picture and enough sound, holding still until then.
+    Waiting(Instant),
+    Running(Instant),
+}
+
+/// Where a moment on the timeline falls in a clip's video.
+fn source_time_in(clip: &Clip, now: Ticks) -> Ticks {
+    Ticks(clip.source.start.0 + now.0 - clip.start.0).clamp(clip.source.start, clip.source.end)
+}
+
 pub struct Preview {
     /// Most recently used last.
     slots: Vec<Slot>,
@@ -35,9 +54,16 @@ pub struct Preview {
     current: Option<(ClipId, MediaId)>,
     playing: bool,
     position: Ticks,
-    /// When playback entered the dead space it is now passing through.
-    gap_clock: Option<Instant>,
+    clock: Clock,
+    /// Where the clock was when it last started.
+    clock_base: Ticks,
     use_sound: bool,
+    /// Connected the first time anything plays.
+    sound: Option<SoundEngine>,
+    sound_failed: bool,
+    spans: Vec<MixSpan>,
+    /// How long the whole project is, which sound can make longer than its pictures.
+    project_length: Ticks,
     /// Whether pictures come out ready for the GPU compositor.
     planes: bool,
     /// The user moved the playhead, or started or stopped, since this was last asked about.
@@ -56,8 +82,13 @@ impl Preview {
             current: None,
             playing: false,
             position: Ticks(0),
-            gap_clock: None,
+            clock: Clock::Stopped,
+            clock_base: Ticks(0),
             use_sound,
+            sound: None,
+            sound_failed: false,
+            spans: Vec::new(),
+            project_length: Ticks(0),
             planes: false,
             jumped: false,
             last_picture_from: None,
@@ -74,14 +105,30 @@ impl Preview {
         self.slots
             .iter_mut()
             .find_map(|slot| slot.player.take_error())
+            .or_else(|| self.sound.as_ref().and_then(SoundEngine::take_problem))
             .or_else(|| self.error.take())
     }
 
-    /// Whether every open source video that has audio can actually be heard.
+    /// Says what can be heard and how long the project is. Anything already playing carries on
+    /// with the changes, so a change of volume is heard straight away.
+    pub fn set_sound(&mut self, spans: Vec<MixSpan>, project_length: Ticks) {
+        self.project_length = project_length;
+        if spans != self.spans {
+            if let Some(sound) = &self.sound {
+                sound.set_spans(spans.clone());
+            }
+            self.spans = spans;
+        }
+    }
+
+    /// Says how long the project is, for a change that has to take effect straight away.
+    pub fn set_project_length(&mut self, length: Ticks) {
+        self.project_length = length;
+    }
+
+    /// Whether what should be heard can be.
     pub fn sound_works(&self) -> bool {
-        self.slots
-            .iter()
-            .all(|slot| slot.player.has_sound() || !slot.player.expects_sound())
+        !self.sound_failed || self.spans.is_empty()
     }
 
     /// Whether the playhead is in dead space, where the picture is black.
@@ -89,27 +136,72 @@ impl Preview {
         self.current.is_none() && !timeline.is_empty()
     }
 
+    fn length(&self, timeline: &Timeline) -> Ticks {
+        self.project_length.max(timeline.duration())
+    }
+
     /// Where the playhead is on the timeline.
     pub fn position(&self, timeline: &Timeline) -> Ticks {
         if !self.playing {
             return self.position;
         }
-        if let Some(entered) = self.gap_clock {
-            let passed = Ticks::from_seconds(entered.elapsed().as_secs_f64());
-            return Ticks(self.position.0 + passed.0).min(timeline.duration());
+        let Clock::Running(since) = self.clock else {
+            return self.clock_base;
+        };
+        let passed = match &self.sound {
+            Some(sound) => sound.played(),
+            None => advance_from_time(since.elapsed()),
+        };
+        Ticks(self.clock_base.0 + passed.0).min(self.length(timeline))
+    }
+
+    fn connect_sound(&mut self) {
+        if !self.use_sound || self.sound.is_some() || self.sound_failed {
+            return;
         }
-        let Some((clip_id, media)) = self.current else {
-            return self.position;
+        match SoundEngine::open() {
+            Ok(sound) => {
+                sound.set_spans(self.spans.clone());
+                self.sound = Some(sound);
+            }
+            // Playback carries on against the real time, and the top row says why it is silent.
+            Err(_) => self.sound_failed = true,
+        }
+    }
+
+    fn start_clock_from(&mut self, at: Ticks) {
+        self.clock_base = at;
+        self.clock = Clock::Waiting(Instant::now());
+        if let Some(sound) = &self.sound {
+            sound.start_at(at);
+        }
+    }
+
+    /// Lets the clock go once there is a picture to show and sound to play.
+    fn start_clock_when_ready(&mut self) {
+        let Clock::Waiting(since) = self.clock else {
+            return;
         };
-        let Some(index) = timeline.index_of(clip_id) else {
-            return self.position;
-        };
-        let Some(slot) = self.slots.iter().find(|slot| slot.media == media) else {
-            return self.position;
-        };
-        let clip = timeline.clips()[index];
-        let in_clip = (slot.player.position().0 - clip.source.start.0).clamp(0, clip.duration().0);
-        Ticks(clip.start.0 + in_clip)
+        let picture_ready = self.current.is_none_or(|(_, media)| {
+            self.slots
+                .iter()
+                .find(|slot| slot.media == media)
+                .is_none_or(|slot| slot.player.has_first_picture())
+        });
+        let sound_ready = self.sound.as_ref().is_none_or(SoundEngine::is_ready);
+        if (picture_ready && sound_ready) || since.elapsed() >= START_TIMEOUT {
+            if let Some(sound) = &self.sound {
+                sound.resume();
+            }
+            self.clock = Clock::Running(Instant::now());
+        }
+    }
+
+    fn stop_clock(&mut self) {
+        self.clock = Clock::Stopped;
+        if let Some(sound) = &self.sound {
+            sound.pause();
+        }
     }
 
     fn player_for(
@@ -122,7 +214,7 @@ impl Preview {
             self.slots.push(slot);
         } else {
             let info = lookup(media)?;
-            match Player::open_as(&info, self.use_sound, self.planes, self.notify.clone()) {
+            match Player::open_as(&info, self.planes, self.notify.clone()) {
                 Ok(player) => {
                     if self.slots.len() >= MAX_OPEN_PLAYERS {
                         self.slots.remove(0);
@@ -189,6 +281,9 @@ impl Preview {
         self.jumped = true;
         self.prepared = None;
         self.go_to(timeline, lookup, time);
+        if self.playing {
+            self.start_clock_from(self.position);
+        }
     }
 
     /// Starts getting the clip after this moment ready, if it is about to be needed.
@@ -217,7 +312,7 @@ impl Preview {
         let Some(info) = lookup(next.media) else {
             return;
         };
-        match Player::open_as(&info, self.use_sound, self.planes, self.notify.clone()) {
+        match Player::open_as(&info, self.planes, self.notify.clone()) {
             Ok(mut player) => {
                 player.prepare(next.source.start);
                 self.prepared = Some(Prepared {
@@ -266,21 +361,21 @@ impl Preview {
         true
     }
 
+    /// Puts the pictures at a moment. This never touches the clock, so moving on from one clip to
+    /// the next doesn't disturb the sound.
     fn go_to(
         &mut self,
         timeline: &Timeline,
         lookup: &dyn Fn(MediaId) -> Option<MediaInfo>,
         time: Ticks,
     ) {
-        self.position = time.clamp(Ticks(0), timeline.duration());
-        self.gap_clock = None;
+        self.position = time.clamp(Ticks(0), self.length(timeline));
         let Some(location) = timeline.locate(self.position) else {
             self.pause_all();
             self.current = None;
-            if timeline.is_empty() {
+            if self.length(timeline) == Ticks(0) {
                 self.playing = false;
-            } else if self.playing {
-                self.gap_clock = Some(Instant::now());
+                self.stop_clock();
             }
             return;
         };
@@ -313,14 +408,16 @@ impl Preview {
     }
 
     pub fn play(&mut self, timeline: &Timeline, lookup: &dyn Fn(MediaId) -> Option<MediaInfo>) {
-        if timeline.is_empty() || self.playing {
+        let length = self.length(timeline);
+        if length == Ticks(0) || self.playing {
             return;
         }
-        let start = if self.position >= timeline.duration() {
+        let start = if self.position >= length {
             Ticks(0)
         } else {
             self.position
         };
+        self.connect_sound();
         self.playing = true;
         self.seek(timeline, lookup, start);
     }
@@ -330,10 +427,10 @@ impl Preview {
             return;
         }
         self.position = self.position(timeline);
-        self.gap_clock = None;
         self.playing = false;
         self.jumped = true;
         self.prepared = None;
+        self.stop_clock();
         self.pause_all();
     }
 
@@ -345,14 +442,36 @@ impl Preview {
         }
     }
 
-    /// Moves between clips as they finish, and returns the picture to show now.
+    /// Moves between clips as the clock reaches them, and returns the picture to show now.
     pub fn update(
         &mut self,
         timeline: &Timeline,
         lookup: &dyn Fn(MediaId) -> Option<MediaInfo>,
     ) -> Option<PreviewFrame> {
+        let frame = self.update_pictures(timeline, lookup);
+        self.start_clock_when_ready();
+        frame
+    }
+
+    fn stop_at_the_end(&mut self, timeline: &Timeline) -> bool {
+        let length = self.length(timeline);
+        if self.position(timeline) < length {
+            return false;
+        }
+        self.position = length;
+        self.playing = false;
+        self.stop_clock();
+        self.pause_all();
+        true
+    }
+
+    fn update_pictures(
+        &mut self,
+        timeline: &Timeline,
+        lookup: &dyn Fn(MediaId) -> Option<MediaInfo>,
+    ) -> Option<PreviewFrame> {
         let Some((clip_id, media)) = self.current else {
-            if self.playing {
+            if self.playing && !self.stop_at_the_end(timeline) {
                 self.prepare_next(timeline, lookup, self.position(timeline));
                 self.keep_preparing();
                 self.leave_gap_when_due(timeline, lookup);
@@ -361,31 +480,27 @@ impl Preview {
         };
         let Some(index) = timeline.index_of(clip_id) else {
             // The clip was removed, so the playhead finds whatever is there now.
-            let position = self.position;
+            let position = self.position(timeline);
             self.go_to(timeline, lookup, position);
             return None;
         };
         let clip = timeline.clips()[index];
         self.last_picture_from = Some(clip);
+        let now = self.position(timeline);
+        let playing = self.playing;
         let slot = self.slots.iter_mut().find(|slot| slot.media == media)?;
-        let frame = slot.player.update();
-        let source_position = slot.player.position();
-        let player_stopped = !slot.player.is_playing();
+        let frame = if playing {
+            slot.player.update_following(source_time_in(&clip, now))
+        } else {
+            slot.player.update()
+        };
 
-        if self.playing {
-            self.position = self.position(timeline);
-            let now = self.position;
+        if playing {
+            self.position = now;
             self.prepare_next(timeline, lookup, now);
             self.keep_preparing();
-            if source_position >= clip.source.end || player_stopped {
-                match timeline.clips().get(index + 1) {
-                    Some(_) => self.go_to(timeline, lookup, clip.end()),
-                    None => {
-                        self.position = timeline.duration();
-                        self.playing = false;
-                        self.pause_all();
-                    }
-                }
+            if now >= clip.end() && !self.stop_at_the_end(timeline) {
+                self.go_to(timeline, lookup, clip.end());
             }
         }
 
@@ -833,6 +948,7 @@ mod tests {
         let mut preview = Preview::new(false, no_notify());
         preview.seek(&timeline, &lookup, seconds(0.35));
         preview.play(&timeline, &lookup);
+        preview.update(&timeline, &lookup);
         thread::sleep(Duration::from_millis(50));
 
         preview.pause(&timeline);
@@ -843,6 +959,94 @@ mod tests {
         assert_eq!(preview.position(&timeline), held);
         assert!(held > seconds(0.35));
         assert!(preview.in_gap(&timeline));
+    }
+
+    #[test]
+    fn a_project_of_nothing_but_sound_plays_on_the_clock_and_stops_at_its_end() {
+        let timeline = Timeline::default();
+        let mut preview = Preview::new(false, no_notify());
+        preview.set_sound(Vec::new(), seconds(0.2));
+
+        preview.play(&timeline, &lookup);
+        assert!(preview.is_playing());
+
+        let started = Instant::now();
+        while preview.is_playing() {
+            assert!(started.elapsed() < Duration::from_secs(5), "it never ended");
+            assert!(preview.update(&timeline, &lookup).is_none());
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(preview.position(&timeline), seconds(0.2));
+    }
+
+    #[test]
+    fn sound_that_outlasts_the_pictures_keeps_the_playhead_going_after_them() {
+        let mut timeline = Timeline::default();
+        timeline.push(MediaId(1), range(1.0, 1.2));
+        let mut preview = Preview::new(false, no_notify());
+        preview.set_sound(Vec::new(), seconds(0.5));
+
+        preview.play(&timeline, &lookup);
+        let started = Instant::now();
+        let mut furthest = Ticks(0);
+        while preview.is_playing() {
+            assert!(started.elapsed() < Duration::from_secs(5), "it never ended");
+            preview.update(&timeline, &lookup);
+            furthest = furthest.max(preview.position(&timeline));
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        assert!(furthest > seconds(0.2), "it stopped at the last picture");
+        assert_eq!(preview.position(&timeline), seconds(0.5));
+    }
+
+    #[test]
+    fn the_playhead_never_jumps_back_when_one_clip_gives_way_to_the_next() {
+        let timeline = two_clip_timeline();
+        let mut preview = Preview::new(false, no_notify());
+
+        preview.play(&timeline, &lookup);
+        let started = Instant::now();
+        let mut last = Ticks(0);
+        while preview.is_playing() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "it never ended"
+            );
+            preview.update(&timeline, &lookup);
+            let now = preview.position(&timeline);
+            assert!(now >= last, "it went from {last:?} back to {now:?}");
+            last = now;
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn the_clock_waits_for_the_first_picture_before_it_moves() {
+        let timeline = two_clip_timeline();
+        let mut preview = Preview::new(false, no_notify());
+
+        preview.play(&timeline, &lookup);
+
+        assert_eq!(preview.position(&timeline), Ticks(0));
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(preview.position(&timeline), Ticks(0), "nothing has run yet");
+    }
+
+    #[test]
+    fn saying_what_can_be_heard_with_nothing_connected_is_harmless() {
+        let mut preview = Preview::new(true, no_notify());
+        let span = MixSpan {
+            path: PathBuf::from("a.wav"),
+            start: Ticks(0),
+            source: range(0.0, 1.0),
+            sound: Default::default(),
+            bus: bareclip_audio::Bus::All(0),
+        };
+
+        preview.set_sound(vec![span], seconds(1.0));
+
+        assert!(preview.sound_works(), "nothing has tried to play yet");
     }
 
     #[test]

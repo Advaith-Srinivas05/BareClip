@@ -143,7 +143,7 @@ impl Canvas {
         if self.original.is_none() {
             // The earliest clip is the first one, however many arrived together.
             let first = tracks
-                .tracks()
+                .picture_tracks()
                 .iter()
                 .flat_map(|track| track.clips())
                 .min_by_key(|clip| clip.start)
