@@ -28,10 +28,10 @@ use bareclip_core::{
 };
 use bareclip_export::{
     CHOICES_REASON, ExportChoices, ExportRate, ExportSize, FullPlan, LAYERED_REASON, LayeredClip,
-    LayeredRequest, LayeredStretch, ProjectReport, Route, SIZES, STILLS_REASON, SoundPlan,
-    copying_suits, export_layered, export_sound_only, export_with_new_sound, full_output_path,
-    mixed_rates, rates_on_offer, route_for, size_problem, size_with_shorter_side, sizes_on_offer,
-    sound_labels,
+    LayeredRequest, LayeredStretch, ProjectReport, Route, SIZES, SPEED_REASON, STILLS_REASON,
+    SoundPlan, copying_suits, export_layered, export_sound_only, export_with_new_sound,
+    full_output_path, mixed_rates, rates_on_offer, route_for, size_problem, size_with_shorter_side,
+    sizes_on_offer, sound_labels,
 };
 use bareclip_media::{
     DecodeStep, ExportPart, ExportRequest, MediaError, MediaInfo, PreviewFrame, Quality,
@@ -138,6 +138,7 @@ const DIALOG_RADIUS: u8 = 10;
 /// A dialog's own buttons are never narrower than this, so short names still feel solid.
 const DIALOG_BUTTON_WIDTH: f32 = 84.0;
 const STILL_THUMBNAIL_WIDTH: usize = 320;
+const SNAPPED_CLOSE_ENOUGH: i64 = 64;
 const EXPORT_DROPDOWN_WIDTH: f32 = 128.0;
 const MATCH_SOURCE: &str = "Match source";
 /// The playback buttons: four of 32, the play button, and the spaces between them.
@@ -308,6 +309,7 @@ fn heard_spans(media: &[MediaEntry], tracks: &Tracks) -> Vec<MixSpan> {
                 start: span.start,
                 source: span.source,
                 sound: span.sound,
+                speed: span.speed,
                 bus: Bus::All(0),
             })
         })
@@ -1410,8 +1412,7 @@ impl Editor {
             return;
         };
         self.preview.pause(self.project.tracks.played_videos());
-        let source_time = Ticks(clip.source.start.0 + position.0 - clip.start.0);
-        let split_at = self.snap_to_frame(clip.media, source_time);
+        let split_at = self.snap_to_frame(clip.media, clip.source_at(position));
         let before = self.project.clone();
         if let Some(second) = self.project.tracks.split(clip.id, split_at) {
             self.history.record(before);
@@ -1527,7 +1528,10 @@ impl Editor {
         // carry on past them.
         let target = neighbour.map_or(Ticks(position.0 + gap_step.0), |pts| {
             let gap = Ticks::from_pts(pts, time_base).0 - shown_time.0;
-            Ticks(location.clip.start.0 + shown_time.0 - location.clip.source.start.0 + gap)
+            let at = location.clip.time_of(Ticks(shown_time.0 + gap));
+            // Rounding must not land it just before the frame, which would show the last one.
+            let nudge = i64::from(!location.clip.speed.is_normal());
+            Ticks(at.0 + nudge)
         });
         self.seek(target);
     }
@@ -1887,6 +1891,7 @@ impl Editor {
                             start: clip.start,
                             source: clip.source,
                             placement: clip.placement,
+                            speed: clip.speed,
                         })
                     })
                     .collect(),
@@ -1919,8 +1924,15 @@ impl Editor {
     /// How the timeline would be exported, leaving aside any difference in frame rates.
     fn route_before_rates(&self, videos: &[MediaInfo]) -> Route {
         if self.takes_layers() {
+            let other_speeds = self.final_canvas().is_some_and(|canvas| {
+                self.project
+                    .tracks
+                    .shows_other_speeds(canvas, &|id| self.video_size(id))
+            });
             let reason = if videos.iter().any(MediaInfo::is_still) {
                 STILLS_REASON
+            } else if other_speeds {
+                SPEED_REASON
             } else {
                 LAYERED_REASON
             };
@@ -2015,6 +2027,7 @@ impl Editor {
                     start: span.start,
                     source: span.source,
                     sound: span.sound,
+                    speed: span.speed,
                     bus: Bus::ByTrack(0),
                 })
             })
@@ -2047,6 +2060,7 @@ impl Editor {
                     start: span.start,
                     source: span.source,
                     sound: span.sound,
+                    speed: span.speed,
                     bus,
                 })
             })
@@ -3610,15 +3624,24 @@ impl Editor {
                 track,
                 start: clip.start,
                 end: clip.end(),
-                label: self
-                    .entry(clip.media)
-                    .map_or_else(String::new, |entry| entry.name.clone()),
+                label: self.entry(clip.media).map_or_else(String::new, |entry| {
+                    if clip.speed.is_normal() {
+                        entry.name.clone()
+                    } else {
+                        format!(
+                            "{}, {}",
+                            text::speed_name(clip.speed.as_factor()),
+                            entry.name
+                        )
+                    }
+                }),
                 media: clip.media,
                 source_start: clip.source.start,
                 has_sound: self.has_sound(clip.media),
                 muted: clip.sound.muted,
                 sound_only: self.project.tracks.is_sound_row(track),
                 is_still: clip.is_still(),
+                speed: clip.speed,
                 fade_in: clip.sound.fade_in_on(clip.duration()),
                 fade_out: clip.sound.fade_out_on(clip.duration()),
             })
@@ -3746,7 +3769,9 @@ impl Editor {
         let Some(duration) = self.entry(clip.media).map(|entry| entry.info.duration) else {
             return;
         };
-        let wanted = Ticks(origin.source.0 + pointer.0 - origin.pointer.0);
+        // The pointer moves along the timeline, and a fast clip gets through more footage there.
+        let moved = clip.speed.in_footage(Ticks(pointer.0 - origin.pointer.0));
+        let wanted = Ticks(origin.source.0 + moved.0);
         let source_time = if snap.is_some() {
             wanted
         } else {
@@ -3762,9 +3787,13 @@ impl Editor {
         );
         let trimmed = self.project.tracks.clip(id);
         self.timeline_state.trim_aligned = snap.filter(|moment| {
-            trimmed.is_some_and(|clip| match edge {
-                ClipEdge::Start => clip.start == *moment,
-                ClipEdge::End => clip.end() == *moment,
+            trimmed.is_some_and(|clip| {
+                let edge_at = match edge {
+                    ClipEdge::Start => clip.start,
+                    ClipEdge::End => clip.end(),
+                };
+                // At another speed, rounding can leave it a few ticks off, far under a frame.
+                (edge_at.0 - moment.0).abs() <= SNAPPED_CLOSE_ENOUGH
             })
         });
         if self.project.tracks.played().locate(origin.playhead) != under_playhead {
@@ -3893,6 +3922,17 @@ impl Editor {
         })
     }
 
+    /// The selected clip's speed. An image has no footage to play through.
+    fn selected_speed(&self) -> Option<stage::SelectedSpeed> {
+        let id = self.selected?;
+        let clip = self.project.tracks.clip(id)?;
+        (!clip.is_still()).then(|| stage::SelectedSpeed {
+            id,
+            speed: clip.speed,
+            has_sound: self.has_sound(clip.media),
+        })
+    }
+
     /// Gives a clip's sound tracks clips of their own.
     fn detach_sound(&mut self, id: ClipId) {
         let Some(clip) = self.project.tracks.clip(id) else {
@@ -3955,6 +3995,7 @@ impl Editor {
                     .can_move_in_order(id, OrderMove::Backward)
             }),
             sound: self.selected_sound(),
+            speed: self.selected_speed(),
         };
         let events = stage::show(ui, palette, &mut self.stage_state, &view);
         let pointer_down = ui.input(|input| input.pointer.any_down());
@@ -3982,6 +4023,22 @@ impl Editor {
             let before = self.project.clone();
             if self.project.tracks.set_clip_sound(id, sound) && self.stage_before.is_none() {
                 self.stage_before = Some(before);
+            }
+        }
+        if let Some((id, speed)) = events.speed {
+            // Always worked out from how things were when the slider was taken hold of, so that
+            // clips pushed along by slowing down go back if the slider comes back.
+            let before = self
+                .stage_before
+                .clone()
+                .unwrap_or_else(|| self.project.clone());
+            let mut tracks = before.tracks.clone();
+            tracks.set_speed(id, speed);
+            if tracks != self.project.tracks {
+                self.project.tracks = tracks;
+                self.stage_before.get_or_insert(before);
+                let position = self.position();
+                self.seek(position);
             }
         }
         if let Some(id) = events.detach {
@@ -5039,6 +5096,7 @@ fn show_in_folder(path: &Path) {
 mod tests {
     use super::*;
     use bareclip_core::placement::{Placement, WHOLE};
+    use bareclip_core::speed::Speed;
     use eframe::{egui_wgpu, wgpu};
     use std::{process::Command, sync::OnceLock, time::Instant};
 
@@ -10999,6 +11057,231 @@ mod tests {
         path
     }
 
+    fn times(factor: f64) -> Speed {
+        Speed::default().with_factor(factor)
+    }
+
+    /// Changes the selected clip's speed the way the toolbar does.
+    fn speed_change(id: ClipId, speed: Speed) -> stage::StageEvents {
+        stage::StageEvents {
+            speed: Some((id, speed)),
+            ..stage::StageEvents::default()
+        }
+    }
+
+    #[test]
+    fn the_toolbar_offers_speed_on_a_video_and_a_press_changes_it_as_one_undo_step() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        let clip = picture_clip(&editor);
+        editor.selected = Some(clip.id);
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Speed");
+        let_dialog_open(&ctx, &mut editor);
+
+        click_named(&ctx, &mut editor, "2x");
+        run_frame(&ctx, &mut editor, vec![]);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert_eq!(picture_clip(&editor).speed, times(2.0));
+        assert_eq!(
+            picture_clip(&editor).duration(),
+            Ticks(clip.duration().0 / 2)
+        );
+        editor.undo();
+        assert_eq!(picture_clip(&editor).speed, Speed::default());
+        assert_eq!(picture_clip(&editor).duration(), clip.duration());
+    }
+
+    #[test]
+    fn keep_pitch_starts_on_and_the_menu_turns_it_off() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        editor.selected = Some(picture_clip(&editor).id);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(picture_clip(&editor).speed.keep_pitch);
+        click_named(&ctx, &mut editor, "Speed");
+        let_dialog_open(&ctx, &mut editor);
+
+        click_named(&ctx, &mut editor, "Keep pitch");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert!(!picture_clip(&editor).speed.keep_pitch);
+    }
+
+    #[test]
+    fn a_clip_with_no_sound_has_no_pitch_to_keep_and_an_image_has_no_speed() {
+        let ctx = context();
+        let image = image_file("no-speed", "64x36", "white");
+        let silent = test_clip().to_path_buf();
+        let mut editor = with_videos(&ctx, &[&silent, &image]);
+        let clips = editor.project.tracks.picture_tracks()[0].clips().to_vec();
+
+        editor.selected = Some(clips[0].id);
+        assert!(
+            editor
+                .selected_speed()
+                .is_some_and(|speed| !speed.has_sound)
+        );
+        editor.selected = Some(clips[1].id);
+        assert!(editor.selected_speed().is_none());
+    }
+
+    #[test]
+    fn one_slider_drag_is_one_undo_and_coming_back_puts_later_clips_back() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound, &sound]);
+        let clips = editor.project.tracks.picture_tracks()[0].clips().to_vec();
+        let (first, second) = (clips[0], clips[1]);
+        let can_undo_before = editor.history.can_undo();
+
+        editor.apply_stage_events(speed_change(first.id, times(0.5)), true);
+        let pushed = editor.project.tracks.clip(second.id).expect("it is there");
+        assert_eq!(pushed.start, Ticks(first.duration().0 * 2));
+
+        editor.apply_stage_events(speed_change(first.id, times(0.75)), true);
+        editor.apply_stage_events(speed_change(first.id, times(1.0)), true);
+        let back = editor.project.tracks.clip(second.id).expect("it is there");
+        assert_eq!(back.start, second.start, "it goes back where it was");
+
+        editor.apply_stage_events(speed_change(first.id, times(2.0)), true);
+        editor.apply_stage_events(stage::StageEvents::default(), false);
+        assert_eq!(
+            editor.project.tracks.clip(first.id).map(|clip| clip.speed),
+            Some(times(2.0))
+        );
+        assert_eq!(
+            editor.project.tracks.clip(second.id).map(|clip| clip.start),
+            Some(second.start),
+            "speeding up leaves dead space and moves nothing"
+        );
+        editor.undo();
+        assert_eq!(
+            editor.project.tracks.clip(first.id).map(|clip| clip.speed),
+            Some(Speed::default())
+        );
+        assert_eq!(editor.history.can_undo(), can_undo_before);
+    }
+
+    #[test]
+    fn a_video_at_another_speed_is_redrawn_says_why_and_comes_out_shorter_with_its_sound() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        let clip = picture_clip(&editor);
+        editor.project.tracks.set_speed(clip.id, times(2.0));
+
+        assert_eq!(editor.export_route(), Route::Full(SPEED_REASON.to_owned()));
+        let output = output_called("video-at-speed");
+        let report = exported_report(&ctx, &mut editor, &output);
+
+        assert!(matches!(report, ProjectReport::Full(_)), "{report:?}");
+        let info = probe(&output).expect("it can be read");
+        assert!(
+            (info.duration.as_seconds() - 4.0).abs() < 0.2,
+            "{:?}",
+            info.duration
+        );
+        assert_eq!(info.audio.len(), 1);
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn music_at_another_speed_keeps_the_picture_copied() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound, song_file()]);
+        let clip = picture_clip(&editor);
+        let song = sound_row_clip(&editor);
+        editor.project.tracks.set_speed(song.id, times(2.0));
+        let song = sound_row_clip(&editor);
+        assert!(song.end() <= clip.end());
+
+        assert_eq!(editor.export_route(), Route::Fast);
+        let output = output_called("music-at-speed");
+        let report = exported_report(&ctx, &mut editor, &output);
+
+        assert!(matches!(report, ProjectReport::Fast(_)), "{report:?}");
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn a_fast_clip_plays_through_in_its_shorter_time_and_stops_at_the_end() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        let clip = picture_clip(&editor);
+        editor.project.tracks.set_speed(clip.id, times(8.0));
+        run_frame(&ctx, &mut editor, vec![]);
+        let length = picture_clip(&editor).duration();
+        assert_eq!(length, Ticks::from_seconds(1.0));
+
+        editor.toggle_playback();
+        let started = Instant::now();
+        while editor.preview.is_playing() {
+            assert!(
+                started.elapsed() < Duration::from_secs(6),
+                "it never finished"
+            );
+            run_frame(&ctx, &mut editor, vec![]);
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(editor.position(), length);
+    }
+
+    #[test]
+    fn splitting_a_fast_clip_at_the_playhead_cuts_the_footage_that_is_playing_there() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        let clip = picture_clip(&editor);
+        editor.project.tracks.set_speed(clip.id, times(2.0));
+        editor.seek(Ticks::from_seconds(1.0));
+        editor.selected = Some(clip.id);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        editor.split_at_playhead();
+
+        let clips = editor.project.tracks.picture_tracks()[0].clips();
+        assert_eq!(clips.len(), 2);
+        let cut = clips[0].source.end.as_seconds();
+        assert!((cut - 2.0).abs() < 0.05, "it cut the footage at {cut} s");
+        assert_eq!(clips[1].speed, times(2.0));
+        assert_eq!(clips[0].end(), clips[1].start);
+    }
+
+    #[test]
+    fn a_clips_speed_survives_saving_and_opening() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        let wanted = Speed {
+            keep_pitch: false,
+            ..times(0.5)
+        };
+        editor
+            .project
+            .tracks
+            .set_speed(picture_clip(&editor).id, wanted);
+
+        let folder = project_folder("speed");
+        let path = folder.join("speed.bareclip");
+        assert!(editor.save_to(&path));
+        let mut reopened = Editor::new(&ctx, false);
+        reopened.open_project(&ctx, &path);
+        settle(&ctx, &mut reopened);
+
+        assert_eq!(picture_clip(&reopened).speed, wanted);
+        assert_eq!(
+            picture_clip(&reopened).duration(),
+            picture_clip(&editor).duration()
+        );
+    }
+
     #[test]
     fn a_new_image_goes_on_a_picture_row_for_four_seconds_with_its_own_kind_of_card() {
         let ctx = context();
@@ -11661,6 +11944,39 @@ mod tests {
         assert_eq!(reopened.project.tracks.audio_tracks().len(), 1);
         assert_eq!(sound_row_clip(&reopened).sound, changed);
         assert!(reopened.project.tracks.row_sounds()[0].muted);
+    }
+
+    /// Draws the speed controls on the real screen, with no window. Run with
+    /// `$env:BARECLIP_SCREENS = '<folder>'; ./scripts/cargo.ps1 test -p bareclip-app draw_the_speed_screens '--' --ignored`
+    #[test]
+    #[ignore = "needs a real GPU, and draws pictures to look at rather than checking anything"]
+    fn draw_the_speed_screens() {
+        let folder = std::env::var_os("BARECLIP_SCREENS").map_or_else(
+            || std::env::temp_dir().join("bareclip-screens"),
+            PathBuf::from,
+        );
+        let ctx = context();
+        let mut camera = Camera::new(folder);
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound, &sound]);
+        editor.use_gpu(LayerDisplay::new(
+            camera.device.clone(),
+            camera.queue.clone(),
+            camera.renderer.clone(),
+        ));
+        let first = picture_clip(&editor);
+        editor.project.tracks.set_speed(first.id, times(2.0));
+        editor.selected = Some(first.id);
+        editor.seek(Ticks::from_seconds(1.0));
+        for _ in 0..40 {
+            run_frame(&ctx, &mut editor, vec![]);
+            thread::sleep(Duration::from_millis(10));
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "speed-01-faster-clip");
+
+        click_named(&ctx, &mut editor, "Speed");
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "speed-02-menu");
     }
 
     /// Draws images on the real screen, with no window. Run with
@@ -12596,6 +12912,7 @@ mod tests {
             source_end: Ticks::from_seconds(1.0).0,
             placement: Placement::default(),
             sound: Default::default(),
+            speed: Default::default(),
         };
         let mut file = ProjectFile {
             audio_tracks: Vec::new(),

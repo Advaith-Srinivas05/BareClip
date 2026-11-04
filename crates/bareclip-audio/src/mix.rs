@@ -5,10 +5,13 @@ use std::{collections::VecDeque, path::PathBuf};
 
 use bareclip_core::{
     sound::ClipSound,
+    speed::Speed,
     time::{TICKS_PER_SECOND, Ticks},
     timeline::TimeRange,
 };
 use bareclip_media::{AudioPreview, AudioStep, MediaError};
+
+use crate::stretch::{Frames, Stretch};
 
 const CHANNELS: usize = 2;
 /// Decoded blocks rarely line up to the sample, so a difference this small is not a real hole.
@@ -56,15 +59,18 @@ pub struct MixSpan {
     pub start: Ticks,
     pub source: TimeRange,
     pub sound: ClipSound,
+    pub speed: Speed,
     pub bus: Bus,
 }
 
 impl MixSpan {
+    /// How long this lasts on the timeline.
     fn length(&self) -> Ticks {
-        self.source.duration()
+        self.speed.on_timeline(self.source.duration())
     }
 
-    fn end(&self) -> Ticks {
+    /// Where this ends on the timeline.
+    pub fn end(&self) -> Ticks {
         Ticks(self.start.0 + self.length().0)
     }
 
@@ -79,6 +85,7 @@ impl MixSpan {
         self.path == other.path
             && self.start == other.start
             && self.source == other.source
+            && self.speed == other.speed
             && self.sound.only_track == other.sound.only_track
     }
 }
@@ -128,10 +135,22 @@ impl TrackBuffer {
     }
 }
 
+impl Frames for TrackBuffer {
+    fn frame(&self, at: i64) -> [f32; 2] {
+        let place = (at - self.first) as usize * CHANNELS;
+        if at < self.first || place + 1 >= self.samples.len() {
+            return [0.0; 2];
+        }
+        [self.samples[place], self.samples[place + 1]]
+    }
+}
+
 /// One open file, positioned for one span.
 struct SpanReader {
     preview: AudioPreview,
     tracks: Vec<TrackBuffer>,
+    /// For a clip at another speed, what turns each track's footage into sound for the timeline.
+    stretches: Vec<Stretch>,
     source_start: i64,
     ended: bool,
 }
@@ -139,17 +158,25 @@ struct SpanReader {
 impl SpanReader {
     fn open(span: &MixSpan, rate: u32, from: i64) -> Result<Self, MediaError> {
         let mut preview = AudioPreview::open(&span.path, rate)?;
-        let seconds = span.source.start.as_seconds() + from as f64 / f64::from(rate);
+        // `from` is a frame on the timeline, and everything here is in frames of the footage.
+        let from_footage = frame_at(span.speed.in_footage(time_of_frames(from, rate)), rate);
+        let seconds = span.source.start.as_seconds() + from_footage as f64 / f64::from(rate);
         preview.seek(seconds)?;
-        let tracks = (0..preview.track_count())
+        let tracks: Vec<TrackBuffer> = (0..preview.track_count())
             .map(|_| TrackBuffer {
                 samples: VecDeque::new(),
-                first: from,
+                first: from_footage,
             })
+            .collect();
+        let footage_frames = frame_at(span.source.duration(), rate);
+        let stretches = tracks
+            .iter()
+            .map(|_| Stretch::new(span.speed, footage_frames))
             .collect();
         Ok(Self {
             preview,
             tracks,
+            stretches,
             source_start: frame_at(span.source.start, rate),
             ended: false,
         })
@@ -308,30 +335,62 @@ impl TimelineMix {
             return;
         };
         let (begin, finish) = (first - from, last - from);
-        reader.fill_to(span, finish, rate);
+        let count = (finish - begin) as usize;
+        let normal = span.speed.is_normal();
+        let until = if normal {
+            finish
+        } else {
+            reader
+                .stretches
+                .first()
+                .map_or(finish, |stretch| stretch.needs_until(finish))
+        };
+        reader.fill_to(span, until, rate);
 
         let length = span.length();
-        for (track, buffer) in reader.tracks.iter_mut().enumerate() {
+        let mut stretched = Vec::new();
+        for track in 0..reader.tracks.len() {
             if !span.wants(track) {
                 continue;
             }
-            buffer.skip_to(begin);
+            let buffer = &mut reader.tracks[track];
+            if normal {
+                buffer.skip_to(begin);
+            } else {
+                stretched.clear();
+                reader.stretches[track].produce(buffer, begin, count, &mut stretched);
+            }
             let bus = span.bus.of(track);
             if let Some(out) = buses.get_mut(bus) {
                 let offset = starts[bus] + (first - start) as usize * CHANNELS;
-                let count = (finish - begin) as usize;
-                let samples = buffer.samples.iter().take(count * CHANNELS);
                 let gain_of = |frame: usize| {
                     let into = time_of_frames(begin + frame as i64, rate);
                     span.sound.gain_at(into, length)
                 };
                 let fixed = fixed_gain(&span.sound, begin, finish, rate, length);
-                for (place, sample) in samples.enumerate() {
+                let mut add = |place: usize, sample: f32| {
                     let gain = fixed.unwrap_or_else(|| gain_of(place / CHANNELS));
                     out[offset + place] += sample * gain;
+                };
+                if normal {
+                    let samples = buffer.samples.iter().take(count * CHANNELS);
+                    for (place, sample) in samples.enumerate() {
+                        add(place, *sample);
+                    }
+                } else {
+                    for (place, sample) in stretched.iter().enumerate() {
+                        add(place, *sample);
+                    }
                 }
             }
-            buffer.skip_to(finish);
+            if normal {
+                buffer.skip_to(finish);
+            } else {
+                let from = reader.stretches[track].keeps_from(finish);
+                if from > buffer.first {
+                    buffer.skip_to(from);
+                }
+            }
         }
     }
 }
@@ -402,7 +461,15 @@ mod tests {
                 end: seconds(source_start + length),
             },
             sound: ClipSound::default(),
+            speed: Speed::default(),
             bus: Bus::All(0),
+        }
+    }
+
+    fn at_speed(span: MixSpan, factor: f64) -> MixSpan {
+        MixSpan {
+            speed: Speed::default().with_factor(factor),
+            ..span
         }
     }
 
@@ -732,5 +799,213 @@ mod tests {
         buffer.add(900, &[0.5; 400]);
 
         assert_eq!(buffer.end(), 1100);
+    }
+
+    /// A file with a steady note, to measure what speed does to it.
+    fn note_file() -> &'static Path {
+        static FILE: OnceLock<PathBuf> = OnceLock::new();
+        FILE.get_or_init(|| {
+            let folder = std::env::temp_dir().join("bareclip-audio-tests");
+            std::fs::create_dir_all(&folder).expect("the folder can be created");
+            let path = folder.join(format!("note-{}.mkv", std::process::id()));
+            let status = Command::new("ffmpeg")
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                ])
+                .arg(format!("sine=f=440:r={RATE}:d=8"))
+                .args(["-c:a", "pcm_f32le"])
+                .arg(&path)
+                .status()
+                .expect("ffmpeg is on PATH");
+            assert!(status.success());
+            path
+        })
+    }
+
+    fn frequency_of(left_and_right: &[f32]) -> f64 {
+        let left: Vec<f32> = left_and_right.iter().step_by(CHANNELS).copied().collect();
+        let crossings = left
+            .windows(2)
+            .filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0)
+            .count();
+        crossings as f64 / (left.len() as f64 / f64::from(RATE))
+    }
+
+    /// How much faster than it plays sound at other speeds can be worked out. Run with
+    /// `./scripts/cargo.ps1 test --release -p bareclip-audio stretching_keeps_ahead_of_real_time '--' --ignored --nocapture`
+    #[test]
+    #[ignore = "reports numbers rather than checking them, and needs an optimised build to mean anything"]
+    fn stretching_keeps_ahead_of_real_time() {
+        for (factor, keep_pitch) in [
+            (1.0, true),
+            (0.5, true),
+            (2.0, true),
+            (4.0, true),
+            (16.0, true),
+            (2.0, false),
+            (16.0, false),
+        ] {
+            let quick = MixSpan {
+                speed: Speed {
+                    keep_pitch,
+                    ..Speed::default().with_factor(factor)
+                },
+                ..span(note_file(), 0.0, 0.0, 8.0)
+            };
+            let length = quick.length().as_seconds();
+            let started = std::time::Instant::now();
+            let mut mix = TimelineMix::new(vec![quick], RATE, seconds(0.0));
+            let mut buses = vec![Vec::new()];
+            mix.fill(frames(length), &mut buses);
+            let taken = started.elapsed().as_secs_f64();
+            println!(
+                "{factor}x, keep pitch {keep_pitch}: {length:.1} s of sound in {:.0} ms, {:.0} times real time",
+                taken * 1000.0,
+                length / taken
+            );
+        }
+    }
+
+    #[test]
+    fn a_span_at_twice_the_speed_lasts_half_as_long_and_is_silent_after() {
+        let quick = at_speed(span(quarter(), 0.0, 0.0, 2.0), 2.0);
+
+        let out = mixed(vec![quick], 0.0, 1.5);
+
+        // Stereo, past where the first grain fades in.
+        let middle = out[frames(0.5) * CHANNELS];
+        assert!(
+            (middle - 0.25).abs() < 0.01,
+            "the middle came out as {middle}"
+        );
+        let after = out[frames(1.2) * CHANNELS];
+        assert!(
+            after.abs() < 1e-6,
+            "it should have ended at 1 s, got {after}"
+        );
+    }
+
+    #[test]
+    fn a_slow_span_lasts_longer() {
+        let slow = at_speed(span(quarter(), 0.0, 0.0, 1.0), 0.5);
+
+        let out = mixed(vec![slow], 0.0, 2.5);
+
+        let late = out[frames(1.8) * CHANNELS];
+        assert!((late - 0.25).abs() < 0.01, "at 1.8 s it came out as {late}");
+        let after = out[frames(2.2) * CHANNELS];
+        assert!(
+            after.abs() < 1e-6,
+            "it should have ended at 2 s, got {after}"
+        );
+    }
+
+    #[test]
+    fn a_fast_clip_keeps_its_note_when_asked_and_moves_it_when_not() {
+        let quick = at_speed(span(note_file(), 0.0, 0.0, 4.0), 2.0);
+        let kept = mixed(vec![quick.clone()], 0.2, 1.0);
+        let tape = mixed(
+            vec![MixSpan {
+                speed: Speed {
+                    keep_pitch: false,
+                    ..quick.speed
+                },
+                ..quick
+            }],
+            0.2,
+            1.0,
+        );
+
+        let (kept, tape) = (frequency_of(&kept), frequency_of(&tape));
+        assert!((kept - 440.0).abs() < 15.0, "kept came out at {kept}");
+        assert!((tape - 880.0).abs() < 30.0, "tape came out at {tape}");
+    }
+
+    #[test]
+    fn starting_partway_through_a_fast_clip_reads_from_the_right_place_in_the_footage() {
+        // Quarter level for its first second, then tenth level, by a file made of two.
+        let folder = std::env::temp_dir().join("bareclip-audio-tests");
+        let path = folder.join(format!("steps-{}.mkv", std::process::id()));
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg(format!(
+                "aevalsrc='if(lt(t,2),0.25,0.1)|if(lt(t,2),0.25,0.1)':d=4:s={RATE}"
+            ))
+            .args(["-c:a", "pcm_f32le"])
+            .arg(&path)
+            .status()
+            .expect("ffmpeg is on PATH");
+        assert!(status.success());
+
+        // At 2x, a second in on the timeline is two seconds into the footage.
+        let quick = at_speed(span(&path, 0.0, 0.0, 4.0), 2.0);
+        let before = mixed(vec![quick.clone()], 0.5, 0.2);
+        let after = mixed(vec![quick], 1.2, 0.2);
+
+        assert!((before[frames(0.1) * CHANNELS] - 0.25).abs() < 0.01);
+        assert!((after[frames(0.1) * CHANNELS] - 0.1).abs() < 0.01);
+    }
+
+    #[test]
+    fn fades_are_measured_on_the_timeline_at_any_speed() {
+        let quick = MixSpan {
+            sound: ClipSound {
+                fade_out: seconds(0.5).0,
+                ..ClipSound::default()
+            },
+            ..at_speed(span(quarter(), 0.0, 0.0, 2.0), 2.0)
+        };
+
+        let out = mixed(vec![quick], 0.0, 1.0);
+
+        let halfway_down = out[frames(0.75) * CHANNELS];
+        assert!(
+            halfway_down > 0.05 && halfway_down < 0.24,
+            "the fade should be partway at 0.75 s, got {halfway_down}"
+        );
+    }
+
+    #[test]
+    fn changing_speed_while_playing_opens_the_sound_again_in_the_right_place() {
+        let mut mix = TimelineMix::new(vec![span(quarter(), 0.0, 0.0, 2.0)], RATE, seconds(0.0));
+        let mut buses = vec![Vec::new()];
+        mix.fill(frames(0.2), &mut buses);
+
+        mix.set_spans(vec![at_speed(span(quarter(), 0.0, 0.0, 2.0), 2.0)]);
+        buses[0].clear();
+        mix.fill(frames(0.2), &mut buses);
+
+        assert_eq!(mix.take_problem(), None);
+        let late = buses[0][frames(0.15) * CHANNELS];
+        assert!((late - 0.25).abs() < 0.01, "{late}");
+    }
+
+    #[test]
+    fn a_normal_speed_span_with_tape_pitch_still_passes_straight_through() {
+        let plain = MixSpan {
+            speed: Speed {
+                keep_pitch: false,
+                ..Speed::default()
+            },
+            ..span(quarter(), 0.0, 0.0, 1.0)
+        };
+
+        let out = mixed(vec![plain], 0.0, 0.5);
+
+        assert!(out.iter().all(|sample| (*sample - 0.25).abs() < 1e-6));
     }
 }

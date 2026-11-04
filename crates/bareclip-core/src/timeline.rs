@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::{
     placement::Placement,
     sound::ClipSound,
+    speed::Speed,
     time::{TICKS_PER_SECOND, Ticks},
 };
 
@@ -53,7 +54,7 @@ pub struct MediaId(pub u64);
 pub struct ClipId(pub u64);
 
 /// Ids stay unique across undo and redo because they never come from a snapshot.
-fn next_clip_id() -> ClipId {
+pub(crate) fn next_clip_id() -> ClipId {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     ClipId(NEXT.fetch_add(1, Ordering::Relaxed))
 }
@@ -70,11 +71,33 @@ pub struct Clip {
     pub placement: Placement,
     /// How it sounds. This belongs to the whole clip too.
     pub sound: ClipSound,
+    /// How fast it plays, and so how long it lasts. This too.
+    pub speed: Speed,
 }
 
 impl Clip {
+    /// How long this clip lasts on the timeline.
     pub fn duration(self) -> Ticks {
-        self.source.duration()
+        Ticks(self.speed.on_timeline(self.source.duration()).0.max(1))
+    }
+
+    /// The moment in the footage that plays at a moment on the timeline.
+    pub fn source_at(self, time: Ticks) -> Ticks {
+        if time >= self.end() {
+            return self.source.end;
+        }
+        Ticks(self.source.start.0 + self.speed.in_footage(Ticks(time.0 - self.start.0)).0)
+    }
+
+    /// The moment on the timeline that a moment in the footage plays at.
+    pub fn time_of(self, source_time: Ticks) -> Ticks {
+        Ticks(
+            self.start.0
+                + self
+                    .speed
+                    .on_timeline(Ticks(source_time.0 - self.source.start.0))
+                    .0,
+        )
     }
 
     /// Whether this clip shows an image.
@@ -145,11 +168,10 @@ impl Timeline {
                 .position(|clip| time >= clip.start && time < clip.end())?
         };
         let clip = self.clips[index];
-        let offset = time.0.min(clip.end().0) - clip.start.0;
         Some(Location {
             index,
             clip,
-            source_time: Ticks(clip.source.start.0 + offset),
+            source_time: clip.source_at(time),
         })
     }
 
@@ -179,15 +201,15 @@ impl Timeline {
     /// Puts saved clips back, each with a new id. Going through the usual rules means a
     /// file edited by hand can't produce an arrangement the editor couldn't.
     pub(crate) fn restore(
-        saved: impl IntoIterator<Item = (MediaId, Ticks, TimeRange, Placement, ClipSound)>,
+        saved: impl IntoIterator<Item = (MediaId, Ticks, TimeRange, Placement, ClipSound, Speed)>,
     ) -> Self {
-        let mut clips: Vec<(MediaId, Ticks, TimeRange, Placement, ClipSound)> = saved
+        let mut clips: Vec<(MediaId, Ticks, TimeRange, Placement, ClipSound, Speed)> = saved
             .into_iter()
-            .filter(|(_, _, source, _, _)| source.start < source.end)
+            .filter(|(_, _, source, ..)| source.start < source.end)
             .collect();
-        clips.sort_by_key(|(_, start, _, _, _)| *start);
+        clips.sort_by_key(|(_, start, ..)| *start);
         let mut timeline = Self::default();
-        for (media, start, source, placement, sound) in clips {
+        for (media, start, source, placement, sound, speed) in clips {
             let id = next_clip_id();
             let wanted = start.max(Ticks(0));
             // Past whatever is already there, since these arrive in order.
@@ -199,6 +221,7 @@ impl Timeline {
                 source,
                 placement: placement.clamped(),
                 sound: sound.clamped(),
+                speed: speed.clamped(),
             });
         }
         timeline
@@ -304,6 +327,7 @@ impl Timeline {
             source,
             placement: Placement::default(),
             sound: ClipSound::default(),
+            speed: Speed::default(),
         });
         id
     }
@@ -319,6 +343,7 @@ impl Timeline {
             source,
             placement: Placement::default(),
             sound: ClipSound::default(),
+            speed: Speed::default(),
         });
         id
     }
@@ -358,12 +383,13 @@ impl Timeline {
         // The fades stay at the ends they were made for.
         self.clips[index].sound.fade_out = 0;
         let second = next_clip_id();
+        let start = self.clips[index].end();
         self.clips.insert(
             index + 1,
             Clip {
                 id: second,
                 media: clip.media,
-                start: Ticks(clip.start.0 + source_time.0 - clip.source.start.0),
+                start,
                 source: TimeRange {
                     start: source_time,
                     end: clip.source.end,
@@ -373,6 +399,7 @@ impl Timeline {
                     fade_in: 0,
                     ..clip.sound
                 },
+                speed: clip.speed,
             },
         );
         Some(second)
@@ -386,6 +413,26 @@ impl Timeline {
         let placement = placement.clamped();
         let changed = self.clips[index].placement != placement;
         self.clips[index].placement = placement;
+        changed
+    }
+
+    /// Changes how fast a clip plays. It keeps its start, so playing faster leaves dead space
+    /// after it, and playing slower moves later clips along only as far as they must.
+    pub(crate) fn set_speed(&mut self, id: ClipId, speed: Speed) -> bool {
+        let Some(index) = self.index_of(id) else {
+            return false;
+        };
+        let speed = speed.clamped();
+        let changed = self.clips[index].speed != speed;
+        self.clips[index].speed = speed;
+        let mut free = self.clips[index].end();
+        for later in &mut self.clips[index + 1..] {
+            if later.start >= free {
+                break;
+            }
+            later.start = free;
+            free = later.end();
+        }
         changed
     }
 
@@ -441,22 +488,35 @@ impl Timeline {
             .get(index + 1)
             .map(|next| next.start.0 - self.clips[index].end().0);
         let clip = &mut self.clips[index];
+        let speed = clip.speed;
+        let shortest = speed.in_footage(min_duration).0;
         match edge {
             ClipEdge::Start => {
-                let earliest = (clip.source.start.0 - room_before).max(0);
-                let latest = (clip.source.end.0 - min_duration.0).max(earliest);
-                let new_start = source_time.0.clamp(earliest, latest);
-                clip.start = Ticks(clip.start.0 + new_start - clip.source.start.0);
-                clip.source.start = Ticks(new_start);
+                let end = clip.end();
+                let reach = speed.in_footage(Ticks(room_before)).0;
+                let earliest = (clip.source.start.0 - reach).max(0);
+                let latest = (clip.source.end.0 - shortest).max(earliest);
+                clip.source.start = Ticks(source_time.0.clamp(earliest, latest));
+                // The other end stays exactly where it is, whatever rounding does to the length.
+                clip.start = Ticks((end.0 - clip.duration().0).max(0));
             }
             ClipEdge::End => {
-                let earliest = clip.source.start.0 + min_duration.0;
+                let earliest = clip.source.start.0 + shortest;
                 let limit = match room_after {
-                    Some(room) => source_duration.0.min(clip.source.end.0 + room),
+                    Some(room) => source_duration
+                        .0
+                        .min(clip.source.end.0 + speed.in_footage(Ticks(room)).0),
                     None => source_duration.0,
                 };
                 let latest = limit.max(earliest);
+                let allowed = room_after.map(|room| clip.end().0 + room);
                 clip.source.end = Ticks(source_time.0.clamp(earliest, latest));
+                // Rounding mustn't let it touch the next clip.
+                if let Some(allowed) = allowed {
+                    while clip.end().0 > allowed && clip.source.end.0 > earliest {
+                        clip.source.end.0 -= 1;
+                    }
+                }
             }
         }
     }
@@ -497,6 +557,163 @@ mod tests {
         for pair in timeline.clips().windows(2) {
             assert!(pair[0].end() <= pair[1].start, "{pair:?}");
         }
+    }
+
+    fn at(factor: f64) -> Speed {
+        Speed::default().with_factor(factor)
+    }
+
+    #[test]
+    fn a_faster_clip_is_shorter_and_finds_its_footage_from_anywhere() {
+        let mut timeline = Timeline::default();
+        let id = timeline.place(VIDEO, range(1000, 3000), Ticks(100));
+        timeline.set_speed(id, at(2.0));
+
+        let clip = timeline.clip(id).expect("it is there");
+        assert_eq!(clip.duration(), Ticks(1000));
+        assert_eq!(clip.end(), Ticks(1100));
+        assert_eq!(clip.source_at(Ticks(600)), Ticks(2000));
+        assert_eq!(clip.time_of(Ticks(2000)), Ticks(600));
+        assert_eq!(
+            timeline.locate(Ticks(600)).map(|at| at.source_time),
+            Some(Ticks(2000))
+        );
+    }
+
+    #[test]
+    fn the_very_end_of_a_clip_is_the_end_of_its_footage_whatever_rounding_says() {
+        let mut timeline = Timeline::default();
+        let id = timeline.place(VIDEO, range(0, 1000), Ticks(0));
+        timeline.set_speed(id, at(3.0));
+
+        let clip = timeline.clip(id).expect("it is there");
+        assert_eq!(clip.source_at(clip.end()), Ticks(1000));
+    }
+
+    #[test]
+    fn speeding_up_leaves_dead_space_and_moves_nothing() {
+        let (mut timeline, [first, second, third]) = three_clips();
+        let starts_before = starts(&timeline);
+
+        timeline.set_speed(first, at(2.0));
+
+        assert_eq!(starts(&timeline), starts_before);
+        assert_eq!(timeline.clip(first).map(Clip::end), Some(Ticks(5)));
+        assert_eq!(timeline.gaps().len(), 1);
+        assert_eq!(order(&timeline), [first, second, third]);
+    }
+
+    #[test]
+    fn slowing_down_moves_later_clips_only_as_far_as_they_must() {
+        let mut timeline = Timeline::default();
+        let first = timeline.place(VIDEO, range(0, 100), Ticks(0));
+        let near = timeline.place(OTHER, range(0, 10), Ticks(110));
+        let far = timeline.place(OTHER, range(0, 10), Ticks(500));
+
+        timeline.set_speed(first, at(0.5));
+
+        assert_eq!(timeline.clip(first).map(Clip::end), Some(Ticks(200)));
+        assert_eq!(timeline.clip(near).map(|clip| clip.start), Some(Ticks(200)));
+        assert_eq!(timeline.clip(far).map(|clip| clip.start), Some(Ticks(500)));
+        assert_no_overlaps(&timeline);
+    }
+
+    #[test]
+    fn splitting_a_faster_clip_keeps_both_halves_touching_and_at_the_same_speed() {
+        let mut timeline = Timeline::default();
+        let id = timeline.place(VIDEO, range(0, 1000), Ticks(100));
+        timeline.set_speed(id, at(2.0));
+
+        let second = timeline.split(id, Ticks(400)).expect("it splits");
+
+        let (a, b) = (
+            timeline.clip(id).expect("it is there"),
+            timeline.clip(second).expect("it is there"),
+        );
+        assert_eq!(a.end(), Ticks(300));
+        assert_eq!(b.start, a.end());
+        assert_eq!(b.end(), Ticks(600));
+        assert_eq!(b.speed, a.speed);
+        assert_eq!(b.source_at(b.start), Ticks(400));
+    }
+
+    #[test]
+    fn splitting_at_an_awkward_speed_never_leaves_a_gap_or_an_overlap() {
+        for factor in [0.1, 0.3, 0.7, 1.3, 3.0, 7.0, 16.0] {
+            let mut timeline = Timeline::default();
+            let id = timeline.place(VIDEO, range(0, 1_000_003), Ticks(7));
+            timeline.set_speed(id, at(factor));
+            let second = timeline.split(id, Ticks(333_331)).expect("it splits");
+            let third = timeline.split(second, Ticks(777_773)).expect("it splits");
+
+            let clips = timeline.clips();
+            assert_eq!(clips[0].end(), clips[1].start, "{factor}");
+            assert_eq!(clips[1].end(), clips[2].start, "{factor}");
+            assert_eq!(
+                timeline.clip(third).map(|clip| clip.source.end),
+                Some(Ticks(1_000_003))
+            );
+            assert_no_overlaps(&timeline);
+        }
+    }
+
+    #[test]
+    fn trimming_a_faster_clips_start_keeps_its_end_and_the_footage_in_place() {
+        let mut timeline = Timeline::default();
+        let id = timeline.place(VIDEO, range(1000, 3000), Ticks(100));
+        timeline.set_speed(id, at(2.0));
+
+        timeline.trim(id, ClipEdge::Start, Ticks(1400), Ticks(5000), Ticks(1));
+
+        let clip = timeline.clip(id).expect("it is there");
+        assert_eq!(clip.end(), Ticks(1100));
+        assert_eq!(clip.start, Ticks(300));
+        assert_eq!(
+            clip.source_at(Ticks(600)),
+            Ticks(2000),
+            "footage stays where it was"
+        );
+    }
+
+    #[test]
+    fn a_faster_clip_can_only_stretch_into_the_room_it_has_on_the_timeline() {
+        let mut timeline = Timeline::default();
+        let id = timeline.place(VIDEO, range(1000, 2000), Ticks(0));
+        timeline.set_speed(id, at(2.0));
+        let next = timeline.place(OTHER, range(0, 100), Ticks(600));
+        assert_eq!(timeline.clip(id).map(Clip::end), Some(Ticks(500)));
+
+        timeline.trim(id, ClipEdge::End, Ticks(4000), Ticks(5000), Ticks(1));
+
+        assert_eq!(timeline.clip(id).map(Clip::end), Some(Ticks(600)));
+        assert_eq!(
+            timeline.clip(id).map(|clip| clip.source.end),
+            Some(Ticks(2200))
+        );
+        assert_eq!(timeline.clip(next).map(|clip| clip.start), Some(Ticks(600)));
+    }
+
+    #[test]
+    fn the_shortest_a_trim_can_leave_is_measured_on_the_timeline() {
+        let mut timeline = Timeline::default();
+        let id = timeline.place(VIDEO, range(0, 1000), Ticks(0));
+        timeline.set_speed(id, at(4.0));
+
+        timeline.trim(id, ClipEdge::End, Ticks(0), Ticks(5000), Ticks(100));
+
+        assert_eq!(timeline.clip(id).map(Clip::duration), Some(Ticks(100)));
+    }
+
+    #[test]
+    fn a_duplicate_keeps_its_speed() {
+        let mut timeline = Timeline::default();
+        let id = timeline.place(VIDEO, range(0, 1000), Ticks(0));
+        timeline.set_speed(id, at(2.0));
+
+        let copy = timeline.duplicate(id).expect("it copies");
+
+        assert_eq!(timeline.clip(copy).map(|clip| clip.start), Some(Ticks(500)));
+        assert_eq!(timeline.clip(copy).map(Clip::duration), Some(Ticks(500)));
     }
 
     #[test]

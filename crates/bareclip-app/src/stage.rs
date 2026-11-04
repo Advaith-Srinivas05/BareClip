@@ -9,6 +9,7 @@ use bareclip_core::{
         CanvasCorner, CropSides, FULL_TURN, LARGEST_SCALE, Placement, SMALLEST_SCALE, WHOLE,
     },
     sound::{ClipSound, FULL_VOLUME},
+    speed::{FASTEST, NORMAL, SLOWEST, Speed},
     time::Ticks,
     timeline::ClipId,
     tracks::OrderMove,
@@ -16,8 +17,8 @@ use bareclip_core::{
 use eframe::egui::{self, CursorIcon, Pos2, Rect, Sense, Shape, Slider, Stroke, pos2, vec2};
 
 use crate::{
-    components::{IconButton, Kind, MenuItem},
-    icons,
+    components::{ActionButton, IconButton, Kind, MenuItem},
+    icons, text,
     theme::Palette,
 };
 
@@ -611,6 +612,7 @@ pub struct StageView<'a> {
     pub can_go_forward: bool,
     pub can_go_back: bool,
     pub sound: Option<SelectedSound>,
+    pub speed: Option<SelectedSpeed>,
 }
 
 /// What happened on the stage this frame.
@@ -621,7 +623,17 @@ pub struct StageEvents {
     pub place: Option<(ClipId, Placement)>,
     pub order: Option<(ClipId, OrderMove)>,
     pub sound: Option<(ClipId, ClipSound)>,
+    pub speed: Option<(ClipId, Speed)>,
     pub detach: Option<ClipId>,
+}
+
+/// The selected clip's speed, if it can have one, for the toolbar's controls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectedSpeed {
+    pub id: ClipId,
+    pub speed: Speed,
+    /// Whether it has sound, and so a pitch to keep.
+    pub has_sound: bool,
 }
 
 /// The selected clip's sound, if it has any, for the toolbar's controls.
@@ -915,6 +927,7 @@ pub fn show(
 
 /// How wide the sound controls' popup is laid out, leaving room for labels and values.
 const SOUND_LABEL_WIDTH: f32 = 58.0;
+const SPEED_MENU_WIDTH: f32 = 250.0;
 /// As far as the fade sliders go. Longer fades can be typed in, as in Clipchamp.
 const FADE_SLIDER_SECONDS: f64 = 2.0;
 
@@ -981,6 +994,92 @@ fn fade_row(
         }
     });
     changed
+}
+
+/// The speeds one press away.
+const SPEED_CHOICES: [f64; 7] = [0.25, 0.5, 1.0, 1.5, 2.0, 4.0, 8.0];
+
+/// A speed from the slider, kept to two places, so that 1x can actually be reached.
+fn tidy_factor(factor: f64) -> f64 {
+    (factor * 100.0).round() / 100.0
+}
+
+/// How fast a clip plays, and whether its voice keeps its pitch.
+fn speed_menu(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    selected: &SelectedSpeed,
+    events: &mut StageEvents,
+) {
+    let speed = selected.speed;
+    let factor = speed.as_factor();
+    ui.horizontal(|ui| {
+        sound_row_setup(ui, palette);
+        sound_label(ui, palette, "Speed");
+        // Even steps along the slider are even multiples, so 0.5x and 2x sit either side of 1x.
+        let (slowest, fastest) = (f64::from(SLOWEST), f64::from(FASTEST));
+        let normal = f64::from(NORMAL);
+        let mut along = factor.log2();
+        let slider = ui
+            .add(
+                Slider::new(
+                    &mut along,
+                    (slowest / normal).log2()..=(fastest / normal).log2(),
+                )
+                .show_value(false)
+                .trailing_fill(true),
+            )
+            .on_hover_text("Slower or faster than it was recorded");
+        slider.widget_info(|| egui::WidgetInfo::slider(slider.enabled(), factor, "Clip speed"));
+        if slider.changed() {
+            events.speed = Some((selected.id, speed.with_factor(tidy_factor(along.exp2()))));
+        }
+        if slider.drag_stopped() || slider.clicked() {
+            slider.surrender_focus();
+        }
+        let mut typed_factor = factor;
+        let typed = ui.add(
+            egui::DragValue::new(&mut typed_factor)
+                .range((slowest / normal)..=(fastest / normal))
+                .speed(0.01)
+                .max_decimals(2)
+                .suffix("x"),
+        );
+        if typed.changed() {
+            events.speed = Some((selected.id, speed.with_factor(typed_factor)));
+        }
+    });
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.set_max_width(SPEED_MENU_WIDTH);
+        for choice in SPEED_CHOICES {
+            let name = text::speed_name(choice);
+            let chosen = (factor - choice).abs() < 0.001;
+            let button = ActionButton::new(palette, Kind::Ghost, &name)
+                .small()
+                .selected(chosen);
+            if ui.add(button).clicked() {
+                events.speed = Some((selected.id, speed.with_factor(choice)));
+            }
+        }
+    });
+    if selected.has_sound {
+        ui.separator();
+        let keep = MenuItem::choice(palette, "Keep pitch", speed.keep_pitch);
+        if ui
+            .add(keep)
+            .on_hover_text("Voices stay at their own pitch. Off, sound rises and falls with speed, like a tape")
+            .clicked()
+        {
+            events.speed = Some((
+                selected.id,
+                Speed {
+                    keep_pitch: !speed.keep_pitch,
+                    ..speed
+                },
+            ));
+        }
+    }
 }
 
 /// Volume, fades, mute and taking the sound out of a video.
@@ -1065,7 +1164,9 @@ fn sound_toolbar(
     selected: &SelectedSound,
     events: &mut StageEvents,
 ) {
-    let width = TOOLBAR_PADDING * 2.0 + TOOLBAR_BUTTON;
+    let speed = view.speed.filter(|speed| speed.id == selected.id);
+    let buttons = if speed.is_some() { 2.0 } else { 1.0 };
+    let width = TOOLBAR_PADDING * 2.0 + TOOLBAR_BUTTON * buttons;
     let rect = toolbar_rect(width, view.frame, view.area, view.row_above_is_free);
     let id = ui.scope_id().with("stage-sound-toolbar");
     egui::Area::new(id)
@@ -1095,6 +1196,15 @@ fn sound_toolbar(
             egui::Popup::menu(&button)
                 .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                 .show(|ui| sound_menu(ui, palette, selected, events));
+            if let Some(speed) = &speed {
+                let spot = spot.translate(vec2(TOOLBAR_BUTTON, 0.0));
+                let button = IconButton::new(palette, Kind::Ghost, icons::GAUGE, "Speed")
+                    .show_at(ui, id.with("speed"), spot)
+                    .on_hover_text("Slower or faster");
+                egui::Popup::menu(&button)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show(|ui| speed_menu(ui, palette, speed, events));
+            }
         });
 }
 
@@ -1228,7 +1338,9 @@ fn toolbar(
     events: &mut StageEvents,
 ) {
     let sound = view.sound.filter(|sound| sound.id == clip.id);
-    let buttons = if sound.is_some() { 6.0 } else { 5.0 };
+    let speed = view.speed.filter(|speed| speed.id == clip.id);
+    let optional = f32::from(u8::from(sound.is_some())) + f32::from(u8::from(speed.is_some()));
+    let buttons = 5.0 + optional;
     let width = TOOLBAR_PADDING * 2.0 + TOOLBAR_BUTTON * buttons;
     let rect = toolbar_rect(width, clip_rect, view.area, view.row_above_is_free);
     let id = ui.scope_id().with("stage-toolbar");
@@ -1298,8 +1410,21 @@ fn toolbar(
             {
                 events.place = Some((clip.id, placement.flipped_down()));
             }
+            if let Some(speed) = &speed {
+                let opened = button(ui, 4.0, icons::GAUGE, "Speed", "Slower or faster");
+                egui::Popup::menu(&opened)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show(|ui| speed_menu(ui, palette, speed, events));
+            }
             if let Some(sound) = &sound {
-                let opened = button(ui, 4.0, icons::VOLUME_2, "Sound", "Volume, fades and mute");
+                let place = if speed.is_some() { 5.0 } else { 4.0 };
+                let opened = button(
+                    ui,
+                    place,
+                    icons::VOLUME_2,
+                    "Sound",
+                    "Volume, fades and mute",
+                );
                 egui::Popup::menu(&opened)
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                     .show(|ui| sound_menu(ui, palette, sound, events));

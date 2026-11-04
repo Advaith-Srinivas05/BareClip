@@ -50,6 +50,10 @@ pub fn copying_suits<'a>(mut frames: impl Iterator<Item = &'a FrameIndex>) -> bo
 pub const LAYERED_REASON: &str =
     "Clips are resized, moved, see-through or showing together, so every frame is redrawn.";
 
+/// Why a project with a clip at another speed can't be copied.
+pub const SPEED_REASON: &str =
+    "A clip plays at another speed, so its frames are redrawn at their new times.";
+
 /// Why a project showing an image can't be copied.
 pub const STILLS_REASON: &str =
     "Images have to be drawn into the video, so every frame is redrawn.";

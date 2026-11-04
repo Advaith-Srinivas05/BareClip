@@ -798,6 +798,7 @@ fn whole(input: &Path, key: u64, start: f64, length: f64, placement: Placement) 
             end: seconds(length),
         },
         placement,
+        speed: Default::default(),
     }
 }
 
@@ -1426,6 +1427,7 @@ fn song_span(start: f64, length: f64, bus: Bus) -> MixSpan {
         start: seconds(start),
         source: range(0.0, length),
         sound: ClipSound::default(),
+        speed: Default::default(),
         bus,
     }
 }
@@ -1467,6 +1469,7 @@ fn clip_span(path: &Path, start: f64, source_start: f64, length: f64, bus: Bus) 
         start: seconds(start),
         source: range(source_start, source_start + length),
         sound: ClipSound::default(),
+        speed: Default::default(),
         bus,
     }
 }
@@ -1938,6 +1941,7 @@ fn song_spans(input: &Path, seconds_long: f64, start: f64) -> SoundPlan {
                 end: seconds(seconds_long),
             },
             sound: ClipSound::default(),
+            speed: Default::default(),
             bus: Bus::All(0),
         }],
         tracks: vec![SoundLabel::default()],
@@ -2045,6 +2049,7 @@ fn still_clip(input: &Path, key: u64, start: f64, length: f64) -> LayeredClip {
             end: Ticks(source.start.0 + seconds(length).0),
         },
         placement: Placement::default(),
+        speed: Default::default(),
     }
 }
 
@@ -2159,4 +2164,113 @@ fn a_see_through_image_lets_the_video_under_it_show_in_the_export() {
         "half white over black came out as {middle}"
     );
     let _ = std::fs::remove_file(&job.output);
+}
+
+fn at_speed(clip: LayeredClip, factor: f64) -> LayeredClip {
+    LayeredClip {
+        speed: bareclip_core::speed::Speed::default().with_factor(factor),
+        ..clip
+    }
+}
+
+#[test]
+fn a_clip_at_twice_the_speed_shows_twice_as_much_footage_in_half_the_time() {
+    let input = fast_clip();
+    let info = probe(&input).expect("it can be read");
+    let rate = info.video.frame_rate;
+    let job = LayeredRequest {
+        canvas: Some((info.video.width, info.video.height)),
+        ..layered_request(
+            "twice-the-speed",
+            vec![stretch(
+                0.0,
+                0.5,
+                vec![at_speed(
+                    whole(&input, 1, 0.0, 1.0, Placement::default()),
+                    2.0,
+                )],
+            )],
+            Vec::new(),
+        )
+    };
+
+    let report = export_layered(&job, &AtomicBool::new(false), &|_| {}).expect("it exports");
+
+    assert_eq!(report.frames, (rate / 2.0).round() as u64);
+    let pictures = pictures_of(&job.output);
+    assert_eq!(pictures[0].number, 2000);
+    let middle = &pictures[pictures.len() / 2];
+    let wanted = 2000 + (middle.seconds * 2.0 * rate).round() as i64;
+    assert!(
+        (i64::from(middle.number) - wanted).abs() <= 2,
+        "at {} s it showed frame {}, wanted about {wanted}",
+        middle.seconds,
+        middle.number
+    );
+    let _ = std::fs::remove_file(&job.output);
+}
+
+#[test]
+fn a_clip_at_half_the_speed_repeats_pictures_and_lasts_twice_as_long() {
+    let input = fast_clip();
+    let info = probe(&input).expect("it can be read");
+    let rate = info.video.frame_rate;
+    let job = LayeredRequest {
+        canvas: Some((info.video.width, info.video.height)),
+        ..layered_request(
+            "half-the-speed",
+            vec![stretch(
+                0.0,
+                2.0,
+                vec![at_speed(
+                    whole(&input, 1, 0.0, 1.0, Placement::default()),
+                    0.5,
+                )],
+            )],
+            Vec::new(),
+        )
+    };
+
+    let report = export_layered(&job, &AtomicBool::new(false), &|_| {}).expect("it exports");
+
+    assert_eq!(report.frames, (rate * 2.0).round() as u64);
+    assert!(report.repeated_frames > report.frames / 3, "{report:?}");
+    let pictures = pictures_of(&job.output);
+    let middle = &pictures[pictures.len() / 2];
+    let wanted = 2000 + (middle.seconds * 0.5 * rate).round() as i64;
+    assert!(
+        (i64::from(middle.number) - wanted).abs() <= 2,
+        "at {} s it showed frame {}, wanted about {wanted}",
+        middle.seconds,
+        middle.number
+    );
+    let _ = std::fs::remove_file(&job.output);
+}
+
+#[test]
+fn sound_at_another_speed_goes_in_the_file_for_as_long_as_the_clip_lasts() {
+    let input = large_clip();
+    let plan = SoundPlan {
+        spans: vec![MixSpan {
+            path: input.clone(),
+            start: Ticks(0),
+            source: TimeRange {
+                start: Ticks(0),
+                end: seconds(2.0),
+            },
+            sound: ClipSound::default(),
+            speed: bareclip_core::speed::Speed::default().with_factor(2.0),
+            bus: Bus::All(0),
+        }],
+        tracks: vec![SoundLabel::default()],
+    };
+    let output = output_path("sound-at-speed", "m4a");
+
+    let report =
+        export_sound_only(&plan, &output, &AtomicBool::new(false), &|_| {}).expect("it exports");
+
+    assert_eq!(report.length, seconds(1.0));
+    let info = probe(&output).expect("it can be read");
+    assert!((info.duration.as_seconds() - 1.0).abs() < 0.1);
+    let _ = std::fs::remove_file(&output);
 }

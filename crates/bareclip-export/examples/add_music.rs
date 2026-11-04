@@ -34,6 +34,7 @@ fn main() {
             volume,
             ..ClipSound::default()
         },
+        speed: Default::default(),
         bus: Bus::All(0),
     };
     let request = ExportRequest {

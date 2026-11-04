@@ -9,7 +9,8 @@ use std::{
 
 use bareclip_core::{
     picture::StillPicture,
-    time::Ticks,
+    speed::{NORMAL, Speed},
+    time::{TICKS_PER_SECOND, Ticks},
     timeline::{Clip, ClipId, MediaId},
 };
 use bareclip_media::{MediaInfo, PreviewFrame, fit_preview_size};
@@ -26,6 +27,11 @@ use crate::player::{Notify, PREVIEW_HEIGHT, PREVIEW_WIDTH, Player};
 const LATE_LIMIT: Duration = Duration::from_millis(500);
 /// How long it gets to recover from one jump before it can jump again.
 const CATCH_UP_EVERY: Duration = Duration::from_secs(2);
+/// The same for a clip playing faster than it was recorded.
+const FAST_CATCH_UP_EVERY: Duration = Duration::from_millis(400);
+/// How close a piece's footage has to line up with a clip's to be part of it. Different speeds
+/// can round a little.
+const SAME_PLACE_IN_FOOTAGE: i64 = TICKS_PER_SECOND / 1000;
 
 /// The videos in a stack that need a player of their own, which is all but the top one, because
 /// the main `Preview` plays that. An image has nothing to play.
@@ -41,23 +47,40 @@ fn followed_videos(stack: &[Clip]) -> Vec<Clip> {
 
 /// Where a moment on the timeline falls in a clip's video.
 fn source_time(clip: &Clip, now: Ticks) -> Ticks {
-    Ticks(clip.source.start.0 + now.0 - clip.start.0).min(clip.source.end)
+    clip.source_at(now).min(clip.source.end)
 }
 
 /// Whether a picture has fallen so far behind that it should stop trying to decode its way there.
-fn should_catch_up(now: Ticks, shown: Option<Ticks>, last_jump: Duration) -> bool {
-    let late = Ticks::from_seconds(LATE_LIMIT.as_secs_f64());
-    shown.is_some_and(|shown| now.0 - shown.0 > late.0) && last_jump >= CATCH_UP_EVERY
+/// `now` and `shown` are places in its footage. How late is late goes by the time it takes on
+/// screen, and a clip playing fast gets to jump more often, so it goes in steps and doesn't sit
+/// frozen.
+pub fn should_catch_up(
+    now: Ticks,
+    shown: Option<Ticks>,
+    last_jump: Duration,
+    speed: Speed,
+) -> bool {
+    let late = speed.in_footage(Ticks::from_seconds(LATE_LIMIT.as_secs_f64()));
+    let every = if speed.rate > NORMAL {
+        FAST_CATCH_UP_EVERY
+    } else {
+        CATCH_UP_EVERY
+    };
+    shown.is_some_and(|shown| now.0 - shown.0 > late.0) && last_jump >= every
 }
 
 /// The piece of the stack a picture from the main player belongs to. Pieces of a clip have their
 /// own ids, but they line up with the clip's footage in the same way.
 fn clip_of_piece(stack: &[Clip], piece: &Clip) -> Option<ClipId> {
-    let offset = |clip: &Clip| clip.source.start.0 - clip.start.0;
     stack
         .iter()
         .rev()
-        .find(|clip| clip.media == piece.media && offset(clip) == offset(piece))
+        .find(|clip| {
+            clip.media == piece.media
+                && clip.speed == piece.speed
+                && (clip.source_at(piece.start).0 - piece.source.start.0).abs()
+                    <= SAME_PLACE_IN_FOOTAGE
+        })
         .map(|clip| clip.id)
 }
 
@@ -186,7 +209,12 @@ impl LayerPictures {
                 }
                 follower.shown = None;
             } else if moment.playing
-                && should_catch_up(wanted, follower.shown, follower.last_jump.elapsed())
+                && should_catch_up(
+                    wanted,
+                    follower.shown,
+                    follower.last_jump.elapsed(),
+                    clip.speed,
+                )
             {
                 follower.player.seek(wanted);
                 follower.last_jump = Instant::now();
@@ -437,6 +465,7 @@ mod tests {
             },
             placement: Placement::default(),
             sound: Default::default(),
+            speed: Default::default(),
         }
     }
 
@@ -461,7 +490,8 @@ mod tests {
         assert!(!should_catch_up(
             seconds(5.0),
             Some(seconds(4.8)),
-            Duration::from_secs(60)
+            Duration::from_secs(60),
+            Speed::default(),
         ));
     }
 
@@ -472,12 +502,14 @@ mod tests {
         assert!(should_catch_up(
             seconds(5.0),
             behind,
-            Duration::from_secs(3)
+            Duration::from_secs(3),
+            Speed::default(),
         ));
         assert!(!should_catch_up(
             seconds(5.0),
             behind,
-            Duration::from_millis(100)
+            Duration::from_millis(100),
+            Speed::default(),
         ));
     }
 
@@ -486,7 +518,8 @@ mod tests {
         assert!(!should_catch_up(
             seconds(5.0),
             None,
-            Duration::from_secs(60)
+            Duration::from_secs(60),
+            Speed::default(),
         ));
     }
 
@@ -620,7 +653,7 @@ mod tests {
                     || pictures
                         .pictures
                         .get(&clip.id)
-                        .is_some_and(|picture| picture.time >= at)
+                        .is_some_and(|picture| picture.time >= clip.source_at(at))
             })
         };
         let started = Instant::now();
@@ -646,6 +679,195 @@ mod tests {
             })
             .expect("it draws");
         compositor.read_display().expect("it reads back")
+    }
+
+    /// What playing real recordings fast looks like, against a real clock. Run with
+    /// `$env:BARECLIP_LAYER_FILES = 'a.mp4'; ./scripts/cargo.ps1 test --release -p bareclip-app fast_playback_on_real_recordings '--' --ignored --nocapture`
+    #[test]
+    #[ignore = "needs real recordings, and reports numbers rather than checking them"]
+    fn fast_playback_on_real_recordings() {
+        let Some(paths) = real_files() else {
+            eprintln!("set BARECLIP_LAYER_FILES");
+            return;
+        };
+        for path in paths {
+            let info = probe(&path).expect("the video can be read");
+            println!(
+                "{}: {:.1} s at {:.1} fps",
+                path.display(),
+                info.duration.as_seconds(),
+                info.video.frame_rate
+            );
+            for factor in [0.5, 1.0, 2.0, 4.0, 8.0, 16.0] {
+                let infos = [info.clone()];
+                let lookup = |id: MediaId| infos.get(id.0 as usize).cloned();
+                let mut tracks = Tracks::default();
+                let id = tracks.push(
+                    MediaId(0),
+                    TimeRange {
+                        start: Ticks(0),
+                        end: info.duration,
+                    },
+                );
+                tracks.set_speed(id, Speed::default().with_factor(factor));
+                let notify: Notify = Arc::new(|| {});
+                let mut preview = Preview::new(false, notify);
+                preview.set_planes(true, tracks.played_videos(), &lookup);
+                preview.play(tracks.played_videos(), &lookup);
+                let started = Instant::now();
+                // At most this long, so slow motion doesn't take all day.
+                let longest = Duration::from_secs(8);
+                let (mut pictures, mut last, mut longest_wait) = (0_u32, Instant::now(), 0.0_f64);
+                let mut furthest_behind = 0.0_f64;
+                while preview.is_playing() && started.elapsed() < longest {
+                    if let Some(frame) = preview.update(tracks.played_videos(), &lookup) {
+                        pictures += 1;
+                        longest_wait = longest_wait.max(last.elapsed().as_secs_f64());
+                        last = Instant::now();
+                        let wanted = tracks
+                            .clip(id)
+                            .expect("it is there")
+                            .source_at(preview.position(tracks.played_videos()));
+                        let behind = (wanted.0 - frame.time.0) as f64 / 705_600_000.0;
+                        furthest_behind = furthest_behind.max(behind);
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+                let seconds_played = started.elapsed().as_secs_f64();
+                println!(
+                    "  {factor}x: {:.1} pictures a second, longest wait {:.0} ms, at most {:.2} s of footage behind, over {seconds_played:.1} s",
+                    f64::from(pictures) / seconds_played,
+                    longest_wait * 1000.0,
+                    furthest_behind,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_clip_playing_fast_can_catch_up_sooner_and_is_late_by_its_own_measure() {
+        let fast = Speed::default().with_factor(8.0);
+        let (now, shown) = (seconds(10.0), Some(seconds(8.0)));
+
+        assert!(!should_catch_up(
+            now,
+            shown,
+            Duration::from_millis(500),
+            fast
+        ));
+        let far_behind = Some(seconds(5.0));
+        assert!(should_catch_up(
+            now,
+            far_behind,
+            Duration::from_millis(500),
+            fast
+        ));
+        assert!(!should_catch_up(
+            now,
+            far_behind,
+            Duration::from_millis(100),
+            fast
+        ));
+    }
+
+    #[test]
+    fn a_faster_clip_looks_the_same_in_the_preview_and_the_export() {
+        let path = detailed_clip("at-speed", "testsrc2");
+        let info = probe(&path).expect("the video can be read");
+        let infos = vec![info.clone()];
+        let mut tracks = Tracks::default();
+        let id = tracks.place(
+            MediaId(0),
+            TimeRange {
+                start: Ticks(0),
+                end: seconds(3.0),
+            },
+            Ticks(0),
+            TrackTarget::New(0),
+        );
+        tracks.set_speed(id, Speed::default().with_factor(2.0));
+        let canvas = (info.video.width, info.video.height);
+        let size_of = |_: MediaId| Some(canvas);
+        let Some(mut compositor) = compositor_of(canvas) else {
+            return;
+        };
+        let at = seconds(1.0);
+        let previewed = drawn_by_the_preview(&tracks, &infos, at, &mut compositor);
+
+        let output = std::env::temp_dir().join(format!(
+            "bareclip-app-tests/layers-speed-matches-{}.mp4",
+            std::process::id()
+        ));
+        let stretches = tracks
+            .stretches(canvas, &size_of)
+            .into_iter()
+            .map(|stretch| bareclip_export::LayeredStretch {
+                start: stretch.start,
+                end: stretch.end,
+                stack: stretch
+                    .stack
+                    .iter()
+                    .map(|clip| bareclip_export::LayeredClip {
+                        key: clip.id.0,
+                        input: path.clone(),
+                        start: clip.start,
+                        source: clip.source,
+                        placement: clip.placement,
+                        speed: clip.speed,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let request = bareclip_export::LayeredRequest {
+            output: output.clone(),
+            stretches,
+            sound: bareclip_export::SoundPlan::default(),
+            canvas: Some(canvas),
+            background: [0, 0, 0],
+            quality: Default::default(),
+            rate: Default::default(),
+        };
+        bareclip_export::export_layered(
+            &request,
+            &std::sync::atomic::AtomicBool::new(false),
+            &|_| {},
+        )
+        .expect("the export succeeds");
+
+        let mut reader = bareclip_media::PictureReader::open(&output).expect("the export opens");
+        reader.seek(at).expect("it seeks");
+        let exported = loop {
+            let picture = reader
+                .next_picture()
+                .expect("it decodes")
+                .expect("the moment is in the video");
+            if picture.time() >= at {
+                break picture;
+            }
+        };
+        let layer = Layer {
+            picture: exported.view().into(),
+            rect: bareclip_render::fit_inside(exported.size(), canvas),
+            opacity: 1.0,
+            look: bareclip_render::PictureLook::PLAIN,
+        };
+        compositor.draw_for_display(&[layer]).expect("it draws");
+        let shown = compositor.read_display().expect("it reads back");
+
+        let difference = average_difference(&previewed, &shown);
+        assert!(
+            difference < 6.0,
+            "the export differs from the preview by {difference:.2} out of 255"
+        );
+        // A clip at the wrong place in its footage makes this large, so it means something.
+        let mut normal = tracks.clone();
+        normal.set_speed(id, Speed::default());
+        let elsewhere = drawn_by_the_preview(&normal, &infos, at, &mut compositor);
+        assert!(
+            average_difference(&previewed, &elsewhere) > difference + 1.0,
+            "the speed made no difference to the picture"
+        );
+        let _ = std::fs::remove_file(&output);
     }
 
     #[test]
@@ -724,6 +946,7 @@ mod tests {
                         start: clip.start,
                         source: clip.source,
                         placement: clip.placement,
+                        speed: clip.speed,
                     })
                     .collect(),
             })
@@ -844,6 +1067,7 @@ mod tests {
                         start: clip.start,
                         source: clip.source,
                         placement: clip.placement,
+                        speed: clip.speed,
                     })
                     .collect(),
             })
@@ -1119,6 +1343,7 @@ mod tests {
                         volume: 0,
                         ..Default::default()
                     },
+                    speed: clip.speed,
                     bus: bareclip_audio::Bus::All(0),
                 })
                 .collect();
@@ -1293,6 +1518,7 @@ mod tests {
                         start: clip.start,
                         source: clip.source,
                         placement: clip.placement,
+                        speed: clip.speed,
                     })
                     .collect(),
             })

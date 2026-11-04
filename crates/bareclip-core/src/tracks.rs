@@ -6,8 +6,9 @@ use crate::{
     placement::{Placement, final_size},
     project::SavedClip,
     sound::{ClipSound, RowSound},
+    speed::Speed,
     time::Ticks,
-    timeline::{Clip, ClipEdge, ClipId, MediaId, TimeRange, Timeline},
+    timeline::{Clip, ClipEdge, ClipId, MediaId, TimeRange, Timeline, next_clip_id},
 };
 
 /// A later piece of a clip that another track's clip cuts in two. The first piece keeps
@@ -56,13 +57,14 @@ pub struct SoundSpan {
     pub start: Ticks,
     pub source: TimeRange,
     pub sound: ClipSound,
+    pub speed: Speed,
     /// Which sound row it is on, counted from the top. Picture rows have none.
     pub sound_row: Option<usize>,
 }
 
 impl SoundSpan {
     pub fn length(&self) -> Ticks {
-        self.source.duration()
+        self.speed.on_timeline(self.source.duration())
     }
 
     pub fn end(&self) -> Ticks {
@@ -74,6 +76,7 @@ impl SoundSpan {
             && self.sound_row == earlier.sound_row
             && self.start == earlier.end()
             && self.source.start == earlier.source.end
+            && self.speed == earlier.speed
             && self.sound.volume == earlier.sound.volume
             && self.sound.only_track == earlier.sound.only_track
             && self.sound.fade_in == 0
@@ -120,6 +123,7 @@ impl Tracks {
                         clip.source(),
                         clip.placement,
                         clip.sound,
+                        clip.speed,
                     ))
                 }))
             })
@@ -373,13 +377,18 @@ impl Tracks {
             let row = self.row_for_sound_at(clip.start, clip.end());
             let target = row.map_or(TrackTarget::New(self.tracks.len()), TrackTarget::Existing);
             let index = self.make_room(target, RowKind::Sound);
-            let detached = self.tracks[index].place(clip.media, clip.source, clip.start);
-            self.tracks[index].set_sound(
-                detached,
-                ClipSound {
-                    only_track: Some(track),
-                    ..clip.sound
+            let detached = next_clip_id();
+            self.tracks[index].land(
+                Clip {
+                    id: detached,
+                    placement: Placement::default(),
+                    sound: ClipSound {
+                        only_track: Some(track),
+                        ..clip.sound
+                    },
+                    ..clip
                 },
+                clip.start,
             );
             detached
         });
@@ -417,6 +426,28 @@ impl Tracks {
         changed
     }
 
+    /// Changes how fast a clip plays. Clips later on its row move along only if they must, and
+    /// other rows stay as they are. Returns whether that changed anything.
+    pub fn set_speed(&mut self, id: ClipId, speed: Speed) -> bool {
+        let Some(track) = self.track_of(id) else {
+            return false;
+        };
+        let changed = self.tracks[track].set_speed(id, speed);
+        self.refresh();
+        changed
+    }
+
+    /// Whether any clip that shows plays at another speed.
+    pub fn shows_other_speeds(
+        &self,
+        canvas: (u32, u32),
+        size_of: &dyn Fn(MediaId) -> Option<(u32, u32)>,
+    ) -> bool {
+        self.stretches(canvas, size_of)
+            .iter()
+            .any(|stretch| stretch.stack.iter().any(|clip| !clip.speed.is_normal()))
+    }
+
     /// Everything that can be heard, in order of time. Muted clips and rows are left out, and so
     /// is every row but those on solo when any is. `has_sound` says which files have any.
     pub fn sound_spans(&self, has_sound: &dyn Fn(MediaId) -> bool) -> Vec<SoundSpan> {
@@ -438,6 +469,7 @@ impl Tracks {
                     start: clip.start,
                     source: clip.source,
                     sound: clip.sound,
+                    speed: clip.speed,
                     sound_row,
                 };
                 match &mut last {
@@ -467,7 +499,9 @@ impl Tracks {
             .filter(|clip| has_sound(clip.media))
             .collect();
         heard.sort_by_key(|clip| clip.start);
-        heard.iter().all(|clip| clip.sound.is_default())
+        heard
+            .iter()
+            .all(|clip| clip.sound.is_default() && clip.speed.is_normal())
             && heard.windows(2).all(|pair| pair[0].end() <= pair[1].start)
     }
 
@@ -719,10 +753,9 @@ impl Tracks {
     ) -> bool {
         self.stretches(canvas, size_of).iter().any(|stretch| {
             stretch.stack.len() > 1
-                || stretch
-                    .stack
-                    .iter()
-                    .any(|clip| clip.is_still() || !clip.placement.is_default())
+                || stretch.stack.iter().any(|clip| {
+                    clip.is_still() || !clip.speed.is_normal() || !clip.placement.is_default()
+                })
         })
     }
 
@@ -971,7 +1004,6 @@ fn visible_pieces(clip: Clip, covered: &[TimeRange], pieces: &mut Vec<Clip>) {
 
 /// The stretch of a clip between two moments on the timeline.
 fn piece_of(clip: Clip, start: Ticks, end: Ticks, number: u64) -> Clip {
-    let into_source = clip.source.start.0 - clip.start.0;
     let id = if number == 0 {
         clip.id
     } else {
@@ -981,8 +1013,8 @@ fn piece_of(clip: Clip, start: Ticks, end: Ticks, number: u64) -> Clip {
         id,
         start,
         source: TimeRange {
-            start: Ticks(start.0 + into_source),
-            end: Ticks(end.0 + into_source),
+            start: clip.source_at(start),
+            end: clip.source_at(end),
         },
         ..clip
     }
@@ -1954,6 +1986,106 @@ mod tests {
 
         assert_eq!(stack.last().map(|clip| clip.id), Some(above));
         assert_eq!(tracks.played().clips()[0].id, above);
+    }
+
+    fn faster(factor: f64) -> Speed {
+        Speed::default().with_factor(factor)
+    }
+
+    #[test]
+    fn another_speed_makes_a_project_take_layers_only_if_the_clip_shows() {
+        let mut tracks = Tracks::default();
+        let video = tracks.push(VIDEO, range(0, 100));
+        assert!(!tracks.needs_layers(WIDE, &all_wide));
+
+        tracks.set_speed(video, faster(2.0));
+
+        assert!(tracks.needs_layers(WIDE, &all_wide));
+        assert!(tracks.shows_other_speeds(WIDE, &all_wide));
+    }
+
+    #[test]
+    fn slowing_a_clip_moves_later_clips_on_its_own_row_and_no_others() {
+        let mut tracks = Tracks::default();
+        let first = tracks.push(VIDEO, range(0, 100));
+        let second = tracks.push(OTHER, range(0, 100));
+        let other_row = tracks.place(OTHER, range(0, 10), Ticks(150), TrackTarget::New(0));
+
+        tracks.set_speed(first, faster(0.5));
+
+        assert_eq!(tracks.clip(second).map(|clip| clip.start), Some(Ticks(200)));
+        assert_eq!(
+            tracks.clip(other_row).map(|clip| clip.start),
+            Some(Ticks(150))
+        );
+    }
+
+    #[test]
+    fn sound_changes_length_with_its_clip_and_takes_the_speed_with_it() {
+        let mut tracks = Tracks::default();
+        let video = tracks.push(VIDEO, range(0, 100));
+        tracks.set_speed(video, faster(2.0));
+
+        let spans = tracks.sound_spans(&with_sound);
+
+        assert_eq!(spans[0].speed, faster(2.0));
+        assert_eq!(spans[0].source, range(0, 100));
+        assert_eq!(spans[0].end(), Ticks(50));
+    }
+
+    #[test]
+    fn another_speed_means_the_sound_is_not_plain() {
+        let mut tracks = Tracks::default();
+        let video = tracks.push(VIDEO, range(0, 100));
+        assert!(tracks.sound_is_plain(&with_sound));
+
+        tracks.set_speed(video, faster(2.0));
+
+        assert!(!tracks.sound_is_plain(&with_sound));
+    }
+
+    #[test]
+    fn splits_at_the_same_speed_still_read_as_one_run_of_sound() {
+        let mut tracks = Tracks::default();
+        let video = tracks.push(VIDEO, range(0, 1000));
+        tracks.set_speed(video, faster(2.0));
+        tracks.split(video, Ticks(400));
+
+        let spans = tracks.sound_spans(&with_sound);
+
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].source, range(0, 1000));
+    }
+
+    #[test]
+    fn pieces_of_a_faster_clip_under_another_find_the_right_footage() {
+        let mut tracks = Tracks::default();
+        tracks.place(VIDEO, range(0, 1000), Ticks(0), TrackTarget::New(0));
+        let video = tracks.picture_tracks()[0].clips()[0].id;
+        tracks.set_speed(video, faster(2.0));
+        tracks.place(OTHER, range(0, 100), Ticks(100), TrackTarget::New(0));
+
+        let played = tracks.played().clips();
+
+        assert_eq!(played[0].source, range(0, 200));
+        assert_eq!(played[2].start, Ticks(200));
+        assert_eq!(played[2].source, range(400, 1000));
+        assert_eq!(played[2].end(), Ticks(500));
+    }
+
+    #[test]
+    fn detached_sound_keeps_the_speed_and_stays_in_time_with_its_clip() {
+        let mut tracks = Tracks::default();
+        let video = tracks.push(VIDEO, range(0, 1000));
+        tracks.set_speed(video, faster(2.0));
+
+        let detached = tracks.detach_sound(video, 1);
+
+        let sound = tracks.clip(detached[0]).expect("it is there");
+        assert_eq!(sound.speed, faster(2.0));
+        assert_eq!(sound.start, Ticks(0));
+        assert_eq!(sound.end(), Ticks(500));
+        assert_eq!(sound.sound.only_track, Some(0));
     }
 
     #[test]

@@ -43,6 +43,7 @@ impl SoundPlan {
                     start,
                     source: part.range,
                     sound: ClipSound::default(),
+                    speed: Default::default(),
                     bus: Bus::ByTrack(0),
                 }
             })
@@ -57,7 +58,7 @@ impl SoundPlan {
     pub fn end(&self) -> Ticks {
         self.spans
             .iter()
-            .map(|span| Ticks(span.start.0 + span.source.duration().0))
+            .map(MixSpan::end)
             .max()
             .unwrap_or(Ticks(0))
     }
