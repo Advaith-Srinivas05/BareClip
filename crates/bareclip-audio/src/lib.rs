@@ -3,6 +3,7 @@
 mod engine;
 mod mix;
 mod output;
+mod stretch;
 
 pub use engine::SoundEngine;
 pub use mix::{Bus, MixSpan, TimelineMix, soft_limit};

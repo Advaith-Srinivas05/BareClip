@@ -297,6 +297,7 @@ mod tests {
                 end: Ticks(TICKS_PER_SECOND),
             },
             sound: ClipSound::default(),
+            speed: Default::default(),
             bus: Bus::All(0),
         }
     }

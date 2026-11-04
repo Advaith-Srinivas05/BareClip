@@ -2,6 +2,7 @@
 
 use bareclip_core::{
     sound::RowSound,
+    speed::Speed,
     time::{Ticks, format_timecode},
     timeline::{ClipEdge, ClipId, MediaId, TimeRange},
     tracks::{TrackTarget, Tracks},
@@ -180,6 +181,7 @@ pub struct ClipView {
     pub sound_only: bool,
     /// Whether it shows an image.
     pub is_still: bool,
+    pub speed: Speed,
     /// How long its fades really are.
     pub fade_in: Ticks,
     pub fade_out: Ticks,
@@ -203,7 +205,7 @@ fn picture_index_at(pictures: &[(Ticks, TextureHandle)], time: Ticks) -> usize {
 /// The moment in a clip's video that a place on screen shows.
 fn source_time_at(clip: &ClipView, scale: &TimeScale, x: f32) -> Ticks {
     let along = scale.time_of_pixels(x - scale.x_of(clip.start));
-    Ticks(clip.source_start.0 + along.0)
+    Ticks(clip.source_start.0 + clip.speed.in_footage(along).0)
 }
 
 /// What the timeline needs to know to draw the project.
@@ -2215,6 +2217,7 @@ mod tests {
             muted: false,
             sound_only: false,
             is_still: false,
+            speed: Speed::default(),
             fade_in: Ticks(0),
             fade_out: Ticks(0),
         }

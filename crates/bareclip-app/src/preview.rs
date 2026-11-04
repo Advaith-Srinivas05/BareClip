@@ -7,12 +7,16 @@ use std::time::{Duration, Instant};
 use bareclip_audio::{MixSpan, SoundEngine};
 use bareclip_core::{
     playback::advance_from_time,
+    speed::NORMAL,
     time::Ticks,
     timeline::{Clip, ClipId, MediaId, Timeline},
 };
 use bareclip_media::{MediaInfo, PreviewFrame};
 
-use crate::player::{Notify, Player};
+use crate::{
+    layers::should_catch_up,
+    player::{Notify, Player},
+};
 
 /// Open players hold decoders, so only a few stay open.
 const MAX_OPEN_PLAYERS: usize = 4;
@@ -44,7 +48,8 @@ enum Clock {
 
 /// Where a moment on the timeline falls in a clip's video.
 fn source_time_in(clip: &Clip, now: Ticks) -> Ticks {
-    Ticks(clip.source.start.0 + now.0 - clip.start.0).clamp(clip.source.start, clip.source.end)
+    clip.source_at(now)
+        .clamp(clip.source.start, clip.source.end)
 }
 
 pub struct Preview {
@@ -70,6 +75,9 @@ pub struct Preview {
     jumped: bool,
     /// Which piece of the timeline the last picture came from.
     last_picture_from: Option<Clip>,
+    /// Where in its footage the last picture was, for a clip playing fast.
+    shown_footage: Option<Ticks>,
+    last_jump: Instant,
     notify: Notify,
     error: Option<String>,
 }
@@ -92,6 +100,8 @@ impl Preview {
             planes: false,
             jumped: false,
             last_picture_from: None,
+            shown_footage: None,
+            last_jump: Instant::now(),
             notify,
             error: None,
         }
@@ -496,11 +506,30 @@ impl Preview {
         let now = self.position(timeline);
         let playing = self.playing;
         let slot = self.slots.iter_mut().find(|slot| slot.media == media)?;
+        let wanted = source_time_in(&clip, now);
         let frame = if playing {
-            slot.player.update_following(source_time_in(&clip, now))
+            slot.player.update_following(wanted)
         } else {
             slot.player.update()
         };
+        // Played fast enough, the decoder can't keep up. Rather than falling further and further
+        // behind, the picture goes in steps. At normal speed this never comes up.
+        if let Some(frame) = &frame {
+            self.shown_footage = Some(frame.time);
+        }
+        if playing
+            && clip.speed.rate > NORMAL
+            && should_catch_up(
+                wanted,
+                self.shown_footage,
+                self.last_jump.elapsed(),
+                clip.speed,
+            )
+        {
+            slot.player.seek(wanted);
+            self.last_jump = Instant::now();
+            self.shown_footage = None;
+        }
 
         if playing {
             self.position = now;
@@ -1048,6 +1077,7 @@ mod tests {
             start: Ticks(0),
             source: range(0.0, 1.0),
             sound: Default::default(),
+            speed: Default::default(),
             bus: bareclip_audio::Bus::All(0),
         };
 

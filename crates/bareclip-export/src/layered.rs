@@ -12,6 +12,7 @@ use bareclip_core::{
     canvas::{BLACK, Colour},
     picture::{BlackPicture, StillPicture},
     placement::{Placement, WHOLE},
+    speed::Speed,
     time::Ticks,
     timeline::TimeRange,
 };
@@ -36,11 +37,16 @@ pub struct LayeredClip {
     pub start: Ticks,
     pub source: TimeRange,
     pub placement: Placement,
+    pub speed: Speed,
 }
 
 impl LayeredClip {
     fn source_time(&self, time: Ticks) -> Ticks {
-        Ticks(self.source.start.0 + time.0 - self.start.0)
+        Ticks(self.source.start.0 + self.speed.in_footage(Ticks(time.0 - self.start.0)).0)
+    }
+
+    fn end(&self) -> Ticks {
+        Ticks(self.start.0 + self.speed.on_timeline(self.source.duration()).0)
     }
 }
 
@@ -225,10 +231,12 @@ pub fn export_layered(
                     };
                     let span = Span {
                         start: clip.start,
-                        end: Ticks(clip.start.0 + clip.source.duration().0),
+                        end: clip.end(),
                         source: clip.source,
                     };
-                    let before = pick_pictures_before(clip.source_time(time), half_frame, span);
+                    // Half a frame of the finished video, as a stretch of this clip's footage.
+                    let half = clip.speed.in_footage(half_frame);
+                    let before = pick_pictures_before(clip.source_time(time), half, span);
                     stack_changed |= feed.advance_to(before)?;
                 }
 
@@ -357,9 +365,28 @@ mod tests {
                 end: seconds(8.0),
             },
             placement: Placement::default(),
+            speed: Speed::default(),
         };
 
         assert_eq!(clip.source_time(seconds(12.0)), seconds(5.0));
+    }
+
+    #[test]
+    fn a_faster_clip_runs_through_its_footage_faster_and_ends_sooner() {
+        let clip = LayeredClip {
+            key: 1,
+            input: PathBuf::from("a.mp4"),
+            start: seconds(10.0),
+            source: TimeRange {
+                start: seconds(3.0),
+                end: seconds(7.0),
+            },
+            placement: Placement::default(),
+            speed: Speed::default().with_factor(2.0),
+        };
+
+        assert_eq!(clip.source_time(seconds(11.0)), seconds(5.0));
+        assert_eq!(clip.end(), seconds(12.0));
     }
 
     #[test]

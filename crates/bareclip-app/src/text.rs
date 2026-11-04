@@ -239,6 +239,13 @@ pub fn full_export_plan(plan: &FullPlan) -> String {
     )
 }
 
+/// A speed as people say it, such as `2x` or `0.25x`.
+pub fn speed_name(factor: f64) -> String {
+    let two_places = format!("{factor:.2}");
+    let trimmed = two_places.trim_end_matches('0').trim_end_matches('.');
+    format!("{trimmed}x")
+}
+
 /// What a quality is called in the export window.
 pub fn quality_name(quality: Quality) -> &'static str {
     match quality {
@@ -395,6 +402,15 @@ fn compare_digit_runs(a: &str, b: &str) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_speed_is_named_with_no_needless_decimals() {
+        assert_eq!(speed_name(2.0), "2x");
+        assert_eq!(speed_name(0.25), "0.25x");
+        assert_eq!(speed_name(1.5), "1.5x");
+        assert_eq!(speed_name(16.0), "16x");
+        assert_eq!(speed_name(0.1), "0.1x");
+    }
 
     #[test]
     fn names_sort_the_way_file_explorer_sorts_them() {
