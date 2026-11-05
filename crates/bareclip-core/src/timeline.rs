@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
+    effects::{ClipLook, SHORTEST_TRANSITION_SECONDS, Transition},
     placement::Placement,
     sound::ClipSound,
     speed::Speed,
@@ -83,6 +84,10 @@ pub struct Clip {
     pub sound: ClipSound,
     /// How fast it plays, and so how long it lasts. This too.
     pub speed: Speed,
+    /// Its filter, colour adjustments and picture fades. This too.
+    pub look: ClipLook,
+    /// The transition from this clip into the one straight after it on its row.
+    pub transition: Option<Transition>,
 }
 
 impl Clip {
@@ -97,6 +102,27 @@ impl Clip {
             return self.source.end;
         }
         Ticks(self.source.start.0 + self.speed.in_footage(Ticks(time.0 - self.start.0)).0)
+    }
+
+    /// The moment in the footage for any moment on the timeline, even outside the clip, which is
+    /// where a transition plays it. It can't go back past the start of its file. Past the end of
+    /// the file, whatever plays it just holds its last picture.
+    pub fn footage_at(self, time: Ticks) -> Ticks {
+        Ticks((self.source.start.0 + self.speed.in_footage(Ticks(time.0 - self.start.0)).0).max(0))
+    }
+
+    /// Where its picture goes at a moment, with its fades allowed for.
+    pub fn placement_at(self, time: Ticks) -> Placement {
+        let into = Ticks(time.0 - self.start.0);
+        let placement = self.placement.at(into);
+        if !self.look.has_fade() {
+            return placement;
+        }
+        let shown = f64::from(self.look.fade_at(into, self.duration()));
+        Placement {
+            opacity: (f64::from(placement.opacity) * shown).round() as i32,
+            ..placement
+        }
     }
 
     /// The moment on the timeline that a moment in the footage plays at.
@@ -215,31 +241,56 @@ impl Timeline {
 
     /// Puts saved clips back, each with a new id. Going through the usual rules means a
     /// file edited by hand can't produce an arrangement the editor couldn't.
-    pub(crate) fn restore(
-        saved: impl IntoIterator<Item = (MediaId, Ticks, TimeRange, Placement, ClipSound, Speed)>,
-    ) -> Self {
-        let mut clips: Vec<(MediaId, Ticks, TimeRange, Placement, ClipSound, Speed)> = saved
+    pub(crate) fn restore(saved: impl IntoIterator<Item = (MediaId, Clip)>) -> Self {
+        let mut clips: Vec<(MediaId, Clip)> = saved
             .into_iter()
-            .filter(|(_, _, source, ..)| source.start < source.end)
+            .filter(|(_, clip)| clip.source.start < clip.source.end)
             .collect();
-        clips.sort_by_key(|(_, start, ..)| *start);
+        clips.sort_by_key(|(_, clip)| clip.start);
         let mut timeline = Self::default();
-        for (media, start, source, placement, sound, speed) in clips {
+        for (media, clip) in clips {
             let id = next_clip_id();
-            let wanted = start.max(Ticks(0));
+            let wanted = clip.start.max(Ticks(0));
             // Past whatever is already there, since these arrive in order.
             let start = wanted.max(timeline.duration());
             timeline.clips.push(Clip {
                 id,
                 media,
                 start,
-                source,
-                placement: placement.clamped(),
-                sound: sound.clamped(),
-                speed: speed.clamped(),
+                placement: clip.placement.clamped(),
+                sound: clip.sound.clamped(),
+                speed: clip.speed.clamped(),
+                look: clip.look.checked(),
+                ..clip
             });
         }
         timeline
+    }
+
+    pub(crate) fn clip_mut(&mut self, id: ClipId) -> Option<&mut Clip> {
+        self.clips.iter_mut().find(|clip| clip.id == id)
+    }
+
+    /// Takes away transitions whose clips no longer touch, or that aren't on a row of pictures, and
+    /// shortens any that have outgrown their clips.
+    pub(crate) fn settle_transitions(&mut self, on_pictures: bool) {
+        let shortest = Ticks::from_seconds(SHORTEST_TRANSITION_SECONDS).0;
+        for index in 0..self.clips.len() {
+            let Some(transition) = self.clips[index].transition else {
+                continue;
+            };
+            let clip = self.clips[index];
+            let touching = self.clips.get(index + 1).filter(|next| {
+                on_pictures && next.start == clip.end() && !clip.is_title() && !next.is_title()
+            });
+            self.clips[index].transition = touching.map(|next| Transition {
+                duration: transition
+                    .duration
+                    .min(clip.duration().0.min(next.duration().0) / 2)
+                    .max(shortest.min(clip.duration().0.min(next.duration().0) / 2)),
+                ..transition
+            });
+        }
     }
 
     /// Clips already in order and not overlapping, such as what a stack of tracks plays.
@@ -343,6 +394,8 @@ impl Timeline {
             placement: Placement::default(),
             sound: ClipSound::default(),
             speed: Speed::default(),
+            look: ClipLook::default(),
+            transition: None,
         });
         id
     }
@@ -359,6 +412,8 @@ impl Timeline {
             placement: Placement::default(),
             sound: ClipSound::default(),
             speed: Speed::default(),
+            look: ClipLook::default(),
+            transition: None,
         });
         id
     }
@@ -371,6 +426,7 @@ impl Timeline {
             id,
             media,
             start,
+            transition: None,
             ..clip
         });
         id
@@ -417,6 +473,10 @@ impl Timeline {
     pub fn duplicate(&mut self, id: ClipId) -> Option<ClipId> {
         let clip = self.clip(id)?;
         let copy = next_clip_id();
+        // The copy goes between this clip and the next, so it is the one that now joins the next.
+        if let Some(index) = self.index_of(id) {
+            self.clips[index].transition = None;
+        }
         self.settle(Clip {
             id: copy,
             start: clip.end(),
@@ -445,8 +505,10 @@ impl Timeline {
             return None;
         }
         self.clips[index].source.end = source_time;
-        // The fades stay at the ends they were made for.
+        // The fades stay at the ends they were made for, and so does a transition.
         self.clips[index].sound.fade_out = 0;
+        self.clips[index].look.fade_out = 0;
+        self.clips[index].transition = None;
         let second = next_clip_id();
         let start = self.clips[index].end();
         self.clips.insert(
@@ -465,6 +527,11 @@ impl Timeline {
                     ..clip.sound
                 },
                 speed: clip.speed,
+                look: ClipLook {
+                    fade_in: 0,
+                    ..clip.look
+                },
+                transition: clip.transition,
             },
         );
         Some(second)

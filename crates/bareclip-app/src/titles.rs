@@ -7,10 +7,13 @@ use bareclip_core::{
     srt::{decode_subtitles, parse_srt},
     time::TimeBase,
     timeline::Clip,
-    title::{LARGEST_SIZE, SMALLEST_SIZE, STYLE_GROUPS, TitleSpot},
+    title::{
+        LARGEST_SIZE, SMALLEST_SIZE, STYLE_GROUPS, TEXT_STYLES_HEADING, TEXT_STYLES_SHOWN,
+        TitleSpot,
+    },
 };
 use bareclip_media::VideoInfo;
-use bareclip_text::{draw_font_name, draw_title, font_list};
+use bareclip_text::{MovingTitle, draw_font_name, draw_title, draw_title_with_logo, font_list};
 
 use super::*;
 
@@ -19,10 +22,15 @@ const TITLE_PANEL_WIDTH: f32 = 250.0;
 /// The canvas the Text panel's cards draw their styles for. Only the shape matters, and these are
 /// shown smaller than they are drawn so they stay sharp on any display.
 const CARD_CANVAS: (u32, u32) = (640, 360);
+/// The canvas for styles that run across the whole canvas. Their cards are laid out on a
+/// square, so a frame goes around all four sides and a panel keeps its words, where cropping the
+/// middle of a wide canvas would cut them.
+const FULL_CARD_CANVAS: (u32, u32) = (360, 360);
 const CARD_COLUMNS: usize = 2;
 const CARD_GAP: f32 = 8.0;
 const CARD_ROOM: f32 = 8.0;
 const CARD_CHECK: f32 = 10.0;
+const CARD_RADIUS: f32 = 6.0;
 const FONT_ROW_HEIGHT: f32 = 32.0;
 const FONT_ROW_TEXT: f32 = 18.0;
 const FONT_LIST_WIDTH: f32 = 240.0;
@@ -34,6 +42,11 @@ const SPOT_GAP: f32 = 2.0;
 const CAPTIONS_TOUCHING_SECONDS: f64 = 0.05;
 const SHIPPED_HEADING: &str = "Fonts with BareClip";
 const ON_THIS_PC_HEADING: &str = "On this PC";
+/// How long the pointer rests on a card before it starts moving.
+const CARD_HOVER_SECONDS: f64 = 1.0;
+/// How long a clip a moving card pretends to be, and the pause before it starts again.
+const CARD_CLIP_SECONDS: f32 = 3.0;
+const CARD_PAUSE_SECONDS: f32 = 0.5;
 
 /// A clip copied to be pasted, with what it needs to stand on its own.
 #[derive(Clone, Debug)]
@@ -52,6 +65,41 @@ pub(super) struct TitleResize {
     scale: i32,
 }
 
+/// A style's card in the Text panel, at rest.
+pub(super) struct TitleCard {
+    texture: TextureHandle,
+    /// The scale that shows its picture at its own pixels on the card's canvas.
+    scale: i32,
+    /// Where a logo goes, as shares of the picture, on styles with a place for one.
+    logo_spot: Option<[f32; 4]>,
+}
+
+/// The card the pointer is on, and what it needs to move.
+pub(super) struct CardHover {
+    style: TitleStyle,
+    since: f64,
+    /// Whether the pointer was on it this frame.
+    seen: bool,
+    moving: Option<MovingTitle>,
+    frame: Option<TextureHandle>,
+}
+
+#[cfg(test)]
+impl CardHover {
+    pub(super) fn moving_yet(&self) -> Option<&MovingTitle> {
+        self.moving.as_ref()
+    }
+
+    pub(super) fn wait_over(&mut self) {
+        self.since -= CARD_HOVER_SECONDS;
+    }
+
+    /// Jumps this far into the card's motion, as if the pointer had rested on it that much longer.
+    pub(super) fn play_to(&mut self, seconds: f64, now: f64) {
+        self.since = now - CARD_HOVER_SECONDS - seconds;
+    }
+}
+
 /// The Edit duration window, with what has been typed so far.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct DurationEdit {
@@ -66,6 +114,7 @@ pub(super) enum LeftPanel {
     #[default]
     Media,
     Text,
+    Transitions,
 }
 
 /// A line of the font list.
@@ -110,7 +159,7 @@ fn texture_of(ctx: &egui::Context, name: String, picture: &StillPicture) -> Text
 
 /// The squares that mean "see-through" behind a style, so that a black outline or box shows up.
 fn paint_checks(painter: &egui::Painter, palette: &Palette, rect: egui::Rect) {
-    painter.rect_filled(rect, 6.0, palette.raised);
+    painter.rect_filled(rect, CARD_RADIUS, palette.raised);
     let columns = (rect.width() / CARD_CHECK).ceil() as usize;
     let rows = (rect.height() / CARD_CHECK).ceil() as usize;
     for row in 0..rows {
@@ -120,6 +169,111 @@ fn paint_checks(painter: &egui::Painter, palette: &Palette, rect: egui::Rect) {
             painter.rect_filled(check.intersect(rect), 0.0, palette.surface);
         }
     }
+}
+
+/// The canvas a style's card draws it for.
+fn card_canvas(style: TitleStyle) -> (u32, u32) {
+    if style.fills_its_card() {
+        FULL_CARD_CANVAS
+    } else {
+        CARD_CANVAS
+    }
+}
+
+/// Where a style's picture goes on its card, and how many points each pixel of the card's canvas
+/// takes up there.
+fn card_view(style: TitleStyle, card: egui::Rect, picture: egui::Vec2) -> (egui::Rect, f32) {
+    if style.fills_its_card() {
+        // The canvas, edge to edge. Shrinking a wide canvas into
+        // the square left a thin strip with words too small to read.
+        let canvas = FULL_CARD_CANVAS;
+        let across = card.width() / canvas.0 as f32;
+        let down = card.height() / canvas.1 as f32;
+        (card, across.max(down))
+    } else {
+        let room = card.shrink(CARD_ROOM);
+        let fit = (room.width() / picture.x).min(room.height() / picture.y);
+        (room, fit)
+    }
+}
+
+/// Paints over a card's square corners outside its rounding, in the colour behind the card, for a
+/// picture that runs to the card's edges.
+fn round_off_corners(painter: &egui::Painter, rect: egui::Rect, radius: f32, colour: Color32) {
+    const STEPS: u32 = 8;
+    use std::f32::consts::{FRAC_PI_2, PI};
+    let mut mesh = egui::Mesh::default();
+    // Each corner, the middle of its rounding, and the angle its curve starts at, going clockwise
+    // on the screen, where down is positive.
+    for (corner, middle, start) in [
+        (rect.left_top(), rect.left_top() + vec2(radius, radius), PI),
+        (
+            rect.right_top(),
+            rect.right_top() + vec2(-radius, radius),
+            PI + FRAC_PI_2,
+        ),
+        (
+            rect.right_bottom(),
+            rect.right_bottom() + vec2(-radius, -radius),
+            0.0,
+        ),
+        (
+            rect.left_bottom(),
+            rect.left_bottom() + vec2(radius, -radius),
+            FRAC_PI_2,
+        ),
+    ] {
+        let first = mesh.vertices.len() as u32;
+        mesh.colored_vertex(corner, colour);
+        for step in 0..=STEPS {
+            let angle = start + step as f32 / STEPS as f32 * FRAC_PI_2;
+            mesh.colored_vertex(middle + radius * vec2(angle.cos(), angle.sin()), colour);
+        }
+        for step in 0..STEPS {
+            mesh.add_triangle(first, first + 1 + step, first + 2 + step);
+        }
+    }
+    painter.add(mesh);
+}
+
+/// Gets a slider ready to fill the panel, in BareClip's colours.
+fn style_slider(ui: &mut egui::Ui, palette: &Palette) {
+    let visuals = &mut ui.style_mut().visuals;
+    visuals.widgets.inactive.bg_fill = palette.border_strong;
+    visuals.widgets.hovered.bg_fill = palette.border_strong;
+    visuals.widgets.active.bg_fill = palette.border_strong;
+    visuals.selection.bg_fill = palette.accent;
+    ui.spacing_mut().slider_width = ui.available_width();
+}
+
+/// Paints part of a picture, turned about its middle and partly see-through.
+fn paint_turned(
+    painter: &egui::Painter,
+    texture: egui::TextureId,
+    (centre, size): (egui::Pos2, egui::Vec2),
+    degrees: f32,
+    source: [f32; 4],
+    opacity: f32,
+) {
+    let (sin, cos) = degrees.to_radians().sin_cos();
+    let colour = Color32::WHITE.gamma_multiply(opacity);
+    let corner = |across: f32, down: f32, u: f32, v: f32| {
+        let (x, y) = (across * size.x / 2.0, down * size.y / 2.0);
+        egui::epaint::Vertex {
+            pos: centre + vec2(x * cos - y * sin, x * sin + y * cos),
+            uv: pos2(u, v),
+            color: colour,
+        }
+    };
+    let [left, top, right, bottom] = source;
+    let mut mesh = egui::epaint::Mesh::with_texture(texture);
+    mesh.vertices.push(corner(-1.0, -1.0, left, top));
+    mesh.vertices.push(corner(1.0, -1.0, right, top));
+    mesh.vertices.push(corner(1.0, 1.0, right, bottom));
+    mesh.vertices.push(corner(-1.0, 1.0, left, bottom));
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 fn colour32(colour: Colour) -> Color32 {
@@ -248,7 +402,8 @@ impl Editor {
 
     /// Draws a title into its entry, and returns the scale that shows it right.
     fn draw_title_into(&mut self, index: usize, title: &Title, canvas: (u32, u32)) -> i32 {
-        let drawing = draw_title(title, canvas);
+        let logo = self.title_frames.logo(title);
+        let drawing = draw_title_with_logo(title, canvas, logo.as_deref());
         if drawing.font_missing && !self.fonts_reported.contains(&title.font) {
             self.fonts_reported.push(title.font.clone());
             self.notice = Some(format!(
@@ -720,15 +875,56 @@ impl Editor {
     /// The Text panel's list of styles.
     pub(super) fn text_panel(&mut self, ui: &mut egui::Ui, palette: &Palette) {
         let mut add = None;
+        if let Some(hover) = &mut self.card_hover {
+            hover.seen = false;
+        }
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let width = ui.available_width();
                 let columns = CARD_COLUMNS as f32;
                 let card = (width - CARD_GAP * (columns - 1.0)) / columns;
-                for (heading, styles) in STYLE_GROUPS {
-                    ui.label(RichText::new(heading).font(fonts::strong(13.0)));
+                if self.all_text_styles {
+                    let back = IconButton::new(
+                        palette,
+                        Kind::Ghost,
+                        icons::ARROW_LEFT,
+                        "Back to all the text",
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.add(back).clicked() {
+                            self.all_text_styles = false;
+                        }
+                        ui.label(RichText::new(TEXT_STYLES_HEADING).font(fonts::strong(13.0)));
+                    });
                     ui.add_space(6.0);
+                }
+                for (heading, styles) in STYLE_GROUPS {
+                    let is_text_styles = heading == TEXT_STYLES_HEADING;
+                    if self.all_text_styles && !is_text_styles {
+                        continue;
+                    }
+                    let shown = if is_text_styles && !self.all_text_styles {
+                        &styles[..TEXT_STYLES_SHOWN]
+                    } else {
+                        styles
+                    };
+                    if !self.all_text_styles {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(heading).font(fonts::strong(13.0)));
+                            if is_text_styles {
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    let see_all =
+                                        ActionButton::new(palette, Kind::Ghost, "See all")
+                                            .icon(icons::CHEVRON_RIGHT);
+                                    if ui.add(see_all).clicked() {
+                                        self.all_text_styles = true;
+                                    }
+                                });
+                            }
+                        });
+                        ui.add_space(6.0);
+                    }
                     if styles.contains(&TitleStyle::Subtitle) {
                         let button = ActionButton::new(palette, Kind::Secondary, "Import SRT file")
                             .icon(icons::FILE_PLUS)
@@ -742,7 +938,7 @@ impl Editor {
                         }
                         ui.add_space(CARD_GAP);
                     }
-                    for row in styles.chunks(CARD_COLUMNS) {
+                    for row in shown.chunks(CARD_COLUMNS) {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = CARD_GAP;
                             for style in row {
@@ -756,6 +952,9 @@ impl Editor {
                     ui.add_space(6.0);
                 }
             });
+        if self.card_hover.as_ref().is_some_and(|hover| !hover.seen) {
+            self.card_hover = None;
+        }
         if let Some(style) = add {
             let time = self.position();
             self.add_title(style, time, None);
@@ -785,25 +984,55 @@ impl Editor {
             return response.clicked();
         }
         let ctx = ui.ctx().clone();
-        let texture = self.title_cards.entry(style).or_insert_with(|| {
-            let drawing = draw_title(&Title::in_style(style), CARD_CANVAS);
-            texture_of(&ctx, format!("title-card-{style:?}"), &drawing.picture)
+        let card = self.title_cards.entry(style).or_insert_with(|| {
+            let drawing = draw_title(&Title::in_style(style), card_canvas(style));
+            TitleCard {
+                texture: texture_of(&ctx, format!("title-card-{style:?}"), &drawing.picture),
+                scale: drawing.scale,
+                logo_spot: drawing.logo_spot,
+            }
         });
+        let (rest_texture, rest_scale, logo_spot) =
+            (card.texture.clone(), card.scale, card.logo_spot);
         let painter = ui.painter_at(rect);
         paint_checks(&painter, palette, rect);
-        let room = rect.shrink(CARD_ROOM);
-        let picture = texture.size_vec2();
-        let scale = (room.width() / picture.x).min(room.height() / picture.y);
-        painter.image(
-            texture.id(),
-            egui::Rect::from_center_size(room.center(), picture * scale),
-            egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-            Color32::WHITE,
-        );
+        let picture = rest_texture.size_vec2();
+        let fills = style.fills_its_card();
+        let (room, fit) = card_view(style, rect, picture);
+        let hovering = response.hovered() && !style.motion().is_still();
+        let moved = hovering
+            && self.paint_moving_card(&ctx, &painter, style, room, picture, (fit, rest_scale));
+        if !moved {
+            painter.image(
+                rest_texture.id(),
+                egui::Rect::from_center_size(room.center(), picture * fit),
+                egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+            if let Some([left, top, wide, tall]) = logo_spot {
+                // Only a card shows this. Nothing shows in the video until a logo is chosen.
+                let shown = egui::Rect::from_center_size(room.center(), picture * fit);
+                let middle = shown.left_top()
+                    + vec2(
+                        (left + wide / 2.0) * shown.width(),
+                        (top + tall / 2.0) * shown.height(),
+                    );
+                let reach = (wide * shown.width()).min(tall * shown.height()) / 2.0;
+                painter.circle(
+                    middle,
+                    reach,
+                    palette.raised,
+                    Stroke::new(1.0, palette.text_muted),
+                );
+            }
+        }
+        if fills {
+            round_off_corners(&painter, rect, CARD_RADIUS, palette.surface);
+        }
         if response.hovered() {
             painter.rect_stroke(
                 rect,
-                6.0,
+                CARD_RADIUS,
                 Stroke::new(2.0, palette.accent),
                 egui::StrokeKind::Inside,
             );
@@ -826,6 +1055,108 @@ impl Editor {
         response.clicked()
     }
 
+    /// Plays a card's motion, once the pointer has rested on it long enough. Returns whether it
+    /// painted anything, which it doesn't until then.
+    fn paint_moving_card(
+        &mut self,
+        ctx: &egui::Context,
+        painter: &egui::Painter,
+        style: TitleStyle,
+        room: egui::Rect,
+        picture: egui::Vec2,
+        (fit, rest_scale): (f32, i32),
+    ) -> bool {
+        let now = ctx.input(|input| input.time);
+        let same = self
+            .card_hover
+            .as_ref()
+            .is_some_and(|hover| hover.style == style);
+        if !same {
+            self.card_hover = Some(CardHover {
+                style,
+                since: now,
+                seen: true,
+                moving: None,
+                frame: None,
+            });
+        }
+        let Some(hover) = &mut self.card_hover else {
+            return false;
+        };
+        hover.seen = true;
+        let waited = now - hover.since;
+        if waited < CARD_HOVER_SECONDS {
+            // Asks for one frame when the wait ends, so an idle window stays idle until then.
+            ctx.request_repaint_after(Duration::from_secs_f64(CARD_HOVER_SECONDS - waited));
+            return false;
+        }
+        ctx.request_repaint();
+        let canvas = card_canvas(style);
+        let title = Title {
+            spot: Some(TitleSpot::Middle),
+            ..Title::in_style(style)
+        };
+        let motion = style.motion();
+        let looped =
+            (waited - CARD_HOVER_SECONDS) as f32 % (CARD_CLIP_SECONDS + CARD_PAUSE_SECONDS);
+        let seconds = looped.min(CARD_CLIP_SECONDS);
+        let stage = motion.stage(seconds, CARD_CLIP_SECONDS);
+        // The pause at the end of a loop leaves the card empty for a moment, like a clip ending.
+        let pose = motion.pose(stage);
+        let rest_size = (picture.x as u32, picture.y as u32);
+        let frame_size = if motion.draws_frames() && motion.draws_frame_at(stage) {
+            let moving = hover
+                .moving
+                .get_or_insert_with(|| MovingTitle::prepare(&title, canvas, None));
+            let frame = moving.frame(stage);
+            let size = (frame.width, frame.height);
+            let image = egui::ColorImage::from_rgba_premultiplied(
+                [frame.width as usize, frame.height as usize],
+                &frame.rgba,
+            );
+            match &mut hover.frame {
+                Some(texture) => texture.set(image, TextureOptions::LINEAR),
+                None => {
+                    hover.frame =
+                        Some(ctx.load_texture("title-card-moving", image, TextureOptions::LINEAR));
+                }
+            }
+            Some((size, moving.scale_for(size)))
+        } else {
+            None
+        };
+        let (size, scale, texture) = match (frame_size, &hover.frame) {
+            (Some((size, scale)), Some(texture)) => (size, scale, texture.id()),
+            _ => {
+                let rest = self.title_cards.get(&style).map(|card| card.texture.id());
+                let Some(rest) = rest else {
+                    return false;
+                };
+                (rest_size, rest_scale, rest)
+            }
+        };
+        let rest = Placement {
+            scale,
+            ..Placement::default()
+        };
+        let placed = pose.on(rest, size, canvas);
+        let rect = placed.rect(size, canvas);
+        let look = placed.look();
+        let opacity = placed.opacity as f32 / WHOLE as f32;
+        let canvas_middle = vec2(canvas.0 as f32, canvas.1 as f32) / 2.0;
+        let middle = vec2(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+        let centre = room.center() + (middle - canvas_middle) * fit;
+        paint_turned(
+            painter,
+            texture,
+            (centre, vec2(rect.width, rect.height) * fit),
+            look.degrees,
+            look.source,
+            opacity,
+        );
+        true
+    }
+
     /// The selected clip, if it is a title.
     pub(super) fn selected_title(&self) -> Option<(MediaId, Title)> {
         let clip = self.selected.and_then(|id| self.project.tracks.clip(id))?;
@@ -836,6 +1167,10 @@ impl Editor {
     /// because they have more to set than fits on the toolbar.
     pub(super) fn title_panel(&mut self, ui: &mut egui::Ui, palette: &Palette) {
         let Some((id, title)) = self.selected_title() else {
+            if let Some(clip) = self.looking_at() {
+                self.look_panel(ui, palette, clip);
+                return;
+            }
             // A panel counts as one widget, and everything after it is numbered from there. Without
             // this, its coming and going would renumber the timeline, cancelling any drag and
             // closing any menu that was open on it at the time.
@@ -849,11 +1184,43 @@ impl Editor {
             .show_separator_line(false)
             .frame(frame)
             .show(ui, |ui| {
-                ui.label(RichText::new("Text").font(fonts::strong(15.0)));
+                let heading = match self.title_tab {
+                    TitleTab::Text => "Text",
+                    TitleTab::Colours => "Adjust colours",
+                    TitleTab::Fade => "Fade",
+                };
+                ui.label(RichText::new(heading).font(fonts::strong(15.0)));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for (tab, name) in [
+                        (TitleTab::Text, "Text"),
+                        (TitleTab::Colours, "Colours"),
+                        (TitleTab::Fade, "Fade"),
+                    ] {
+                        let kind = if self.title_tab == tab {
+                            Kind::Secondary
+                        } else {
+                            Kind::Ghost
+                        };
+                        if ui
+                            .add(ActionButton::new(palette, kind, name).small())
+                            .clicked()
+                        {
+                            self.title_tab = tab;
+                        }
+                    }
+                });
                 ui.add_space(10.0);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
-                    .show(ui, |ui| self.title_controls(ui, palette, id, &title));
+                    .show(ui, |ui| {
+                        if self.title_tab == TitleTab::Text {
+                            self.title_controls(ui, palette, id, &title);
+                        } else {
+                            self.title_look(ui, palette);
+                        }
+                    });
             });
     }
 
@@ -867,6 +1234,13 @@ impl Editor {
 
         heading(ui, "Text");
         let is_caption = title.style == TitleStyle::Subtitle;
+        let counts_down = title.style == TitleStyle::Countdown;
+        if counts_down {
+            ui.colored_label(
+                palette.text_muted,
+                RichText::new("Counts down the length of this clip.").size(12.0),
+            );
+        }
         let mut words = title.text.clone();
         let mut text_box = egui::TextEdit::multiline(&mut words)
             .id(egui::Id::unique("title-text"))
@@ -878,7 +1252,7 @@ impl Editor {
                 Key::Enter,
             )));
         }
-        let field = ui.add(text_box);
+        let field = ui.add_enabled(!counts_down, text_box);
         field.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, "Title text"));
         if std::mem::take(&mut self.focus_title_text) {
             field.request_focus();
@@ -919,7 +1293,13 @@ impl Editor {
         if title.style.look().second_line.is_some() {
             heading(ui, "Second line");
             let mut words = title.second_text.clone();
-            let field = ui.add(egui::TextEdit::singleline(&mut words).desired_width(width));
+            // Credits run to many lines, where every other style's second line is just the one.
+            let second_box = if title.style == TitleStyle::CreditsRoll {
+                egui::TextEdit::multiline(&mut words).desired_rows(4)
+            } else {
+                egui::TextEdit::singleline(&mut words)
+            };
+            let field = ui.add(second_box.desired_width(width));
             field.widget_info(|| {
                 egui::WidgetInfo::labeled(egui::Role::TextInput, true, "Second line text")
             });
@@ -951,17 +1331,107 @@ impl Editor {
             self.change_title_look(id, |title| title.accent = colour.unwrap_or(title.accent));
         }
 
+        if title.style == TitleStyle::Rating {
+            heading(ui, "Stars");
+            self.stars_slider(ui, palette, id, title);
+        }
+        if title.style.has_logo() {
+            self.logo_controls(ui, palette, id, title, width);
+        }
+
         heading(ui, "Position");
         self.position_grid(ui, palette, id, title);
     }
 
+    fn stars_slider(&mut self, ui: &mut egui::Ui, palette: &Palette, id: MediaId, title: &Title) {
+        style_slider(ui, palette);
+        let mut stars = u32::from(title.stars);
+        let slider = ui.add(
+            egui::Slider::new(&mut stars, 0..=5)
+                .show_value(true)
+                .trailing_fill(true),
+        );
+        slider.widget_info(|| {
+            egui::WidgetInfo::slider(slider.enabled(), f64::from(stars), "Stars lit")
+        });
+        if slider.changed() {
+            self.change_title_look(id, |title| title.stars = stars as u8);
+        }
+        if slider.drag_stopped() || slider.clicked() {
+            slider.surrender_focus();
+        }
+    }
+
+    /// Choosing a logo.
+    fn logo_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        palette: &Palette,
+        id: MediaId,
+        title: &Title,
+        width: f32,
+    ) {
+        ui.add_space(6.0);
+        ui.label(RichText::new("Logo size").font(fonts::strong(13.0)));
+        ui.add_space(4.0);
+        style_slider(ui, palette);
+        let whole = f64::from(WHOLE);
+        let mut size = f64::from(title.logo_size) / whole;
+        let range = f64::from(SMALLEST_SIZE) / whole..=f64::from(LARGEST_SIZE) / whole;
+        let slider = ui.add(
+            egui::Slider::new(&mut size, range)
+                .show_value(false)
+                .trailing_fill(true),
+        );
+        slider
+            .widget_info(|| egui::WidgetInfo::slider(slider.enabled(), size * 100.0, "Logo size"));
+        if slider.changed() {
+            self.change_title_look(id, |title| title.logo_size = (size * whole).round() as i32);
+        }
+        if slider.drag_stopped() || slider.clicked() {
+            slider.surrender_focus();
+        }
+        ui.add_space(6.0);
+        let import = ActionButton::new(palette, Kind::Secondary, "Import logo")
+            .icon(icons::IMAGE)
+            .width(width);
+        if ui.add(import).clicked() {
+            self.pick_logo_for = Some(id);
+        }
+        if title.logo.is_some() {
+            ui.add_space(4.0);
+            let none = ActionButton::new(palette, Kind::Ghost, "No logo")
+                .icon(icons::X)
+                .width(width);
+            if ui.add(none).clicked() {
+                self.change_title_look(id, |title| title.logo = None);
+            }
+        }
+    }
+
+    /// Asks which picture to use as a title's logo.
+    pub(super) fn pick_logo(&mut self, id: MediaId) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Import logo")
+            .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp"])
+            .pick_file()
+        else {
+            return;
+        };
+        self.set_title_logo(id, path);
+    }
+
+    /// Gives a title a logo, if the file can be read as a picture.
+    pub(super) fn set_title_logo(&mut self, id: MediaId, path: PathBuf) {
+        if bareclip_media::read_still(&path).is_err() {
+            self.notice = Some(format!("{} can't be read as a picture.", path.display()));
+            return;
+        }
+        self.change_title_look(id, |title| title.logo = Some(path.clone()));
+    }
+
     fn size_slider(&mut self, ui: &mut egui::Ui, palette: &Palette, id: MediaId, title: &Title) {
-        let visuals = &mut ui.style_mut().visuals;
-        visuals.widgets.inactive.bg_fill = palette.border_strong;
-        visuals.widgets.hovered.bg_fill = palette.border_strong;
-        visuals.widgets.active.bg_fill = palette.border_strong;
-        visuals.selection.bg_fill = palette.accent;
-        ui.spacing_mut().slider_width = ui.available_width();
+        style_slider(ui, palette);
         let whole = f64::from(WHOLE);
         let mut size = f64::from(title.size) / whole;
         let range = f64::from(SMALLEST_SIZE) / whole..=f64::from(LARGEST_SIZE) / whole;
@@ -1204,6 +1674,46 @@ mod tests {
             shipped: vec!["Abel".to_owned(), "DM Sans".to_owned()],
             on_this_pc: vec!["Arial".to_owned(), "Calibri".to_owned()],
         }
+    }
+
+    #[test]
+    fn a_style_across_the_whole_canvas_fills_its_card_edge_to_edge() {
+        let card = egui::Rect::from_min_size(pos2(10.0, 20.0), vec2(103.0, 103.0));
+        for style in [
+            TitleStyle::Circular,
+            TitleStyle::IntroClean,
+            TitleStyle::Rapid,
+        ] {
+            let canvas = card_canvas(style);
+            let drawing = draw_title(&Title::in_style(style), canvas);
+            let picture = vec2(drawing.picture.width as f32, drawing.picture.height as f32);
+            let (room, fit) = card_view(style, card, picture);
+            assert_eq!(room, card, "{style:?} uses the whole card");
+            let shown = vec2(canvas.0 as f32, canvas.1 as f32) * fit;
+            assert!(
+                (shown.x - card.width()).abs() < 0.01 && (shown.y - card.height()).abs() < 0.01,
+                "{style:?}'s canvas is the card's shape and covers it, not {shown:?}"
+            );
+        }
+        // Laid out on a square, a frame goes around all four sides.
+        let frame = draw_title(&Title::in_style(TitleStyle::IntroClean), FULL_CARD_CANVAS);
+        assert_eq!(
+            (frame.picture.width, frame.picture.height),
+            FULL_CARD_CANVAS
+        );
+    }
+
+    #[test]
+    fn other_styles_fit_inside_their_card_with_room_around() {
+        let card = egui::Rect::from_min_size(pos2(10.0, 20.0), vec2(103.0, 103.0));
+        let style = TitleStyle::Typewriter;
+        assert_eq!(card_canvas(style), CARD_CANVAS);
+        let drawing = draw_title(&Title::in_style(style), CARD_CANVAS);
+        let picture = vec2(drawing.picture.width as f32, drawing.picture.height as f32);
+        let (room, fit) = card_view(style, card, picture);
+        assert_eq!(room, card.shrink(CARD_ROOM));
+        let shown = picture * fit;
+        assert!(shown.x <= room.width() + 0.01 && shown.y <= room.height() + 0.01);
     }
 
     #[test]

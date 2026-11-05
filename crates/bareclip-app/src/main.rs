@@ -12,6 +12,7 @@ mod storage;
 mod text;
 mod theme;
 mod timeline;
+mod title_frames;
 
 use std::path::PathBuf;
 

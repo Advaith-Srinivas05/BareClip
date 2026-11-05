@@ -37,6 +37,11 @@ shadcn-egui-icons-lucide = "0.7"
 wgpu = "30"
 ffmpeg-next = { version = "9.0", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling"] }
 
+# Test and dev builds keep only line numbers for errors, which takes far less disk than full
+# debugging detail. Debugging step by step would want this off.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

@@ -652,6 +652,10 @@ pub struct StageEvents {
     pub sound: Option<(ClipId, ClipSound)>,
     pub speed: Option<(ClipId, Speed)>,
     pub detach: Option<ClipId>,
+    /// The button for the clip's filters, colours and fades was pressed.
+    pub toggle_look: bool,
+    /// A clip on the picture was right-clicked, and where, to open its menu there.
+    pub menu: Option<(ClipId, Pos2)>,
 }
 
 /// The selected clip's speed, if it can have one, for the toolbar's controls.
@@ -781,6 +785,17 @@ pub fn show(
                 }
             }
             None => events.select = Some(clip_at(view.clips, view.canvas, x, y)),
+        }
+    }
+
+    // Right-clicking a clip on the picture opens the same menu as on the timeline.
+    if response.secondary_clicked()
+        && let Some(pointer) = response.interact_pointer_pos()
+    {
+        let (x, y) = canvas_share(pointer, view.frame);
+        if let Some(clip) = clip_at(view.clips, view.canvas, x, y) {
+            events.select = Some(Some(clip));
+            events.menu = Some((clip, pointer));
         }
     }
 
@@ -1427,7 +1442,7 @@ fn toolbar(
     let speed = view.speed.filter(|speed| speed.id == clip.id);
     let optional = f32::from(u8::from(sound.is_some())) + f32::from(u8::from(speed.is_some()));
     let is_title = view.selected_is_title;
-    let buttons = if is_title { 2.0 } else { 5.0 + optional };
+    let buttons = if is_title { 2.0 } else { 6.0 + optional };
     let width = TOOLBAR_PADDING * 2.0 + TOOLBAR_BUTTON * buttons;
     let rect = toolbar_rect(width, clip_rect, view.area, view.row_above_is_free);
     let id = ui.scope_id().with("stage-toolbar");
@@ -1463,6 +1478,21 @@ fn toolbar(
 
             if !is_title && button(ui, 0.0, icons::CROP, "Crop", "Crop").clicked() {
                 state.cropping = Some(clip.id);
+            }
+            if !is_title {
+                let hint = "Filters, colours and fade";
+                let look_spot = 4.0 + optional;
+                if button(
+                    ui,
+                    look_spot,
+                    icons::SLIDERS_HORIZONTAL,
+                    "Filters and colours",
+                    hint,
+                )
+                .clicked()
+                {
+                    events.toggle_look = true;
+                }
             }
             if button(
                 ui,

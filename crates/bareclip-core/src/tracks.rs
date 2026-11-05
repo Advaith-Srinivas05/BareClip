@@ -3,6 +3,7 @@
 //! Everything on every row can be heard at once.
 
 use crate::{
+    effects::{ClipLook, LayerJoin, Transition, join_progress},
     placement::{Placement, final_size},
     project::SavedClip,
     sound::ClipSound,
@@ -120,16 +121,23 @@ impl Tracks {
             .map(|(row, track)| {
                 let row_muted = muted_rows.get(row).copied().unwrap_or(false);
                 Timeline::restore(track.iter().filter_map(|clip| {
+                    let media = media(clip.media)?;
                     Some((
-                        media(clip.media)?,
-                        Ticks(clip.start),
-                        clip.source(),
-                        clip.placement,
-                        ClipSound {
-                            muted: clip.sound.muted || row_muted,
-                            ..clip.sound
+                        media,
+                        Clip {
+                            id: ClipId(0),
+                            media,
+                            start: Ticks(clip.start),
+                            source: clip.source(),
+                            placement: clip.placement,
+                            sound: ClipSound {
+                                muted: clip.sound.muted || row_muted,
+                                ..clip.sound
+                            },
+                            speed: clip.speed,
+                            look: clip.look,
+                            transition: clip.transition,
                         },
-                        clip.speed,
                     ))
                 }))
             })
@@ -369,6 +377,8 @@ impl Tracks {
                 placement: Placement::default(),
                 sound: ClipSound::default(),
                 speed: Speed::default(),
+                look: ClipLook::default(),
+                transition: None,
             };
             ids.push(clip.id);
             let free = rows
@@ -477,6 +487,8 @@ impl Tracks {
                         only_track: Some(track),
                         ..clip.sound
                     },
+                    look: ClipLook::default(),
+                    transition: None,
                     ..clip
                 },
                 clip.start,
@@ -730,8 +742,17 @@ impl Tracks {
                 continue;
             };
             stack.push(*clip);
-            // Any image might be see-through, so what is under one always shows.
-            let hides = !clip.is_still()
+            // The other side of a transition goes under what is playing, which keeps the top of
+            // the stack the clip the main player is on.
+            let partner = joining_partner(clips, after - 1, time);
+            if let Some(partner) = partner {
+                stack.push(partner);
+            }
+            // Any image might be see-through, so what is under one always shows, and so might a
+            // picture fading or part way through a transition.
+            let hides = partner.is_none()
+                && !clip.is_still()
+                && !clip.look.has_fade()
                 && size_of(clip.media).is_some_and(|size| {
                     clip.placement
                         .at(Ticks(time.0 - clip.start.0))
@@ -758,7 +779,7 @@ impl Tracks {
             .picture_tracks()
             .iter()
             .flat_map(|track| track.clips())
-            .flat_map(|clip| [clip.start, clip.end()])
+            .flat_map(moments_of)
             .filter(|moment| *moment > time && moment.0 - time.0 <= within.0)
             .collect();
         moments.sort();
@@ -779,7 +800,7 @@ impl Tracks {
             .picture_tracks()
             .iter()
             .flat_map(|track| track.clips())
-            .flat_map(|clip| [clip.start, clip.end()])
+            .flat_map(moments_of)
             .collect();
         moments.sort();
         moments.dedup();
@@ -846,7 +867,10 @@ impl Tracks {
         self.stretches(canvas, size_of).iter().any(|stretch| {
             stretch.stack.len() > 1
                 || stretch.stack.iter().any(|clip| {
-                    clip.is_still() || !clip.speed.is_normal() || !clip.placement.is_default()
+                    clip.is_still()
+                        || !clip.speed.is_normal()
+                        || !clip.placement.is_default()
+                        || !clip.look.is_default()
                 })
         })
     }
@@ -1028,12 +1052,121 @@ impl Tracks {
         new_at
     }
 
+    /// Whether the clip can have a transition into the clip straight after it on its row.
+    pub fn can_join(&self, id: ClipId) -> bool {
+        self.partner_after(id).is_some()
+    }
+
+    /// The clip after this one, if the two touch on a row of pictures and neither is a title.
+    fn partner_after(&self, id: ClipId) -> Option<Clip> {
+        let tracks = &self.tracks[..self.picture_rows];
+        let track = tracks.iter().find(|track| track.clip(id).is_some())?;
+        let clips = track.clips();
+        let index = clips.iter().position(|clip| clip.id == id)?;
+        let clip = clips[index];
+        let next = *clips.get(index + 1)?;
+        (next.start == clip.end() && !clip.is_title() && !next.is_title()).then_some(next)
+    }
+
+    /// Every place a transition could go or is, as the clip before it and where the cut is.
+    pub fn joins(&self) -> Vec<(ClipId, Ticks)> {
+        self.picture_tracks()
+            .iter()
+            .flat_map(|track| track.clips())
+            .filter(|clip| self.can_join(clip.id))
+            .map(|clip| (clip.id, clip.end()))
+            .collect()
+    }
+
+    /// The longest a transition between this clip and the next can be, at half the shorter clip.
+    pub fn longest_join(&self, id: ClipId) -> Option<Ticks> {
+        let clip = self.clip(id)?;
+        let next = self.partner_after(id)?;
+        Some(Ticks(clip.duration().0.min(next.duration().0) / 2))
+    }
+
+    /// The transition into a clip from the one before it, if it has one, with where its cut is.
+    pub fn join_into(&self, id: ClipId) -> Option<(Ticks, Transition)> {
+        let track = self.tracks[..self.picture_rows]
+            .iter()
+            .find(|track| track.clip(id).is_some())?;
+        let clips = track.clips();
+        let index = clips.iter().position(|clip| clip.id == id)?;
+        let before = clips.get(index.checked_sub(1)?)?;
+        let transition = before.transition?;
+        (before.end() == clips[index].start).then_some((clips[index].start, transition))
+    }
+
+    /// A clip's place and footage with enough added for any transition at its ends, because they
+    /// play past where the clip stops. Footage before the start of its file doesn't exist, so that
+    /// part holds its first picture, and past the end of its file holds its last.
+    pub fn with_room_for_joins(&self, clip: &Clip) -> (Ticks, TimeRange) {
+        let mut start = clip.start;
+        let mut source = clip.source;
+        if let Some(transition) = clip.transition {
+            source.end = Ticks(source.end.0 + clip.speed.in_footage(transition.half()).0);
+        }
+        if let Some((_, transition)) = self.join_into(clip.id) {
+            let back = clip
+                .speed
+                .in_footage(transition.half())
+                .0
+                .min(source.start.0);
+            source.start = Ticks(source.start.0 - back);
+            start = Ticks(start.0 - clip.speed.on_timeline(Ticks(back)).0);
+        }
+        (start, source)
+    }
+
+    /// Adds, changes or takes away the transition out of a clip. Returns whether it changed.
+    pub fn set_transition(&mut self, id: ClipId, transition: Option<Transition>) -> bool {
+        if transition.is_some() && !self.can_join(id) {
+            return false;
+        }
+        let Some(clip) = self.clip_mut(id) else {
+            return false;
+        };
+        if clip.transition == transition {
+            return false;
+        }
+        clip.transition = transition;
+        self.refresh();
+        true
+    }
+
+    /// Gives a clip a new look. Returns whether that changed anything.
+    pub fn set_look(&mut self, id: ClipId, look: ClipLook) -> bool {
+        let Some(clip) = self.clip_mut(id) else {
+            return false;
+        };
+        if clip.look == look {
+            return false;
+        }
+        clip.look = look;
+        self.refresh();
+        true
+    }
+
+    fn clip_mut(&mut self, id: ClipId) -> Option<&mut Clip> {
+        self.tracks.iter_mut().find_map(|track| track.clip_mut(id))
+    }
+
+    /// Takes away transitions whose clips no longer touch, and shortens any that have outgrown them.
+    fn settle_transitions(&mut self) {
+        let picture_rows = self.picture_rows;
+        for (row, track) in self.tracks.iter_mut().enumerate() {
+            let on_pictures = row < picture_rows;
+            track.settle_transitions(on_pictures);
+        }
+    }
+
     fn refresh(&mut self) {
         self.picture_rows = self.tracks[..self.picture_rows]
             .iter()
             .filter(|track| !track.is_empty())
             .count();
         self.tracks.retain(|track| !track.is_empty());
+        self.settle_transitions();
         self.played = flatten(self.picture_tracks());
         self.played_videos = if self.has_stills() {
             let videos: Vec<Timeline> = self
@@ -1124,6 +1257,49 @@ fn visible_pieces(clip: Clip, covered: &[TimeRange], pieces: &mut Vec<Clip>) {
 }
 
 /// The stretch of a clip between two moments on the timeline.
+/// The moments where what shows can change because of this clip.
+fn moments_of(clip: &Clip) -> Vec<Ticks> {
+    let mut moments = vec![clip.start, clip.end()];
+    if let Some(transition) = clip.transition {
+        let half = transition.half();
+        moments.push(Ticks(clip.end().0 - half.0));
+        moments.push(Ticks(clip.end().0 + half.0));
+    }
+    moments
+}
+
+/// The other clip that shows at a moment, if the clip at `index` is in a transition then.
+fn joining_partner(clips: &[Clip], index: usize, time: Ticks) -> Option<Clip> {
+    let clip = clips[index];
+    if let Some(transition) = clip.transition {
+        let next = clips.get(index + 1)?;
+        if next.start == clip.end() && clip.end().0 - time.0 <= transition.half().0 {
+            return Some(*next);
+        }
+    }
+    let before = clips.get(index.checked_sub(1)?)?;
+    let transition = before.transition?;
+    (before.end() == clip.start && time.0 - clip.start.0 < transition.half().0).then_some(*before)
+}
+
+/// Works out whether two neighbours in a stack, lowest first, are the sides of a transition.
+pub fn join_between(lower: &Clip, upper: &Clip, now: Ticks) -> Option<LayerJoin> {
+    let (going, coming, goes_out) = if lower.transition.is_some() && lower.end() == upper.start {
+        (lower, upper, true)
+    } else if upper.transition.is_some() && upper.end() == lower.start {
+        (upper, lower, false)
+    } else {
+        return None;
+    };
+    let _ = coming;
+    let transition = going.transition?;
+    Some(LayerJoin {
+        kind: transition.kind,
+        progress: join_progress(going.end(), transition.duration, now),
+        goes_out,
+    })
+}
+
 fn piece_of(clip: Clip, start: Ticks, end: Ticks, number: u64) -> Clip {
     let id = if number == 0 {
         clip.id
@@ -1162,6 +1338,297 @@ fn merged(covered: Vec<TimeRange>, track: &Timeline) -> Vec<TimeRange> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod transitions {
+        use super::*;
+        use crate::effects::{ClipLook, Filter, Transition, TransitionKind};
+
+        const CANVAS: (u32, u32) = (1920, 1080);
+
+        fn range(seconds: f64) -> TimeRange {
+            TimeRange {
+                start: Ticks::from_seconds(10.0),
+                end: Ticks::from_seconds(10.0 + seconds),
+            }
+        }
+
+        fn size_of(_: MediaId) -> Option<(u32, u32)> {
+            Some(CANVAS)
+        }
+
+        /// Two four second clips touching at 4 seconds, with a one second transition between them.
+        fn joined() -> (Tracks, ClipId, ClipId) {
+            let mut tracks = Tracks::default();
+            let first = tracks.place(MediaId(1), range(4.0), Ticks(0), TrackTarget::New(0));
+            let second = tracks.place(
+                MediaId(2),
+                range(4.0),
+                Ticks::from_seconds(4.0),
+                TrackTarget::Existing(0),
+            );
+            let transition = Transition {
+                kind: TransitionKind::CrossFade,
+                duration: Ticks::from_seconds(1.0).0,
+            };
+            assert!(tracks.set_transition(first, Some(transition)));
+            (tracks, first, second)
+        }
+
+        fn ids_at(tracks: &Tracks, seconds: f64) -> Vec<ClipId> {
+            tracks
+                .stack_at(Ticks::from_seconds(seconds), CANVAS, &size_of)
+                .iter()
+                .map(|clip| clip.id)
+                .collect()
+        }
+
+        #[test]
+        fn a_transition_only_goes_between_clips_that_touch() {
+            let mut tracks = Tracks::default();
+            let first = tracks.place(MediaId(1), range(2.0), Ticks(0), TrackTarget::New(0));
+            tracks.place(
+                MediaId(2),
+                range(2.0),
+                Ticks::from_seconds(5.0),
+                TrackTarget::Existing(0),
+            );
+            assert!(!tracks.can_join(first));
+            assert!(!tracks.set_transition(first, Some(Transition::new(TransitionKind::Burn))));
+        }
+
+        #[test]
+        fn adding_a_transition_moves_nothing() {
+            let (tracks, first, second) = joined();
+            assert_eq!(tracks.clip(first).expect("it is there").start, Ticks(0));
+            assert_eq!(
+                tracks.clip(second).expect("it is there").start,
+                Ticks::from_seconds(4.0)
+            );
+            assert_eq!(tracks.duration(), Ticks::from_seconds(8.0));
+        }
+
+        #[test]
+        fn both_clips_show_for_half_the_transition_either_side_of_the_cut() {
+            let (tracks, first, second) = joined();
+            assert_eq!(ids_at(&tracks, 3.4), vec![first]);
+            assert_eq!(ids_at(&tracks, 3.6), vec![second, first], "before the cut");
+            assert_eq!(ids_at(&tracks, 4.4), vec![first, second], "after the cut");
+            assert_eq!(ids_at(&tracks, 4.6), vec![second]);
+        }
+
+        #[test]
+        fn the_clip_playing_stays_on_top_of_the_stack() {
+            let (tracks, first, second) = joined();
+            assert_eq!(ids_at(&tracks, 3.9).last(), Some(&first));
+            assert_eq!(ids_at(&tracks, 4.1).last(), Some(&second));
+        }
+
+        #[test]
+        fn progress_runs_through_the_transition_from_either_order_in_the_stack() {
+            let (tracks, ..) = joined();
+            let progress_at = |seconds: f64| {
+                let now = Ticks::from_seconds(seconds);
+                let stack = tracks.stack_at(now, CANVAS, &size_of);
+                join_between(&stack[0], &stack[1], now).expect("they are joined")
+            };
+            assert!((progress_at(3.75).progress - 0.25).abs() < 0.01);
+            assert!(
+                !progress_at(3.75).goes_out,
+                "the coming clip is lowest here"
+            );
+            assert!((progress_at(4.25).progress - 0.75).abs() < 0.01);
+            assert!(progress_at(4.25).goes_out, "the going clip is lowest here");
+        }
+
+        #[test]
+        fn a_transition_plays_the_footage_past_each_clips_ends_if_there_is_any() {
+            let (tracks, first, second) = joined();
+            let first = tracks.clip(first).expect("it is there");
+            let second = tracks.clip(second).expect("it is there");
+            let at = Ticks::from_seconds(4.25);
+            assert_eq!(first.footage_at(at), Ticks::from_seconds(14.25));
+            let at = Ticks::from_seconds(3.75);
+            assert_eq!(second.footage_at(at), Ticks::from_seconds(9.75));
+        }
+
+        #[test]
+        fn a_clip_starting_at_the_top_of_its_file_can_not_go_before_it() {
+            let mut tracks = Tracks::default();
+            let source = TimeRange {
+                start: Ticks(0),
+                end: Ticks::from_seconds(4.0),
+            };
+            let clip = tracks.place(
+                MediaId(1),
+                source,
+                Ticks::from_seconds(4.0),
+                TrackTarget::New(0),
+            );
+            let clip = tracks.clip(clip).expect("it is there");
+            assert_eq!(clip.footage_at(Ticks::from_seconds(3.5)), Ticks(0));
+        }
+
+        #[test]
+        fn what_is_under_a_transition_keeps_showing() {
+            let (mut tracks, first, second) = joined();
+            let under = tracks.place(MediaId(3), range(8.0), Ticks(0), TrackTarget::New(1));
+            assert_eq!(
+                ids_at(&tracks, 1.0),
+                vec![first],
+                "a full-size clip hides it"
+            );
+            assert_eq!(ids_at(&tracks, 3.9), vec![under, second, first]);
+        }
+
+        #[test]
+        fn pulling_the_clips_apart_takes_the_transition_away() {
+            let (mut tracks, first, second) = joined();
+            tracks.move_clip(second, Ticks::from_seconds(6.0), TrackTarget::Existing(0));
+            assert_eq!(tracks.clip(first).expect("it is there").transition, None);
+            assert_eq!(ids_at(&tracks, 3.9), vec![first]);
+        }
+
+        #[test]
+        fn removing_either_clip_takes_the_transition_away() {
+            let (mut tracks, first, second) = joined();
+            tracks.remove(second);
+            assert_eq!(tracks.clip(first).expect("it is there").transition, None);
+        }
+
+        #[test]
+        fn a_transition_never_outgrows_half_the_shorter_clip() {
+            let (mut tracks, first, second) = joined();
+            let long = Transition {
+                kind: TransitionKind::Burn,
+                duration: Ticks::from_seconds(60.0).0,
+            };
+            tracks.set_transition(first, Some(long));
+            let got = tracks
+                .clip(first)
+                .and_then(|clip| clip.transition)
+                .expect("it is there");
+            assert_eq!(got.duration, Ticks::from_seconds(2.0).0);
+            assert_eq!(tracks.longest_join(first), Some(Ticks::from_seconds(2.0)));
+            let _ = second;
+        }
+
+        #[test]
+        fn splitting_keeps_the_transition_with_the_part_next_to_it() {
+            let (mut tracks, first, _) = joined();
+            let later = tracks
+                .split(first, Ticks::from_seconds(12.0))
+                .expect("it splits");
+            assert_eq!(tracks.clip(first).expect("it is there").transition, None);
+            assert!(
+                tracks
+                    .clip(later)
+                    .expect("it is there")
+                    .transition
+                    .is_some()
+            );
+        }
+
+        #[test]
+        fn duplicating_keeps_the_transition_at_the_join_it_was_on() {
+            let (mut tracks, first, second) = joined();
+            let copy = tracks.duplicate(first).expect("it copies");
+            assert_eq!(tracks.clip(first).expect("it is there").transition, None);
+            let copied = tracks.clip(copy).expect("it is there");
+            assert!(copied.transition.is_some());
+            assert_eq!(
+                copied.end(),
+                tracks.clip(second).expect("it is there").start
+            );
+        }
+
+        #[test]
+        fn room_for_a_transition_is_added_on_the_side_it_is_on() {
+            let (tracks, first, second) = joined();
+            let first = tracks.clip(first).expect("it is there");
+            let second = tracks.clip(second).expect("it is there");
+            let (start, source) = tracks.with_room_for_joins(&first);
+            assert_eq!(start, first.start);
+            assert_eq!(source.start, first.source.start);
+            assert_eq!(source.end, Ticks::from_seconds(14.5));
+            let (start, source) = tracks.with_room_for_joins(&second);
+            assert_eq!(start, Ticks::from_seconds(3.5));
+            assert_eq!(source.start, Ticks::from_seconds(9.5));
+            assert_eq!(source.end, second.source.end);
+        }
+
+        #[test]
+        fn a_transition_makes_a_project_take_layers_and_so_does_a_look() {
+            let (tracks, first, _) = joined();
+            assert!(tracks.needs_layers(CANVAS, &size_of));
+            let mut without = tracks.clone();
+            without.set_transition(first, None);
+            assert!(!without.needs_layers(CANVAS, &size_of));
+            let look = ClipLook {
+                filter: Filter::Winter,
+                ..ClipLook::default()
+            };
+            without.set_look(first, look);
+            assert!(without.needs_layers(CANVAS, &size_of));
+        }
+
+        #[test]
+        fn stretches_change_where_a_transition_starts_and_ends() {
+            let (tracks, first, second) = joined();
+            let stretches = tracks.stretches(CANVAS, &size_of);
+            let ids: Vec<Vec<ClipId>> = stretches
+                .iter()
+                .map(|stretch| stretch.stack.iter().map(|clip| clip.id).collect())
+                .collect();
+            assert_eq!(
+                ids,
+                vec![
+                    vec![first],
+                    vec![second, first],
+                    vec![first, second],
+                    vec![second],
+                ]
+            );
+            assert_eq!(stretches[1].start, Ticks::from_seconds(3.5));
+            assert_eq!(stretches[2].end, Ticks::from_seconds(4.5));
+        }
+
+        #[test]
+        fn a_fading_picture_lets_what_is_under_it_show() {
+            let mut tracks = Tracks::default();
+            let top = tracks.place(MediaId(1), range(4.0), Ticks(0), TrackTarget::New(0));
+            let under = tracks.place(MediaId(2), range(4.0), Ticks(0), TrackTarget::New(1));
+            assert_eq!(ids_at(&tracks, 1.0), vec![top]);
+            let look = ClipLook {
+                fade_out: Ticks::from_seconds(1.0).0,
+                ..ClipLook::default()
+            };
+            tracks.set_look(top, look);
+            assert_eq!(ids_at(&tracks, 1.0), vec![under, top]);
+        }
+
+        #[test]
+        fn a_look_and_a_transition_come_back_from_a_saved_file() {
+            use crate::project::ProjectFile;
+            let (mut tracks, first, _) = joined();
+            let look = ClipLook {
+                filter: Filter::Retro,
+                contrast: 250,
+                fade_in: 500,
+                ..ClipLook::default()
+            };
+            tracks.set_look(first, look);
+            let file = ProjectFile::capture("test", Vec::new(), &tracks);
+            let text = file.to_text();
+            let read = ProjectFile::from_text(&text).expect("it reads");
+            let back = Tracks::restore(&read.tracks, |id| Some(MediaId(id)));
+            let clip = back.tracks()[0].clips()[0];
+            assert_eq!(clip.look, look);
+            assert_eq!(
+                clip.transition.map(|t| t.kind),
+                Some(TransitionKind::CrossFade)
+            );
+        }
+    }
     use crate::time::TICKS_PER_SECOND;
 
     use crate::placement::WHOLE;

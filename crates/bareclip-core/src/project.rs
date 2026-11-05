@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     canvas::Canvas,
+    effects::{ClipLook, Transition},
     placement::Placement,
     sound::ClipSound,
     speed::Speed,
@@ -22,7 +23,7 @@ use crate::{
 
 pub const EXTENSION: &str = "bareclip";
 /// Goes up whenever the format changes in a way older versions can't read.
-const CURRENT_VERSION: u32 = 6;
+const CURRENT_VERSION: u32 = 7;
 /// Files older than this had their size worked out from the largest video.
 const FIRST_VERSION_WITH_CANVAS: u32 = 3;
 pub const DEFAULT_NAME: &str = "untitled";
@@ -59,6 +60,12 @@ pub struct SavedClip {
     /// the same thing.
     #[serde(default, skip_serializing_if = "Speed::is_default")]
     pub speed: Speed,
+    /// Left out for a clip with no filter, adjustments or picture fades.
+    #[serde(default, skip_serializing_if = "ClipLook::is_default")]
+    pub look: ClipLook,
+    /// Left out for a clip with no transition into the next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition: Option<Transition>,
 }
 
 impl SavedClip {
@@ -198,6 +205,8 @@ fn saved_rows(rows: &[Timeline]) -> Vec<Vec<SavedClip>> {
                     placement: clip.placement,
                     sound: clip.sound,
                     speed: clip.speed,
+                    look: clip.look,
+                    transition: clip.transition,
                 })
                 .collect()
         })
@@ -313,6 +322,8 @@ mod tests {
             placement: Placement::default(),
             sound: Default::default(),
             speed: Default::default(),
+            look: Default::default(),
+            transition: None,
         };
         // Out of order, overlapping, empty and starting before zero.
         let tracks = vec![vec![clip(50, 100), clip(0, 100), clip(5, 0), clip(-20, 10)]];
@@ -488,6 +499,8 @@ mod tests {
             },
             sound: Default::default(),
             speed: Default::default(),
+            look: Default::default(),
+            transition: None,
         };
 
         let tracks = Tracks::restore(&[vec![clip]], |id| Some(MediaId(id)));
@@ -507,6 +520,8 @@ mod tests {
             placement: Placement::default(),
             sound: Default::default(),
             speed: Default::default(),
+            look: Default::default(),
+            transition: None,
         };
 
         assert_eq!(clip.fitted_to(Ticks(500)), Some(clip));

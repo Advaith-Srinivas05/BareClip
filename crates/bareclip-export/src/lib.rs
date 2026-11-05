@@ -11,7 +11,7 @@ use std::{path::Path, sync::atomic::AtomicBool, time::Duration};
 
 use bareclip_media::{ExportReport, ExportRequest, MediaError, MediaInfo, export, probe};
 
-pub use layered::{LayeredClip, LayeredRequest, LayeredStretch, export_layered};
+pub use layered::{ExportJoin, LayeredClip, LayeredRequest, LayeredStretch, export_layered};
 pub use mixed::{SoundPlan, SoundReport, export_sound_only, export_with_new_sound};
 pub use plan::{
     CHOICES_REASON, ExportChoices, ExportRate, ExportSize, FullPlan, LAYERED_REASON, Route, SIZES,

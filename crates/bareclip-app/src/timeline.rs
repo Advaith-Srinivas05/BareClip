@@ -1,6 +1,7 @@
 //! Converts between timeline time and screen position, and draws the timeline.
 
 use bareclip_core::{
+    effects::TransitionKind,
     speed::Speed,
     time::{Ticks, format_timecode},
     timeline::{ClipEdge, ClipId, MediaId, TimeRange},
@@ -237,6 +238,164 @@ pub struct TimelineView<'a> {
     pub selected_gap: Option<Ticks>,
     /// Whether a clip has been copied and can be pasted.
     pub can_paste: bool,
+    /// Every place two clips touch on a row, where a transition is or could go.
+    pub joins: &'a [JoinView],
+    /// The clip whose transition out of it is selected.
+    pub selected_join: Option<ClipId>,
+}
+
+/// A place where two clips touch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JoinView {
+    /// The clip before the cut.
+    pub clip: ClipId,
+    pub row: usize,
+    pub cut: Ticks,
+    pub has_transition: bool,
+}
+
+/// A transition being dragged from its panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransitionDrag(pub TransitionKind);
+
+/// How close the pointer has to be to a join for a dragged transition to land on it.
+const JOIN_REACH: f32 = 70.0;
+const JOIN_ICON_SIZE: f32 = 24.0;
+
+/// What was dropped here, if it is of this type. Asking the toolkit directly throws away whatever is
+/// being dragged even when it is of another type, so a drop has to check first.
+fn released<Payload: std::any::Any + Send + Sync>(
+    response: &egui::Response,
+) -> Option<std::sync::Arc<Payload>> {
+    egui::DragAndDrop::has_payload_of_type::<Payload>(&response.ctx)
+        .then(|| response.dnd_release_payload::<Payload>())
+        .flatten()
+}
+
+/// The join a dragged transition would land on, if one is close enough.
+fn join_near(
+    joins: &[JoinView],
+    layout: &TrackLayout,
+    scale: &TimeScale,
+    pointer: Pos2,
+) -> Option<JoinView> {
+    joins
+        .iter()
+        .copied()
+        .map(|join| {
+            let spot = pos2(scale.x_of(join.cut), layout.track(join.row).center().y);
+            (join, spot.distance(pointer))
+        })
+        .filter(|(_, distance)| *distance <= JOIN_REACH)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(join, _)| join)
+}
+
+/// The transitions on the timeline, and where a dragged one can go.
+fn draw_joins(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    view: &TimelineView,
+    layout: &TrackLayout,
+    scale: &TimeScale,
+    response: &egui::Response,
+    events: &mut TimelineEvents,
+) {
+    let area = layout.area;
+    let pointer = ui.input(|input| input.pointer.latest_pos());
+    let dragging = response.dnd_hover_payload::<TransitionDrag>().is_some();
+    let target = pointer.and_then(|at| join_near(view.joins, layout, scale, at));
+    if dragging {
+        let painter = ui.painter_at(area);
+        for join in view.joins {
+            let track = layout.track(join.row);
+            let centre = pos2(scale.x_of(join.cut), track.center().y);
+            if !area.contains(centre) {
+                continue;
+            }
+            let lit = target == Some(*join);
+            let size = if lit { 28.0 } else { 20.0 };
+            let rect = Rect::from_center_size(centre, vec2(size, size));
+            painter.rect_filled(rect, 5.0, if lit { palette.accent } else { palette.raised });
+            icons::paint(
+                &painter,
+                icons::square_at(centre, size * 0.6),
+                &icons::PLUS,
+                if lit {
+                    palette.accent_text
+                } else {
+                    palette.text
+                },
+            );
+            if lit {
+                painter.text(
+                    pos2(centre.x, rect.top() - 6.0),
+                    Align2::CENTER_BOTTOM,
+                    "Add transition",
+                    egui::FontId::proportional(12.0),
+                    palette.text,
+                );
+            }
+        }
+    }
+    if let Some(drag) = released::<TransitionDrag>(response) {
+        match target {
+            Some(join) => events.drop_transition = Some((join.clip, drag.0)),
+            None => events.transition_missed = true,
+        }
+    }
+    for join in view.joins.iter().filter(|join| join.has_transition) {
+        let track = layout.track(join.row);
+        let centre = pos2(scale.x_of(join.cut), track.center().y);
+        let rect = Rect::from_center_size(centre, vec2(JOIN_ICON_SIZE, JOIN_ICON_SIZE));
+        if !area.intersects(rect) {
+            continue;
+        }
+        let id = egui::Id::unique(("timeline-join", join.clip));
+        let icon = ui.interact(rect, id, Sense::click());
+        icon.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Transition"));
+        let selected = view.selected_join == Some(join.clip);
+        let painter = ui.painter_at(area);
+        let fill = if selected || icon.hovered() {
+            palette.accent
+        } else {
+            palette.raised
+        };
+        painter.rect(
+            rect,
+            5.0,
+            fill,
+            Stroke::new(1.0, palette.border_strong),
+            egui::StrokeKind::Inside,
+        );
+        icons::paint(
+            &painter,
+            icons::square_at(centre, JOIN_ICON_SIZE * 0.65),
+            &icons::BLEND,
+            if selected || icon.hovered() {
+                palette.accent_text
+            } else {
+                palette.text
+            },
+        );
+        if icon.clicked() {
+            events.select_join = Some(join.clip);
+        }
+        let mut delete = false;
+        Popup::context_menu(&icon)
+            .close_behavior(PopupCloseBehavior::CloseOnClick)
+            .show(|ui| {
+                if ui
+                    .add(MenuItem::new(palette, icons::TRASH_2, "Delete", "Del"))
+                    .clicked()
+                {
+                    delete = true;
+                }
+            });
+        if delete {
+            events.delete_join = Some(join.clip);
+        }
+    }
 }
 
 /// A video being dragged from the media panel.
@@ -756,6 +915,12 @@ pub struct TimelineEvents {
     pub add_text: bool,
     /// A style from the Text panel was dropped here.
     pub drop_title: Option<(TitleStyle, Ticks, TrackTarget)>,
+    /// A transition from its panel was dropped on a join.
+    pub drop_transition: Option<(ClipId, TransitionKind)>,
+    /// A transition from its panel was dropped away from any join.
+    pub transition_missed: bool,
+    pub select_join: Option<ClipId>,
+    pub delete_join: Option<ClipId>,
     pub seek: Option<Ticks>,
     pub select: Option<Option<ClipId>>,
     /// Comes with `select`: the dead space that was clicked on, if any.
@@ -1540,6 +1705,56 @@ fn clip_flyouts(
 
 /// The menu that opens on a clip or a gap, reporting what was picked from it. Also returns where
 /// any part open beside it is on screen.
+/// The clip's menu, opened from somewhere other than the timeline, such as the picture. Returns
+/// what was picked, a speed change, and whether it is still open.
+pub fn clip_menu_at(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    state: &mut TimelineState,
+    view: &TimelineView,
+    (id, at): (ClipId, Pos2),
+    just_opened: bool,
+) -> (Option<MenuAction>, Option<(ClipId, Speed)>, bool) {
+    let mut speed = None;
+    let mut picked = None;
+    let mut beside = None;
+    let flyouts = &mut state.menu_flyouts;
+    let shown = egui::Area::new(egui::Id::unique("picture-clip-menu"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(at)
+        .constrain(true)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::menu(ui.style()).show(ui, |ui| {
+                let (action, flyout) = timeline_menu(
+                    ui,
+                    palette,
+                    view,
+                    MenuTarget::Clip(id),
+                    (flyouts, &mut speed),
+                );
+                picked = action;
+                beside = flyout;
+            })
+        });
+    let frame = shown.response.rect.expand(MENU_FRAME_ROOM);
+    let clicked_at = ui.input(|input| {
+        input
+            .pointer
+            .any_click()
+            .then(|| input.pointer.interact_pos())
+            .flatten()
+    });
+    let outside = clicked_at.is_some_and(|at| {
+        !frame.contains(at) && !beside.is_some_and(|rect: Rect| rect.contains(at))
+    });
+    let escape = ui.input(|input| input.key_pressed(egui::Key::Escape));
+    let open = picked.is_none() && !(outside && !just_opened) && !escape;
+    if !open {
+        state.menu_flyouts = MenuFlyouts::default();
+    }
+    (picked, speed, open)
+}
+
 fn timeline_menu(
     ui: &mut egui::Ui,
     palette: &Palette,
@@ -2292,7 +2507,7 @@ pub fn timeline(
         );
     }
     if let (Some(drag), Some(time), Some(pointer)) = (
-        response.dnd_release_payload::<MediaDrag>(),
+        released::<MediaDrag>(&response),
         hover_time,
         dragged_pointer,
     ) {
@@ -2306,6 +2521,7 @@ pub fn timeline(
     if furthest > 0.0 {
         track_scrollbar(ui, palette, state, area, furthest);
     }
+    draw_joins(ui, palette, view, &layout, &scale, &response, &mut events);
 
     // The button on a gap, the same way a hovered or selected clip shows its handles.
     let mut on_gap_button = false;
@@ -2556,6 +2772,31 @@ mod tests {
             "on the line"
         );
         assert!(!on_playhead(pos2(100.0, 205.0), x, top, bottom), "below it");
+    }
+
+    #[test]
+    fn a_dragged_transition_lands_on_the_nearest_join_within_reach() {
+        let layout = TrackLayout {
+            area: Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 300.0)),
+            count: 1,
+            scroll: 0.0,
+            thin: 0,
+        };
+        let scale = scale();
+        let join = |id: u64, seconds_at: f64| JoinView {
+            clip: ClipId(id),
+            row: 0,
+            cut: seconds(seconds_at),
+            has_transition: false,
+        };
+        let joins = [join(1, 20.0), join(2, 40.0)];
+        let y = layout.track(0).center().y;
+        let near = |x: f32| join_near(&joins, &layout, &scale, pos2(x, y));
+        let first = scale.x_of(seconds(20.0));
+        let second = scale.x_of(seconds(40.0));
+        assert_eq!(near(first + 5.0).map(|join| join.clip), Some(ClipId(1)));
+        assert_eq!(near(second - 5.0).map(|join| join.clip), Some(ClipId(2)));
+        assert_eq!(near(first - JOIN_REACH - 5.0), None);
     }
 
     fn scale() -> TimeScale {

@@ -4,7 +4,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::time::Ticks;
+use crate::{
+    effects::{Grade, LayerJoin},
+    time::Ticks,
+};
 
 /// What one whole means in a placement: the canvas's full width or height, a picture at its
 /// normal size, or a picture that hides what is under it.
@@ -138,6 +141,10 @@ pub struct PictureLook {
     pub flip_y: bool,
     /// The part of the source picture that shows: left, top, right and bottom, from 0 to 1.
     pub source: [f32; 4],
+    /// What to do to its colours.
+    pub grade: Grade,
+    /// Whether it is drawn together with the next layer up, as the two sides of a transition.
+    pub join: Option<LayerJoin>,
 }
 
 impl PictureLook {
@@ -146,6 +153,8 @@ impl PictureLook {
         flip_x: false,
         flip_y: false,
         source: [0.0, 0.0, 1.0, 1.0],
+        grade: Grade::NONE,
+        join: None,
     };
 
     pub fn is_plain(&self) -> bool {
@@ -310,6 +319,8 @@ impl Placement {
                 1.0 - self.crop_right as f32 / WHOLE as f32,
                 1.0 - self.crop_bottom as f32 / WHOLE as f32,
             ],
+            grade: Grade::NONE,
+            join: None,
         }
     }
 

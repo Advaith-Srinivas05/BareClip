@@ -8,10 +8,12 @@ use std::{
 };
 
 use bareclip_core::{
+    effects::{Filter, LayerJoin, TransitionKind},
     picture::StillPicture,
     speed::{NORMAL, Speed},
     time::{TICKS_PER_SECOND, Ticks},
     timeline::{Clip, ClipId, MediaId},
+    tracks::join_between,
 };
 use bareclip_media::{MediaInfo, PreviewFrame, fit_preview_size};
 use bareclip_render::{Compositor, Layer, LayerPicture, RenderError};
@@ -47,7 +49,29 @@ fn followed_videos(stack: &[Clip]) -> Vec<Clip> {
 
 /// Where a moment on the timeline falls in a clip's video.
 fn source_time(clip: &Clip, now: Ticks) -> Ticks {
-    clip.source_at(now).min(clip.source.end)
+    if clip.transition.is_some() {
+        // A transition plays on past the end of the clip.
+        clip.footage_at(now)
+    } else {
+        clip.footage_at(now).min(clip.source.end)
+    }
+}
+
+/// How far from the end of a file a transition asks for its last picture, because asking for a moment
+/// past the end would find nothing at all.
+const LAST_PICTURE_BEFORE_END_SECONDS: f64 = 0.1;
+
+/// Where a clip's player should be. A transition can play on past the end of the file, and then it
+/// stays on the last picture there is.
+fn wanted_time(clip: &Clip, now: Ticks, lookup: &dyn Fn(MediaId) -> Option<MediaInfo>) -> Ticks {
+    let wanted = source_time(clip, now);
+    if clip.transition.is_none() {
+        return wanted;
+    }
+    let before_end = Ticks::from_seconds(LAST_PICTURE_BEFORE_END_SECONDS).0;
+    lookup(clip.media).map_or(wanted, |info| {
+        wanted.min(Ticks(info.duration.0 - before_end))
+    })
 }
 
 /// Whether a picture has fallen so far behind that it should stop trying to decode its way there.
@@ -67,6 +91,14 @@ pub fn should_catch_up(
         CATCH_UP_EVERY
     };
     shown.is_some_and(|shown| now.0 - shown.0 > late.0) && last_jump >= every
+}
+
+/// Whether what is drawn for this stack differs from one moment to the next, even with no new picture.
+fn changes_over_time(stack: &[Clip]) -> bool {
+    stack.iter().any(|clip| clip.look.has_fade())
+        || stack
+            .windows(2)
+            .any(|pair| join_between(&pair[0], &pair[1], Ticks(0)).is_some())
 }
 
 /// The piece of the stack a picture from the main player belongs to. Pieces of a clip have their
@@ -112,6 +144,8 @@ pub struct LayerPictures {
     changed: bool,
     /// The clips and where they were when the canvas was last drawn.
     drawn: Vec<Clip>,
+    /// The moment it was last drawn for, which matters if something in it changes over time.
+    drawn_at: Ticks,
 }
 
 impl LayerPictures {
@@ -151,7 +185,7 @@ impl LayerPictures {
             };
             match Player::open_as(&info, true, notify.clone()) {
                 Ok(mut player) => {
-                    player.prepare(source_time(clip, coming_at));
+                    player.prepare(wanted_time(clip, coming_at, lookup));
                     self.followers.push(Follower {
                         clip: clip.id,
                         waiting: true,
@@ -173,7 +207,7 @@ impl LayerPictures {
             };
             match Player::open_as(&info, true, notify.clone()) {
                 Ok(mut player) => {
-                    player.seek(source_time(clip, moment.now));
+                    player.seek(wanted_time(clip, moment.now, lookup));
                     if moment.playing {
                         player.play();
                     }
@@ -199,7 +233,7 @@ impl LayerPictures {
                 follower.player.begin();
                 follower.last_jump = Instant::now();
             }
-            let wanted = source_time(clip, moment.now);
+            let wanted = wanted_time(clip, moment.now, lookup);
             if moment.jumped {
                 follower.player.seek(wanted);
                 if moment.playing {
@@ -229,7 +263,9 @@ impl LayerPictures {
             if let Some(error) = follower.player.take_error() {
                 problem = Some(error);
             }
-            if let Some(frame) = frame.filter(|frame| frame.time < clip.source.end) {
+            let in_clip =
+                |frame: &PreviewFrame| clip.transition.is_some() || frame.time < clip.source.end;
+            if let Some(frame) = frame.filter(in_clip) {
                 follower.shown = Some(frame.time);
                 self.pictures.insert(clip.id, frame);
                 self.changed = true;
@@ -254,8 +290,8 @@ impl LayerPictures {
     }
 
     /// Whether the canvas needs drawing again for this stack.
-    pub fn needs_drawing(&self, stack: &[Clip]) -> bool {
-        self.changed || self.drawn != stack
+    pub fn needs_drawing(&self, stack: &[Clip], now: Ticks) -> bool {
+        self.changed || self.drawn != stack || (self.drawn_at != now && changes_over_time(stack))
     }
 
     /// Whether every clip in the stack has a picture to show.
@@ -282,28 +318,43 @@ impl LayerPictures {
             .filter(|clip| clip.is_still())
             .filter_map(|clip| Some((clip.media, still_of(clip.media)?)))
             .collect();
-        let layers: Vec<Layer> = stack
+        let mut in_stack = Vec::with_capacity(stack.len());
+        let mut layers: Vec<Layer> = stack
             .iter()
-            .filter_map(|clip| {
+            .enumerate()
+            .filter_map(|(index, clip)| {
                 let picture: LayerPicture = if clip.is_still() {
                     let (_, still) = stills.iter().find(|(media, _)| *media == clip.media)?;
                     (&**still).into()
                 } else {
                     self.pictures.get(&clip.id)?.view()?.into()
                 };
-                let placement = clip.placement.at(Ticks(now.0 - clip.start.0));
+                let placement = clip.placement_at(now);
                 let size = size_of(clip.media)?;
+                in_stack.push(index);
+                let mut look = placement.look();
+                look.grade = clip.look.grade();
                 Some(Layer {
                     picture,
                     rect: scaled_rect(placement.rect(size, canvas), canvas, target),
                     opacity: placement.opacity as f32 / bareclip_core::placement::WHOLE as f32,
-                    look: placement.look(),
+                    look,
                 })
             })
             .collect();
+        // Until both sides of a transition have a picture, whichever has one shows alone.
+        for place in 0..layers.len().saturating_sub(1) {
+            let (lower, upper) = (in_stack[place], in_stack[place + 1]);
+            if upper == lower + 1
+                && let Some(join) = join_between(&stack[lower], &stack[upper], now)
+            {
+                layers[place].look.join = Some(join);
+            }
+        }
         compositor.draw_for_display(&layers)?;
         self.changed = false;
         self.drawn = stack.to_vec();
+        self.drawn_at = now;
         Ok(())
     }
 }
@@ -402,7 +453,7 @@ impl LayerDisplay {
         self.compositor_for(canvas)?.set_background(background);
         // Places are worked out from the canvas, so a new one means drawing them again.
         let new_canvas = self.drawn_on != Some((canvas, background));
-        let wanted = pictures.needs_drawing(stack) || new_canvas || !self.drawn;
+        let wanted = pictures.needs_drawing(stack, now) || new_canvas || !self.drawn;
         if !wanted || (!self.drawn && !pictures.is_ready(stack)) {
             return Ok(());
         }
@@ -417,6 +468,165 @@ impl LayerDisplay {
         self.drawn = true;
         self.drawn_on = Some((canvas, background));
         Ok(())
+    }
+}
+
+/// How big the panels' cards are drawn.
+const CARD_SIZE: (u32, u32) = (256, 160);
+/// How far through a transition a card shows when it isn't moving.
+const CARD_AT_REST: f32 = 0.35;
+
+/// A simple landscape of BareClip's own for transition cards to show: a sky, and hills in front.
+fn card_scene(size: (u32, u32), sky: [[f32; 3]; 2], hills: [f32; 3], shift: f32) -> StillPicture {
+    let (width, height) = (size.0 as usize, size.1 as usize);
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for y in 0..height {
+        let down = y as f32 / height as f32;
+        for x in 0..width {
+            let across = x as f32 / width as f32;
+            let ridge = 0.62
+                + ((across + shift) * 7.0).sin() * 0.07
+                + ((across + shift) * 17.0).sin() * 0.025;
+            let colour = if down > ridge {
+                let deep = ((down - ridge) / (1.0 - ridge)).min(1.0);
+                [
+                    hills[0] * (1.0 - deep * 0.4),
+                    hills[1] * (1.0 - deep * 0.4),
+                    hills[2] * (1.0 - deep * 0.4),
+                ]
+            } else {
+                let t = down / ridge;
+                [
+                    sky[0][0] + (sky[1][0] - sky[0][0]) * t,
+                    sky[0][1] + (sky[1][1] - sky[0][1]) * t,
+                    sky[0][2] + (sky[1][2] - sky[0][2]) * t,
+                ]
+            };
+            for part in colour {
+                rgba.push((part * 255.0) as u8);
+            }
+            rgba.push(255);
+        }
+    }
+    StillPicture::new(size.0, size.1, rgba)
+}
+
+/// Draws the panels' cards with the same compositor as everything else, so a card shows what the
+/// transition or filter really does. One canvas stays on show for the card that is moving, and
+/// another makes pictures of the rest, because a window only shows a canvas when it finishes.
+pub struct CardDrawer {
+    live: Compositor,
+    live_texture: egui::TextureId,
+    stills: Compositor,
+    going: StillPicture,
+    coming: StillPicture,
+}
+
+impl CardDrawer {
+    pub fn new(display: &LayerDisplay) -> Result<Self, RenderError> {
+        let open = || {
+            Compositor::on_device(
+                display.device.clone(),
+                display.queue.clone(),
+                CARD_SIZE.0,
+                CARD_SIZE.1,
+            )
+        };
+        let live = open()?;
+        let stills = open()?;
+        let live_texture = display.renderer.write().register_native_texture(
+            &display.device,
+            live.display_view(),
+            wgpu::FilterMode::Linear,
+        );
+        Ok(Self {
+            live,
+            live_texture,
+            stills,
+            going: card_scene(
+                CARD_SIZE,
+                [[0.42, 0.33, 0.72], [0.93, 0.66, 0.72]],
+                [0.27, 0.22, 0.42],
+                0.0,
+            ),
+            coming: card_scene(
+                CARD_SIZE,
+                [[0.65, 0.84, 0.95], [0.93, 0.93, 0.88]],
+                [0.1, 0.4, 0.62],
+                0.4,
+            ),
+        })
+    }
+
+    fn join_layers<'a>(
+        going: &'a StillPicture,
+        coming: &'a StillPicture,
+        kind: TransitionKind,
+        progress: f32,
+    ) -> [Layer<'a>; 2] {
+        let whole = bareclip_render::fit_inside(CARD_SIZE, CARD_SIZE);
+        let layer = |picture: &'a StillPicture| Layer {
+            picture: picture.into(),
+            rect: whole,
+            opacity: 1.0,
+            look: bareclip_render::PictureLook::PLAIN,
+        };
+        let mut lower = layer(going);
+        lower.look.join = Some(LayerJoin {
+            kind,
+            progress,
+            goes_out: true,
+        });
+        [lower, layer(coming)]
+    }
+
+    /// A transition part way through, to show on a card at rest.
+    pub fn transition(&mut self, kind: TransitionKind) -> Option<StillPicture> {
+        let layers = Self::join_layers(&self.going, &self.coming, kind, CARD_AT_REST);
+        self.stills.draw_for_display(&layers).ok()?;
+        let rgba = self.stills.read_display().ok()?;
+        Some(StillPicture::new(CARD_SIZE.0, CARD_SIZE.1, rgba))
+    }
+
+    /// Draws a moving card on the canvas that is on show, and says which picture to paint.
+    pub fn live_transition(
+        &mut self,
+        kind: TransitionKind,
+        progress: f32,
+    ) -> Option<egui::TextureId> {
+        let layers = Self::join_layers(&self.going, &self.coming, kind, progress);
+        self.live.draw_for_display(&layers).ok()?;
+        Some(self.live_texture)
+    }
+
+    fn filter_card(&mut self, picture: LayerPicture, filter: Filter) -> Option<StillPicture> {
+        let mut look = bareclip_render::PictureLook::PLAIN;
+        look.grade = filter.grade();
+        let layer = Layer {
+            rect: bareclip_render::fit_inside(picture.size(), CARD_SIZE),
+            picture,
+            opacity: 1.0,
+            look,
+        };
+        self.stills.draw_for_display(&[layer]).ok()?;
+        let rgba = self.stills.read_display().ok()?;
+        Some(StillPicture::new(CARD_SIZE.0, CARD_SIZE.1, rgba))
+    }
+
+    pub fn filter_on_still(
+        &mut self,
+        still: &StillPicture,
+        filter: Filter,
+    ) -> Option<StillPicture> {
+        self.filter_card(still.into(), filter)
+    }
+
+    pub fn filter_on_video(
+        &mut self,
+        picture: &bareclip_media::DecodedPicture,
+        filter: Filter,
+    ) -> Option<StillPicture> {
+        self.filter_card(picture.view().into(), filter)
     }
 }
 
@@ -439,6 +649,7 @@ fn scaled_rect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bareclip_core::effects::{ClipLook, Transition};
     use std::{path::PathBuf, process::Command, sync::Arc, thread};
 
     use bareclip_core::{
@@ -466,6 +677,8 @@ mod tests {
             placement: Placement::default(),
             sound: Default::default(),
             speed: Default::default(),
+            look: Default::default(),
+            transition: None,
         }
     }
 
@@ -625,7 +838,7 @@ mod tests {
         at: Ticks,
         compositor: &mut Compositor,
     ) -> Vec<u8> {
-        drawn_by_the_preview_with_titles(tracks, infos, &HashMap::new(), at, compositor)
+        drawn_by_the_preview_with_titles(tracks, infos, &HashMap::new(), None, at, compositor)
     }
 
     /// The same, with pictures already drawn for the titles among the clips.
@@ -633,6 +846,7 @@ mod tests {
         tracks: &Tracks,
         infos: &[MediaInfo],
         titles: &HashMap<MediaId, Arc<StillPicture>>,
+        moving: Option<&std::collections::BTreeMap<MediaId, bareclip_core::title::Title>>,
         at: Ticks,
         compositor: &mut Compositor,
     ) -> Vec<u8> {
@@ -670,7 +884,7 @@ mod tests {
                     || pictures
                         .pictures
                         .get(&clip.id)
-                        .is_some_and(|picture| picture.time >= clip.source_at(at))
+                        .is_some_and(|picture| picture.time >= wanted_time(clip, at, &lookup))
             })
         };
         let started = Instant::now();
@@ -690,9 +904,17 @@ mod tests {
             pictures.update(&stack, moment, top, &lookup, &notify);
             thread::sleep(Duration::from_millis(2));
         }
+        let mut posed = stack.clone();
+        let mut frames = crate::title_frames::TitleFrames::default();
+        if let Some(moving) = moving {
+            frames.pose_stack(&mut posed, at, canvas, moving, &size_of, None);
+        }
+        let shown_size_of = |id: MediaId| frames.shown_size(id).or_else(|| size_of(id));
         pictures
-            .draw(compositor, &stack, at, canvas, &size_of, &|id| {
-                stills.get(&id).cloned()
+            .draw(compositor, &posed, at, canvas, &shown_size_of, &|id| {
+                frames
+                    .shown_picture(id)
+                    .or_else(|| stills.get(&id).cloned())
             })
             .expect("it draws");
         compositor.read_display().expect("it reads back")
@@ -832,6 +1054,9 @@ mod tests {
                         placement: clip.placement,
                         speed: clip.speed,
                         title: None,
+                        look: Default::default(),
+                        join_in: None,
+                        join_out: None,
                     })
                     .collect(),
             })
@@ -966,6 +1191,9 @@ mod tests {
                         placement: clip.placement,
                         speed: clip.speed,
                         title: None,
+                        look: Default::default(),
+                        join_in: None,
+                        join_out: None,
                     })
                     .collect(),
             })
@@ -1088,6 +1316,9 @@ mod tests {
                         placement: clip.placement,
                         speed: clip.speed,
                         title: None,
+                        look: Default::default(),
+                        join_in: None,
+                        join_out: None,
                     })
                     .collect(),
             })
@@ -1200,7 +1431,7 @@ mod tests {
 
         let at = seconds(1.0);
         let previewed =
-            drawn_by_the_preview_with_titles(&tracks, &infos, &titles, at, &mut compositor);
+            drawn_by_the_preview_with_titles(&tracks, &infos, &titles, None, at, &mut compositor);
 
         let output = std::env::temp_dir().join(format!(
             "bareclip-app-tests/title-matches-{}.mp4",
@@ -1234,6 +1465,9 @@ mod tests {
                         placement: clip.placement,
                         speed: clip.speed,
                         title: (clip.media == media).then(|| title.clone()),
+                        look: Default::default(),
+                        join_in: None,
+                        join_out: None,
                     })
                     .collect(),
             })
@@ -1286,6 +1520,293 @@ mod tests {
             "the title made too little difference to tell"
         );
         let _ = std::fs::remove_file(&output);
+    }
+
+    /// Exports a video with a title on it, and reads back one moment of the finished file.
+    fn moving_title_matches(
+        style: bareclip_core::title::TitleStyle,
+        name: &str,
+        at_seconds: f64,
+    ) -> f64 {
+        use bareclip_core::title::Title;
+        let path = detailed_clip(&format!("under-moving-{name}"), "testsrc2");
+        let infos = vec![probe(&path).expect("the video can be read")];
+        let source = TimeRange {
+            start: Ticks(0),
+            end: seconds(3.0),
+        };
+        let canvas = (infos[0].video.width, infos[0].video.height);
+        let title = Title {
+            size: WHOLE / 7,
+            ..Title::in_style(style)
+        };
+        let drawing = bareclip_text::draw_title(&title, canvas);
+        let size = (drawing.picture.width, drawing.picture.height);
+        let picture = Arc::new(drawing.picture);
+        let media = MediaId::for_title(1);
+        let mut tracks = Tracks::default();
+        tracks.place(MediaId(0), source, Ticks(0), TrackTarget::New(0));
+        let on_top = tracks.place_title(media, TimeRange::new_title(), Ticks(0));
+        let start = Placement {
+            scale: drawing.scale,
+            ..Placement::default()
+        };
+        tracks.set_placement(on_top, title.placed(start, size, drawing.scale, canvas));
+        let still = HashMap::from([(media, picture)]);
+        let moving = std::collections::BTreeMap::from([(media, title.clone())]);
+        let mut compositor = compositor_of(canvas).expect("the GPU opens");
+        let at = seconds(at_seconds);
+        let previewed = drawn_by_the_preview_with_titles(
+            &tracks,
+            &infos,
+            &still,
+            Some(&moving),
+            at,
+            &mut compositor,
+        );
+        let output = std::env::temp_dir().join(format!(
+            "bareclip-app-tests/moving-title-{name}-{}.mp4",
+            std::process::id()
+        ));
+        let size_of = |id: MediaId| {
+            if id == media {
+                Some(size)
+            } else {
+                Some(canvas)
+            }
+        };
+        let stretches = tracks
+            .stretches(canvas, &size_of)
+            .into_iter()
+            .map(|stretch| bareclip_export::LayeredStretch {
+                start: stretch.start,
+                end: stretch.end,
+                stack: stretch
+                    .stack
+                    .iter()
+                    .map(|clip| bareclip_export::LayeredClip {
+                        key: clip.id.0,
+                        input: if clip.media == media {
+                            PathBuf::new()
+                        } else {
+                            path.clone()
+                        },
+                        start: clip.start,
+                        source: clip.source,
+                        placement: clip.placement,
+                        speed: clip.speed,
+                        title: (clip.media == media).then(|| title.clone()),
+                        look: Default::default(),
+                        join_in: None,
+                        join_out: None,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let request = bareclip_export::LayeredRequest {
+            output: output.clone(),
+            stretches,
+            sound: bareclip_export::SoundPlan::default(),
+            canvas: Some(canvas),
+            background: [0, 0, 0],
+            quality: Default::default(),
+            rate: Default::default(),
+        };
+        bareclip_export::export_layered(
+            &request,
+            &std::sync::atomic::AtomicBool::new(false),
+            &|_| {},
+        )
+        .expect("the export succeeds");
+        let mut reader = bareclip_media::PictureReader::open(&output).expect("the export opens");
+        reader.seek(at).expect("it seeks");
+        let exported = loop {
+            let picture = reader
+                .next_picture()
+                .expect("it decodes")
+                .expect("the moment is in the video");
+            if picture.time() >= at {
+                break picture;
+            }
+        };
+        let layer = Layer {
+            picture: exported.view().into(),
+            rect: bareclip_render::fit_inside(exported.size(), canvas),
+            opacity: 1.0,
+            look: bareclip_render::PictureLook::PLAIN,
+        };
+        compositor.draw_for_display(&[layer]).expect("it draws");
+        let shown = compositor.read_display().expect("it reads back");
+        let _ = std::fs::remove_file(&output);
+        average_difference(&previewed, &shown)
+    }
+
+    #[test]
+    fn a_title_in_mid_motion_looks_the_same_in_the_preview_and_the_export() {
+        if compositor_of((64, 64)).is_none() {
+            return;
+        }
+        use bareclip_core::title::TitleStyle;
+        for (style, name, at) in [
+            (TitleStyle::Bouncing, "whole", 0.2),
+            (TitleStyle::Rating, "letters", 0.3),
+            (TitleStyle::Gliding, "boxes", 0.2),
+            (TitleStyle::Typewriter, "typing", 0.3),
+            (TitleStyle::Glitch, "glitch", 0.2),
+            (TitleStyle::Circular, "circle", 0.15),
+            (TitleStyle::PushThrough, "sweep", 0.2),
+            (TitleStyle::Countdown, "countdown", 1.0),
+        ] {
+            let difference = moving_title_matches(style, name, at);
+            assert!(
+                difference < 6.0,
+                "{style:?} differs from the preview by {difference:.2} out of 255"
+            );
+        }
+    }
+
+    /// Two clips joined by a transition, as the preview shows them and as they export, at a moment.
+    fn joined_clips_match(
+        kind: TransitionKind,
+        name: &str,
+        at_seconds: f64,
+        look: ClipLook,
+    ) -> f64 {
+        let first = detailed_clip(&format!("join-first-{name}"), "testsrc2");
+        let second = detailed_clip(&format!("join-second-{name}"), "rgbtestsrc");
+        let infos = vec![
+            probe(&first).expect("the video can be read"),
+            probe(&second).expect("the video can be read"),
+        ];
+        let paths = [first.clone(), second.clone()];
+        let canvas = (infos[0].video.width, infos[0].video.height);
+        let middle = TimeRange {
+            start: seconds(1.0),
+            end: seconds(3.0),
+        };
+        let mut tracks = Tracks::default();
+        let going = tracks.place(MediaId(0), middle, Ticks(0), TrackTarget::New(0));
+        tracks.place(MediaId(1), middle, seconds(2.0), TrackTarget::Existing(0));
+        assert!(tracks.set_transition(
+            going,
+            Some(Transition {
+                kind,
+                duration: seconds(1.0).0,
+            })
+        ));
+        tracks.set_look(going, look);
+        let mut compositor = compositor_of(canvas).expect("the GPU opens");
+        let at = seconds(at_seconds);
+        let previewed = drawn_by_the_preview(&tracks, &infos, at, &mut compositor);
+        let output = std::env::temp_dir().join(format!(
+            "bareclip-app-tests/joined-{name}-{}.mp4",
+            std::process::id()
+        ));
+        let size_of = |_: MediaId| Some(canvas);
+        let stretches = tracks
+            .stretches(canvas, &size_of)
+            .into_iter()
+            .map(|stretch| bareclip_export::LayeredStretch {
+                start: stretch.start,
+                end: stretch.end,
+                stack: stretch
+                    .stack
+                    .iter()
+                    .map(|clip| {
+                        let (start, source) = tracks.with_room_for_joins(clip);
+                        bareclip_export::LayeredClip {
+                            key: clip.id.0,
+                            input: paths[clip.media.0 as usize].clone(),
+                            start,
+                            source,
+                            placement: clip.placement,
+                            speed: clip.speed,
+                            title: None,
+                            look: clip.look,
+                            join_in: tracks.join_into(clip.id).map(|(cut, transition)| {
+                                bareclip_export::ExportJoin { cut, transition }
+                            }),
+                            join_out: clip.transition.map(|transition| {
+                                bareclip_export::ExportJoin {
+                                    cut: clip.end(),
+                                    transition,
+                                }
+                            }),
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+        let request = bareclip_export::LayeredRequest {
+            output: output.clone(),
+            stretches,
+            sound: bareclip_export::SoundPlan::default(),
+            canvas: Some(canvas),
+            background: [0, 0, 0],
+            quality: Default::default(),
+            rate: Default::default(),
+        };
+        bareclip_export::export_layered(
+            &request,
+            &std::sync::atomic::AtomicBool::new(false),
+            &|_| {},
+        )
+        .expect("the export succeeds");
+        let mut reader = bareclip_media::PictureReader::open(&output).expect("the export opens");
+        reader.seek(at).expect("it seeks");
+        let exported = loop {
+            let picture = reader
+                .next_picture()
+                .expect("it decodes")
+                .expect("the moment is in the video");
+            if picture.time() >= at {
+                break picture;
+            }
+        };
+        let layer = Layer {
+            picture: exported.view().into(),
+            rect: bareclip_render::fit_inside(exported.size(), canvas),
+            opacity: 1.0,
+            look: bareclip_render::PictureLook::PLAIN,
+        };
+        compositor.draw_for_display(&[layer]).expect("it draws");
+        let shown = compositor.read_display().expect("it reads back");
+        let _ = std::fs::remove_file(&output);
+        average_difference(&previewed, &shown)
+    }
+
+    #[test]
+    fn a_transition_looks_the_same_in_the_preview_and_the_export() {
+        if compositor_of((64, 64)).is_none() {
+            return;
+        }
+        for (kind, name, at) in [
+            (TransitionKind::CrossFade, "fade-before", 1.75),
+            (TransitionKind::CrossFade, "fade-after", 2.25),
+            (TransitionKind::HardWipeRight, "wipe", 2.0),
+            (TransitionKind::Spin, "spin", 2.1),
+        ] {
+            let difference = joined_clips_match(kind, name, at, ClipLook::default());
+            assert!(
+                difference < 8.0,
+                "{name} differs from the preview by {difference:.2} out of 255"
+            );
+        }
+    }
+
+    #[test]
+    fn a_filter_and_a_fade_look_the_same_in_the_preview_and_the_export() {
+        if compositor_of((64, 64)).is_none() {
+            return;
+        }
+        let look = ClipLook {
+            filter: Filter::OrangeAndTeal,
+            contrast: 300,
+            fade_in: seconds(1.0).0,
+            ..ClipLook::default()
+        };
+        let difference = joined_clips_match(TransitionKind::CrossFade, "looks", 0.5, look);
+        assert!(difference < 8.0, "it differs by {difference:.2} out of 255");
     }
 
     #[test]
@@ -1551,7 +2072,7 @@ mod tests {
                     }
                 }
             }
-            if pictures.needs_drawing(&stack) {
+            if pictures.needs_drawing(&stack, now) {
                 let before = Instant::now();
                 pictures
                     .draw(&mut compositor, &stack, now, canvas, &size_of, &|_| None)
@@ -1673,6 +2194,9 @@ mod tests {
                         placement: clip.placement,
                         speed: clip.speed,
                         title: None,
+                        look: Default::default(),
+                        join_in: None,
+                        join_out: None,
                     })
                     .collect(),
             })

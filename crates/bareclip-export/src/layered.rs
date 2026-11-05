@@ -10,6 +10,8 @@ use std::{
 
 use bareclip_core::{
     canvas::{BLACK, Colour},
+    effects::{ClipLook, LayerJoin, Transition, join_progress},
+    motion::{Pose, TitleMotion},
     picture::{BlackPicture, StillPicture},
     placement::{Placement, WHOLE},
     speed::Speed,
@@ -41,6 +43,18 @@ pub struct LayeredClip {
     pub speed: Speed,
     /// What to draw for a title, which has no file behind it.
     pub title: Option<Title>,
+    pub look: ClipLook,
+    /// The transition into this clip, if there is one.
+    pub join_in: Option<ExportJoin>,
+    /// The transition out of this clip, if there is one.
+    pub join_out: Option<ExportJoin>,
+}
+
+/// A transition at one end of a clip. `start` and `source` on the clip already have room for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExportJoin {
+    pub cut: Ticks,
+    pub transition: Transition,
 }
 
 impl LayeredClip {
@@ -51,6 +65,32 @@ impl LayeredClip {
     fn end(&self) -> Ticks {
         Ticks(self.start.0 + self.speed.on_timeline(self.source.duration()).0)
     }
+
+    /// How much its picture fades at a moment. Room added for a transition isn't part of the clip,
+    /// so this goes by where the clip really starts and stops.
+    fn fade_at(&self, time: Ticks) -> f32 {
+        if !self.look.has_fade() {
+            return 1.0;
+        }
+        let start = self.join_in.map_or(self.start, |join| join.cut);
+        let end = self.join_out.map_or(self.end(), |join| join.cut);
+        self.look
+            .fade_at(Ticks(time.0 - start.0), Ticks(end.0 - start.0))
+    }
+}
+
+/// Whether two neighbours in a stack, lowest first, are the sides of a transition.
+fn join_between(lower: &LayeredClip, upper: &LayeredClip, time: Ticks) -> Option<LayerJoin> {
+    let (join, goes_out) = match (lower.join_out, upper.join_in, lower.join_in, upper.join_out) {
+        (Some(out), Some(into), ..) if out.cut == into.cut => (out, true),
+        (.., Some(into), Some(out)) if out.cut == into.cut => (out, false),
+        _ => return None,
+    };
+    Some(LayerJoin {
+        kind: join.transition.kind,
+        progress: join_progress(join.cut, join.transition.duration, time),
+        goes_out,
+    })
 }
 
 /// A stretch of the finished video over which the same clips show, lowest first. Whatever falls
@@ -84,6 +124,86 @@ fn stretch_at(stretches: &[LayeredStretch], time: Ticks, slack: Ticks) -> Option
         None => {
             let last = stretches.len().checked_sub(1)?;
             (time.0 - stretches[last].end.0 < slack.0).then_some(last)
+        }
+    }
+}
+
+/// A title showing in the export, and where and what it is at the frame being made.
+struct ShownTitle {
+    rest: StillPicture,
+    rest_place: Placement,
+    motion: TitleMotion,
+    /// Filled in the first time its parts have to move.
+    moving: Option<bareclip_text::MovingTitle>,
+    title: Title,
+    logo: Option<StillPicture>,
+    frame: Option<(u64, StillPicture)>,
+    /// Where it goes at the frame being made, and whether that's on its moving picture.
+    place: Placement,
+    on_frame: bool,
+    moved_last_frame: bool,
+}
+
+impl ShownTitle {
+    fn new(title: &Title, placement: Placement, canvas: (u32, u32)) -> Self {
+        let logo = title.logo.as_ref().and_then(|path| read_still(path).ok());
+        let drawing = bareclip_text::draw_title_with_logo(title, canvas, logo.as_ref());
+        let size = (drawing.picture.width, drawing.picture.height);
+        let rest_place = title.placed(placement, size, drawing.scale, canvas);
+        Self {
+            rest: drawing.picture,
+            rest_place,
+            motion: title.style.motion(),
+            moving: None,
+            title: title.clone(),
+            logo,
+            frame: None,
+            place: rest_place,
+            on_frame: false,
+            moved_last_frame: false,
+        }
+    }
+
+    /// Gets it ready for this moment. Returns whether the picture can differ from the last frame's.
+    fn advance(&mut self, seconds: f32, length: f32, canvas: (u32, u32)) -> bool {
+        if self.motion.is_still() {
+            return false;
+        }
+        let stage = self.motion.stage(seconds, length);
+        let pose = self.motion.pose(stage);
+        let draws = self.motion.draws_frames() && self.motion.draws_frame_at(stage);
+        if draws {
+            let key = self.motion.frame_key(stage);
+            let moving = self.moving.get_or_insert_with(|| {
+                bareclip_text::MovingTitle::prepare(&self.title, canvas, self.logo.as_ref())
+            });
+            if self.frame.as_ref().is_none_or(|frame| frame.0 != key) {
+                self.frame = Some((key, moving.frame(stage)));
+            }
+            let picture = self.frame.as_ref().map(|frame| &frame.1);
+            if let Some(picture) = picture {
+                let size = (picture.width, picture.height);
+                let rest = Placement {
+                    scale: moving.scale_for(size),
+                    ..self.rest_place
+                };
+                self.place = pose.on(rest, size, canvas);
+            }
+        } else {
+            let size = (self.rest.width, self.rest.height);
+            self.place = pose.on(self.rest_place, size, canvas);
+        }
+        self.on_frame = draws;
+        let moves = draws || pose != Pose::REST;
+        let changed = moves || self.moved_last_frame;
+        self.moved_last_frame = moves;
+        changed
+    }
+
+    fn picture(&self) -> &StillPicture {
+        match &self.frame {
+            Some((_, picture)) if self.on_frame => picture,
+            _ => &self.rest,
         }
     }
 }
@@ -183,7 +303,7 @@ pub fn export_layered(
         }
     }
     // Only the titles showing are kept, because a project can hold thousands of captions.
-    let mut titles: HashMap<u64, (StillPicture, Placement)> = HashMap::new();
+    let mut titles: HashMap<u64, ShownTitle> = HashMap::new();
     let mut feeds: HashMap<u64, PictureFeed> = HashMap::new();
     let mut current_stretch = None;
     // Whether the last frame written was dead space, or else came from the current stretch.
@@ -220,10 +340,7 @@ pub fn export_layered(
             titles.retain(|key, _| stack.iter().any(|clip| clip.key == *key));
             for clip in stack {
                 if let (Some(title), Entry::Vacant(place)) = (&clip.title, titles.entry(clip.key)) {
-                    let drawing = bareclip_text::draw_title(title, canvas);
-                    let size = (drawing.picture.width, drawing.picture.height);
-                    let placed = title.placed(clip.placement, size, drawing.scale, canvas);
-                    place.insert((drawing.picture, placed));
+                    place.insert(ShownTitle::new(title, clip.placement, canvas));
                 }
             }
             for clip in stack.iter().filter(|clip| !clip.source.is_still()) {
@@ -241,7 +358,17 @@ pub fn export_layered(
         match stretch_index {
             Some(index) => {
                 let stack = &stretches[index].stack;
+                // Fades and transitions change the picture even when no clip has a new one.
+                stack_changed |= stack.iter().any(|clip| clip.look.has_fade())
+                    || stack
+                        .windows(2)
+                        .any(|pair| join_between(&pair[0], &pair[1], time).is_some());
                 for clip in stack {
+                    if let Some(shown) = titles.get_mut(&clip.key) {
+                        let seconds = Ticks(time.0 - clip.start.0).as_seconds() as f32;
+                        let length = Ticks(clip.end().0 - clip.start.0).as_seconds() as f32;
+                        stack_changed |= shown.advance(seconds, length, canvas);
+                    }
                     let Some(feed) = feeds.get_mut(&clip.key) else {
                         continue;
                     };
@@ -260,11 +387,15 @@ pub fn export_layered(
                     writer.repeat_picture()?;
                     report.repeated_frames += 1;
                 } else {
-                    let layers: Vec<Layer> = stack
+                    let mut in_stack = Vec::with_capacity(stack.len());
+                    let mut layers: Vec<Layer> = stack
                         .iter()
-                        .filter_map(|clip| {
-                            if let Some((picture, placed)) = titles.get(&clip.key) {
-                                let placement = placed.at(Ticks(time.0 - clip.start.0));
+                        .enumerate()
+                        .filter_map(|(index, clip)| {
+                            if let Some(shown) = titles.get(&clip.key) {
+                                in_stack.push(index);
+                                let picture = shown.picture();
+                                let placement = shown.place;
                                 let size = (picture.width, picture.height);
                                 return Some(Layer {
                                     picture: picture.into(),
@@ -280,14 +411,26 @@ pub fn export_layered(
                             };
                             let placement = clip.placement.at(Ticks(time.0 - clip.start.0));
                             let size = sizes.get(&clip.input).copied()?;
+                            in_stack.push(index);
+                            let mut look = placement.look();
+                            look.grade = clip.look.grade();
+                            let opacity = placement.opacity as f32 / WHOLE as f32;
                             Some(Layer {
                                 picture,
                                 rect: placement.rect(size, canvas),
-                                opacity: placement.opacity as f32 / WHOLE as f32,
-                                look: placement.look(),
+                                opacity: opacity * clip.fade_at(time),
+                                look,
                             })
                         })
                         .collect();
+                    for place in 0..layers.len().saturating_sub(1) {
+                        let (lower, upper) = (in_stack[place], in_stack[place + 1]);
+                        if upper == lower + 1
+                            && let Some(join) = join_between(&stack[lower], &stack[upper], time)
+                        {
+                            layers[place].look.join = Some(join);
+                        }
+                    }
                     if layers.is_empty() && request.background == BLACK {
                         writer.write_picture(&black.view())?;
                         report.black_frames += 1;
@@ -393,6 +536,9 @@ mod tests {
             placement: Placement::default(),
             speed: Speed::default(),
             title: None,
+            look: ClipLook::default(),
+            join_in: None,
+            join_out: None,
         };
 
         assert_eq!(clip.source_time(seconds(12.0)), seconds(5.0));
@@ -411,6 +557,9 @@ mod tests {
             placement: Placement::default(),
             speed: Speed::default().with_factor(2.0),
             title: None,
+            look: ClipLook::default(),
+            join_in: None,
+            join_out: None,
         };
 
         assert_eq!(clip.source_time(seconds(11.0)), seconds(5.0));

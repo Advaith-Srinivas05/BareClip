@@ -1,7 +1,9 @@
 //! Project model and timeline rules. This crate has no video dependencies.
 
 pub mod canvas;
+pub mod effects;
 pub mod history;
+pub mod motion;
 pub mod picture;
 pub mod placement;
 pub mod playback;

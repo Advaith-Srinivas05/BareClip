@@ -63,6 +63,9 @@ use crate::{
     },
 };
 
+const TRANSITIONS_REASON: &str = "Transitions show two clips at once, so the video is drawn again.";
+const LOOKS_REASON: &str =
+    "Filters, colours and picture fades change the picture, so the video is drawn again.";
 const LOGO_DARK: &[u8] = include_bytes!("../../../assets/brand/png/mark-dark-256.png");
 const LOGO_LIGHT: &[u8] = include_bytes!("../../../assets/brand/png/mark-light-256.png");
 // The brand rules call for the simplified mark at this size.
@@ -394,9 +397,12 @@ enum RatePick {
     Redraw,
 }
 
+#[path = "looks.rs"]
+mod looks;
 #[path = "titles.rs"]
 mod titles;
-use titles::{CopiedClip, DurationEdit, LeftPanel, TitleResize};
+use looks::{LookPictures, LookTab, TitleTab};
+use titles::{CardHover, CopiedClip, DurationEdit, LeftPanel, TitleCard, TitleResize};
 
 struct MediaEntry {
     id: MediaId,
@@ -543,7 +549,24 @@ pub struct Editor {
     /// The undo step for a title being typed in or having a control held.
     title_before: Option<Snapshot>,
     title_resize: Option<TitleResize>,
-    title_cards: HashMap<TitleStyle, TextureHandle>,
+    title_cards: HashMap<TitleStyle, TitleCard>,
+    /// The clip whose transition out of it is selected on the timeline.
+    selected_join: Option<ClipId>,
+    /// A clip's menu opened from the picture, where, and whether it opened this frame.
+    picture_menu: Option<(ClipId, egui::Pos2, bool)>,
+    transition_search: String,
+    filter_search: String,
+    look_pictures: LookPictures,
+    look_panel_open: bool,
+    look_tab: LookTab,
+    title_tab: TitleTab,
+    /// The card the pointer is resting on, which starts moving after a moment.
+    card_hover: Option<CardHover>,
+    /// Whether all the text styles are showing, after "See all" was pressed.
+    all_text_styles: bool,
+    title_frames: crate::title_frames::TitleFrames,
+    /// The title that gets the logo picked next.
+    pick_logo_for: Option<MediaId>,
     title_colour_text: Option<String>,
     /// Whether a change to a caption's look goes to every caption on its row.
     style_whole_row: bool,
@@ -687,6 +710,18 @@ impl Editor {
             title_before: None,
             title_resize: None,
             title_cards: HashMap::new(),
+            selected_join: None,
+            picture_menu: None,
+            transition_search: String::new(),
+            filter_search: String::new(),
+            look_pictures: LookPictures::default(),
+            look_panel_open: false,
+            look_tab: LookTab::default(),
+            title_tab: TitleTab::default(),
+            card_hover: None,
+            all_text_styles: false,
+            title_frames: crate::title_frames::TitleFrames::default(),
+            pick_logo_for: None,
             title_colour_text: None,
             style_whole_row: true,
             focus_title_text: false,
@@ -1751,6 +1786,8 @@ impl Editor {
             layer_pictures,
             layer_display,
             stage_state,
+            title_frames,
+            selected,
             ..
         } = self;
         let lookup = |id: MediaId| media_info(media, id);
@@ -1804,18 +1841,28 @@ impl Editor {
                 *notice = Some(problem);
             }
             let background = project.canvas.background;
+            // A selected title rests while nothing plays, because it is being changed and may be
+            // invisible at this moment of its motion.
+            let held = (*selected).filter(|_| !preview.is_playing());
+            if title_frames.pose_stack(&mut stack, now, canvas, &project.titles, &size_of, held) {
+                layer_pictures.picture_arrived();
+            }
+            let title_frames = &*title_frames;
+            let shown_size_of = |id: MediaId| title_frames.shown_size(id).or_else(|| size_of(id));
             let still_of = |id: MediaId| {
-                media
-                    .iter()
-                    .find(|entry| entry.id == id)
-                    .and_then(|entry| entry.still.clone())
+                title_frames.shown_picture(id).or_else(|| {
+                    media
+                        .iter()
+                        .find(|entry| entry.id == id)
+                        .and_then(|entry| entry.still.clone())
+                })
             };
             if let Err(error) = display.draw(
                 layer_pictures,
                 &stack,
                 now,
                 (canvas, background),
-                &size_of,
+                &shown_size_of,
                 &still_of,
             ) {
                 *notice = Some(error.to_string());
@@ -2025,14 +2072,26 @@ impl Editor {
                         } else {
                             self.entry(clip.media)?.info.path.clone()
                         };
+                        let (start, source) = self.project.tracks.with_room_for_joins(clip);
+                        let tracks = &self.project.tracks;
                         Some(LayeredClip {
                             key: clip.id.0,
                             input,
-                            start: clip.start,
-                            source: clip.source,
+                            start,
+                            source,
                             placement: clip.placement,
                             speed: clip.speed,
                             title,
+                            look: clip.look,
+                            join_in: tracks.join_into(clip.id).map(|(cut, transition)| {
+                                bareclip_export::ExportJoin { cut, transition }
+                            }),
+                            join_out: clip.transition.map(|transition| {
+                                bareclip_export::ExportJoin {
+                                    cut: clip.end(),
+                                    transition,
+                                }
+                            }),
                         })
                     })
                     .collect(),
@@ -2078,8 +2137,26 @@ impl Editor {
                 .iter()
                 .flat_map(Timeline::clips)
                 .any(|clip| clip.is_title());
+            let has_transitions = self
+                .project
+                .tracks
+                .picture_tracks()
+                .iter()
+                .flat_map(Timeline::clips)
+                .any(|clip| clip.transition.is_some());
+            let has_looks = self
+                .project
+                .tracks
+                .picture_tracks()
+                .iter()
+                .flat_map(Timeline::clips)
+                .any(|clip| !clip.look.is_default());
             let reason = if has_titles {
                 TITLES_REASON
+            } else if has_transitions {
+                TRANSITIONS_REASON
+            } else if has_looks {
+                LOOKS_REASON
             } else if videos.iter().any(MediaInfo::is_still) {
                 STILLS_REASON
             } else if other_speeds {
@@ -2527,7 +2604,9 @@ impl Editor {
         if consume(Modifiers::NONE, Key::S) {
             self.split_at_playhead();
         }
-        if consume(Modifiers::NONE, Key::Delete) || consume(Modifiers::NONE, Key::Backspace) {
+        if (consume(Modifiers::NONE, Key::Delete) || consume(Modifiers::NONE, Key::Backspace))
+            && !self.delete_selected_join()
+        {
             self.delete_selected();
         }
         if consume(Modifiers::SHIFT, Key::ArrowLeft) {
@@ -2624,6 +2703,9 @@ impl Editor {
         if std::mem::take(&mut self.pick_captions_requested) {
             self.pick_captions();
         }
+        if let Some(title) = self.pick_logo_for.take() {
+            self.pick_logo(title);
+        }
         let palette = theme::palette(&ctx);
         // The background shows through the gaps between the panels.
         ui.painter().rect_filled(ui.max_rect(), 0.0, palette.bg_app);
@@ -2632,6 +2714,7 @@ impl Editor {
             self.handle_close_request(&ctx);
         }
         self.sync_titles();
+        self.settle_selected_join();
         self.poll_background(&ctx);
         self.handle_shortcuts(&ctx);
         self.take_dropped_files(&ctx);
@@ -3280,6 +3363,7 @@ impl Editor {
                 for (tab, icon, name) in [
                     (LeftPanel::Media, &icons::FILM, "My media"),
                     (LeftPanel::Text, &icons::TYPE, "Text"),
+                    (LeftPanel::Transitions, &icons::BLEND, "Transitions"),
                 ] {
                     let open = self.media_panel_open && self.left_panel == tab;
                     let hint = if open {
@@ -3314,8 +3398,13 @@ impl Editor {
             .frame(frame)
             .show_collapsible(ui, &mut expanded, |ui| {
                 let on_text = self.left_panel == LeftPanel::Text;
+                let on_transitions = self.left_panel == LeftPanel::Transitions;
                 ui.horizontal(|ui| {
-                    let heading = if on_text { "Text" } else { "My media" };
+                    let heading = match self.left_panel {
+                        LeftPanel::Media => "My media",
+                        LeftPanel::Text => "Text",
+                        LeftPanel::Transitions => "Transitions",
+                    };
                     ui.label(RichText::new(heading).font(fonts::strong(15.0)));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         close = ui
@@ -3335,6 +3424,10 @@ impl Editor {
                 ui.add_space(10.0);
                 if on_text {
                     self.text_panel(ui, palette);
+                    return;
+                }
+                if on_transitions {
+                    self.transitions_panel(ui, palette);
                     return;
                 }
                 let width = ui.available_width();
@@ -3815,6 +3908,7 @@ impl Editor {
                 (entry.id, face)
             })
             .collect();
+        let joins = self.join_views();
         let view = TimelineView {
             tracks: &self.project.tracks,
             clips: &clips,
@@ -3823,10 +3917,51 @@ impl Editor {
             selected: self.selected,
             selected_gap: self.selected_gap,
             can_paste: self.clipboard.is_some(),
+            joins: &joins,
+            selected_join: self.selected_join,
         };
-        let events = timeline::timeline(ui, palette, &mut self.timeline_state, &view);
+        let mut events = timeline::timeline(ui, palette, &mut self.timeline_state, &view);
+        if let Some((id, at, just_opened)) = self.picture_menu {
+            let (picked, speed, open) = timeline::clip_menu_at(
+                ui,
+                palette,
+                &mut self.timeline_state,
+                &view,
+                (id, at),
+                just_opened,
+            );
+            events.menu = events.menu.or(picked);
+            events.speed = events.speed.or(speed);
+            self.picture_menu = open.then_some((id, at, false));
+        }
         let pointer_down = ui.input(|input| input.pointer.any_down());
         self.apply_timeline_events(events, pointer_down);
+    }
+
+    #[cfg(test)]
+    fn change_filter_for_screen(&mut self, id: ClipId) {
+        let look = bareclip_core::effects::ClipLook {
+            filter: bareclip_core::effects::Filter::OrangeAndTeal,
+            ..Default::default()
+        };
+        self.project.tracks.set_look(id, look);
+    }
+
+    /// Every place two clips touch on a row, for the timeline.
+    fn join_views(&self) -> Vec<timeline::JoinView> {
+        let tracks = &self.project.tracks;
+        tracks
+            .joins()
+            .into_iter()
+            .filter_map(|(clip, cut)| {
+                Some(timeline::JoinView {
+                    clip,
+                    row: tracks.track_of(clip)?,
+                    cut,
+                    has_transition: tracks.clip(clip)?.transition.is_some(),
+                })
+            })
+            .collect()
     }
 
     fn toggle_clip_mute(&mut self, id: ClipId) {
@@ -3869,6 +4004,20 @@ impl Editor {
         if let Some(selection) = events.select {
             self.selected = selection;
             self.selected_gap = events.select_gap;
+            self.selected_join = None;
+        }
+        if let Some((id, kind)) = events.drop_transition {
+            self.add_transition(id, kind);
+        }
+        if events.transition_missed {
+            self.notice = Some("Drop a transition where two clips touch on a row.".to_owned());
+        }
+        if let Some(id) = events.select_join {
+            self.select_join(id);
+        }
+        if let Some(id) = events.delete_join {
+            self.selected_join = Some(id);
+            self.delete_selected_join();
         }
         if let Some((id, edge, pointer)) = events.trim_started
             && let Some(clip) = self.project.tracks.clip(id)
@@ -4225,6 +4374,12 @@ impl Editor {
                 let position = self.position();
                 self.seek(position);
             }
+        }
+        if events.toggle_look {
+            self.look_panel_open = !self.look_panel_open;
+        }
+        if let Some((id, at)) = events.menu {
+            self.picture_menu = Some((id, at, true));
         }
         if let Some(id) = events.detach {
             self.detach_sound(id);
@@ -5321,6 +5476,8 @@ fn show_in_folder(path: &Path) {
 
 #[cfg(test)]
 mod tests {
+    use bareclip_core::effects::{Filter, TRANSITION_GROUPS, Transition, TransitionKind};
+
     use super::*;
     use bareclip_core::placement::{Placement, WHOLE};
     use bareclip_core::speed::Speed;
@@ -12959,7 +13116,472 @@ mod tests {
         camera.shoot(&ctx, &mut editor, vec![], "export-04-sound-only");
     }
 
+    // Transitions and looks.
+
+    /// Saves the Transitions panel, a transition on the timeline and a clip's look, to look at. Set
+    /// `BARECLIP_SCREENS` to a folder.
+    #[test]
+    #[ignore = "makes pictures to look at, not a check"]
+    fn draw_the_look_screens() {
+        let folder = std::env::var_os("BARECLIP_SCREENS").map_or_else(
+            || std::env::temp_dir().join("bareclip-screens"),
+            PathBuf::from,
+        );
+        let ctx = context();
+        let mut camera = Camera::new(folder);
+        let (mut editor, first, _) = with_two_touching_clips(&ctx);
+        editor.use_gpu(LayerDisplay::new(
+            camera.device.clone(),
+            camera.queue.clone(),
+            camera.renderer.clone(),
+        ));
+        let settle = |ctx: &egui::Context, editor: &mut Editor| {
+            for _ in 0..40 {
+                run_frame(ctx, editor, vec![]);
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        settle(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Transitions");
+        settle(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "look-01-transitions");
+
+        editor.add_transition(first, TransitionKind::HardWipeRight);
+        let cut = editor
+            .project
+            .tracks
+            .clip(first)
+            .expect("it is there")
+            .end();
+        editor.seek(cut);
+        settle(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "look-02-selected-transition");
+
+        editor.selected_join = None;
+        editor.selected = Some(first);
+        editor.look_panel_open = true;
+        editor.seek(Ticks::from_seconds(0.5));
+        for _ in 0..80 {
+            run_frame(&ctx, &mut editor, vec![]);
+            thread::sleep(Duration::from_millis(10));
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "look-03-filters");
+
+        editor.look_tab = LookTab::Colours;
+        editor.change_filter_for_screen(first);
+        settle(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "look-04-colours");
+
+        editor.look_tab = LookTab::Fade;
+        settle(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "look-05-fade");
+    }
+
+    /// Two videos side by side on one row.
+    fn with_two_touching_clips(ctx: &egui::Context) -> (Editor, ClipId, ClipId) {
+        let editor = with_videos(ctx, &[test_clip(), test_clip()]);
+        let row = editor.project.tracks.tracks()[0].clips();
+        let (first, second) = (row[0].id, row[1].id);
+        assert_eq!(row[0].end(), row[1].start);
+        (editor, first, second)
+    }
+
+    #[test]
+    fn dragging_a_transition_onto_a_join_adds_it_there() {
+        let ctx = context();
+        let (mut editor, first, _) = with_two_touching_clips(&ctx);
+        click_named(&ctx, &mut editor, "Transitions");
+        run_frame(&ctx, &mut editor, vec![]);
+        let from = named_rect(&ctx, &mut editor, "Add Cross blur").center();
+        let cut = editor
+            .project
+            .tracks
+            .clip(first)
+            .expect("it is there")
+            .end();
+        let to = pos2(
+            editor.timeline_state.scale.x_of(cut),
+            editor.timeline_state.track.center().y,
+        );
+
+        pointer_drag(&ctx, &mut editor, from, to);
+
+        let clip = editor.project.tracks.clip(first).expect("it is there");
+        assert_eq!(
+            clip.transition.map(|t| t.kind),
+            Some(TransitionKind::CrossBlur)
+        );
+        assert_eq!(editor.selected_join, Some(first));
+    }
+
+    #[test]
+    fn dragging_a_transition_away_from_any_join_adds_nothing_and_says_so() {
+        let ctx = context();
+        let (mut editor, first, _) = with_two_touching_clips(&ctx);
+        click_named(&ctx, &mut editor, "Transitions");
+        run_frame(&ctx, &mut editor, vec![]);
+        let from = named_rect(&ctx, &mut editor, "Add Cross blur").center();
+        let clip = editor.project.tracks.clip(first).expect("it is there");
+        let to = pos2(
+            editor.timeline_state.scale.x_of(Ticks(clip.start.0 + 1)) + 10.0,
+            editor.timeline_state.track.center().y,
+        );
+
+        pointer_drag(&ctx, &mut editor, from, to);
+
+        let clip = editor.project.tracks.clip(first).expect("it is there");
+        assert_eq!(clip.transition, None);
+        assert!(editor.notice.is_some());
+    }
+
+    #[test]
+    fn right_clicking_a_clip_on_the_picture_opens_its_menu_and_delete_takes_it_away() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        settle_animations(&ctx, &mut editor);
+        let picture = stage_frame(&editor);
+        let events = vec![
+            egui::Event::PointerMoved(picture.center()),
+            egui::Event::PointerButton {
+                pos: picture.center(),
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: picture.center(),
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            },
+        ];
+        run_frame(&ctx, &mut editor, events);
+        run_frame(&ctx, &mut editor, vec![]);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.picture_menu.is_some(), "the menu opens");
+        assert_eq!(clip_count(&editor), 1);
+        click_named(&ctx, &mut editor, "Delete");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(clip_count(&editor), 0);
+        assert!(editor.picture_menu.is_none());
+    }
+
+    #[test]
+    fn right_clicking_where_no_clip_shows_opens_nothing() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        settle_animations(&ctx, &mut editor);
+        let events = stage::StageEvents::default();
+        editor.apply_stage_events(events, false);
+        assert!(editor.picture_menu.is_none());
+    }
+
+    #[test]
+    fn the_transitions_tab_lists_all_44_with_a_search_box() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Transitions");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.left_panel, LeftPanel::Transitions);
+        let names: Vec<String> = named_nodes(&ctx, &mut editor)
+            .into_iter()
+            .map(|(name, ..)| name)
+            .collect();
+        assert!(names.contains(&"Search transitions".to_owned()));
+        assert!(names.contains(&"Add Cross fade".to_owned()));
+        editor.transition_search = "barn".to_owned();
+        run_frame(&ctx, &mut editor, vec![]);
+        let found: Vec<String> = named_nodes(&ctx, &mut editor)
+            .into_iter()
+            .map(|(name, ..)| name)
+            .filter(|name| name.starts_with("Add "))
+            .collect();
+        assert_eq!(found.len(), 2, "{found:?}");
+    }
+
+    #[test]
+    fn adding_a_transition_selects_it_opens_its_panel_and_moves_nothing() {
+        let ctx = context();
+        let (mut editor, first, second) = with_two_touching_clips(&ctx);
+        let before = editor.project.tracks.duration();
+        editor.add_transition(first, TransitionKind::Burn);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.project.tracks.duration(), before);
+        assert_eq!(editor.selected_join, Some(first));
+        assert_eq!(editor.left_panel, LeftPanel::Transitions);
+        let clip = editor.project.tracks.clip(first).expect("it is there");
+        assert_eq!(clip.transition.map(|t| t.kind), Some(TransitionKind::Burn));
+        assert_eq!(
+            editor
+                .project
+                .tracks
+                .clip(second)
+                .expect("it is there")
+                .start,
+            clip.end()
+        );
+    }
+
+    #[test]
+    fn a_transition_is_one_undo_step_and_comes_back_with_redo() {
+        let ctx = context();
+        let (mut editor, first, _) = with_two_touching_clips(&ctx);
+        editor.add_transition(first, TransitionKind::Burn);
+        run_frame(&ctx, &mut editor, vec![]);
+        let has_one = |editor: &Editor| {
+            editor.project.tracks.tracks()[0].clips()[0]
+                .transition
+                .is_some()
+        };
+        assert!(has_one(&editor));
+        editor.undo();
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(!has_one(&editor));
+        assert_eq!(editor.selected_join, None, "nothing is left to be selected");
+        editor.redo();
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(has_one(&editor));
+    }
+
+    #[test]
+    fn swapping_a_transition_keeps_how_long_it_lasts() {
+        let ctx = context();
+        let (mut editor, first, _) = with_two_touching_clips(&ctx);
+        editor.add_transition(first, TransitionKind::Burn);
+        let length = Ticks::from_seconds(0.25).0;
+        let transition = Transition {
+            kind: TransitionKind::Burn,
+            duration: length,
+        };
+        editor
+            .project
+            .tracks
+            .set_transition(first, Some(transition));
+        editor.add_transition(first, TransitionKind::Spin);
+        let clip = editor.project.tracks.clip(first).expect("it is there");
+        let got = clip.transition.expect("it has one");
+        assert_eq!(got.kind, TransitionKind::Spin);
+        assert_eq!(got.duration, length);
+    }
+
+    #[test]
+    fn the_delete_key_takes_a_selected_transition_away_and_leaves_the_clips() {
+        let ctx = context();
+        let (mut editor, first, second) = with_two_touching_clips(&ctx);
+        editor.add_transition(first, TransitionKind::Burn);
+        run_frame(&ctx, &mut editor, vec![]);
+        run_frame(&ctx, &mut editor, key_event(Key::Delete, Modifiers::NONE));
+        let clip = editor.project.tracks.clip(first).expect("the clip stays");
+        assert_eq!(clip.transition, None);
+        assert!(editor.project.tracks.clip(second).is_some());
+    }
+
+    #[test]
+    fn pressing_a_transition_on_the_timeline_selects_it() {
+        let ctx = context();
+        let (mut editor, first, _) = with_two_touching_clips(&ctx);
+        editor.add_transition(first, TransitionKind::Burn);
+        editor.selected_join = None;
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Transition");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.selected_join, Some(first));
+    }
+
+    #[test]
+    fn selecting_a_clip_lets_go_of_the_transition() {
+        let ctx = context();
+        let (mut editor, first, _) = with_two_touching_clips(&ctx);
+        editor.add_transition(first, TransitionKind::Burn);
+        let events = timeline::TimelineEvents {
+            select: Some(Some(first)),
+            ..Default::default()
+        };
+        editor.apply_timeline_events(events, false);
+        assert_eq!(editor.selected_join, None);
+        assert_eq!(editor.selected, Some(first));
+    }
+
+    #[test]
+    fn dropping_a_transition_away_from_a_join_says_where_it_goes() {
+        let ctx = context();
+        let (mut editor, ..) = with_two_touching_clips(&ctx);
+        let events = timeline::TimelineEvents {
+            transition_missed: true,
+            ..Default::default()
+        };
+        editor.apply_timeline_events(events, false);
+        assert!(editor.notice.is_some());
+    }
+
+    #[test]
+    fn a_transition_or_a_filter_means_redrawing_on_export() {
+        let ctx = context();
+        let (mut editor, first, _) = with_two_touching_clips(&ctx);
+        assert!(matches!(editor.export_route(), Route::Fast));
+        editor.add_transition(first, TransitionKind::Burn);
+        let Route::Full(reason) = editor.export_route() else {
+            panic!("it should be redrawn");
+        };
+        assert!(reason.contains("Transitions"), "{reason}");
+    }
+
+    #[test]
+    fn the_toolbar_opens_a_clips_look_and_filters_can_be_chosen() {
+        let ctx = context();
+        let (mut editor, first, _) = with_two_touching_clips(&ctx);
+        editor.selected = Some(first);
+        editor.look_panel_open = true;
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.looking_at().is_some());
+        click_named(&ctx, &mut editor, "Filter Winter");
+        run_frame(&ctx, &mut editor, vec![]);
+        let clip = editor.project.tracks.clip(first).expect("it is there");
+        assert_eq!(clip.look.filter, Filter::Winter);
+        editor.settle_title_edit(&ctx);
+        run_frame(&ctx, &mut editor, vec![]);
+        editor.undo();
+        run_frame(&ctx, &mut editor, vec![]);
+        let clip = editor.project.tracks.tracks()[0].clips()[0];
+        assert_eq!(clip.look.filter, Filter::None);
+    }
+
+    #[test]
+    fn a_title_does_not_open_the_look_panel_but_has_its_own_tabs() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        editor.look_panel_open = true;
+        with_a_title(&ctx, &mut editor, TitleStyle::Plain);
+        assert!(editor.looking_at().is_none());
+        click_named(&ctx, &mut editor, "Fade");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.title_tab, TitleTab::Fade);
+    }
+
+    #[test]
+    fn every_transition_has_a_card() {
+        let total: usize = TRANSITION_GROUPS.iter().map(|(_, kinds)| kinds.len()).sum();
+        assert_eq!(total, 44);
+    }
+
     // Titles.
+
+    #[test]
+    fn a_style_card_only_starts_moving_once_the_pointer_has_rested_on_it() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Text");
+        run_frame(&ctx, &mut editor, vec![]);
+        let rect = named_rect(&ctx, &mut editor, "Add Typewriter");
+        run_frame(
+            &ctx,
+            &mut editor,
+            vec![egui::Event::PointerMoved(rect.center())],
+        );
+        run_frame(&ctx, &mut editor, vec![]);
+        let hover = editor
+            .card_hover
+            .as_mut()
+            .expect("the pointer is on a card");
+        assert!(hover.moving_yet().is_none(), "it waits before it moves");
+        hover.wait_over();
+        run_frame(&ctx, &mut editor, vec![]);
+        let hover = editor
+            .card_hover
+            .as_ref()
+            .expect("the pointer is still on it");
+        assert!(hover.moving_yet().is_some(), "it moves after the wait");
+
+        run_frame(
+            &ctx,
+            &mut editor,
+            vec![egui::Event::PointerMoved(pos2(900.0, 700.0))],
+        );
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(
+            editor.card_hover.is_none(),
+            "it stops when the pointer goes"
+        );
+    }
+
+    #[test]
+    fn a_card_that_has_no_motion_never_starts() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Text");
+        run_frame(&ctx, &mut editor, vec![]);
+        let rect = named_rect(&ctx, &mut editor, "Add Text");
+        run_frame(
+            &ctx,
+            &mut editor,
+            vec![egui::Event::PointerMoved(rect.center())],
+        );
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.card_hover.is_none());
+    }
+
+    #[test]
+    fn see_all_opens_every_text_style_and_back_returns() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Text");
+        run_frame(&ctx, &mut editor, vec![]);
+        let names = |ctx: &egui::Context, editor: &mut Editor| -> Vec<String> {
+            named_nodes(ctx, editor)
+                .into_iter()
+                .map(|(name, ..)| name)
+                .collect()
+        };
+        let before = names(&ctx, &mut editor);
+        assert!(before.contains(&"Add Pride".to_owned()));
+        assert!(!before.contains(&"Add Neon".to_owned()));
+        click_named(&ctx, &mut editor, "See all");
+        run_frame(&ctx, &mut editor, vec![]);
+        let all = names(&ctx, &mut editor);
+        assert!(all.contains(&"Add Neon".to_owned()));
+        assert!(
+            !all.contains(&"Add Text".to_owned()),
+            "only the text styles show"
+        );
+        click_named(&ctx, &mut editor, "Back to all the text");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(names(&ctx, &mut editor).contains(&"Add Text".to_owned()));
+    }
+
+    #[test]
+    fn every_title_style_can_be_added_and_played_through() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        for (_, styles) in bareclip_core::title::STYLE_GROUPS {
+            for style in styles {
+                let id = with_a_title(&ctx, &mut editor, *style);
+                let clip = editor.project.tracks.clip(id).expect("the clip is there");
+                editor.seek(Ticks(clip.start.0 + Ticks::from_seconds(0.3).0));
+                run_frame(&ctx, &mut editor, vec![]);
+                editor.selected = None;
+                run_frame(&ctx, &mut editor, vec![]);
+                editor.seek(clip.end());
+            }
+        }
+    }
+
+    #[test]
+    fn a_logo_that_cannot_be_read_is_refused_and_says_so() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let id = with_a_title(&ctx, &mut editor, TitleStyle::IntroMirror);
+        let media = editor.project.tracks.clip(id).expect("it is there").media;
+        editor.set_title_logo(media, PathBuf::from("no such picture.png"));
+        assert!(title_of_clip(&editor, id).logo.is_none());
+        assert!(editor.notice.is_some());
+    }
 
     /// A title added at the playhead, and its clip.
     fn with_a_title(ctx: &egui::Context, editor: &mut Editor, style: TitleStyle) -> ClipId {
@@ -13550,8 +14172,9 @@ mod tests {
             run_frame(&ctx, &mut editor, vec![]);
             thread::sleep(Duration::from_millis(10));
         }
-        // A big white box in the middle is easy to find in the finished video.
-        let id = with_a_title(&ctx, &mut editor, TitleStyle::TextBox);
+        // A big white box in the middle is easy to find in the finished video, and plain text has no
+        // motion, so it is there from the very first picture.
+        let id = with_a_title(&ctx, &mut editor, TitleStyle::Plain);
         let media = editor.project.tracks.clip(id).expect("it is there").media;
         editor.change_title(media, |title| {
             title.background = Some([255, 255, 255]);
@@ -14304,6 +14927,81 @@ mod tests {
         assert!(editor.notice.is_some());
     }
 
+    /// Each card that fills its square, at rest and at moments of its motion, early on because
+    /// Circular opens within 0.35 s. Files are named after the style and the moment.
+    /// `$env:BARECLIP_SCREENS = '<folder>'; ./scripts/cargo.ps1 test -p bareclip-app --bin bareclip draw_the_full_frame_cards '--' --ignored`
+    #[test]
+    #[ignore = "makes pictures to look at, not a check"]
+    fn draw_the_full_frame_cards() {
+        let folder = std::env::var_os("BARECLIP_SCREENS").map_or_else(
+            || std::env::temp_dir().join("bareclip-screens"),
+            PathBuf::from,
+        );
+        let ctx = context();
+        let mut camera = Camera::new(folder);
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Text");
+        for _ in 0..12 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        let filling = bareclip_core::title::STYLE_GROUPS
+            .iter()
+            .flat_map(|(_, styles)| styles.iter().copied())
+            .filter(|style| style.fills_its_card());
+        for style in filling {
+            let name = style.name();
+            let label = format!("Add {name}");
+            for _ in 0..60 {
+                let rect = named_rect(&ctx, &mut editor, &label);
+                if rect.top() > 120.0 && rect.bottom() < 760.0 {
+                    break;
+                }
+                let delta = if rect.top() <= 120.0 { 60.0 } else { -60.0 };
+                run_frame(
+                    &ctx,
+                    &mut editor,
+                    vec![
+                        egui::Event::PointerMoved(pos2(200.0, 400.0)),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: vec2(0.0, delta),
+                            modifiers: egui::Modifiers::NONE,
+                            phase: egui::TouchPhase::Move,
+                            source: egui::MouseWheelSource::Unknown,
+                        },
+                    ],
+                );
+            }
+            for _ in 0..30 {
+                run_frame(&ctx, &mut editor, vec![]);
+            }
+            let rect = named_rect(&ctx, &mut editor, &label);
+            println!("{name} is at {rect:?}");
+            let slug = name.replace(' ', "-");
+            run_frame(
+                &ctx,
+                &mut editor,
+                vec![egui::Event::PointerMoved(pos2(5.0, 790.0))],
+            );
+            camera.shoot(&ctx, &mut editor, vec![], &format!("{slug}-rest"));
+            for seconds in [0.1, 0.2, 1.5, 2.85] {
+                run_frame(
+                    &ctx,
+                    &mut editor,
+                    vec![egui::Event::PointerMoved(rect.center())],
+                );
+                run_frame(&ctx, &mut editor, vec![]);
+                let now = ctx.input(|input| input.time);
+                let Some(hover) = editor.card_hover.as_mut() else {
+                    break;
+                };
+                hover.play_to(seconds, now);
+                camera.shoot(&ctx, &mut editor, vec![], &format!("{slug}-{seconds}"));
+            }
+        }
+    }
+
     /// `$env:BARECLIP_SCREENS = '<folder>'; ./scripts/cargo.ps1 test -p bareclip-app --bin bareclip draw_the_title_screens '--' --ignored`
     #[test]
     #[ignore = "makes pictures to look at, not a check"]
@@ -14335,6 +15033,16 @@ mod tests {
             run_frame(&ctx, &mut editor, vec![]);
         }
         camera.shoot(&ctx, &mut editor, vec![], "title-02-text-panel");
+
+        click_named(&ctx, &mut editor, "See all");
+        for _ in 0..12 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "title-02-see-all");
+        click_named(&ctx, &mut editor, "Back to all the text");
+        for _ in 0..4 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
 
         with_a_title(&ctx, &mut editor, TitleStyle::Outlined);
         for _ in 0..12 {
@@ -15372,6 +16080,8 @@ mod tests {
             placement: Placement::default(),
             sound: Default::default(),
             speed: Default::default(),
+            look: Default::default(),
+            transition: None,
         };
         let mut file = ProjectFile {
             titles: Vec::new(),

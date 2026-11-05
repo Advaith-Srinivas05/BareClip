@@ -3,6 +3,8 @@
 
 mod draw;
 mod fonts;
+mod moving;
 
-pub use draw::{TitleDrawing, draw_font_name, draw_title};
+pub use draw::{TitleDrawing, draw_font_name, draw_title, draw_title_with_logo};
 pub use fonts::{FontList, font_list, has_font};
+pub use moving::MovingTitle;

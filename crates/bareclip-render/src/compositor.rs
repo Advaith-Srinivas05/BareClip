@@ -8,6 +8,8 @@ use std::{
 
 use bareclip_core::picture::{ColorFormat, Yuv420};
 
+use bareclip_core::effects::{Grade, LayerJoin};
+
 use crate::{
     color,
     scene::{Layer, LayerPicture},
@@ -17,7 +19,8 @@ use crate::{
 const CANVAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// What the window's renderer takes for a picture it didn't make itself.
 const DISPLAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
-const LAYER_UNIFORM_SIZE: u64 = 112;
+const LAYER_UNIFORM_SIZE: u64 = 224;
+const JOIN_UNIFORM_SIZE: u64 = 16;
 const BLACK: wgpu::Color = wgpu::Color {
     r: 0.0,
     g: 0.0,
@@ -120,6 +123,10 @@ pub struct Compositor {
     size: (u32, u32),
     layer_pipeline: wgpu::RenderPipeline,
     layer_layout: wgpu::BindGroupLayout,
+    join_pipeline: wgpu::RenderPipeline,
+    join_layout: wgpu::BindGroupLayout,
+    /// Where the two sides of a transition are drawn. Made the first time one shows.
+    join_sides: Option<JoinSides>,
     sampler: wgpu::Sampler,
     slots: Vec<LayerSlot>,
     canvas_view: wgpu::TextureView,
@@ -137,6 +144,13 @@ pub struct Compositor {
     finished_u: Vec<u8>,
     finished_v: Vec<u8>,
     problem: Arc<Mutex<Option<String>>>,
+}
+
+/// Canvases for the two sides of a transition, and what each transition showing needs to read them.
+struct JoinSides {
+    going: wgpu::TextureView,
+    coming: wgpu::TextureView,
+    passes: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
 }
 
 /// The graphics chip, opened for this run of the app.
@@ -263,6 +277,26 @@ fn strip_pipeline(
     })
 }
 
+fn begin_pass<'a>(
+    encoder: &'a mut wgpu::CommandEncoder,
+    view: &wgpu::TextureView,
+    load: wgpu::LoadOp<wgpu::Color>,
+) -> wgpu::RenderPass<'a> {
+    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("canvas"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load,
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        ..Default::default()
+    })
+}
+
 /// Copies a plane into memory without the padding the GPU insists on.
 fn copy_rows(mapped: &[u8], row_bytes: usize, used_bytes: usize, into: &mut Vec<u8>) {
     into.clear();
@@ -337,6 +371,36 @@ impl Compositor {
             ],
         });
 
+        let join_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("join"),
+            entries: &[
+                binding(
+                    0,
+                    fragment,
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
+                binding(1, fragment, TEXTURE_BINDING),
+                binding(2, fragment, TEXTURE_BINDING),
+                binding(3, fragment, SAMPLER_BINDING),
+            ],
+        });
+        let join_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("join"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("transition.wgsl"))),
+        });
+        // Both sides are already scaled by how see-through they are, which is what this blends.
+        let join_pipeline = strip_pipeline(
+            &device,
+            &join_layout,
+            &join_shader,
+            "fragment_main",
+            CANVAS_FORMAT,
+            Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+        );
         let layer_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("layer"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("layer.wgsl"))),
@@ -431,6 +495,9 @@ impl Compositor {
             size: (width, height),
             layer_pipeline,
             layer_layout,
+            join_pipeline,
+            join_layout,
+            join_sides: None,
             sampler,
             slots: Vec::new(),
             canvas_view,
@@ -609,7 +676,9 @@ impl Compositor {
         } else {
             1.0
         };
-        let uniform: [f32; 28] = [
+        let grade = layer.look.grade;
+        let graded = if grade == Grade::NONE { 0.0 } else { 1.0 };
+        let uniform: [f32; 56] = [
             rect.x + rect.width / 2.0,
             rect.y + rect.height / 2.0,
             rect.width / 2.0,
@@ -637,7 +706,35 @@ impl Compositor {
             layer.opacity,
             soft_edges,
             if holds_still { 1.0 } else { 0.0 },
+            graded,
+            grade.basic[0],
+            grade.basic[1],
+            grade.basic[2],
+            grade.basic[3],
+            grade.shadows[0],
+            grade.shadows[1],
+            grade.shadows[2],
             0.0,
+            grade.highlights[0],
+            grade.highlights[1],
+            grade.highlights[2],
+            0.0,
+            grade.duotone.0[0],
+            grade.duotone.0[1],
+            grade.duotone.0[2],
+            grade.duotone.2,
+            grade.duotone.1[0],
+            grade.duotone.1[1],
+            grade.duotone.1[2],
+            0.0,
+            grade.wash.0[0],
+            grade.wash.0[1],
+            grade.wash.0[2],
+            grade.wash.1,
+            grade.adjust[0],
+            grade.adjust[1],
+            grade.adjust[2],
+            grade.adjust[3],
         ];
         self.queue
             .write_buffer(&slot.uniform, 0, bytemuck::cast_slice(&uniform));
@@ -667,29 +764,166 @@ impl Compositor {
         for (index, layer) in layers.iter().enumerate() {
             self.upload(index, layer);
         }
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("canvas"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.canvas_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(self.background),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                ..Default::default()
-            });
-            pass.set_pipeline(&self.layer_pipeline);
-            for slot in &self.slots[..layers.len()] {
-                pass.set_bind_group(0, &slot.bind_group, &[]);
-                pass.draw(0..4, 0..1);
+        // Only a join with something above it can be drawn as one.
+        let joins: Vec<(usize, LayerJoin)> = layers
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| index + 1 < layers.len())
+            .filter_map(|(index, layer)| Some((index, layer.look.join?)))
+            .collect();
+        if !joins.is_empty() {
+            self.prepare_joins(joins.len());
+        }
+        for (pass, (_, join)) in joins.iter().enumerate() {
+            let values: [f32; 4] = [
+                0.0,
+                join.progress,
+                self.size.0 as f32 / self.size.1.max(1) as f32,
+                0.0,
+            ];
+            let mut bytes: [u8; 16] = bytemuck::cast(values);
+            bytes[..4].copy_from_slice(&join.kind.code().to_ne_bytes());
+            if let Some(sides) = &self.join_sides {
+                self.queue.write_buffer(&sides.passes[pass].0, 0, &bytes);
             }
         }
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        let mut next_layer = 0;
+        let mut first_on_canvas = true;
+        for (pass, (index, join)) in joins.iter().enumerate() {
+            // A layer can be the top of one join and not the start of another, and never both,
+            // because each join takes two.
+            if *index < next_layer {
+                continue;
+            }
+            self.draw_run(&mut encoder, next_layer..*index, &mut first_on_canvas);
+            let (going, coming) = if join.goes_out {
+                (*index, index + 1)
+            } else {
+                (index + 1, *index)
+            };
+            self.draw_join(&mut encoder, pass, going, coming, &mut first_on_canvas);
+            next_layer = index + 2;
+        }
+        self.draw_run(&mut encoder, next_layer..layers.len(), &mut first_on_canvas);
         self.queue.submit([encoder.finish()]);
         self.check_for_problem()
+    }
+
+    /// Draws layers one after another on the canvas, clearing it first if nothing has yet.
+    fn draw_run(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        layers: std::ops::Range<usize>,
+        first_on_canvas: &mut bool,
+    ) {
+        if layers.is_empty() && !*first_on_canvas {
+            return;
+        }
+        let load = if std::mem::take(first_on_canvas) {
+            wgpu::LoadOp::Clear(self.background)
+        } else {
+            wgpu::LoadOp::Load
+        };
+        let mut pass = begin_pass(encoder, &self.canvas_view, load);
+        pass.set_pipeline(&self.layer_pipeline);
+        for slot in &self.slots[layers] {
+            pass.set_bind_group(0, &slot.bind_group, &[]);
+            pass.draw(0..4, 0..1);
+        }
+    }
+
+    /// Draws two layers on canvases of their own, and then the two as a transition on the canvas.
+    fn draw_join(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pass: usize,
+        going: usize,
+        coming: usize,
+        first_on_canvas: &mut bool,
+    ) {
+        let Some(sides) = &self.join_sides else {
+            return;
+        };
+        for (view, slot) in [(&sides.going, going), (&sides.coming, coming)] {
+            let mut side = begin_pass(encoder, view, wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT));
+            side.set_pipeline(&self.layer_pipeline);
+            side.set_bind_group(0, &self.slots[slot].bind_group, &[]);
+            side.draw(0..4, 0..1);
+        }
+        let load = if std::mem::take(first_on_canvas) {
+            wgpu::LoadOp::Clear(self.background)
+        } else {
+            wgpu::LoadOp::Load
+        };
+        let mut canvas = begin_pass(encoder, &self.canvas_view, load);
+        canvas.set_pipeline(&self.join_pipeline);
+        canvas.set_bind_group(0, &sides.passes[pass].1, &[]);
+        canvas.draw(0..4, 0..1);
+    }
+
+    /// Makes sure there is somewhere to draw this many transitions at once.
+    fn prepare_joins(&mut self, count: usize) {
+        if self.join_sides.is_none() {
+            let canvas = || {
+                self.device
+                    .create_texture(&wgpu::TextureDescriptor {
+                        label: Some("join side"),
+                        size: wgpu::Extent3d {
+                            width: self.size.0,
+                            height: self.size.1,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: CANVAS_FORMAT,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    })
+                    .create_view(&Default::default())
+            };
+            self.join_sides = Some(JoinSides {
+                going: canvas(),
+                coming: canvas(),
+                passes: Vec::new(),
+            });
+        }
+        let Some(sides) = &mut self.join_sides else {
+            return;
+        };
+        while sides.passes.len() < count {
+            let uniform = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("join"),
+                size: JOIN_UNIFORM_SIZE,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("join"),
+                layout: &self.join_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniform.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&sides.going),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&sides.coming),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            sides.passes.push((uniform, group));
+        }
     }
 
     /// Draws the layers and makes them ready to show in the window, through `display_view`.
@@ -902,6 +1136,8 @@ impl fmt::Debug for Compositor {
 
 #[cfg(test)]
 mod tests {
+    use bareclip_core::effects::{FILTERS, Filter, TRANSITION_GROUPS, TransitionKind};
+
     use super::*;
     use crate::scene::{PictureLook, Rect, fit_inside};
     use bareclip_core::picture::ColorMatrix;
@@ -1532,6 +1768,317 @@ mod tests {
             opacity: 1.0,
             look: PictureLook::PLAIN,
         }
+    }
+
+    fn whole_canvas() -> Rect {
+        Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 64.0,
+            height: 36.0,
+        }
+    }
+
+    /// What a transition shows at one moment, red going and blue coming, as RGBA in rows.
+    fn transition_at(
+        compositor: &mut Compositor,
+        kind: TransitionKind,
+        progress: f32,
+        goes_out_is_lower: bool,
+    ) -> Vec<u8> {
+        let red = still_of((64, 36), [255, 0, 0], 255);
+        let blue = still_of((64, 36), [0, 0, 255], 255);
+        let (lower, upper) = if goes_out_is_lower {
+            (&red, &blue)
+        } else {
+            (&blue, &red)
+        };
+        let mut below = image_layer(lower, whole_canvas());
+        below.look.join = Some(LayerJoin {
+            kind,
+            progress,
+            goes_out: goes_out_is_lower,
+        });
+        let above = image_layer(upper, whole_canvas());
+        compositor
+            .draw_for_display(&[below, above])
+            .expect("it draws");
+        compositor.read_display().expect("it reads back")
+    }
+
+    fn average_rgb(rgba: &[u8]) -> [f32; 3] {
+        let mut total = [0.0_f32; 3];
+        let pixels = rgba.as_chunks::<4>().0;
+        for pixel in pixels {
+            for part in 0..3 {
+                total[part] += f32::from(pixel[part]);
+            }
+        }
+        total.map(|part| part / pixels.len() as f32)
+    }
+
+    #[test]
+    fn every_transition_starts_on_the_old_clip_and_ends_on_the_new_one() {
+        let Ok(mut compositor) = Compositor::new(64, 36) else {
+            return;
+        };
+        compositor.set_background([0, 0, 0]);
+        for (_, kinds) in TRANSITION_GROUPS {
+            for kind in kinds {
+                let start = average_rgb(&transition_at(&mut compositor, *kind, 0.0, true));
+                assert!(
+                    start[0] > 245.0 && start[2] < 10.0,
+                    "{kind:?} starts at {start:?}"
+                );
+                let end = average_rgb(&transition_at(&mut compositor, *kind, 1.0, true));
+                assert!(end[2] > 245.0 && end[0] < 10.0, "{kind:?} ends at {end:?}");
+            }
+        }
+    }
+
+    /// A picture with something different everywhere, so any movement in it shows.
+    fn ramps(colour: [u8; 3]) -> StillPicture {
+        let mut rgba = Vec::with_capacity(64 * 36 * 4);
+        for y in 0..36_u32 {
+            for x in 0..64_u32 {
+                let level = 40 + (x * 3 + y * 2) % 200;
+                for part in colour {
+                    rgba.push((u32::from(part) * level / 255) as u8);
+                }
+                rgba.push(255);
+            }
+        }
+        StillPicture::new(64, 36, rgba)
+    }
+
+    #[test]
+    fn every_transition_shows_something_of_a_change_part_way_through() {
+        let Ok(mut compositor) = Compositor::new(64, 36) else {
+            return;
+        };
+        let (going, coming) = (ramps([255, 60, 0]), ramps([0, 60, 255]));
+        let mut at = |kind: TransitionKind, progress: f32| {
+            let mut below = image_layer(&going, whole_canvas());
+            below.look.join = Some(LayerJoin {
+                kind,
+                progress,
+                goes_out: true,
+            });
+            let above = image_layer(&coming, whole_canvas());
+            compositor
+                .draw_for_display(&[below, above])
+                .expect("it draws");
+            compositor.read_display().expect("it reads back")
+        };
+        for (_, kinds) in TRANSITION_GROUPS {
+            for kind in kinds {
+                let start = at(*kind, 0.0);
+                let middle = at(*kind, 0.4);
+                let end = at(*kind, 1.0);
+                assert_ne!(start, middle, "{kind:?}");
+                assert_ne!(end, middle, "{kind:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_transition_comes_out_the_same_whichever_side_is_lower_in_the_stack() {
+        let Ok(mut compositor) = Compositor::new(64, 36) else {
+            return;
+        };
+        for kind in [TransitionKind::CrossFade, TransitionKind::HardWipeLeft] {
+            let one = transition_at(&mut compositor, kind, 0.4, true);
+            let two = transition_at(&mut compositor, kind, 0.4, false);
+            assert_eq!(one, two, "{kind:?}");
+        }
+    }
+
+    /// How long each transition takes the GPU at 1080p, with two full pictures. Run with
+    /// `./scripts/cargo.ps1 test --release -p bareclip-render how_long_transitions_take '--' --ignored --nocapture`
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn how_long_transitions_take() {
+        let Ok(mut compositor) = Compositor::new(1920, 1080) else {
+            return;
+        };
+        let (going, coming) = (
+            still_of((1920, 1080), [200, 120, 40], 255),
+            still_of((1920, 1080), [40, 120, 200], 255),
+        );
+        let whole = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+        };
+        for (_, kinds) in TRANSITION_GROUPS {
+            for kind in kinds {
+                let started = std::time::Instant::now();
+                for frame in 0..30 {
+                    let mut below = image_layer(&going, whole);
+                    below.look.join = Some(LayerJoin {
+                        kind: *kind,
+                        progress: frame as f32 / 30.0,
+                        goes_out: true,
+                    });
+                    let above = image_layer(&coming, whole);
+                    compositor.draw(&[below, above]).expect("it draws");
+                    compositor.wait().expect("it finishes");
+                }
+                println!("{kind:?}: {:?} a frame", started.elapsed() / 30);
+            }
+        }
+    }
+
+    #[test]
+    fn a_cross_fade_is_half_of_each_half_way_through() {
+        let Ok(mut compositor) = Compositor::new(64, 36) else {
+            return;
+        };
+        let middle = average_rgb(&transition_at(
+            &mut compositor,
+            TransitionKind::CrossFade,
+            0.5,
+            true,
+        ));
+        assert!((middle[0] - 127.0).abs() < 6.0, "{middle:?}");
+        assert!((middle[2] - 127.0).abs() < 6.0, "{middle:?}");
+    }
+
+    #[test]
+    fn a_hard_wipe_shows_each_clip_on_its_side_of_the_line() {
+        let Ok(mut compositor) = Compositor::new(64, 36) else {
+            return;
+        };
+        let rgba = transition_at(&mut compositor, TransitionKind::HardWipeRight, 0.5, true);
+        let pixel = |x: usize| {
+            let at = (18 * 64 + x) * 4;
+            [rgba[at], rgba[at + 2]]
+        };
+        assert!(pixel(8)[1] > 240, "the new clip comes in from the left");
+        assert!(pixel(56)[0] > 240, "the old clip stays on the right");
+    }
+
+    #[test]
+    fn what_is_under_a_transition_shows_through_a_clip_that_does_not_cover_it() {
+        let Ok(mut compositor) = Compositor::new(64, 36) else {
+            return;
+        };
+        compositor.set_background([0, 255, 0]);
+        let red = still_of((64, 36), [255, 0, 0], 255);
+        let half = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 32.0,
+            height: 36.0,
+        };
+        let mut below = image_layer(&red, half);
+        below.look.join = Some(LayerJoin {
+            kind: TransitionKind::CrossFade,
+            progress: 0.0,
+            goes_out: true,
+        });
+        let above = image_layer(&red, half);
+        compositor
+            .draw_for_display(&[below, above])
+            .expect("it draws");
+        let rgba = compositor.read_display().expect("it reads back");
+        let at = (18 * 64 + 56) * 4;
+        assert!(rgba[at + 1] > 240, "the background still shows");
+    }
+
+    #[test]
+    fn layers_over_a_transition_still_draw_over_it() {
+        let Ok(mut compositor) = Compositor::new(64, 36) else {
+            return;
+        };
+        let red = still_of((64, 36), [255, 0, 0], 255);
+        let green = still_of((64, 36), [0, 255, 0], 255);
+        let mut below = image_layer(&red, whole_canvas());
+        below.look.join = Some(LayerJoin {
+            kind: TransitionKind::CrossFade,
+            progress: 0.5,
+            goes_out: true,
+        });
+        let above = image_layer(&red, whole_canvas());
+        let top = image_layer(&green, whole_canvas());
+        compositor
+            .draw_for_display(&[below, above, top])
+            .expect("it draws");
+        let average = average_rgb(&compositor.read_display().expect("it reads back"));
+        assert!(average[1] > 245.0, "{average:?}");
+    }
+
+    fn graded_colour(grade: Grade, [red, green, blue]: [u8; 3]) -> Option<[f32; 3]> {
+        let mut compositor = Compositor::new(64, 36).ok()?;
+        let still = still_of((64, 36), [red, green, blue], 255);
+        let mut layer = image_layer(&still, whole_canvas());
+        layer.look.grade = grade;
+        compositor.draw_for_display(&[layer]).expect("it draws");
+        Some(average_rgb(
+            &compositor.read_display().expect("it reads back"),
+        ))
+    }
+
+    #[test]
+    fn every_filter_changes_the_picture() {
+        let plain = [180, 120, 60];
+        let Some(without) = graded_colour(Grade::NONE, plain) else {
+            return;
+        };
+        for filter in FILTERS {
+            let with = graded_colour(filter.grade(), plain).expect("it draws");
+            let apart: f32 = with.iter().zip(without).map(|(a, b)| (a - b).abs()).sum();
+            assert!(apart > 3.0, "{filter:?} barely changes it: {with:?}");
+        }
+    }
+
+    #[test]
+    fn black_and_white_has_no_colour_in_it() {
+        let Some(got) = graded_colour(Filter::BlackAndWhite1.grade(), [200, 60, 30]) else {
+            return;
+        };
+        assert!(
+            (got[0] - got[1]).abs() < 3.0 && (got[1] - got[2]).abs() < 3.0,
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn exposure_contrast_saturation_and_temperature_each_do_what_they_say() {
+        let plain = [120, 120, 120];
+        let adjust = |values: [f32; 4], colour: [u8; 3]| {
+            let grade = Grade {
+                adjust: values,
+                ..Grade::NONE
+            };
+            graded_colour(grade, colour)
+        };
+        let Some(brighter) = adjust([0.5, 0.0, 0.0, 0.0], plain) else {
+            return;
+        };
+        assert!(brighter[0] > 150.0, "{brighter:?}");
+        let darker = adjust([-0.5, 0.0, 0.0, 0.0], plain).expect("it draws");
+        assert!(darker[0] < 100.0, "{darker:?}");
+        let warmer = adjust([0.0, 0.0, 0.0, 1.0], plain).expect("it draws");
+        assert!(warmer[0] > warmer[2] + 20.0, "{warmer:?}");
+        let cooler = adjust([0.0, 0.0, 0.0, -1.0], plain).expect("it draws");
+        assert!(cooler[2] > cooler[0] + 20.0, "{cooler:?}");
+        let grey = adjust([0.0, 0.0, -1.0, 0.0], [200, 60, 30]).expect("it draws");
+        assert!((grey[0] - grey[2]).abs() < 3.0, "{grey:?}");
+        let harder = adjust([0.0, 1.0, 0.0, 0.0], [200, 200, 200]).expect("it draws");
+        assert!(harder[0] > 225.0, "{harder:?}");
+    }
+
+    #[test]
+    fn a_duotone_turns_dark_and_light_into_its_two_colours() {
+        let filter = Filter::GreenBlueDuotone.grade();
+        let Some(dark) = graded_colour(filter, [0, 0, 0]) else {
+            return;
+        };
+        let light = graded_colour(filter, [255, 255, 255]).expect("it draws");
+        assert!(dark[2] > dark[1], "{dark:?}");
+        assert!(light[1] > light[2], "{light:?}");
     }
 
     #[test]

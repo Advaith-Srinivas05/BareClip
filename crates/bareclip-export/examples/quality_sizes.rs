@@ -56,6 +56,9 @@ fn main() {
                     placement: Placement::default(),
                     speed,
                     title: None,
+                    look: Default::default(),
+                    join_in: None,
+                    join_out: None,
                 }],
             }],
             sound: if info.audio.is_empty() {
