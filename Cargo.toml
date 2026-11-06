@@ -27,6 +27,8 @@ bytemuck = "1"
 cosmic-text = { version = "0.19", default-features = false, features = ["std", "swash"] }
 cpal = "0.18"
 eframe = { version = "0.37", default-features = false, features = ["accesskit", "default_fonts", "wgpu"] }
+# Noise suppression. Without its default features it leaves out its command-line tool.
+nnnoiseless = { version = "0.5.2", default-features = false }
 pollster = "1"
 rfd = "0.17"
 rtrb = "0.4"

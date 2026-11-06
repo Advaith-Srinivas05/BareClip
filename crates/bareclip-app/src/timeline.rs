@@ -192,6 +192,8 @@ pub struct ClipView {
     /// Whether its file has sound at all, and so a speaker to press.
     pub has_sound: bool,
     pub muted: bool,
+    /// Whether noise suppression is on for its sound.
+    pub noise_suppression: bool,
     /// Whether it is on a row of sound, with no picture.
     pub sound_only: bool,
     /// Whether the settings ask for this clip's sound to be drawn on it.
@@ -695,6 +697,7 @@ pub enum MenuAction {
     EditDuration(ClipId),
     Delete(ClipId),
     ToggleMute(ClipId),
+    ToggleNoiseSuppression(ClipId),
     Detach(ClipId),
     RemoveGap(Ticks),
     RemoveAllGaps,
@@ -1696,6 +1699,15 @@ fn clip_flyouts(
                         .clicked()
                 {
                     events.1 = Some(MenuAction::Detach(clip.id));
+                }
+                let noise = MenuItem::choice(palette, "Noise suppression", clip.noise_suppression);
+                if ui
+                    .add_enabled(clip.sound_only, noise)
+                    .on_hover_text(text::NOISE_SUPPRESSION_HINT)
+                    .on_disabled_hover_text(text::NOISE_SUPPRESSION_ON_VIDEO)
+                    .clicked()
+                {
+                    events.1 = Some(MenuAction::ToggleNoiseSuppression(clip.id));
                 }
             },
         ));
@@ -2819,6 +2831,7 @@ mod tests {
             source_start: Ticks(0),
             has_sound: false,
             muted: false,
+            noise_suppression: false,
             sound_only: false,
             shows_waveform: false,
             is_still: false,

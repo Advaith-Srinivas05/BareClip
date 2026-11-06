@@ -23,7 +23,7 @@ use crate::{
 
 pub const EXTENSION: &str = "bareclip";
 /// Goes up whenever the format changes in a way older versions can't read.
-const CURRENT_VERSION: u32 = 8;
+const CURRENT_VERSION: u32 = 9;
 /// Files older than this had their size worked out from the largest video.
 const FIRST_VERSION_WITH_CANVAS: u32 = 3;
 pub const DEFAULT_NAME: &str = "untitled";
@@ -412,6 +412,9 @@ mod tests {
             },
         );
         let detached = tracks.detach_sound(video, 1)[0];
+        let mut cleaned = tracks.clip(detached).expect("it is there").sound;
+        cleaned.noise_suppression = true;
+        tracks.set_clip_sound(detached, cleaned);
         let file = ProjectFile::capture("x", Vec::new(), &tracks);
 
         let back = ProjectFile::from_text(&file.to_text()).expect("it can be read");
@@ -428,6 +431,7 @@ mod tests {
         assert_eq!(saved, tracks.clip(detached).expect("it is there").sound);
         assert_eq!(saved.only_track, Some(0));
         assert_eq!(saved.volume, 750_000);
+        assert!(saved.noise_suppression);
     }
 
     #[test]

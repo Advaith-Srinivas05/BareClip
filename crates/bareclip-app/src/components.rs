@@ -54,6 +54,8 @@ const SETTINGS_ROW_HEIGHT: f32 = 44.0;
 const SPOT_BUTTON_SIZE: f32 = 26.0;
 const SETTINGS_ROW_WITH_DETAIL_HEIGHT: f32 = 54.0;
 const SWITCH_SIZE: egui::Vec2 = vec2(34.0, 18.0);
+/// The information symbol after a switch row's name.
+const INFO_SIZE: f32 = 14.0;
 const SWITCH_KNOB_RADIUS: f32 = 6.0;
 const SWITCH_SECONDS: f32 = 0.12;
 
@@ -714,22 +716,45 @@ pub fn note_on_rest(ui: &Ui, palette: &Palette, response: &Response, note: &str)
 }
 
 /// A setting that is on or off: its name on the left and a switch on the right, with the whole
-/// line to press. Made to sit inside a [`settings_group`].
+/// line to press. Made to sit inside a [`settings_group`] or a menu.
 pub struct SwitchRow<'a> {
     palette: &'a Palette,
     name: &'a str,
     on: bool,
+    info: bool,
+    width: Option<f32>,
 }
 
 impl<'a> SwitchRow<'a> {
     pub fn new(palette: &'a Palette, name: &'a str, on: bool) -> Self {
-        Self { palette, name, on }
+        Self {
+            palette,
+            name,
+            on,
+            info: false,
+            width: None,
+        }
+    }
+
+    /// Keeps to this width rather than taking all there is, which in a menu is a great deal.
+    pub fn width(mut self, width: f32) -> Self {
+        self.width = Some(width);
+        self
+    }
+
+    /// Puts an information symbol after the name, saying the row has a hint to rest on.
+    pub fn with_info(mut self) -> Self {
+        self.info = true;
+        self
     }
 }
 
 impl Widget for SwitchRow<'_> {
     fn ui(self, ui: &mut Ui) -> Response {
-        let size = vec2(ui.available_width(), SETTINGS_ROW_HEIGHT);
+        let size = vec2(
+            self.width.unwrap_or_else(|| ui.available_width()),
+            SETTINGS_ROW_HEIGHT,
+        );
         let (rect, response) = ui.allocate_exact_size(size, Sense::click());
         let (name, on) = (self.name, self.on);
         let enabled = response.enabled();
@@ -741,13 +766,30 @@ impl Widget for SwitchRow<'_> {
         let palette = self.palette;
         let row_look = look(palette, Kind::Ghost, state_of(&response));
         paint_box(ui, rect.shrink(3.0), 5.0, &row_look, &response, palette);
-        ui.painter().text(
+        let text_colour = if enabled {
+            palette.text
+        } else {
+            row_look.content
+        };
+        let name_rect = ui.painter().text(
             pos2(rect.left() + SETTINGS_ROW_PADDING, rect.center().y),
             Align2::LEFT_CENTER,
             name,
             fonts::strong(13.0),
-            palette.text,
+            text_colour,
         );
+        if self.info {
+            let symbol = Rect::from_center_size(
+                pos2(name_rect.right() + 6.0 + INFO_SIZE / 2.0, rect.center().y),
+                vec2(INFO_SIZE, INFO_SIZE),
+            );
+            let colour = if enabled {
+                palette.text_muted
+            } else {
+                row_look.content
+            };
+            icons::paint(ui.painter(), symbol, &icons::INFO, colour);
+        }
         let along = ui
             .ctx()
             .animate_bool_with_time(response.id.with("switch"), on, SWITCH_SECONDS);
@@ -758,7 +800,11 @@ impl Widget for SwitchRow<'_> {
             ),
             SWITCH_SIZE,
         );
-        let (track_fill, knob, edge) = switch_colours(palette, along);
+        let (track_fill, knob, edge) = if enabled {
+            switch_colours(palette, along)
+        } else {
+            (palette.surface, palette.border_strong, palette.border)
+        };
         let radius = SWITCH_SIZE.y / 2.0;
         ui.painter().rect_filled(track, radius, track_fill);
         ui.painter()

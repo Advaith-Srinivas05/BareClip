@@ -17,7 +17,7 @@ use bareclip_core::{
 use eframe::egui::{self, CursorIcon, Pos2, Rect, Sense, Shape, Slider, Stroke, pos2, vec2};
 
 use crate::{
-    components::{ActionButton, IconButton, Kind, MenuItem},
+    components::{ActionButton, IconButton, Kind, MenuItem, SwitchRow},
     icons, text,
     theme::Palette,
 };
@@ -675,6 +675,8 @@ pub struct SelectedSound {
     pub length: Ticks,
     /// A clip on a picture row with sound of its own can have it taken out.
     pub can_detach: bool,
+    /// Only a clip on a row of sound can have noise taken out.
+    pub can_clean: bool,
 }
 
 /// The crop handle at a place on the screen, on the clip being cropped.
@@ -1230,6 +1232,27 @@ fn sound_menu(
     }
     if let Some(fade_out) = fade_row(ui, palette, "Fade out", sound.fade_out, longest) {
         events.sound = Some((selected.id, ClipSound { fade_out, ..sound }));
+    }
+    let on = sound.noise_suppression;
+    // As wide as the rows above, which set the menu's width.
+    let width = ui.min_rect().width();
+    let row = ui
+        .add_enabled(
+            selected.can_clean,
+            SwitchRow::new(palette, "Noise suppression", on)
+                .with_info()
+                .width(width),
+        )
+        .on_hover_text(text::NOISE_SUPPRESSION_HINT)
+        .on_disabled_hover_text(text::NOISE_SUPPRESSION_ON_VIDEO);
+    if row.clicked() {
+        events.sound = Some((
+            selected.id,
+            ClipSound {
+                noise_suppression: !on,
+                ..sound
+            },
+        ));
     }
     ui.separator();
     let (icon, name) = if sound.muted {

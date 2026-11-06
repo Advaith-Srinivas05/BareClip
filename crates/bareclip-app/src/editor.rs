@@ -3975,6 +3975,7 @@ impl Editor {
                 source_start: clip.source.start,
                 has_sound: self.has_sound(clip.media),
                 muted: clip.sound.muted,
+                noise_suppression: clip.sound.noise_suppression,
                 sound_only: self.project.tracks.is_sound_row(track),
                 shows_waveform: self
                     .settings
@@ -4064,6 +4065,22 @@ impl Editor {
                     ..clip.sound
                 },
             );
+        }
+    }
+
+    /// Turns noise suppression on or off, for a clip on a row of sound only.
+    fn toggle_noise_suppression(&mut self, id: ClipId) {
+        let tracks = &self.project.tracks;
+        let on_sound_row = tracks
+            .track_of(id)
+            .is_some_and(|row| tracks.is_sound_row(row));
+        if let Some(clip) = tracks.clip(id).filter(|_| on_sound_row) {
+            let sound = ClipSound {
+                noise_suppression: !clip.sound.noise_suppression,
+                ..clip.sound
+            };
+            self.record();
+            self.project.tracks.set_clip_sound(id, sound);
         }
     }
 
@@ -4157,6 +4174,7 @@ impl Editor {
                 self.delete_selected();
             }
             Some(MenuAction::ToggleMute(id)) => self.toggle_clip_mute(id),
+            Some(MenuAction::ToggleNoiseSuppression(id)) => self.toggle_noise_suppression(id),
             Some(MenuAction::Detach(id)) => self.detach_sound(id),
             Some(MenuAction::RemoveGap(time)) => self.remove_gap(time),
             Some(MenuAction::RemoveAllGaps) => self.remove_all_gaps(),
@@ -4336,6 +4354,9 @@ impl Editor {
                 .track_of(id)
                 .is_some_and(|row| !tracks.is_sound_row(row))
                 && !clip.sound.muted,
+            can_clean: tracks
+                .track_of(id)
+                .is_some_and(|row| tracks.is_sound_row(row)),
         })
     }
 
@@ -7686,6 +7707,28 @@ mod tests {
             editor.project.tracks.clip(id).map(|clip| clip.sound.muted),
             Some(true)
         );
+    }
+
+    #[test]
+    fn the_clips_menu_turns_noise_suppression_on_for_sound_and_greys_it_out_for_a_video() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[song_file()]);
+        open_clip_menu(&ctx, &mut editor);
+        open_flyout(&ctx, &mut editor, "Audio");
+
+        click_menu_item(&ctx, &mut editor, "Noise suppression");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(sound_row_clip(&editor).sound.noise_suppression);
+        editor.undo();
+        assert!(!sound_row_clip(&editor).sound.noise_suppression);
+
+        let sound = clip_with_sound();
+        let mut video = with_videos(&ctx, &[&sound]);
+        open_clip_menu(&ctx, &mut video);
+        open_flyout(&ctx, &mut video, "Audio");
+        let (_, disabled) =
+            menu_item(&ctx, &mut video, "Noise suppression").expect("it is listed for a video too");
+        assert!(disabled, "a video has to have its sound detached first");
     }
 
     #[test]
@@ -13141,6 +13184,56 @@ mod tests {
     }
 
     #[test]
+    fn noise_suppression_switches_on_from_the_sound_menu_for_detached_sound_as_one_undo_step() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        editor.detach_sound(picture_clip(&editor).id);
+        editor.selected = Some(sound_row_clip(&editor).id);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        click_named(&ctx, &mut editor, "Sound");
+        let_dialog_open(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Noise suppression");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert!(sound_row_clip(&editor).sound.noise_suppression);
+        assert!(!picture_clip(&editor).sound.noise_suppression);
+        editor.undo();
+        assert!(!sound_row_clip(&editor).sound.noise_suppression);
+        assert_eq!(
+            editor.project.tracks.audio_tracks().len(),
+            1,
+            "only the switch was undone"
+        );
+    }
+
+    #[test]
+    fn a_videos_own_sound_shows_noise_suppression_greyed_out() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        click_named(&ctx, &mut editor, "Sound");
+        let_dialog_open(&ctx, &mut editor);
+        let switch = named_nodes(&ctx, &mut editor)
+            .into_iter()
+            .find(|(label, ..)| label == "Noise suppression")
+            .expect("the switch is there");
+        assert!(switch.2, "it can't be turned on");
+        click_named(&ctx, &mut editor, "Noise suppression");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert!(!picture_clip(&editor).sound.noise_suppression);
+        assert!(
+            editor
+                .selected_sound()
+                .is_some_and(|sound| !sound.can_clean)
+        );
+    }
+
+    #[test]
     fn a_clip_already_detached_has_nothing_left_to_detach() {
         let ctx = context();
         let sound = clip_with_sound();
@@ -15526,6 +15619,20 @@ mod tests {
         editor.export_state = ExportState::Choosing;
         let_dialog_open(&ctx, &mut editor);
         camera.shoot(&ctx, &mut editor, vec![], "sound-06-export-window");
+
+        editor.export_state = ExportState::Closed;
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Sound");
+        let_dialog_open(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Noise suppression");
+        let_dialog_open(&ctx, &mut editor);
+        let switch = named_rect(&ctx, &mut editor, "Noise suppression");
+        let rest = vec![egui::Event::PointerMoved(switch.center())];
+        for _ in 0..40 {
+            run_frame(&ctx, &mut editor, rest.clone());
+            thread::sleep(Duration::from_millis(20));
+        }
+        camera.shoot(&ctx, &mut editor, rest, "sound-07-noise-suppression-on");
     }
 
     #[test]

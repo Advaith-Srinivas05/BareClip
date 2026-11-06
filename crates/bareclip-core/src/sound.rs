@@ -1,4 +1,4 @@
-//! How a clip sounds: its volume, fades and whether it is muted.
+//! How a clip sounds: its volume, fades, whether it is muted and whether noise is taken out.
 
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +24,9 @@ pub struct ClipSound {
     /// Which of its file's sound tracks it plays, once detached from its video. All of them if
     /// not.
     pub only_track: Option<u32>,
+    /// Takes steady background noise out of a voice. Only clips on
+    /// rows of sound can have it, because it is made for voices and would harm a game's sound.
+    pub noise_suppression: bool,
 }
 
 impl Default for ClipSound {
@@ -34,6 +37,7 @@ impl Default for ClipSound {
             fade_in: 0,
             fade_out: 0,
             only_track: None,
+            noise_suppression: false,
         }
     }
 }

@@ -8,6 +8,7 @@ mod nal;
 mod preview;
 mod probe;
 mod remux;
+mod resample;
 mod still;
 mod strip;
 
@@ -26,6 +27,7 @@ pub use preview::{
 };
 pub use probe::{AudioInfo, MediaInfo, VideoInfo, join_problem, probe, scan_frames};
 pub use remux::{SoundFile, join_picture_and_sound};
+pub use resample::RateChange;
 pub use still::read_still;
 pub use strip::{SoundShape, StripPicture, picture_spacing, read_sound_shape, read_strip_pictures};
 

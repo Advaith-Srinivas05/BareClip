@@ -22,6 +22,11 @@ pub const MEDIA_EXTENSIONS: [&str; 19] = [
     "jpg", "jpeg", "png", "webp", "bmp", "gif",
 ];
 
+/// What Noise suppression's hint says.
+pub const NOISE_SUPPRESSION_HINT: &str = "Quietens steady background noise such as fans, hum and hiss. Made for voices, so it can damage music and game sound.";
+/// Why a video's own sound can't have it.
+pub const NOISE_SUPPRESSION_ON_VIDEO: &str = "Detach the sound to use this";
+
 /// A project's name as Windows will accept it for a file.
 pub fn safe_file_name(name: &str) -> String {
     let replaced: String = name

@@ -1,5 +1,6 @@
 //! Audio mixing and playback.
 
+mod clean;
 mod engine;
 mod mix;
 mod output;

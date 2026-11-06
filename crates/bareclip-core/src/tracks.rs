@@ -82,6 +82,7 @@ impl SoundSpan {
             && self.speed == earlier.speed
             && self.sound.volume == earlier.sound.volume
             && self.sound.only_track == earlier.sound.only_track
+            && self.sound.noise_suppression == earlier.sound.noise_suppression
             && self.sound.fade_in == 0
             && earlier.sound.fade_out == 0
     }
@@ -566,7 +567,11 @@ impl Tracks {
                     media: clip.media,
                     start: clip.start,
                     source: clip.source,
-                    sound: clip.sound,
+                    // A video's own sound is never cleaned, even if a file says so.
+                    sound: ClipSound {
+                        noise_suppression: clip.sound.noise_suppression && sound_row.is_some(),
+                        ..clip.sound
+                    },
                     speed: clip.speed,
                     sound_row,
                 };
@@ -2225,6 +2230,52 @@ mod tests {
                 ..ClipSound::default()
             },
         );
+        assert_eq!(tracks.sound_spans(&with_sound).len(), 2);
+    }
+
+    const CLEANED: ClipSound = ClipSound {
+        volume: crate::sound::FULL_VOLUME,
+        muted: false,
+        fade_in: 0,
+        fade_out: 0,
+        only_track: None,
+        noise_suppression: true,
+    };
+
+    #[test]
+    fn noise_suppression_reaches_the_mix_from_a_sound_row_but_never_from_a_videos_own_sound() {
+        let mut tracks = Tracks::default();
+        let video = tracks.push(VIDEO, range(0, 100));
+        let song = tracks.push_sound(OTHER, range(0, 100));
+        tracks.set_clip_sound(video, CLEANED);
+        tracks.set_clip_sound(song, CLEANED);
+
+        let spans = tracks.sound_spans(&with_sound);
+
+        let cleaned = |media| {
+            spans
+                .iter()
+                .find(|span| span.media == media)
+                .unwrap()
+                .sound
+                .noise_suppression
+        };
+        assert!(cleaned(OTHER));
+        assert!(!cleaned(VIDEO));
+    }
+
+    #[test]
+    fn halves_of_a_split_sound_play_as_one_only_if_both_are_cleaned_or_neither() {
+        let mut tracks = Tracks::default();
+        let first = tracks.push_sound(OTHER, range(0, 100));
+        tracks.set_clip_sound(first, CLEANED);
+        let second = tracks.split(first, Ticks(40)).expect("it splits");
+
+        let spans = tracks.sound_spans(&with_sound);
+        assert_eq!(spans.len(), 1, "the cleaning carries on across the cut");
+        assert!(spans[0].sound.noise_suppression);
+
+        tracks.set_clip_sound(second, ClipSound::default());
         assert_eq!(tracks.sound_spans(&with_sound).len(), 2);
     }
 

@@ -9,4 +9,5 @@ publish.workspace = true
 bareclip-core.workspace = true
 bareclip-media.workspace = true
 cpal.workspace = true
+nnnoiseless.workspace = true
 rtrb.workspace = true

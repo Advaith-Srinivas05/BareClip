@@ -9,9 +9,12 @@ use bareclip_core::{
     time::{TICKS_PER_SECOND, Ticks},
     timeline::TimeRange,
 };
-use bareclip_media::{AudioPreview, AudioStep, MediaError};
+use bareclip_media::{AudioPreview, AudioStep, MediaError, RateChange};
 
-use crate::stretch::{Frames, Stretch};
+use crate::{
+    clean::{BLOCK_FRAMES, CLEAN_RATE, Cleaner, DELAY_FRAMES, LEAD_IN_FRAMES},
+    stretch::{Frames, Stretch},
+};
 
 const CHANNELS: usize = 2;
 /// Decoded blocks rarely line up to the sample, so a difference this small is not a real hole.
@@ -87,6 +90,7 @@ impl MixSpan {
             && self.source == other.source
             && self.speed == other.speed
             && self.sound.only_track == other.sound.only_track
+            && self.sound.noise_suppression == other.sound.noise_suppression
     }
 }
 
@@ -148,20 +152,32 @@ impl Frames for TrackBuffer {
 /// One open file, positioned for one span.
 struct SpanReader {
     preview: AudioPreview,
+    /// What is heard from each track, in frames of the footage at the mix's rate.
     tracks: Vec<TrackBuffer>,
     /// For a clip at another speed, what turns each track's footage into sound for the timeline.
     stretches: Vec<Stretch>,
+    /// With noise suppression on, each track's sound on its way to be cleaned.
+    cleaning: Vec<Option<TrackCleaning>>,
+    /// Where the span's footage starts, in frames at the rate the file is decoded at.
     source_start: i64,
     ended: bool,
 }
 
 impl SpanReader {
     fn open(span: &MixSpan, rate: u32, from: i64) -> Result<Self, MediaError> {
-        let mut preview = AudioPreview::open(&span.path, rate)?;
+        let cleans = span.sound.noise_suppression;
+        let decode_rate = if cleans { CLEAN_RATE } else { rate };
+        let mut preview = AudioPreview::open(&span.path, decode_rate)?;
         // `from` is a frame on the timeline, and everything here is in frames of the footage.
         let from_footage = frame_at(span.speed.in_footage(time_of_frames(from, rate)), rate);
-        let seconds = span.source.start.as_seconds() + from_footage as f64 / f64::from(rate);
-        preview.seek(seconds)?;
+        // Cleaning starts a little earlier, so it has settled by the time anything is heard.
+        let from_decoded = if cleans {
+            rescale(from_footage, rate, CLEAN_RATE) - LEAD_IN_FRAMES
+        } else {
+            from_footage
+        };
+        let seconds = span.source.start.as_seconds() + from_decoded as f64 / f64::from(decode_rate);
+        preview.seek(seconds.max(0.0))?;
         let tracks: Vec<TrackBuffer> = (0..preview.track_count())
             .map(|_| TrackBuffer {
                 samples: VecDeque::new(),
@@ -173,40 +189,161 @@ impl SpanReader {
             .iter()
             .map(|_| Stretch::new(span.speed, footage_frames))
             .collect();
+        let cleaning = tracks
+            .iter()
+            .map(|_| {
+                cleans
+                    .then(|| TrackCleaning::new(from_decoded, rate))
+                    .transpose()
+            })
+            .collect::<Result<_, _>>()?;
         Ok(Self {
             preview,
             tracks,
             stretches,
-            source_start: frame_at(span.source.start, rate),
+            cleaning,
+            source_start: frame_at(span.source.start, decode_rate),
             ended: false,
         })
+    }
+
+    /// How far a track has been decoded, in frames of the footage at the mix's rate.
+    fn reach(&self, track: usize, rate: u32) -> i64 {
+        match &self.cleaning[track] {
+            Some(cleaning) => rescale(cleaning.raw.end(), CLEAN_RATE, rate),
+            None => self.tracks[track].end(),
+        }
     }
 
     /// Decodes until every track the span wants has sound up to this frame of the span.
     fn fill_to(&mut self, span: &MixSpan, until: i64, rate: u32) {
         let furthest = until + MOST_SECONDS_AHEAD * i64::from(rate);
-        while !self.ended {
+        loop {
+            self.clean_what_is_ready(rate);
+            if self.ended {
+                return;
+            }
             let lacking = self
                 .tracks
                 .iter()
                 .enumerate()
                 .any(|(track, buffer)| span.wants(track) && buffer.end() < until);
-            let room = self.tracks.iter().all(|buffer| buffer.end() < furthest);
+            let room = (0..self.tracks.len()).all(|track| self.reach(track, rate) < furthest);
             if !lacking || !room {
                 return;
             }
             match self.preview.next_step() {
                 Ok(AudioStep::Chunk(chunk)) => {
-                    if span.wants(chunk.track)
-                        && let Some(buffer) = self.tracks.get_mut(chunk.track)
-                    {
-                        buffer.add(chunk.start_frame - self.source_start, &chunk.samples);
+                    if span.wants(chunk.track) {
+                        let start = chunk.start_frame - self.source_start;
+                        let buffer = match self.cleaning.get_mut(chunk.track) {
+                            Some(Some(cleaning)) => Some(&mut cleaning.raw),
+                            _ => self.tracks.get_mut(chunk.track),
+                        };
+                        if let Some(buffer) = buffer {
+                            buffer.add(start, &chunk.samples);
+                        }
                     }
                 }
                 Ok(AudioStep::Pending) => {}
                 // A damaged file should cost a moment of sound, not the whole mix.
                 Ok(AudioStep::End) | Err(_) => self.ended = true,
             }
+        }
+    }
+
+    fn clean_what_is_ready(&mut self, rate: u32) {
+        for (cleaning, heard) in self.cleaning.iter_mut().zip(&mut self.tracks) {
+            if let Some(cleaning) = cleaning {
+                cleaning.run(heard, rate, self.ended);
+            }
+        }
+    }
+}
+
+/// Adds cleaned sound that is exactly in place. What overlaps what is already there, which is the
+/// lead-in at the start, is cut off to the frame, where `TrackBuffer::add` would let a small
+/// overlap through and leave the sound up to 32 frames late.
+fn put(heard: &mut TrackBuffer, at: i64, samples: &[f32]) {
+    let skip = ((heard.end() - at).max(0) as usize * CHANNELS).min(samples.len());
+    heard.add(at + (skip / CHANNELS) as i64, &samples[skip..]);
+}
+
+/// A frame count at one rate, at another.
+fn rescale(frames: i64, from: u32, to: u32) -> i64 {
+    if from == to {
+        return frames;
+    }
+    (i128::from(frames) * i128::from(to)).div_euclid(i128::from(from)) as i64
+}
+
+/// One track's sound being cleaned at 48 kHz, on its way to be heard at the mix's rate.
+struct TrackCleaning {
+    /// Decoded sound waiting to be cleaned, in frames of the footage at 48 kHz.
+    raw: TrackBuffer,
+    cleaner: Cleaner,
+    /// Takes cleaned sound to the mix's rate, if that isn't 48 kHz.
+    rate_change: Option<RateChange>,
+    /// Where the next cleaned frame goes, in frames of the footage at the mix's rate.
+    next: Option<i64>,
+    /// The end of the file has been pushed through.
+    finished: bool,
+}
+
+impl TrackCleaning {
+    fn new(from: i64, rate: u32) -> Result<Self, MediaError> {
+        let rate_change = (rate != CLEAN_RATE)
+            .then(|| RateChange::new(CLEAN_RATE, rate))
+            .transpose()?;
+        Ok(Self {
+            raw: TrackBuffer {
+                samples: VecDeque::new(),
+                first: from,
+            },
+            cleaner: Cleaner::default(),
+            rate_change,
+            next: None,
+            finished: false,
+        })
+    }
+
+    /// Cleans every whole block waiting, or everything once the file has ended, and puts it
+    /// where it belongs in what is heard, taking off the cleaner's delay. What was only there to
+    /// let the cleaner settle lands before what is heard begins, so it is dropped.
+    fn run(&mut self, heard: &mut TrackBuffer, rate: u32, ended: bool) {
+        if self.finished {
+            return;
+        }
+        if ended {
+            // Silence pushes the last of the sound out of the cleaner, a block late.
+            let waiting = self.raw.samples.len() / CHANNELS;
+            let pad =
+                (BLOCK_FRAMES - waiting % BLOCK_FRAMES) % BLOCK_FRAMES + DELAY_FRAMES as usize;
+            self.raw
+                .samples
+                .extend(std::iter::repeat_n(0.0, pad * CHANNELS));
+        }
+        while self.raw.samples.len() >= BLOCK_FRAMES * CHANNELS {
+            let at = self.raw.first;
+            let block: Vec<f32> = self.raw.samples.drain(..BLOCK_FRAMES * CHANNELS).collect();
+            self.raw.first += BLOCK_FRAMES as i64;
+            let cleaned = self.cleaner.clean(&block);
+            let next = *self
+                .next
+                .get_or_insert_with(|| rescale(at - DELAY_FRAMES, CLEAN_RATE, rate));
+            let samples = match &mut self.rate_change {
+                Some(change) => change.run(&cleaned).unwrap_or_default(),
+                None => cleaned,
+            };
+            put(heard, next, &samples);
+            self.next = Some(next + (samples.len() / CHANNELS) as i64);
+        }
+        if ended {
+            if let (Some(change), Some(next)) = (&mut self.rate_change, self.next) {
+                let rest = change.finish().unwrap_or_default();
+                put(heard, next, &rest);
+            }
+            self.finished = true;
         }
     }
 }
@@ -1007,5 +1144,237 @@ mod tests {
         let out = mixed(vec![plain], 0.0, 0.5);
 
         assert!(out.iter().all(|sample| (*sample - 0.25).abs() < 1e-6));
+    }
+
+    /// Writes mono sound as a 48 kHz stereo WAV of 32-bit floats.
+    fn wav_file(name: &str, mono: &[f32]) -> PathBuf {
+        let folder = std::env::temp_dir().join("bareclip-audio-tests");
+        std::fs::create_dir_all(&folder).expect("the folder can be created");
+        let path = folder.join(format!("{name}-{}.wav", std::process::id()));
+        let data_bytes = (mono.len() * CHANNELS * 4) as u32;
+        let mut bytes = Vec::with_capacity(44 + data_bytes as usize);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&3u16.to_le_bytes());
+        bytes.extend_from_slice(&(CHANNELS as u16).to_le_bytes());
+        bytes.extend_from_slice(&RATE.to_le_bytes());
+        bytes.extend_from_slice(&(RATE * CHANNELS as u32 * 4).to_le_bytes());
+        bytes.extend_from_slice(&((CHANNELS * 4) as u16).to_le_bytes());
+        bytes.extend_from_slice(&32u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_bytes.to_le_bytes());
+        for sample in mono {
+            for _ in 0..CHANNELS {
+                bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+        }
+        std::fs::write(&path, bytes).expect("the file can be written");
+        path
+    }
+
+    /// Talking from 0.5 to 1.5 seconds and from 2.5 to 3.5, in a four-second file.
+    fn talking(time: f64) -> bool {
+        (0.5..1.5).contains(&time) || (2.5..3.5).contains(&time)
+    }
+
+    fn voice_only() -> &'static Path {
+        static FILE: OnceLock<PathBuf> = OnceLock::new();
+        FILE.get_or_init(|| wav_file("voice", &crate::clean::sounds::voice(4.0, talking)))
+    }
+
+    /// The same voice with a fan's steady hiss under it the whole time.
+    fn voice_and_fan() -> &'static Path {
+        static FILE: OnceLock<PathBuf> = OnceLock::new();
+        FILE.get_or_init(|| {
+            use crate::clean::sounds::{Dice, hiss, voice};
+            let voice = voice(4.0, talking);
+            let fan = hiss(voice.len(), 0.02, &mut Dice::new(11));
+            let both: Vec<f32> = voice.iter().zip(&fan).map(|(v, f)| v + f).collect();
+            wav_file("voice-and-fan", &both)
+        })
+    }
+
+    fn cleaned(span: MixSpan) -> MixSpan {
+        MixSpan {
+            sound: ClipSound {
+                noise_suppression: true,
+                ..span.sound
+            },
+            ..span
+        }
+    }
+
+    fn mixed_at(spans: Vec<MixSpan>, rate: u32, from: f64, length: f64) -> Vec<f32> {
+        let mut mix = TimelineMix::new(spans, rate, seconds(from));
+        let mut buses = vec![Vec::new()];
+        mix.fill((length * f64::from(rate)) as usize, &mut buses);
+        assert_eq!(mix.take_problem(), None);
+        buses.remove(0)
+    }
+
+    /// The left side of a stretch of a mix that started at 0.
+    fn stretch_of(samples: &[f32], rate: u32, from: f64, to: f64) -> Vec<f32> {
+        let at = |time: f64| (time * f64::from(rate)) as usize * CHANNELS;
+        samples[at(from)..at(to)]
+            .iter()
+            .step_by(CHANNELS)
+            .copied()
+            .collect()
+    }
+
+    /// How many frames later `late` is than `early`, judged by where they line up best.
+    fn lag_between(early: &[f32], late: &[f32], most: i64) -> i64 {
+        let score = |lag: i64| -> f64 {
+            (most as usize..early.len() - most as usize)
+                .map(|at| f64::from(early[at]) * f64::from(late[(at as i64 + lag) as usize]))
+                .sum()
+        };
+        (-most..=most)
+            .max_by(|a, b| score(*a).total_cmp(&score(*b)))
+            .unwrap()
+    }
+
+    #[test]
+    fn noise_suppression_quietens_a_fan_between_words_and_keeps_the_words() {
+        use crate::clean::sounds::decibels;
+        let plain = mixed(vec![span(voice_and_fan(), 0.0, 0.0, 4.0)], 0.0, 4.0);
+        let cleaned = mixed(
+            vec![cleaned(span(voice_and_fan(), 0.0, 0.0, 4.0))],
+            0.0,
+            4.0,
+        );
+        let voice = mixed(vec![span(voice_only(), 0.0, 0.0, 4.0)], 0.0, 4.0);
+
+        let fan_before = decibels(&stretch_of(&plain, RATE, 1.7, 2.3));
+        let fan_after = decibels(&stretch_of(&cleaned, RATE, 1.7, 2.3));
+        assert!(
+            fan_after < fan_before - 15.0,
+            "between words the fan went from {fan_before:.1} dB to {fan_after:.1} dB"
+        );
+        let words = decibels(&stretch_of(&voice, RATE, 0.7, 1.3));
+        let words_after = decibels(&stretch_of(&cleaned, RATE, 0.7, 1.3));
+        assert!(
+            (words_after - words).abs() < 3.0,
+            "the words were {words:.1} dB and came out {words_after:.1} dB"
+        );
+    }
+
+    #[test]
+    fn cleaned_sound_stays_in_time() {
+        let plain = mixed(vec![span(voice_only(), 0.0, 0.0, 4.0)], 0.0, 4.0);
+        let cleaned = mixed(vec![cleaned(span(voice_only(), 0.0, 0.0, 4.0))], 0.0, 4.0);
+
+        let lag = lag_between(
+            &stretch_of(&plain, RATE, 0.6, 1.4),
+            &stretch_of(&cleaned, RATE, 0.6, 1.4),
+            600,
+        );
+        assert!(lag.abs() <= 2, "it came out {lag} frames late");
+    }
+
+    #[test]
+    fn jumping_into_the_middle_of_a_word_sounds_as_it_does_playing_through() {
+        use crate::clean::sounds::decibels;
+        let clip = cleaned(span(voice_and_fan(), 0.0, 0.0, 4.0));
+        let through = mixed(vec![clip.clone()], 0.0, 4.0);
+        let jumped = mixed(vec![clip], 2.8, 0.5);
+
+        let expected = stretch_of(&through, RATE, 2.8, 3.3);
+        let got = stretch_of(&jumped, RATE, 0.0, 0.5);
+        let difference: Vec<f32> = expected.iter().zip(&got).map(|(a, b)| a - b).collect();
+        let (level, off) = (decibels(&expected), decibels(&difference));
+        assert!(
+            off < level - 20.0,
+            "the sound was {level:.1} dB and off by {off:.1} dB"
+        );
+    }
+
+    #[test]
+    fn a_sound_card_at_another_rate_hears_the_same_cleaning_in_time() {
+        use crate::clean::sounds::decibels;
+        const CARD: u32 = 44_100;
+        let plain = mixed_at(vec![span(voice_and_fan(), 0.0, 0.0, 4.0)], CARD, 0.0, 4.0);
+        let cleaned_fan = mixed_at(
+            vec![cleaned(span(voice_and_fan(), 0.0, 0.0, 4.0))],
+            CARD,
+            0.0,
+            4.0,
+        );
+        assert_eq!(cleaned_fan.len(), plain.len());
+        let fan_before = decibels(&stretch_of(&plain, CARD, 1.7, 2.3));
+        let fan_after = decibels(&stretch_of(&cleaned_fan, CARD, 1.7, 2.3));
+        assert!(
+            fan_after < fan_before - 15.0,
+            "{fan_before:.1} dB to {fan_after:.1} dB"
+        );
+
+        let voice = mixed_at(vec![span(voice_only(), 0.0, 0.0, 4.0)], CARD, 0.0, 4.0);
+        let cleaned_voice = mixed_at(
+            vec![cleaned(span(voice_only(), 0.0, 0.0, 4.0))],
+            CARD,
+            0.0,
+            4.0,
+        );
+        let lag = lag_between(
+            &stretch_of(&voice, CARD, 0.6, 1.4),
+            &stretch_of(&cleaned_voice, CARD, 0.6, 1.4),
+            600,
+        );
+        assert!(lag.abs() <= 2, "it came out {lag} frames late");
+    }
+
+    #[test]
+    fn cleaned_sound_at_twice_the_speed_lasts_half_as_long() {
+        use crate::clean::sounds::decibels;
+        let fast = at_speed(cleaned(span(voice_and_fan(), 0.0, 0.0, 4.0)), 2.0);
+        let out = mixed(vec![fast], 0.0, 2.5);
+
+        assert!(
+            decibels(&stretch_of(&out, RATE, 0.3, 0.7)) > -60.0,
+            "the words are heard"
+        );
+        assert!(stretch_of(&out, RATE, 2.05, 2.5).iter().all(|s| *s == 0.0));
+    }
+
+    #[test]
+    fn turning_noise_suppression_on_reads_the_clip_again() {
+        let plain = span(voice_and_fan(), 0.0, 0.0, 4.0);
+        assert!(!plain.reads_same_as(&cleaned(plain.clone())));
+        let quieter = MixSpan {
+            sound: ClipSound {
+                volume: FULL_VOLUME / 2,
+                ..plain.sound
+            },
+            ..plain.clone()
+        };
+        assert!(
+            plain.reads_same_as(&quieter),
+            "a volume change still carries on"
+        );
+    }
+
+    /// How much faster than real time cleaning runs, at the export's rate and a common sound
+    /// card's, and how long a jump waits for its lead-in.
+    #[test]
+    #[ignore]
+    fn cleaning_keeps_ahead_of_real_time() {
+        for rate in [RATE, 44_100] {
+            let clip = cleaned(span(voice_and_fan(), 0.0, 0.0, 4.0));
+            let started = std::time::Instant::now();
+            let out = mixed_at(vec![clip.clone()], rate, 0.0, 4.0);
+            let taken = started.elapsed().as_secs_f64();
+            assert!(!out.is_empty());
+            let started = std::time::Instant::now();
+            mixed_at(vec![clip], rate, 2.8, 0.01);
+            let jump = started.elapsed().as_secs_f64();
+            println!(
+                "{rate} Hz: 4 s cleaned in {:.0} ms, {:.0} times real time. A jump waits {:.1} ms",
+                taken * 1000.0,
+                4.0 / taken,
+                jump * 1000.0
+            );
+        }
     }
 }
