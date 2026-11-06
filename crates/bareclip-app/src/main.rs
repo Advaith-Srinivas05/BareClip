@@ -3,6 +3,7 @@
 mod components;
 mod editor;
 mod fonts;
+mod handoff;
 mod icons;
 mod layers;
 mod player;
@@ -14,14 +15,22 @@ mod theme;
 mod timeline;
 mod title_frames;
 
-use std::path::PathBuf;
-
 use eframe::egui;
 
 const WINDOW_ICON: &[u8] = include_bytes!("../../../assets/brand/png/app-icon-64.png");
 
 fn main() -> eframe::Result {
-    let opened_with: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    let launch = handoff::read_launch(std::env::args_os().skip(1));
+    // "Edit with BareClip" goes to a window already open, if there is one.
+    let mut claimed = None;
+    if launch.edit {
+        match handoff::hand_over(handoff::PIPE_PREFIX, &launch.paths) {
+            handoff::HandOver::Delivered => return Ok(()),
+            handoff::HandOver::Claimed(name) => claimed = Some(name),
+            handoff::HandOver::Alone => {}
+        }
+    }
+    let inbox = handoff::Inbox::listen(handoff::PIPE_PREFIX, claimed);
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("BareClip")
@@ -53,10 +62,13 @@ fn main() -> eframe::Result {
             if let Some(folder) = storage::app_folder() {
                 editor.use_storage(&creation_context.egui_ctx, folder);
             }
-            if !opened_with.is_empty() {
-                editor.import(&creation_context.egui_ctx, &opened_with);
+            if launch.edit {
+                editor.edit_files(&launch.paths);
+            } else if !launch.paths.is_empty() {
+                editor.import(&creation_context.egui_ctx, &launch.paths);
             }
-            Ok(Box::new(BareClipApp { editor }))
+            inbox.wake(&creation_context.egui_ctx);
+            Ok(Box::new(BareClipApp { editor, inbox }))
         }),
     )
 }
@@ -75,10 +87,16 @@ fn window_gpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
 
 struct BareClipApp {
     editor: editor::Editor,
+    /// Files from "Edit with BareClip" launches after this window opened.
+    inbox: handoff::Inbox,
 }
 
 impl eframe::App for BareClipApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let arrived = self.inbox.take();
+        if !arrived.is_empty() {
+            self.editor.edit_files(&arrived);
+        }
         self.editor.show(ui);
     }
 

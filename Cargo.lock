@@ -417,6 +417,7 @@ dependencies = [
  "serde_json",
  "shadcn-egui-core",
  "shadcn-egui-icons-lucide",
+ "windows-sys 0.61.2",
  "winresource",
 ]
 

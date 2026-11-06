@@ -471,6 +471,36 @@ pub fn typed_duration(typed: &str) -> Option<f64> {
 mod tests {
     use super::*;
 
+    /// The installer's "Edit with BareClip" goes on every video and sound type the app takes,
+    /// apart from .ts, which TypeScript uses too, and never on images or projects.
+    #[test]
+    fn the_right_click_menu_covers_what_the_app_takes_except_ts() {
+        let installer = include_str!("../../../installer/bareclip.wxs");
+        let has_menu = |extension: &str| {
+            installer.contains(&format!(
+                r"SystemFileAssociations\.{extension}\shell\BareClip.Edit"
+            ))
+        };
+        for extension in VIDEO_EXTENSIONS.iter().chain(&AUDIO_EXTENSIONS) {
+            assert_eq!(has_menu(extension), *extension != "ts", ".{extension}");
+        }
+        for extension in MEDIA_EXTENSIONS
+            .iter()
+            .filter(|extension| !VIDEO_EXTENSIONS.contains(extension))
+            .filter(|extension| !AUDIO_EXTENSIONS.contains(extension))
+            .chain(&[project::EXTENSION])
+        {
+            assert!(!has_menu(extension), ".{extension} has no menu entry");
+        }
+        let entries = installer.matches(r"\shell\BareClip.Edit").count();
+        assert_eq!(entries, VIDEO_EXTENSIONS.len() + AUDIO_EXTENSIONS.len() - 1);
+        assert!(installer.contains(&format!(r"Software\Classes\.{}", project::EXTENSION)));
+        assert!(installer.contains(&format!(
+            "&quot;[INSTALLFOLDER]bareclip.exe&quot; {} &quot;%1&quot;",
+            crate::handoff::EDIT_FLAG
+        )));
+    }
+
     #[test]
     fn a_typed_length_can_be_seconds_or_minutes_and_seconds() {
         assert_eq!(typed_duration("5"), Some(5.0));

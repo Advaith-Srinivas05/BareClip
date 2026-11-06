@@ -540,6 +540,8 @@ pub struct Editor {
     auto_save_held: bool,
     /// Recovery copies from runs that never closed properly, waiting to be offered.
     recovery_offers: Vec<PathBuf>,
+    /// Files from "Edit with BareClip", waiting for any dialog that decides what the project is.
+    waiting_edits: Vec<PathBuf>,
     /// Videos ticked in the panel, in the order they were ticked.
     selected_media: Vec<MediaId>,
     media_panel_open: bool,
@@ -646,6 +648,14 @@ struct CardActions {
     toggle: Option<MediaId>,
 }
 
+/// Whether two paths name one file, however each was written.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 fn media_info(media: &[MediaEntry], id: MediaId) -> Option<MediaInfo> {
     media
         .iter()
@@ -707,6 +717,7 @@ impl Editor {
             auto_save_failed: None,
             auto_save_held: false,
             recovery_offers: Vec::new(),
+            waiting_edits: Vec::new(),
             selected_media: Vec::new(),
             media_panel_open: true,
             left_panel: LeftPanel::default(),
@@ -1337,6 +1348,61 @@ impl Editor {
         }
     }
 
+    /// Files chosen with "Edit with BareClip" in Explorer, which go on the end of the
+    /// timeline. They wait while a dialog is still deciding what the project is, so restoring
+    /// lost work or opening another project can't throw them away.
+    pub fn edit_files(&mut self, paths: &[PathBuf]) {
+        self.waiting_edits.extend(paths.iter().cloned());
+    }
+
+    fn take_waiting_edits(&mut self, ctx: &egui::Context) {
+        let deciding = self.leave_for.is_some()
+            || self.missing_videos.is_some()
+            || !self.recovery_offers.is_empty()
+            || !matches!(self.export_state, ExportState::Closed);
+        if self.waiting_edits.is_empty() || deciding {
+            return;
+        }
+        let mut chosen = Vec::new();
+        for path in std::mem::take(&mut self.waiting_edits) {
+            let is_media = path.extension().is_some_and(|extension| {
+                extension != project::EXTENSION
+                    && !extension.eq_ignore_ascii_case(text::CAPTIONS_EXTENSION)
+            });
+            if !is_media {
+                self.import(ctx, &[path]);
+                continue;
+            }
+            // A video already in the panel is used again rather than listed twice.
+            if let Some(entry) = self
+                .visible_media()
+                .find(|entry| same_file(&entry.info.path, &path))
+            {
+                chosen.push(entry.id);
+                continue;
+            }
+            match self.load(ctx, &path) {
+                Ok(entry) => {
+                    chosen.push(entry.id);
+                    self.media.push(entry);
+                }
+                Err(error) => {
+                    let name = path.file_name().map_or_else(
+                        || "That file".to_owned(),
+                        |name| name.to_string_lossy().into_owned(),
+                    );
+                    self.notice = Some(format!("{name} could not be opened. {error}"));
+                }
+            }
+        }
+        if chosen.is_empty() {
+            return;
+        }
+        self.media_panel_open = true;
+        self.left_panel = LeftPanel::Media;
+        self.add_to_end(chosen);
+    }
+
     fn load(&mut self, ctx: &egui::Context, path: &Path) -> Result<MediaEntry, MediaError> {
         let info = probe(path)?;
         let name = path.file_name().map_or_else(
@@ -1444,6 +1510,11 @@ impl Editor {
     /// as one step to undo.
     fn add_selected_to_timeline(&mut self) {
         let chosen = std::mem::take(&mut self.selected_media);
+        self.add_to_end(chosen);
+    }
+
+    /// Adds whole videos to the end of the timeline in this order, as one step to undo.
+    fn add_to_end(&mut self, chosen: Vec<MediaId>) {
         let ranges: Vec<(MediaId, TimeRange)> = chosen
             .into_iter()
             .filter_map(|id| Some((id, self.full_range(id)?)))
@@ -2735,6 +2806,7 @@ impl Editor {
         self.poll_background(&ctx);
         self.handle_shortcuts(&ctx);
         self.take_dropped_files(&ctx);
+        self.take_waiting_edits(&ctx);
         self.autosave(&ctx);
         self.update_window_title(&ctx);
 
@@ -11092,6 +11164,135 @@ mod tests {
         assert!(second.recovery_offers.is_empty());
         second.recovery.as_mut().expect("it is on").wait();
         assert!(storage::orphaned_recoveries(&folder).is_empty());
+    }
+
+    /// The file names of the clips on the picture rows, in the order they play.
+    fn played_names(editor: &Editor) -> Vec<String> {
+        editor
+            .project
+            .tracks
+            .played()
+            .clips()
+            .iter()
+            .map(|clip| {
+                let entry = editor.entry(clip.media).expect("its video is known");
+                entry
+                    .info
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    fn file_name(path: &Path) -> String {
+        path.file_name().unwrap().to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn edit_with_bareclip_puts_files_on_the_end_of_the_timeline_as_one_undo_step() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let first_end = editor.project.tracks.duration();
+
+        editor.edit_files(&[second_clip().to_path_buf(), song_file().to_path_buf()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        settle(&ctx, &mut editor);
+
+        assert_eq!(
+            played_names(&editor),
+            [file_name(test_clip()), file_name(second_clip())]
+        );
+        let clips = editor.project.tracks.played().clips().to_vec();
+        assert_eq!(
+            clips[1].start, first_end,
+            "it goes straight after what was there"
+        );
+        let sound_rows = editor.project.tracks.audio_tracks();
+        assert_eq!(sound_rows.len(), 1, "sound goes on a sound row");
+        assert_eq!(sound_rows[0].clips().len(), 1);
+        assert!(editor.media_panel_open);
+        assert_eq!(
+            editor.visible_media().count(),
+            3,
+            "both are listed in the panel"
+        );
+
+        editor.undo();
+        assert_eq!(played_names(&editor), [file_name(test_clip())]);
+        assert!(editor.project.tracks.audio_tracks().is_empty());
+    }
+
+    #[test]
+    fn edit_with_bareclip_uses_a_video_already_in_the_panel() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip()]);
+        let id = editor.media[0].id;
+        editor.toggle_media(id);
+
+        editor.edit_files(&[test_clip().to_path_buf()]);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert_eq!(editor.visible_media().count(), 1, "it isn't listed twice");
+        assert_eq!(clip_count(&editor), 1);
+        assert_eq!(editor.project.tracks.played().clips()[0].media, id);
+        assert_eq!(editor.selected_media, [id], "the ticks are left alone");
+    }
+
+    #[test]
+    fn a_file_that_cant_be_read_says_so_and_adds_nothing() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let missing = project_folder("edit-missing").join("gone.mp4");
+
+        editor.edit_files(&[missing]);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert_eq!(clip_count(&editor), 1);
+        let notice = editor.notice.clone().expect("it says what went wrong");
+        assert!(notice.contains("gone.mp4"), "{notice}");
+        editor.undo();
+        assert_eq!(
+            clip_count(&editor),
+            0,
+            "the only step to undo is the first clip"
+        );
+    }
+
+    #[test]
+    fn files_from_explorer_wait_for_the_restore_question_then_join_the_restored_work() {
+        let ctx = context();
+        let folder = project_folder("edit-after-crash");
+        let mut first = with_storage(&ctx, &folder);
+        first.import(&ctx, &[test_clip().to_path_buf()]);
+        settle(&ctx, &mut first);
+        let id = first.media[0].id;
+        first.add_to_timeline(id);
+        autosave_now(&ctx, &mut first);
+        crash(first);
+
+        let mut second = with_storage(&ctx, &folder);
+        second.edit_files(&[second_clip().to_path_buf()]);
+        run_frame(&ctx, &mut second, vec![]);
+        assert_eq!(
+            clip_count(&second),
+            0,
+            "nothing goes in while the question is open"
+        );
+        assert_eq!(second.recovery_offers.len(), 1);
+
+        let_dialog_open(&ctx, &mut second);
+        click_named(&ctx, &mut second, "Restore");
+        settle(&ctx, &mut second);
+        run_frame(&ctx, &mut second, vec![]);
+        settle(&ctx, &mut second);
+
+        assert_eq!(
+            played_names(&second),
+            [file_name(test_clip()), file_name(second_clip())]
+        );
     }
 
     #[test]

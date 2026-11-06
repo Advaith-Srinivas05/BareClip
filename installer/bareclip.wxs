@@ -310,6 +310,96 @@
         <Condition>NOT ADD_DESKTOP</Condition>
         <RegistryValue Root="HKMU" Key="Software\BareClip" Name="Desktop" Type="string" Value="no" KeyPath="yes" />
       </Component>
+      <!-- "Edit with BareClip" on videos and sound, beside whatever opens them, so no file
+           changes owner. TypeScript shares .ts with recordings, so .ts is left out. -->
+      <Component Id="EditWith" Guid="4B8E2D71-C05A-4F39-B6E4-17A93D0C58F2">
+        <RegistryValue Root="HKMU" Key="Software\BareClip" Name="EditWith" Type="integer" Value="1" KeyPath="yes" />
+        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.mp4\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
+          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
+          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
+          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
+        </RegistryKey>
+        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.mkv\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
+          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
+          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
+          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
+        </RegistryKey>
+        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.mov\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
+          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
+          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
+          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
+        </RegistryKey>
+        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.webm\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
+          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
+          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
+          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
+        </RegistryKey>
+        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.avi\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
+          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
+          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
+          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
+        </RegistryKey>
+        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.mp3\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
+          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
+          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
+          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
+        </RegistryKey>
+        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.wav\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
+          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
+          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
+          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
+        </RegistryKey>
+        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.flac\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
+          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
+          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
+          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
+        </RegistryKey>
+        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.m4a\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
+          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
+          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
+          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
+        </RegistryKey>
+        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.aac\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
+          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
+          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
+          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
+        </RegistryKey>
+        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.ogg\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
+          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
+          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
+          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
+        </RegistryKey>
+        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.opus\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
+          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
+          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
+          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
+        </RegistryKey>
+      </Component>
+      <!-- Projects open in a new window on double-click. -->
+      <Component Id="ProjectFiles" Guid="9C3A61F4-7E28-4D05-A1B9-E6D420F7C83A">
+        <RegistryValue Root="HKMU" Key="Software\BareClip" Name="ProjectFiles" Type="integer" Value="1" KeyPath="yes" />
+        <RegistryKey Root="HKMU" Key="Software\Classes\.bareclip" ForceDeleteOnUninstall="yes">
+          <RegistryValue Type="string" Value="BareClip.Project" />
+          <RegistryValue Key="OpenWithProgids" Name="BareClip.Project" Type="string" Value="" />
+        </RegistryKey>
+        <RegistryKey Root="HKMU" Key="Software\Classes\BareClip.Project" ForceDeleteOnUninstall="yes">
+          <RegistryValue Type="string" Value="BareClip project" />
+          <RegistryValue Key="DefaultIcon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
+          <RegistryValue Key="shell\open\command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; &quot;%1&quot;" />
+        </RegistryKey>
+      </Component>
     </DirectoryRef>
 
     <DirectoryRef Id="LicensesDir">
@@ -358,6 +448,8 @@
       <ComponentRef Id="StartMenuDeclined" />
       <ComponentRef Id="DesktopChosen" />
       <ComponentRef Id="DesktopDeclined" />
+      <ComponentRef Id="EditWith" />
+      <ComponentRef Id="ProjectFiles" />
       <ComponentRef Id="Licenses" />
       <ComponentRef Id="StartMenuShortcut" />
       <ComponentRef Id="DesktopShortcut" />

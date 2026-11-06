@@ -1,16 +1,22 @@
 # Installs the MSI for the current user, checks the installed app really runs on its
 # own, then uninstalls it and checks nothing was left behind.
+# -MsiPath tests a particular file instead of the newest in dist.
+param([string]$MsiPath)
 $ErrorActionPreference = 'Stop'
 
 $Root = Split-Path -Parent $PSScriptRoot
-$Msi = Get-ChildItem (Join-Path $Root 'dist') -Filter 'BareClip-*.msi' |
-    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$Msi = if ($MsiPath) { Get-Item $MsiPath } else {
+    Get-ChildItem (Join-Path $Root 'dist') -Filter 'BareClip-*.msi' |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+}
 if (-not $Msi) { throw 'No MSI found. Run scripts/build-msi.ps1 first.' }
 
 $InstallDir = Join-Path $env:LOCALAPPDATA 'Programs\BareClip'
 $Shortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\BareClip.lnk'
 $Desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'BareClip.lnk'
 $Log = Join-Path $env:TEMP 'bareclip-msi-test.log'
+# The installer's right-click entry, which a test in text.rs holds to what the app takes.
+$EditTypes = 'mp4', 'mkv', 'mov', 'webm', 'avi', 'mp3', 'wav', 'flac', 'm4a', 'aac', 'ogg', 'opus'
 
 if (Test-Path $InstallDir) { throw "$InstallDir already exists, so this test will not touch it." }
 if (Test-Path $Desktop) { throw "$Desktop already exists, so this test will not touch it." }
@@ -94,6 +100,99 @@ try {
         # A failed check must not leave the app running while it is uninstalled.
         if ($App -and -not $App.HasExited) { Stop-Process -Id $App.Id -Force }
     }
+
+    # "Edit with BareClip" sits beside whatever opens videos and sound, and projects open in BareClip.
+    $Classes = 'HKCU:\Software\Classes'
+    $Exe = Join-Path $InstallDir 'bareclip.exe'
+    $EditCommand = "`"$Exe`" --edit `"%1`""
+    foreach ($Type in $EditTypes) {
+        $Verb = "$Classes\SystemFileAssociations\.$Type\shell\BareClip.Edit"
+        Assert-That ((Get-ItemProperty $Verb -ErrorAction SilentlyContinue).MUIVerb -eq 'Edit with BareClip') ".$Type has Edit with BareClip"
+        Assert-That ((Get-Item "$Verb\command").GetValue('') -eq $EditCommand) "  and it runs $EditCommand"
+    }
+    foreach ($Type in 'ts', 'png', 'jpg', 'bareclip') {
+        Assert-That (-not (Test-Path "$Classes\SystemFileAssociations\.$Type\shell\BareClip.Edit")) ".$Type has no Edit with BareClip"
+    }
+    Assert-That ((Get-Item "$Classes\.bareclip").GetValue('') -eq 'BareClip.Project') '.bareclip files belong to BareClip'
+    Assert-That ((Get-Item "$Classes\BareClip.Project\shell\open\command").GetValue('') -eq "`"$Exe`" `"%1`"") '  and open in it'
+    Assert-That ((Get-Item "$Classes\BareClip.Project\DefaultIcon").GetValue('') -eq "$Exe,0") '  with its icon'
+
+    $Media = Join-Path $env:TEMP "bareclip edit test $PID"
+    $AppData = Join-Path $env:TEMP "bareclip edit appdata $PID"
+    New-Item -ItemType Directory -Force $Media, $AppData | Out-Null
+    $Ffmpeg = Join-Path $Root 'vendor\ffmpeg\bin\ffmpeg.exe'
+    foreach ($Name in 'one', 'two', 'three') {
+        & $Ffmpeg -hide_banner -loglevel error -y -f lavfi -i 'testsrc=size=320x180:rate=30:duration=1' -pix_fmt yuv420p (Join-Path $Media "$Name.mp4")
+    }
+    & $Ffmpeg -hide_banner -loglevel error -y -f lavfi -i 'sine=frequency=440:duration=2' (Join-Path $Media 'song.m4a')
+    Set-Content (Join-Path $Media 'code.ts') 'export {}'
+    Set-Content (Join-Path $Media 'photo.png') ''
+
+    # The shell reads the same entries Explorer's menu does.
+    $Folder = (New-Object -ComObject Shell.Application).Namespace($Media)
+    $VerbsOf = { param($Name) @($Folder.ParseName($Name).Verbs() | ForEach-Object Name) }
+    Assert-That ((& $VerbsOf 'one.mp4') -contains 'Edit with BareClip') 'the shell offers Edit with BareClip on a video'
+    Assert-That ((& $VerbsOf 'song.m4a') -contains 'Edit with BareClip') '  and on sound'
+    Assert-That (-not ((& $VerbsOf 'code.ts') -contains 'Edit with BareClip')) '  but not on TypeScript'
+    Assert-That (-not ((& $VerbsOf 'photo.png') -contains 'Edit with BareClip')) '  or pictures'
+
+    # The window's recovery copy shows what reached it. The app's folder is moved to a temporary
+    # one for this, so your own settings and recovery copies are never touched.
+    $ClipsIn = {
+        param($Window)
+        $Copy = Get-ChildItem (Join-Path $AppData 'BareClip\recovery') -Filter "$($Window.Id)-*" -ErrorAction SilentlyContinue |
+            Where-Object Extension -ne '.lock' | Select-Object -First 1
+        if (-not $Copy) { return @(-1, -1) }
+        try { $Record = Get-Content $Copy.FullName -Raw | ConvertFrom-Json } catch { return @(-1, -1) }
+        @(@($Record.project.tracks | ForEach-Object { $_ }).Count, @($Record.project.audio_tracks | ForEach-Object { $_ }).Count)
+    }
+    $WaitForClips = {
+        param($Window, $Pictures, $Sounds)
+        $Clock = [Diagnostics.Stopwatch]::StartNew()
+        do {
+            $Counts = & $ClipsIn $Window
+            if ($Counts[0] -eq $Pictures -and $Counts[1] -eq $Sounds) { return $true }
+            Start-Sleep -Milliseconds 250
+        } while ($Clock.Elapsed.TotalSeconds -lt 30)
+        Write-Host "  last seen: $($Counts[0]) pictures and $($Counts[1]) sounds"
+        return $false
+    }
+    $SavedPath = $env:PATH
+    $SavedAppData = $env:LOCALAPPDATA
+    $Launches = @()
+    try {
+        $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+        $env:LOCALAPPDATA = $AppData
+        # Explorer starts one launch per chosen file, all at once.
+        $Launches = foreach ($Name in 'one.mp4', 'two.mp4', 'song.m4a') {
+            Start-Process $Exe -ArgumentList '--edit', "`"$(Join-Path $Media $Name)`"" -PassThru
+        }
+        foreach ($Launch in $Launches) { $null = $Launch.Handle }
+        $Clock = [Diagnostics.Stopwatch]::StartNew()
+        do {
+            $Open = @($Launches | Where-Object { -not $_.HasExited })
+            if ($Open.Count -gt 1) { Start-Sleep -Milliseconds 100 }
+        } while ($Open.Count -gt 1 -and $Clock.Elapsed.TotalSeconds -lt 20)
+        Assert-That ($Open.Count -eq 1) "three launches at once left one window open after $($Clock.ElapsedMilliseconds) ms"
+        $Gone = @($Launches | Where-Object HasExited)
+        Assert-That (@($Gone | Where-Object ExitCode -ne 0).Count -eq 0) '  and the others left cleanly'
+        $Window = $Open[0]
+        Assert-That (& $WaitForClips $Window 2 1) '  holding both videos and the sound on its timeline'
+
+        $Late = Start-Process $Exe -ArgumentList '--edit', "`"$(Join-Path $Media 'three.mp4')`"" -PassThru
+        $null = $Late.Handle
+        $Launches += $Late
+        Assert-That ($Late.WaitForExit(10000)) 'a launch while BareClip is open hands its file over and leaves'
+        Assert-That (& $WaitForClips $Window 3 1) '  and the open window puts it on the end'
+    }
+    finally {
+        $env:PATH = $SavedPath
+        $env:LOCALAPPDATA = $SavedAppData
+        # The project has unsaved changes, so closing would ask, and nothing here needs keeping.
+        foreach ($Launch in $Launches) { if (-not $Launch.HasExited) { Stop-Process -Id $Launch.Id -Force } }
+        Start-Sleep -Milliseconds 500
+        Remove-Item -Recurse -Force $Media, $AppData -ErrorAction SilentlyContinue
+    }
 }
 finally {
     $ExitCode = Invoke-Msi @('/x', "`"$($Msi.FullName)`"", '/qn')
@@ -104,6 +203,11 @@ Assert-That (-not (Test-Path $InstallDir)) 'the install folder is gone'
 Assert-That (-not (Test-Path $Shortcut)) 'the Start menu shortcut is gone'
 Assert-That (-not (Test-Path $Desktop)) 'the desktop shortcut is gone'
 Assert-That (-not (Test-Path 'HKCU:\Software\BareClip')) 'the registry entries are gone'
+foreach ($Type in $EditTypes) {
+    Assert-That (-not (Test-Path "HKCU:\Software\Classes\SystemFileAssociations\.$Type\shell\BareClip.Edit")) "Edit with BareClip is gone from .$Type"
+}
+Assert-That (-not (Test-Path 'HKCU:\Software\Classes\.bareclip')) '.bareclip is no longer registered'
+Assert-That (-not (Test-Path 'HKCU:\Software\Classes\BareClip.Project')) '  and neither is the project type'
 
 # A chosen folder holds a BareClip folder, and unticked shortcuts are left out. The space
 # in the name is on purpose.
