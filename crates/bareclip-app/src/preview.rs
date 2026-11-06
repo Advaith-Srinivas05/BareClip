@@ -71,6 +71,8 @@ pub struct Preview {
     project_length: Ticks,
     /// Whether pictures come out ready for the GPU compositor.
     planes: bool,
+    /// Videos with a clip that zooms in, which are decoded at full size to stay sharp.
+    sharp: Vec<MediaId>,
     /// The user moved the playhead, or started or stopped, since this was last asked about.
     jumped: bool,
     /// Which piece of the timeline the last picture came from.
@@ -98,6 +100,7 @@ impl Preview {
             spans: Vec::new(),
             project_length: Ticks(0),
             planes: false,
+            sharp: Vec::new(),
             jumped: false,
             last_picture_from: None,
             shown_footage: None,
@@ -224,7 +227,8 @@ impl Preview {
             self.slots.push(slot);
         } else {
             let info = lookup(media)?;
-            match Player::open_as(&info, self.planes, self.notify.clone()) {
+            let sharp = self.sharp.contains(&media);
+            match Player::open_as(&info, self.planes, sharp, self.notify.clone()) {
                 Ok(player) => {
                     if self.slots.len() >= MAX_OPEN_PLAYERS {
                         self.slots.remove(0);
@@ -249,6 +253,48 @@ impl Preview {
     /// Whether pictures are coming out ready for the GPU compositor.
     pub fn planes(&self) -> bool {
         self.planes
+    }
+
+    #[cfg(test)]
+    pub fn is_sharp(&self, media: MediaId) -> bool {
+        self.sharp.contains(&media)
+    }
+
+    /// Which videos are decoded at full size because a clip of theirs zooms in. Their players
+    /// can't change size, so those that change close, and playback picks up from the same place.
+    pub fn set_sharp(
+        &mut self,
+        sharp: Vec<MediaId>,
+        timeline: &Timeline,
+        lookup: &dyn Fn(MediaId) -> Option<MediaInfo>,
+    ) {
+        if self.sharp == sharp {
+            return;
+        }
+        let changed: Vec<MediaId> = self
+            .sharp
+            .iter()
+            .chain(&sharp)
+            .filter(|media| self.sharp.contains(media) != sharp.contains(media))
+            .copied()
+            .collect();
+        let position = self.position(timeline);
+        self.sharp = sharp;
+        self.slots.retain(|slot| !changed.contains(&slot.media));
+        if self
+            .prepared
+            .as_ref()
+            .is_some_and(|prepared| changed.contains(&prepared.media))
+        {
+            self.prepared = None;
+        }
+        if self
+            .current
+            .is_some_and(|(_, media)| changed.contains(&media))
+        {
+            self.current = None;
+            self.seek(timeline, lookup, position);
+        }
     }
 
     /// Switches between plain pictures and ones ready for the GPU compositor. Open players can't
@@ -322,7 +368,8 @@ impl Preview {
         let Some(info) = lookup(next.media) else {
             return;
         };
-        match Player::open_as(&info, self.planes, self.notify.clone()) {
+        let sharp = self.sharp.contains(&next.media);
+        match Player::open_as(&info, self.planes, sharp, self.notify.clone()) {
             Ok(mut player) => {
                 player.prepare(next.source.start);
                 self.prepared = Some(Prepared {

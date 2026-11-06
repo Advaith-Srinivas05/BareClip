@@ -753,6 +753,7 @@ impl Tracks {
             let hides = partner.is_none()
                 && !clip.is_still()
                 && !clip.look.has_fade()
+                && !clip.look.effects.may_show_through()
                 && size_of(clip.media).is_some_and(|size| {
                     clip.placement
                         .at(Ticks(time.0 - clip.start.0))

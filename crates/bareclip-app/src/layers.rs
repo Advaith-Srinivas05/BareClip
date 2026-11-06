@@ -8,7 +8,7 @@ use std::{
 };
 
 use bareclip_core::{
-    effects::{Filter, LayerJoin, TransitionKind},
+    effects::{ClipLook, Filter, LayerJoin, TransitionKind},
     picture::StillPicture,
     speed::{NORMAL, Speed},
     time::{TICKS_PER_SECOND, Ticks},
@@ -95,7 +95,9 @@ pub fn should_catch_up(
 
 /// Whether what is drawn for this stack differs from one moment to the next, even with no new picture.
 fn changes_over_time(stack: &[Clip]) -> bool {
-    stack.iter().any(|clip| clip.look.has_fade())
+    stack
+        .iter()
+        .any(|clip| clip.look.has_fade() || clip.look.effects.move_over_time())
         || stack
             .windows(2)
             .any(|pair| join_between(&pair[0], &pair[1], Ticks(0)).is_some())
@@ -118,6 +120,8 @@ fn clip_of_piece(stack: &[Clip], piece: &Clip) -> Option<ClipId> {
 
 struct Follower {
     clip: ClipId,
+    /// Decoded at full size, because the clip zooms in.
+    sharp: bool,
     /// Still getting ready for when this clip first goes under another.
     waiting: bool,
     player: Player,
@@ -167,10 +171,10 @@ impl LayerPictures {
         };
 
         self.followers.retain(|follower| {
-            let wanted = under
-                .iter()
-                .chain(&coming)
-                .any(|clip| clip.id == follower.clip);
+            // One whose clip has started or stopped zooming opens again at the other size.
+            let wanted = under.iter().chain(&coming).any(|clip| {
+                clip.id == follower.clip && clip.look.effects.zooms_in() == follower.sharp
+            });
             // One that was getting ready for a moment that was jumped away from starts over.
             wanted && !(follower.waiting && moment.jumped)
         });
@@ -183,11 +187,13 @@ impl LayerPictures {
             let Some(info) = lookup(clip.media) else {
                 continue;
             };
-            match Player::open_as(&info, true, notify.clone()) {
+            let sharp = clip.look.effects.zooms_in();
+            match Player::open_as(&info, true, sharp, notify.clone()) {
                 Ok(mut player) => {
                     player.prepare(wanted_time(clip, coming_at, lookup));
                     self.followers.push(Follower {
                         clip: clip.id,
+                        sharp,
                         waiting: true,
                         player,
                         shown: None,
@@ -205,7 +211,8 @@ impl LayerPictures {
             let Some(info) = lookup(clip.media) else {
                 continue;
             };
-            match Player::open_as(&info, true, notify.clone()) {
+            let sharp = clip.look.effects.zooms_in();
+            match Player::open_as(&info, true, sharp, notify.clone()) {
                 Ok(mut player) => {
                     player.seek(wanted_time(clip, moment.now, lookup));
                     if moment.playing {
@@ -213,6 +220,7 @@ impl LayerPictures {
                     }
                     self.followers.push(Follower {
                         clip: clip.id,
+                        sharp,
                         waiting: false,
                         player,
                         shown: None,
@@ -334,6 +342,11 @@ impl LayerPictures {
                 in_stack.push(index);
                 let mut look = placement.look();
                 look.grade = clip.look.grade();
+                look.effects = clip.look.effects.at(
+                    Ticks(now.0 - clip.start.0),
+                    clip.duration(),
+                    clip.source.start.0,
+                );
                 Some(Layer {
                     picture,
                     rect: scaled_rect(placement.rect(size, canvas), canvas, target),
@@ -599,34 +612,48 @@ impl CardDrawer {
         Some(self.live_texture)
     }
 
-    fn filter_card(&mut self, picture: LayerPicture, filter: Filter) -> Option<StillPicture> {
-        let mut look = bareclip_render::PictureLook::PLAIN;
-        look.grade = filter.grade();
-        let layer = Layer {
+    fn card_layer(picture: LayerPicture, look: bareclip_render::PictureLook) -> Layer {
+        Layer {
             rect: bareclip_render::fit_inside(picture.size(), CARD_SIZE),
             picture,
             opacity: 1.0,
             look,
-        };
-        self.stills.draw_for_display(&[layer]).ok()?;
+        }
+    }
+
+    /// A card of a clip's picture with a look on it, such as a filter or an effect at one moment.
+    pub fn look_card(
+        &mut self,
+        picture: LayerPicture,
+        look: bareclip_render::PictureLook,
+    ) -> Option<StillPicture> {
+        self.stills
+            .draw_for_display(&[Self::card_layer(picture, look)])
+            .ok()?;
         let rgba = self.stills.read_display().ok()?;
         Some(StillPicture::new(CARD_SIZE.0, CARD_SIZE.1, rgba))
     }
 
-    pub fn filter_on_still(
+    /// The same, drawn on the canvas that is on show, for a card that is moving.
+    pub fn live_look_card(
         &mut self,
-        still: &StillPicture,
-        filter: Filter,
-    ) -> Option<StillPicture> {
-        self.filter_card(still.into(), filter)
+        picture: LayerPicture,
+        look: bareclip_render::PictureLook,
+    ) -> Option<egui::TextureId> {
+        self.live
+            .draw_for_display(&[Self::card_layer(picture, look)])
+            .ok()?;
+        Some(self.live_texture)
     }
 
-    pub fn filter_on_video(
-        &mut self,
-        picture: &bareclip_media::DecodedPicture,
-        filter: Filter,
-    ) -> Option<StillPicture> {
-        self.filter_card(picture.view().into(), filter)
+    pub fn filter_card(&mut self, picture: LayerPicture, filter: Filter) -> Option<StillPicture> {
+        let mut look = bareclip_render::PictureLook::PLAIN;
+        look.grade = ClipLook {
+            filter,
+            ..ClipLook::default()
+        }
+        .grade();
+        self.look_card(picture, look)
     }
 }
 
@@ -650,6 +677,7 @@ fn scaled_rect(
 mod tests {
     use super::*;
     use bareclip_core::effects::{ClipLook, Transition};
+    use bareclip_core::picture_effects::EffectKind;
     use std::{path::PathBuf, process::Command, sync::Arc, thread};
 
     use bareclip_core::{
@@ -1810,6 +1838,28 @@ mod tests {
     }
 
     #[test]
+    fn effects_look_the_same_in_the_preview_and_the_export() {
+        if compositor_of((64, 64)).is_none() {
+            return;
+        }
+        for (kind, name, at) in [
+            (EffectKind::CrashZoom, "crash-zoom", 1.0),
+            (EffectKind::Spin, "spin", 0.8),
+            (EffectKind::Comic, "comic", 1.0),
+            (EffectKind::Glow, "glow", 1.0),
+            (EffectKind::Disco, "disco", 1.0),
+        ] {
+            let mut look = ClipLook::default();
+            look.effects.set(kind, true);
+            let difference = joined_clips_match(TransitionKind::CrossFade, name, at, look);
+            assert!(
+                difference < 8.0,
+                "{name} differs from the preview by {difference:.2} out of 255"
+            );
+        }
+    }
+
+    #[test]
     fn colours_dont_jump_between_a_plain_preview_and_a_layered_one() {
         let path = detailed_clip("colours", "testsrc2");
         let size = (640, 360);
@@ -1946,6 +1996,14 @@ mod tests {
                 if index > 0 { overlays_from } else { Ticks(0) },
                 TrackTarget::New(0),
             );
+            // With BARECLIP_GATE_ZOOM set, every clip has Crash zoom on, so every video is
+            // decoded at full size to stay sharp.
+            if std::env::var_os("BARECLIP_GATE_ZOOM").is_some() {
+                let mut look = bareclip_core::effects::ClipLook::default();
+                look.effects
+                    .set(bareclip_core::picture_effects::EffectKind::CrashZoom, true);
+                tracks.set_look(id, look);
+            }
             if index > 0 {
                 tracks.set_placement(
                     id,
@@ -2004,6 +2062,10 @@ mod tests {
         let notify: Notify = Arc::new(|| {});
         let mut preview = Preview::new(on_sound_card, notify.clone());
         preview.set_planes(true, tracks.played(), &lookup);
+        if std::env::var_os("BARECLIP_GATE_ZOOM").is_some() {
+            let every = (0..infos.len() as u64).map(MediaId).collect();
+            preview.set_sharp(every, tracks.played(), &lookup);
+        }
         if on_sound_card {
             let spans = tracks
                 .tracks()

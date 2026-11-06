@@ -359,7 +359,9 @@ pub fn export_layered(
             Some(index) => {
                 let stack = &stretches[index].stack;
                 // Fades and transitions change the picture even when no clip has a new one.
-                stack_changed |= stack.iter().any(|clip| clip.look.has_fade())
+                stack_changed |= stack
+                    .iter()
+                    .any(|clip| clip.look.has_fade() || clip.look.effects.move_over_time())
                     || stack
                         .windows(2)
                         .any(|pair| join_between(&pair[0], &pair[1], time).is_some());
@@ -414,6 +416,11 @@ pub fn export_layered(
                             in_stack.push(index);
                             let mut look = placement.look();
                             look.grade = clip.look.grade();
+                            look.effects = clip.look.effects.at(
+                                Ticks(time.0 - clip.start.0),
+                                Ticks(clip.end().0 - clip.start.0),
+                                clip.source.start.0,
+                            );
                             let opacity = placement.opacity as f32 / WHOLE as f32;
                             Some(Layer {
                                 picture,

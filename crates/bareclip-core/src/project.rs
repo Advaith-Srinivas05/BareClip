@@ -23,7 +23,7 @@ use crate::{
 
 pub const EXTENSION: &str = "bareclip";
 /// Goes up whenever the format changes in a way older versions can't read.
-const CURRENT_VERSION: u32 = 7;
+const CURRENT_VERSION: u32 = 8;
 /// Files older than this had their size worked out from the largest video.
 const FIRST_VERSION_WITH_CANVAS: u32 = 3;
 pub const DEFAULT_NAME: &str = "untitled";

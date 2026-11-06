@@ -19,6 +19,7 @@ use bareclip_core::{
     },
     history::History,
     picture::StillPicture,
+    picture_effects::EffectKind,
     placement::Placement,
     project::{self, ProjectFile, write_atomic},
     sound::ClipSound,
@@ -556,6 +557,9 @@ pub struct Editor {
     picture_menu: Option<(ClipId, egui::Pos2, bool)>,
     transition_search: String,
     filter_search: String,
+    effect_search: String,
+    /// The effect whose settings are open in the Effects tab.
+    effect_settings: Option<EffectKind>,
     look_pictures: LookPictures,
     look_panel_open: bool,
     look_tab: LookTab,
@@ -714,6 +718,8 @@ impl Editor {
             picture_menu: None,
             transition_search: String::new(),
             filter_search: String::new(),
+            effect_search: String::new(),
+            effect_settings: None,
             look_pictures: LookPictures::default(),
             look_panel_open: false,
             look_tab: LookTab::default(),
@@ -1798,6 +1804,17 @@ impl Editor {
                 display.forget();
             }
         }
+        let mut sharp: Vec<MediaId> = project
+            .tracks
+            .picture_tracks()
+            .iter()
+            .flat_map(Timeline::clips)
+            .filter(|clip| clip.look.effects.zooms_in())
+            .map(|clip| clip.media)
+            .collect();
+        sharp.sort_unstable();
+        sharp.dedup();
+        preview.set_sharp(sharp, project.tracks.played_videos(), &lookup);
         preview.set_sound(
             heard_spans(media, &project.tracks),
             project.tracks.duration(),
@@ -6737,6 +6754,12 @@ mod tests {
             .find(|(label, ..)| label == name)
             .unwrap_or_else(|| panic!("nothing is named {name}"))
             .1
+    }
+
+    fn has_named(ctx: &egui::Context, editor: &mut Editor, name: &str) -> bool {
+        named_nodes(ctx, editor)
+            .iter()
+            .any(|(label, ..)| label == name)
     }
 
     fn click_named(ctx: &egui::Context, editor: &mut Editor, name: &str) {
@@ -13175,6 +13198,25 @@ mod tests {
         editor.look_tab = LookTab::Fade;
         settle(&ctx, &mut editor);
         camera.shoot(&ctx, &mut editor, vec![], "look-05-fade");
+
+        editor.look_tab = LookTab::Filters;
+        settle(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Filter Bold and blue");
+        settle(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "look-06-filter-intensity");
+
+        editor.look_tab = LookTab::Effects;
+        for _ in 0..120 {
+            run_frame(&ctx, &mut editor, vec![]);
+            thread::sleep(Duration::from_millis(10));
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "look-07-effects");
+
+        click_named(&ctx, &mut editor, "Effect Pulse");
+        settle(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Effect Flash");
+        settle(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "look-08-effect-settings");
     }
 
     /// Two videos side by side on one row.
@@ -13445,6 +13487,124 @@ mod tests {
         run_frame(&ctx, &mut editor, vec![]);
         let clip = editor.project.tracks.tracks()[0].clips()[0];
         assert_eq!(clip.look.filter, Filter::None);
+    }
+
+    #[test]
+    fn a_chosen_filter_shows_its_intensity_which_starts_where_it_was_measured() {
+        let ctx = context();
+        let (mut editor, first, _) = with_two_touching_clips(&ctx);
+        editor.selected = Some(first);
+        editor.look_panel_open = true;
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(!has_named(&ctx, &mut editor, "Intensity"));
+        click_named(&ctx, &mut editor, "Filter Orange and teal");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(has_named(&ctx, &mut editor, "Intensity"));
+        let clip = editor.project.tracks.clip(first).expect("it is there");
+        assert_eq!(
+            clip.look.filter_intensity,
+            bareclip_core::effects::FILTER_INTENSITY_START
+        );
+    }
+
+    #[test]
+    fn effects_turn_on_and_off_several_at_once_and_none_clears_them() {
+        let ctx = context();
+        let (mut editor, first, _) = with_two_touching_clips(&ctx);
+        editor.selected = Some(first);
+        editor.look_panel_open = true;
+        editor.look_tab = LookTab::Effects;
+        run_frame(&ctx, &mut editor, vec![]);
+        let effects = |editor: &Editor| {
+            editor
+                .project
+                .tracks
+                .clip(first)
+                .expect("it is there")
+                .look
+                .effects
+        };
+        click_named(&ctx, &mut editor, "Effect Flash");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(effects(&editor).is_on(EffectKind::Flash));
+        // Turning one on shows its settings.
+        assert_eq!(editor.effect_settings, Some(EffectKind::Flash));
+        assert!(has_named(&ctx, &mut editor, "Speed"));
+        click_named(&ctx, &mut editor, "Effect VHS");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(effects(&editor).is_on(EffectKind::Flash));
+        assert!(effects(&editor).is_on(EffectKind::Vhs));
+        click_named(&ctx, &mut editor, "Effect Flash");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(!effects(&editor).is_on(EffectKind::Flash));
+        click_named(&ctx, &mut editor, "Effect None");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(!effects(&editor).any());
+    }
+
+    #[test]
+    fn an_effects_settings_change_it_and_its_button_opens_and_closes_them() {
+        let ctx = context();
+        let (mut editor, first, _) = with_two_touching_clips(&ctx);
+        editor.selected = Some(first);
+        editor.look_panel_open = true;
+        editor.look_tab = LookTab::Effects;
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Effect Crash zoom");
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Top left");
+        run_frame(&ctx, &mut editor, vec![]);
+        let clip = editor.project.tracks.clip(first).expect("it is there");
+        assert_eq!(clip.look.effects.value(EffectKind::CrashZoom, 0), 0);
+        click_named(&ctx, &mut editor, "Effect settings");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.effect_settings, None);
+        assert!(!has_named(&ctx, &mut editor, "Top left"));
+        click_named(&ctx, &mut editor, "Effect settings");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.effect_settings, Some(EffectKind::CrashZoom));
+    }
+
+    #[test]
+    fn a_zoom_effect_keeps_its_video_sharp_in_the_preview() {
+        let ctx = context();
+        let (mut editor, first, _) = with_two_touching_clips(&ctx);
+        let media = editor
+            .project
+            .tracks
+            .clip(first)
+            .expect("it is there")
+            .media;
+        editor.selected = Some(first);
+        editor.look_panel_open = true;
+        editor.look_tab = LookTab::Effects;
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(!editor.preview.is_sharp(media));
+        click_named(&ctx, &mut editor, "Effect Pulse");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.preview.is_sharp(media));
+        click_named(&ctx, &mut editor, "Effect None");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(!editor.preview.is_sharp(media));
+    }
+
+    #[test]
+    fn an_effect_means_redrawing_on_export_and_comes_back_after_undo() {
+        let ctx = context();
+        let (mut editor, first, _) = with_two_touching_clips(&ctx);
+        editor.selected = Some(first);
+        editor.look_panel_open = true;
+        editor.look_tab = LookTab::Effects;
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Effect Pulse");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(matches!(editor.export_route(), Route::Full(_)));
+        editor.settle_title_edit(&ctx);
+        run_frame(&ctx, &mut editor, vec![]);
+        editor.undo();
+        run_frame(&ctx, &mut editor, vec![]);
+        let clip = editor.project.tracks.tracks()[0].clips()[0];
+        assert!(!clip.look.effects.any());
     }
 
     #[test]

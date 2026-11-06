@@ -5,6 +5,7 @@ pub mod effects;
 pub mod history;
 pub mod motion;
 pub mod picture;
+pub mod picture_effects;
 pub mod placement;
 pub mod playback;
 pub mod project;

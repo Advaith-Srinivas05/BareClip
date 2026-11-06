@@ -464,6 +464,7 @@ version = "0.2.0"
 dependencies = [
  "bareclip-core",
  "bytemuck",
+ "naga",
  "pollster 1.0.1",
  "wgpu",
 ]

@@ -1,9 +1,12 @@
-//! What a clip looks like beyond where it sits: its filter, colour adjustments and picture fades, and
-//! the transition from it into the clip after it.
+//! What a clip looks like beyond where it sits: its filter, colour adjustments, picture fades and
+//! effects, and the transition from it into the clip after it.
 
 use serde::{Deserialize, Serialize};
 
-use crate::time::Ticks;
+use crate::{picture_effects::Effects, time::Ticks};
+
+#[path = "filter_grades.rs"]
+mod filter_grades;
 
 /// How far each colour adjustment can go either way.
 pub const ADJUST_RANGE: i32 = 1000;
@@ -320,63 +323,66 @@ pub const FILTERS: [Filter; 49] = {
     ]
 };
 
-/// What a filter does to colours, as numbers the shader can use. Worked out in BareClip's own terms,
-/// not copied from anywhere, so each only aims at what its name and thumbnail suggest.
+/// How many points each colour's curve has, evenly spaced from 0 to 1.
+pub const CURVE_POINTS: usize = 9;
+/// Where a filter's Intensity slider starts, out of `FILTER_INTENSITY_TOP`. That is where it is in
+/// a sample photo, and how strong each filter is in the sample recording.
+pub const FILTER_INTENSITY_START: i32 = 500;
+pub const FILTER_INTENSITY_TOP: i32 = 1000;
+
+/// What a filter does to colours at its usual strength: a mix of red, green and blue with
+/// something added, and then a curve for each colour. The filters in a sample recording were
+/// measured from it, through `scripts/fit-filters.py`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FilterGrade {
+    /// Each row makes one colour from red, green and blue, plus the last number.
+    pub mix: [[f32; 4]; 3],
+    pub curves: [[f32; CURVE_POINTS]; 3],
+}
+
+impl FilterGrade {
+    pub const NONE: Self = Self {
+        mix: [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ],
+        curves: [[0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0]; 3],
+    };
+
+    /// What it does to one colour, the same sum the shader does.
+    pub fn apply(&self, colour: [f32; 3]) -> [f32; 3] {
+        let mut out = [0.0; 3];
+        for (channel, value) in out.iter_mut().enumerate() {
+            let row = self.mix[channel];
+            let mixed = row[0] * colour[0] + row[1] * colour[1] + row[2] * colour[2] + row[3];
+            let spot = mixed.clamp(0.0, 1.0) * (CURVE_POINTS - 1) as f32;
+            let index = (spot as usize).min(CURVE_POINTS - 2);
+            let along = spot - index as f32;
+            let points = self.curves[channel];
+            *value = points[index] * (1.0 - along) + points[index + 1] * along;
+        }
+        out
+    }
+}
+
+/// What to do to a picture's colours, as numbers the shader can use.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Grade {
-    /// Exposure, contrast, saturation and temperature, each 0 for no change.
-    pub basic: [f32; 4],
-    /// What the darkest parts are multiplied by, and how much of it to use in the last place.
-    pub shadows: [f32; 3],
-    /// What the brightest parts are multiplied by.
-    pub highlights: [f32; 3],
-    /// The colours dark and light parts become, and how far they go there.
-    pub duotone: ([f32; 3], [f32; 3], f32),
-    /// A colour to wash over everything, and how much.
-    pub wash: ([f32; 3], f32),
-    /// The clip's own Exposure, Contrast, Saturation and Temperature, on top of all that.
+    pub filter: FilterGrade,
+    /// How much of the filter to use. 1 is as measured, 0 is none and 2 is twice as far.
+    pub strength: f32,
+    /// The clip's own Exposure, Contrast, Saturation and Temperature, on top of the filter, each 0
+    /// for no change.
     pub adjust: [f32; 4],
 }
 
 impl Grade {
     pub const NONE: Self = Self {
-        basic: [0.0; 4],
-        shadows: [1.0; 3],
-        highlights: [1.0; 3],
-        duotone: ([0.0; 3], [1.0; 3], 0.0),
-        wash: ([0.0; 3], 0.0),
+        filter: FilterGrade::NONE,
+        strength: 0.0,
         adjust: [0.0; 4],
     };
-
-    fn basic(exposure: f32, contrast: f32, saturation: f32, temperature: f32) -> Self {
-        Self {
-            basic: [exposure, contrast, saturation, temperature],
-            ..Self::NONE
-        }
-    }
-
-    fn tinted(self, shadows: [f32; 3], highlights: [f32; 3]) -> Self {
-        Self {
-            shadows,
-            highlights,
-            ..self
-        }
-    }
-
-    fn duotone(dark: [f32; 3], light: [f32; 3]) -> Self {
-        Self {
-            basic: [0.0, 0.15, 0.0, 0.0],
-            duotone: (dark, light, 1.0),
-            ..Self::NONE
-        }
-    }
-
-    fn wash(colour: [f32; 3], amount: f32) -> Self {
-        Self {
-            wash: (colour, amount),
-            ..Self::NONE
-        }
-    }
 }
 
 impl Filter {
@@ -435,105 +441,19 @@ impl Filter {
         }
     }
 
-    #[allow(clippy::too_many_lines)] // One line for each filter reads best as a single table.
-    pub fn grade(self) -> Grade {
-        let basic = Grade::basic;
-        let warm_shadows = [1.05, 0.98, 0.9];
-        let cool_shadows = [0.9, 0.98, 1.08];
-        match self {
-            Self::None => Grade::NONE,
-            Self::Retro => {
-                basic(0.05, -0.1, -0.2, 0.25).tinted([1.1, 1.0, 0.85], [1.02, 0.98, 0.85])
-            }
-            Self::OrangeAndTeal => {
-                basic(0.0, 0.15, 0.15, 0.0).tinted([0.8, 1.0, 1.15], [1.15, 1.0, 0.82])
-            }
-            Self::BoldAndBlue => {
-                basic(0.0, 0.2, 0.2, -0.4).tinted([0.9, 0.95, 1.2], [0.98, 1.0, 1.1])
-            }
-            Self::GoldenHour => {
-                basic(0.08, 0.05, 0.1, 0.45).tinted(warm_shadows, [1.08, 1.0, 0.85])
-            }
-            Self::VibrantVlogger => basic(0.08, 0.12, 0.4, 0.05),
-            Self::PurpleUndertone => {
-                basic(0.0, 0.08, 0.05, -0.05).tinted([1.1, 0.85, 1.2], [1.05, 0.96, 1.05])
-            }
-            Self::WinterSunset => {
-                basic(0.0, 0.08, 0.05, 0.1).tinted([0.9, 0.9, 1.2], [1.12, 0.98, 0.9])
-            }
-            Self::Film35mm => {
-                basic(0.0, -0.12, -0.1, 0.08).tinted([1.05, 1.0, 0.95], [1.0, 0.98, 0.92])
-            }
-            Self::Contrast => basic(0.0, 0.4, 0.05, 0.0),
-            Self::Autumn => {
-                basic(0.0, 0.1, 0.05, 0.35).tinted([1.05, 0.95, 0.85], [1.08, 0.98, 0.82])
-            }
-            Self::Winter => basic(0.03, 0.08, -0.15, -0.45),
-            Self::OldWestern => {
-                basic(0.0, 0.05, -0.55, 0.5).tinted([1.05, 0.92, 0.78], [1.05, 0.98, 0.85])
-            }
-            Self::WarmCoastline => basic(0.05, 0.02, 0.05, 0.25),
-            Self::CoolCoastline => basic(0.05, 0.02, 0.05, -0.28),
-            Self::WarmCountryside => {
-                basic(0.03, 0.05, 0.15, 0.2).tinted(warm_shadows, [1.03, 1.02, 0.92])
-            }
-            Self::CoolCountryside => {
-                basic(0.03, 0.05, 0.12, -0.2).tinted(cool_shadows, [0.97, 1.02, 1.03])
-            }
-            Self::Golden => {
-                basic(0.05, 0.05, 0.05, 0.6).tinted([1.05, 1.0, 0.82], [1.08, 1.02, 0.8])
-            }
-            Self::Dreamscape => {
-                basic(0.1, -0.2, 0.15, -0.05).tinted([1.05, 0.92, 1.15], [1.03, 1.0, 1.05])
-            }
-            Self::Sunrise => {
-                basic(0.1, 0.0, 0.12, 0.3).tinted([1.05, 0.92, 0.95], [1.1, 1.0, 0.86])
-            }
-            Self::WarmToneFilm => {
-                basic(0.0, 0.1, 0.05, 0.3).tinted([1.1, 0.95, 0.85], [1.05, 0.98, 0.85])
-            }
-            Self::CoolTone => basic(0.0, 0.05, -0.05, -0.32),
-            Self::PastelDreams => {
-                basic(0.14, -0.3, -0.15, 0.05).tinted([1.12, 1.02, 1.12], [1.02, 1.0, 1.02])
-            }
-            Self::Increased => basic(0.05, 0.2, 0.25, 0.0),
-            Self::Scenery => basic(0.0, 0.15, 0.3, -0.05),
-            Self::Portrait => basic(0.06, -0.05, -0.05, 0.12),
-            Self::Indoors => basic(0.1, 0.03, 0.05, -0.15),
-            Self::Outdoors => basic(0.04, 0.1, 0.12, 0.08),
-            Self::Muted => basic(0.0, -0.15, -0.4, 0.0),
-            Self::BlackAndWhite1 => basic(0.0, 0.12, -1.0, 0.0),
-            Self::BlackAndWhite2 => basic(0.0, 0.35, -1.0, 0.0),
-            Self::SoftBlackAndWhite => basic(0.08, -0.2, -1.0, 0.0),
-            Self::MutedBlackAndWhite => basic(0.0, -0.35, -1.0, 0.0),
-            Self::Gloomy => basic(-0.3, 0.45, -1.0, 0.0),
-            Self::DeepFried => basic(0.25, 0.9, 2.2, 0.35),
-            Self::Euphoric => {
-                basic(0.1, 0.45, 1.5, -0.3).tinted([0.9, 0.85, 1.3], [1.1, 0.95, 1.1])
-            }
-            Self::YellowOrangeDuotone => Grade::duotone([0.86, 0.18, 0.0], [1.0, 0.86, 0.1]),
-            Self::PinkPurpleDuotone => Grade::duotone([0.3, 0.0, 0.75], [0.95, 0.1, 0.9]),
-            Self::BluePinkDuotone => Grade::duotone([0.12, 0.1, 0.9], [1.0, 0.25, 0.9]),
-            Self::GreenBlueDuotone => Grade::duotone([0.0, 0.2, 0.75], [0.0, 0.95, 0.65]),
-            Self::WhiteOverlay => Grade::wash([1.0, 1.0, 1.0], 0.45),
-            Self::BlackOverlay => Grade::wash([0.0, 0.0, 0.0], 0.55),
-            Self::YellowOverlay => Grade::wash([0.95, 0.85, 0.05], 0.6),
-            Self::OrangeOverlay => Grade::wash([0.95, 0.5, 0.05], 0.6),
-            Self::RedOverlay => Grade::wash([0.95, 0.08, 0.08], 0.6),
-            Self::PinkOverlay => Grade::wash([0.95, 0.15, 0.6], 0.6),
-            Self::PurpleOverlay => Grade::wash([0.55, 0.12, 0.85], 0.6),
-            Self::BlueOverlay => Grade::wash([0.1, 0.45, 0.95], 0.6),
-            Self::TurquoiseOverlay => Grade::wash([0.1, 0.85, 0.8], 0.6),
-            Self::GreenOverlay => Grade::wash([0.1, 0.85, 0.3], 0.6),
-        }
+    /// What it does at its usual strength.
+    pub fn grade(self) -> FilterGrade {
+        filter_grades::filter_grade(self)
     }
 }
 
 /// What a clip's picture looks like, beyond where it sits. It belongs to the whole clip.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClipLook {
     pub filter: Filter,
+    /// How strong the filter is, from 0 to `FILTER_INTENSITY_TOP`.
+    pub filter_intensity: i32,
     /// Each from `-ADJUST_RANGE` to `ADJUST_RANGE`, with 0 for no change.
     pub exposure: i32,
     pub contrast: i32,
@@ -543,6 +463,23 @@ pub struct ClipLook {
     pub fade_in: i64,
     /// How long the picture takes to go, in ticks.
     pub fade_out: i64,
+    pub effects: Effects,
+}
+
+impl Default for ClipLook {
+    fn default() -> Self {
+        Self {
+            filter: Filter::None,
+            filter_intensity: FILTER_INTENSITY_START,
+            exposure: 0,
+            contrast: 0,
+            saturation: 0,
+            temperature: 0,
+            fade_in: 0,
+            fade_out: 0,
+            effects: Effects::default(),
+        }
+    }
 }
 
 impl ClipLook {
@@ -552,7 +489,7 @@ impl ClipLook {
 
     /// Filter and adjustments only, leaving fades out.
     pub fn changes_colour(&self) -> bool {
-        self.filter != Filter::None
+        (self.filter != Filter::None && self.filter_intensity > 0)
             || self.exposure != 0
             || self.contrast != 0
             || self.saturation != 0
@@ -570,13 +507,14 @@ impl ClipLook {
         }
         let part = |value: i32| value as f32 / ADJUST_RANGE as f32;
         Grade {
+            filter: self.filter.grade(),
+            strength: self.filter_intensity as f32 / FILTER_INTENSITY_START as f32,
             adjust: [
                 part(self.exposure),
                 part(self.contrast),
                 part(self.saturation),
                 part(self.temperature),
             ],
-            ..self.filter.grade()
         }
     }
 
@@ -599,6 +537,7 @@ impl ClipLook {
     pub fn checked(self) -> Self {
         let adjust = |value: i32| value.clamp(-ADJUST_RANGE, ADJUST_RANGE);
         Self {
+            filter_intensity: self.filter_intensity.clamp(0, FILTER_INTENSITY_TOP),
             exposure: adjust(self.exposure),
             contrast: adjust(self.contrast),
             saturation: adjust(self.saturation),
@@ -638,7 +577,7 @@ mod tests {
     fn filters_all_have_their_own_names_and_change_something() {
         for filter in FILTERS {
             assert_ne!(filter, Filter::None);
-            assert_ne!(filter.grade(), Grade::NONE, "{filter:?}");
+            assert_ne!(filter.grade(), FilterGrade::NONE, "{filter:?}");
             assert_eq!(
                 FILTERS.iter().filter(|f| f.name() == filter.name()).count(),
                 1,
@@ -691,7 +630,60 @@ mod tests {
         };
         let grade = look.grade();
         assert_eq!(grade.adjust[0], 0.5);
-        assert_eq!(grade.basic, Filter::Winter.grade().basic);
+        assert_eq!(grade.filter, Filter::Winter.grade());
+        assert_eq!(grade.strength, 1.0);
+    }
+
+    #[test]
+    fn intensity_starts_at_the_strength_the_filter_was_measured_at() {
+        let look = ClipLook {
+            filter: Filter::Golden,
+            ..ClipLook::default()
+        };
+        assert_eq!(look.grade().strength, 1.0);
+        let none = ClipLook {
+            filter_intensity: 0,
+            ..look
+        };
+        assert!(!none.changes_colour());
+        let most = ClipLook {
+            filter_intensity: FILTER_INTENSITY_TOP,
+            ..look
+        };
+        assert_eq!(most.grade().strength, 2.0);
+    }
+
+    #[test]
+    fn no_filter_leaves_every_colour_alone() {
+        for colour in [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [0.2, 0.6, 0.9]] {
+            let out = FilterGrade::NONE.apply(colour);
+            for (got, wanted) in out.iter().zip(colour) {
+                assert!((got - wanted).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn measured_filters_do_what_their_names_say() {
+        let grey = [0.5, 0.5, 0.5];
+        let [r, g, b] = Filter::BlackAndWhite1.grade().apply([0.8, 0.3, 0.1]);
+        assert!((r - g).abs() < 0.03 && (g - b).abs() < 0.03, "{r} {g} {b}");
+        let [r, _, b] = Filter::Golden.grade().apply(grey);
+        assert!(r > b + 0.03, "{r} {b}");
+        let [r, g, b] = Filter::BlackOverlay.grade().apply(grey);
+        assert!(r < 0.4 && g < 0.4 && b < 0.4, "{r} {g} {b}");
+        let [r, g, b] = Filter::WhiteOverlay.grade().apply(grey);
+        assert!(r > 0.6 && g > 0.6 && b > 0.6, "{r} {g} {b}");
+        let [r, g, b] = Filter::GreenOverlay.grade().apply(grey);
+        assert!(g > r && g > b, "{r} {g} {b}");
+    }
+
+    #[test]
+    fn a_look_saved_before_intensity_or_effects_loads_at_the_usual_strength() {
+        let look: ClipLook =
+            serde_json::from_str(r#"{"filter":"Winter","exposure":10}"#).expect("it loads");
+        assert_eq!(look.filter_intensity, FILTER_INTENSITY_START);
+        assert!(!look.effects.any());
     }
 
     #[test]

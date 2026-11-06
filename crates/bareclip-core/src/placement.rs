@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     effects::{Grade, LayerJoin},
+    picture_effects::EffectsAt,
     time::Ticks,
 };
 
@@ -145,6 +146,8 @@ pub struct PictureLook {
     pub grade: Grade,
     /// Whether it is drawn together with the next layer up, as the two sides of a transition.
     pub join: Option<LayerJoin>,
+    /// Its effects at this moment.
+    pub effects: EffectsAt,
 }
 
 impl PictureLook {
@@ -155,6 +158,7 @@ impl PictureLook {
         source: [0.0, 0.0, 1.0, 1.0],
         grade: Grade::NONE,
         join: None,
+        effects: EffectsAt::NONE,
     };
 
     pub fn is_plain(&self) -> bool {
@@ -321,6 +325,7 @@ impl Placement {
             ],
             grade: Grade::NONE,
             join: None,
+            effects: EffectsAt::NONE,
         }
     }
 

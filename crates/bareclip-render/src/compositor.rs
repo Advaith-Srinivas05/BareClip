@@ -9,6 +9,7 @@ use std::{
 use bareclip_core::picture::{ColorFormat, Yuv420};
 
 use bareclip_core::effects::{Grade, LayerJoin};
+use bareclip_core::picture_effects::{EffectKind, EffectsAt};
 
 use crate::{
     color,
@@ -19,8 +20,9 @@ use crate::{
 const CANVAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// What the window's renderer takes for a picture it didn't make itself.
 const DISPLAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
-const LAYER_UNIFORM_SIZE: u64 = 224;
+const LAYER_UNIFORM_SIZE: u64 = 768;
 const JOIN_UNIFORM_SIZE: u64 = 16;
+const BLUR_UNIFORM_SIZE: u64 = 32;
 const BLACK: wgpu::Color = wgpu::Color {
     r: 0.0,
     g: 0.0,
@@ -64,8 +66,88 @@ struct LayerSlot {
     y: wgpu::Texture,
     u: wgpu::Texture,
     v: wgpu::Texture,
+    views: [wgpu::TextureView; 3],
     uniform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    /// Where its blurred copy is made, kept for the next frame of the same size.
+    blur: Option<BlurSet>,
+    /// What this frame needs blurred, if anything.
+    blur_plan: Option<BlurPlan>,
+}
+
+/// How a layer's blurred copy is made this frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BlurPlan {
+    size: (u32, u32),
+    /// How wide the blur is, in the copy's texels.
+    sigma: f32,
+    /// For Blur fill, where on the copy each spot of the canvas reads from, and how much shows.
+    fill: Option<([f32; 2], [f32; 2], f32)>,
+}
+
+/// A small copy of a layer, then blurred across, then blurred down, which the layer reads.
+struct BlurSet {
+    size: (u32, u32),
+    copy: wgpu::TextureView,
+    across: wgpu::TextureView,
+    done: wgpu::TextureView,
+    across_pass: (wgpu::Buffer, wgpu::BindGroup),
+    down_pass: (wgpu::Buffer, wgpu::BindGroup),
+    fill_pass: (wgpu::Buffer, wgpu::BindGroup),
+}
+
+/// How wide each blurring effect's blur is, as a share of the height of the place it is drawn in,
+/// measured from a sample recording at the starting settings.
+fn blur_share(effects: &EffectsAt) -> Option<f32> {
+    let mut widest: Option<f32> = None;
+    let mut wants = |share: f32| widest = Some(widest.map_or(share, |was| was.max(share)));
+    if effects.is_on(EffectKind::Blur) {
+        wants((0.1 * effects.setting(EffectKind::Blur, 0)).max(0.002));
+    }
+    if effects.is_on(EffectKind::Glass) {
+        wants(0.011);
+    }
+    if effects.is_on(EffectKind::Glow) {
+        wants(0.022);
+    }
+    if effects.is_on(EffectKind::Diffusion) {
+        wants(0.067);
+    }
+    if effects.is_on(EffectKind::BlurFill) {
+        // Strong enough that what fills the bars doesn't pull the eye.
+        wants(0.03);
+    }
+    widest
+}
+
+/// The blurred copy a layer needs this frame, on a canvas of `canvas` pixels. The copy is made
+/// small enough that the blur is about 4 of its texels wide, which keeps it quick however wide
+/// the blur, and the same at any canvas size.
+fn blur_plan(layer: &Layer, canvas: (u32, u32), limit: u32) -> Option<BlurPlan> {
+    let effects = &layer.look.effects;
+    let share = blur_share(effects)?;
+    let rect = layer.rect;
+    let sigma_pixels = share * rect.height.max(1.0);
+    let shrink = (sigma_pixels / 4.0).max(1.0);
+    let side = |length: f32| ((length / shrink).ceil() as u32).clamp(2, limit.min(2048));
+    let size = (side(rect.width), side(rect.height));
+    let fill = effects.is_on(EffectKind::BlurFill).then(|| {
+        // Covers the canvas, keeping the place's shape, centred.
+        let (width, height) = (canvas.0 as f32, canvas.1 as f32);
+        let grow = (width / rect.width.max(1.0)).max(height / rect.height.max(1.0));
+        let shown = (rect.width * grow, rect.height * grow);
+        let scale = [width / shown.0, height / shown.1];
+        let offset = [
+            -(width - shown.0) / 2.0 / shown.0,
+            -(height - shown.1) / 2.0 / shown.1,
+        ];
+        (scale, offset, layer.opacity)
+    });
+    Some(BlurPlan {
+        size,
+        sigma: sigma_pixels / shrink,
+        fill,
+    })
 }
 
 /// A plane of the finished picture, on its way back from the GPU.
@@ -123,6 +205,13 @@ pub struct Compositor {
     size: (u32, u32),
     layer_pipeline: wgpu::RenderPipeline,
     layer_layout: wgpu::BindGroupLayout,
+    /// Draws a layer's picture alone over a whole target, as the copy that gets blurred.
+    source_pipeline: wgpu::RenderPipeline,
+    blur_layout: wgpu::BindGroupLayout,
+    blur_pipeline: wgpu::RenderPipeline,
+    fill_pipeline: wgpu::RenderPipeline,
+    /// Stands in for the blurred copy of a layer that has none.
+    no_blur: wgpu::TextureView,
     join_pipeline: wgpu::RenderPipeline,
     join_layout: wgpu::BindGroupLayout,
     /// Where the two sides of a transition are drawn. Made the first time one shows.
@@ -238,7 +327,7 @@ fn strip_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     shader: &wgpu::ShaderModule,
-    fragment: &str,
+    (vertex, fragment): (&str, &str),
     format: wgpu::TextureFormat,
     blend: Option<wgpu::BlendState>,
 ) -> wgpu::RenderPipeline {
@@ -252,7 +341,7 @@ fn strip_pipeline(
         layout: Some(&pipeline_layout),
         vertex: wgpu::VertexState {
             module: shader,
-            entry_point: Some("vertex_main"),
+            entry_point: Some(vertex),
             compilation_options: Default::default(),
             buffers: &[],
         },
@@ -361,6 +450,7 @@ impl Compositor {
                 binding(2, fragment, TEXTURE_BINDING),
                 binding(3, fragment, TEXTURE_BINDING),
                 binding(4, fragment, SAMPLER_BINDING),
+                binding(5, fragment, TEXTURE_BINDING),
             ],
         });
         let output_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -397,7 +487,7 @@ impl Compositor {
             &device,
             &join_layout,
             &join_shader,
-            "fragment_main",
+            ("vertex_main", "fragment_main"),
             CANVAS_FORMAT,
             Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
         );
@@ -413,15 +503,75 @@ impl Compositor {
             &device,
             &layer_layout,
             &layer_shader,
-            "fragment_main",
+            ("vertex_main", "fragment_main"),
             CANVAS_FORMAT,
             Some(wgpu::BlendState::ALPHA_BLENDING),
         );
+        let source_pipeline = strip_pipeline(
+            &device,
+            &layer_layout,
+            &layer_shader,
+            ("vertex_full", "fragment_source"),
+            CANVAS_FORMAT,
+            None,
+        );
+        let blur_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("blur"),
+            entries: &[
+                binding(
+                    0,
+                    fragment,
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
+                binding(1, fragment, TEXTURE_BINDING),
+                binding(2, fragment, SAMPLER_BINDING),
+            ],
+        });
+        let blur_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("blur"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("blur.wgsl"))),
+        });
+        let blur_pipeline = strip_pipeline(
+            &device,
+            &blur_layout,
+            &blur_shader,
+            ("vertex_main", "blur_main"),
+            CANVAS_FORMAT,
+            None,
+        );
+        let fill_pipeline = strip_pipeline(
+            &device,
+            &blur_layout,
+            &blur_shader,
+            ("vertex_main", "fill_main"),
+            CANVAS_FORMAT,
+            Some(wgpu::BlendState::ALPHA_BLENDING),
+        );
+        let no_blur = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("no blur"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: CANVAS_FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
         let brightness_pipeline = strip_pipeline(
             &device,
             &output_layout,
             &output_shader,
-            "brightness_main",
+            ("vertex_main", "brightness_main"),
             wgpu::TextureFormat::R8Unorm,
             None,
         );
@@ -429,7 +579,7 @@ impl Compositor {
             &device,
             &output_layout,
             &output_shader,
-            "colour_main",
+            ("vertex_main", "colour_main"),
             wgpu::TextureFormat::Rg8Unorm,
             None,
         );
@@ -438,7 +588,7 @@ impl Compositor {
             &device,
             &output_layout,
             &output_shader,
-            "display_main",
+            ("vertex_main", "display_main"),
             DISPLAY_FORMAT,
             None,
         );
@@ -495,6 +645,11 @@ impl Compositor {
             size: (width, height),
             layer_pipeline,
             layer_layout,
+            source_pipeline,
+            blur_layout,
+            blur_pipeline,
+            fill_pipeline,
+            no_blur,
             join_pipeline,
             join_layout,
             join_sides: None,
@@ -562,7 +717,29 @@ impl Compositor {
             mapped_at_creation: false,
         });
         let views = [&y, &u, &v].map(|texture| texture.create_view(&Default::default()));
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_group = self.layer_group(&uniform, &views, &self.no_blur);
+        LayerSlot {
+            size,
+            still: None,
+            holds_still,
+            y,
+            u,
+            v,
+            views,
+            uniform,
+            bind_group,
+            blur: None,
+            blur_plan: None,
+        }
+    }
+
+    fn layer_group(
+        &self,
+        uniform: &wgpu::Buffer,
+        views: &[wgpu::TextureView; 3],
+        blurred: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("layer"),
             layout: &self.layer_layout,
             entries: &[
@@ -586,17 +763,136 @@ impl Compositor {
                     binding: 4,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(blurred),
+                },
             ],
-        });
-        LayerSlot {
+        })
+    }
+
+    /// Somewhere to make a blurred copy of this size.
+    fn new_blur_set(&self, size: (u32, u32)) -> BlurSet {
+        let target = || {
+            self.device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("blur"),
+                    size: wgpu::Extent3d {
+                        width: size.0,
+                        height: size.1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: CANVAS_FORMAT,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default())
+        };
+        let (copy, across, done) = (target(), target(), target());
+        let pass = |reads: &wgpu::TextureView| {
+            let uniform = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("blur"),
+                size: BLUR_UNIFORM_SIZE,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("blur"),
+                layout: &self.blur_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniform.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(reads),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            (uniform, group)
+        };
+        BlurSet {
             size,
-            still: None,
-            holds_still,
-            y,
-            u,
-            v,
-            uniform,
-            bind_group,
+            across_pass: pass(&copy),
+            down_pass: pass(&across),
+            fill_pass: pass(&done),
+            copy,
+            across,
+            done,
+        }
+    }
+
+    /// Gets a layer's blurred copy ready to be made, with its passes' settings, or forgets it.
+    fn plan_blur(&mut self, index: usize, plan: Option<BlurPlan>) {
+        let had = self.slots[index].blur.as_ref().map(|set| set.size);
+        let wanted = plan.map(|plan| plan.size);
+        if had != wanted {
+            let set = wanted.map(|size| self.new_blur_set(size));
+            let slot = &self.slots[index];
+            let blurred = set.as_ref().map_or(&self.no_blur, |set| &set.done);
+            let group = self.layer_group(&slot.uniform, &slot.views, blurred);
+            let slot = &mut self.slots[index];
+            slot.bind_group = group;
+            slot.blur = set;
+        }
+        self.slots[index].blur_plan = plan;
+        let (Some(plan), Some(set)) = (plan, &self.slots[index].blur) else {
+            return;
+        };
+        let texel = [1.0 / plan.size.0 as f32, 1.0 / plan.size.1 as f32];
+        let (fill_scale, fill_offset, opacity) = plan.fill.unwrap_or(([1.0; 2], [0.0; 2], 1.0));
+        let values = |step: [f32; 2]| -> [f32; 8] {
+            [
+                step[0],
+                step[1],
+                plan.sigma,
+                opacity,
+                fill_scale[0],
+                fill_scale[1],
+                fill_offset[0],
+                fill_offset[1],
+            ]
+        };
+        let write = |buffer: &wgpu::Buffer, step: [f32; 2]| {
+            self.queue
+                .write_buffer(buffer, 0, bytemuck::cast_slice(&values(step)));
+        };
+        write(&set.across_pass.0, [texel[0], 0.0]);
+        write(&set.down_pass.0, [0.0, texel[1]]);
+        write(&set.fill_pass.0, [0.0, 0.0]);
+    }
+
+    /// Makes the blurred copies the layers need this frame: the picture drawn small, then
+    /// blurred across, then down.
+    fn make_blurs(&self, encoder: &mut wgpu::CommandEncoder, layers: usize) {
+        for slot in &self.slots[..layers] {
+            let (Some(_), Some(set)) = (slot.blur_plan, &slot.blur) else {
+                continue;
+            };
+            let clear = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
+            {
+                let mut pass = begin_pass(encoder, &set.copy, clear);
+                pass.set_pipeline(&self.source_pipeline);
+                pass.set_bind_group(0, &slot.bind_group, &[]);
+                pass.draw(0..4, 0..1);
+            }
+            for (target, (_, group)) in
+                [(&set.across, &set.across_pass), (&set.done, &set.down_pass)]
+            {
+                let mut pass = begin_pass(encoder, target, clear);
+                pass.set_pipeline(&self.blur_pipeline);
+                pass.set_bind_group(0, group, &[]);
+                pass.draw(0..4, 0..1);
+            }
         }
     }
 
@@ -657,9 +953,20 @@ impl Compositor {
 
         let (width, height) = (self.size.0 as f32, self.size.1 as f32);
         let rect = layer.rect;
-        let radians = layer.look.degrees.to_radians();
-        // Cropping reads only part of the picture, and a flip reads it from the other side.
-        let [left, top, right, bottom] = layer.look.source;
+        let effects = &layer.look.effects;
+        let degrees = layer.look.degrees + effects.turn;
+        let radians = degrees.to_radians();
+        // Cropping reads only part of the picture, and a flip reads it from the other side. A
+        // zoom reads less of what is kept, heading for its spot, in the same place.
+        let [mut left, mut top, mut right, mut bottom] = layer.look.source;
+        if effects.zoom > 1.0 {
+            let toward_x = left + (right - left) * effects.toward[0];
+            let toward_y = top + (bottom - top) * effects.toward[1];
+            left = toward_x + (left - toward_x) / effects.zoom;
+            right = toward_x + (right - toward_x) / effects.zoom;
+            top = toward_y + (top - toward_y) / effects.zoom;
+            bottom = toward_y + (bottom - toward_y) / effects.zoom;
+        }
         let (from_x, to_x) = if layer.look.flip_x {
             (right, left)
         } else {
@@ -671,14 +978,11 @@ impl Compositor {
             (top, bottom)
         };
         // Edges only need softening where they don't line up with the pixels.
-        let soft_edges = if layer.look.degrees % 90.0 == 0.0 {
-            0.0
-        } else {
-            1.0
-        };
+        let soft_edges = if degrees % 90.0 == 0.0 { 0.0 } else { 1.0 };
         let grade = layer.look.grade;
         let graded = if grade == Grade::NONE { 0.0 } else { 1.0 };
-        let uniform: [f32; 56] = [
+        let mut uniform = Vec::with_capacity(LAYER_UNIFORM_SIZE as usize / 4);
+        uniform.extend([
             rect.x + rect.width / 2.0,
             rect.y + rect.height / 2.0,
             rect.width / 2.0,
@@ -691,53 +995,35 @@ impl Compositor {
             from_y,
             to_x,
             to_y,
-            rows[0][0],
-            rows[0][1],
-            rows[0][2],
-            rows[0][3],
-            rows[1][0],
-            rows[1][1],
-            rows[1][2],
-            rows[1][3],
-            rows[2][0],
-            rows[2][1],
-            rows[2][2],
-            rows[2][3],
+        ]);
+        uniform.extend(rows.iter().flatten());
+        uniform.extend([
             layer.opacity,
             soft_edges,
             if holds_still { 1.0 } else { 0.0 },
             graded,
-            grade.basic[0],
-            grade.basic[1],
-            grade.basic[2],
-            grade.basic[3],
-            grade.shadows[0],
-            grade.shadows[1],
-            grade.shadows[2],
-            0.0,
-            grade.highlights[0],
-            grade.highlights[1],
-            grade.highlights[2],
-            0.0,
-            grade.duotone.0[0],
-            grade.duotone.0[1],
-            grade.duotone.0[2],
-            grade.duotone.2,
-            grade.duotone.1[0],
-            grade.duotone.1[1],
-            grade.duotone.1[2],
-            0.0,
-            grade.wash.0[0],
-            grade.wash.0[1],
-            grade.wash.0[2],
-            grade.wash.1,
-            grade.adjust[0],
-            grade.adjust[1],
-            grade.adjust[2],
-            grade.adjust[3],
-        ];
+        ]);
+        uniform.extend(grade.filter.mix.iter().flatten());
+        let mut curves = [0.0; 28];
+        for (spot, value) in curves.iter_mut().zip(grade.filter.curves.iter().flatten()) {
+            *spot = *value;
+        }
+        uniform.extend(curves);
+        uniform.extend(grade.adjust);
+        uniform.extend([
+            grade.strength,
+            effects.seconds,
+            effects.length,
+            if effects.on == 0 { 0.0 } else { 1.0 },
+        ]);
+        uniform.extend([size.0 as f32, size.1 as f32, rect.width, rect.height]);
+        uniform.extend([f32::from_bits(effects.on), 0.0, 0.0, 0.0]);
+        uniform.extend(effects.settings.iter().flatten());
+        debug_assert_eq!(uniform.len() * 4, LAYER_UNIFORM_SIZE as usize);
         self.queue
             .write_buffer(&slot.uniform, 0, bytemuck::cast_slice(&uniform));
+        let limit = self.device.limits().max_texture_dimension_2d;
+        self.plan_blur(index, blur_plan(layer, self.size, limit));
     }
 
     fn check_for_problem(&self) -> Result<(), RenderError> {
@@ -788,6 +1074,7 @@ impl Compositor {
             }
         }
         let mut encoder = self.device.create_command_encoder(&Default::default());
+        self.make_blurs(&mut encoder, layers.len());
         let mut next_layer = 0;
         let mut first_on_canvas = true;
         for (pass, (index, join)) in joins.iter().enumerate() {
@@ -826,8 +1113,15 @@ impl Compositor {
             wgpu::LoadOp::Load
         };
         let mut pass = begin_pass(encoder, &self.canvas_view, load);
-        pass.set_pipeline(&self.layer_pipeline);
         for slot in &self.slots[layers] {
+            // Blur fill goes behind the picture, over the whole canvas.
+            if let (Some(BlurPlan { fill: Some(_), .. }), Some(set)) = (slot.blur_plan, &slot.blur)
+            {
+                pass.set_pipeline(&self.fill_pipeline);
+                pass.set_bind_group(0, &set.fill_pass.1, &[]);
+                pass.draw(0..4, 0..1);
+            }
+            pass.set_pipeline(&self.layer_pipeline);
             pass.set_bind_group(0, &slot.bind_group, &[]);
             pass.draw(0..4, 0..1);
         }
@@ -1137,6 +1431,7 @@ impl fmt::Debug for Compositor {
 #[cfg(test)]
 mod tests {
     use bareclip_core::effects::{FILTERS, Filter, TRANSITION_GROUPS, TransitionKind};
+    use bareclip_core::picture_effects::{EffectKind, Effects};
 
     use super::*;
     use crate::scene::{PictureLook, Rect, fit_inside};
@@ -1851,6 +2146,372 @@ mod tests {
         StillPicture::new(64, 36, rgba)
     }
 
+    /// What a picture looks like with one effect on at its starting settings, `seconds` into a
+    /// 5 second clip, as RGBA in rows, or nothing without a GPU.
+    fn with_effect(
+        still: &StillPicture,
+        kind: EffectKind,
+        seconds: f64,
+        change: impl Fn(&mut Effects),
+    ) -> Option<Vec<u8>> {
+        let mut compositor = Compositor::new(64, 36).ok()?;
+        let mut effects = Effects::default();
+        effects.set(kind, true);
+        change(&mut effects);
+        let mut layer = image_layer(still, whole_canvas());
+        layer.look.effects = effects.at(
+            bareclip_core::time::Ticks::from_seconds(seconds),
+            bareclip_core::time::Ticks::from_seconds(5.0),
+            0,
+        );
+        compositor.draw_for_display(&[layer]).expect("it draws");
+        Some(compositor.read_display().expect("it reads back"))
+    }
+
+    fn apart(one: &[u8], other: &[u8]) -> f32 {
+        let total: u64 = one
+            .iter()
+            .zip(other)
+            .map(|(a, b)| u64::from(a.abs_diff(*b)))
+            .sum();
+        total as f32 / one.len() as f32
+    }
+
+    #[test]
+    fn every_effect_but_the_ones_that_move_the_picture_changes_it() {
+        let still = ramps([200, 150, 90]);
+        let Some(plain) = with_effect(&still, EffectKind::Flash, 0.0, |effects| {
+            effects.set(EffectKind::Flash, false);
+        }) else {
+            return;
+        };
+        // Pulse, Spin, Rotate, the zooms and the blurs are drawn elsewhere, and Black/white and
+        // Green screen take out colours these ramps don't have.
+        let shader_effects = [
+            (EffectKind::Flash, 0.5),
+            (EffectKind::Vhs, 1.0),
+            (EffectKind::Vaporwave, 1.0),
+            (EffectKind::ChromaticAberration, 1.0),
+            (EffectKind::Filmic, 1.0),
+            (EffectKind::Disco, 1.0),
+            (EffectKind::ColourShift, 0.5),
+            (EffectKind::Comic, 1.0),
+            (EffectKind::RetroGraphics, 1.0),
+            (EffectKind::Vertical, 1.0),
+            (EffectKind::Radial, 1.0),
+            (EffectKind::Smoke, 2.5),
+            (EffectKind::Kaleidoscope, 1.0),
+            (EffectKind::Blur, 1.0),
+            (EffectKind::Glass, 1.2),
+            (EffectKind::Glow, 1.0),
+            (EffectKind::Diffusion, 1.0),
+        ];
+        for (kind, seconds) in shader_effects {
+            // On a picture this small, colours a pixel apart barely differ, and blocks and the
+            // blur are about a pixel across, so these go all the way.
+            let drawn = with_effect(&still, kind, seconds, |effects| {
+                effects.set_value(EffectKind::ChromaticAberration, 0, 1000);
+                effects.set_value(EffectKind::RetroGraphics, 0, 1000);
+                effects.set_value(EffectKind::Blur, 0, 1000);
+            })
+            .expect("it draws");
+            assert!(apart(&drawn, &plain) > 2.0, "{kind:?} barely changes it");
+        }
+    }
+
+    /// Draws each effect on frames given as raw RGBA, so they can be laid beside a recording of
+    /// another editor's. `BARECLIP_EFFECT_FRAMES` names a folder of `plain-<seconds>.rgba` files,
+    /// 960 by 540, and each effect's picture is written beside them as
+    /// `<effect>-<seconds>.rgba`, at its starting settings in a 5 second clip.
+    #[test]
+    #[ignore = "a picture to look at, not a check"]
+    fn draw_effects_on_frames() {
+        let folder = std::path::PathBuf::from(
+            std::env::var_os("BARECLIP_EFFECT_FRAMES").expect("BARECLIP_EFFECT_FRAMES is set"),
+        );
+        let (width, height) = (960, 540);
+        let mut compositor = Compositor::new(width, height).expect("there is a GPU");
+        let frames: Vec<(String, StillPicture)> = std::fs::read_dir(&folder)
+            .expect("the folder can be read")
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                let name = path
+                    .file_stem()?
+                    .to_str()?
+                    .strip_prefix("plain-")?
+                    .to_owned();
+                let rgba = std::fs::read(&path).ok()?;
+                Some((name, StillPicture::new(width, height, rgba)))
+            })
+            .collect();
+        for kind in bareclip_core::picture_effects::EFFECTS {
+            for (seconds, still) in &frames {
+                let mut effects = Effects::default();
+                effects.set(kind, true);
+                let mut layer = image_layer(
+                    still,
+                    Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: width as f32,
+                        height: height as f32,
+                    },
+                );
+                layer.look.effects = effects.at(
+                    bareclip_core::time::Ticks::from_seconds(seconds.parse().unwrap_or(0.0)),
+                    bareclip_core::time::Ticks::from_seconds(5.0),
+                    0,
+                );
+                compositor.draw_for_display(&[layer]).expect("it draws");
+                let drawn = compositor.read_display().expect("it reads back");
+                std::fs::write(folder.join(format!("{kind:?}-{seconds}.rgba")), drawn)
+                    .expect("it writes");
+            }
+        }
+    }
+
+    #[test]
+    fn crash_zoom_into_a_corner_shows_that_corner_filling_the_place() {
+        // Red on the top left quarter, blue everywhere else.
+        let mut rgba = Vec::new();
+        for y in 0..36_u32 {
+            for x in 0..64_u32 {
+                let pixel = if x < 32 && y < 18 {
+                    [255, 0, 0, 255]
+                } else {
+                    [0, 0, 255, 255]
+                };
+                rgba.extend(pixel);
+            }
+        }
+        let still = StillPicture::new(64, 36, rgba);
+        let Some(drawn) = with_effect(&still, EffectKind::CrashZoom, 1.0, |effects| {
+            effects.set_value(EffectKind::CrashZoom, 0, 0);
+            effects.set_value(EffectKind::CrashZoom, 1, 200);
+        }) else {
+            return;
+        };
+        // Zoomed in twice toward the top left, all of it is the red quarter.
+        let shown = average_rgb(&drawn);
+        assert!(shown[0] > 240.0 && shown[2] < 15.0, "{shown:?}");
+    }
+
+    #[test]
+    fn rotate_turns_the_picture_and_shows_what_is_behind_its_corners() {
+        let still = still_of((64, 36), [255, 255, 255], 255);
+        let Some(drawn) = with_effect(&still, EffectKind::Rotate, 45.0 / 54.0, |_| {}) else {
+            return;
+        };
+        let at = |x: usize, y: usize| drawn[(y * 64 + x) * 4];
+        assert!(at(32, 18) > 250, "the middle is still the picture");
+        assert!(at(1, 1) < 5, "a corner shows the black background");
+    }
+
+    /// White on the left half, black on the right.
+    fn half_white() -> StillPicture {
+        let mut rgba = Vec::new();
+        for _ in 0..36 {
+            for x in 0..64_u32 {
+                let level = if x < 32 { 255 } else { 0 };
+                rgba.extend([level, level, level, 255]);
+            }
+        }
+        StillPicture::new(64, 36, rgba)
+    }
+
+    #[test]
+    fn blur_softens_a_hard_edge() {
+        let still = half_white();
+        let Some(drawn) = with_effect(&still, EffectKind::Blur, 1.0, |effects| {
+            effects.set_value(EffectKind::Blur, 0, 600);
+        }) else {
+            return;
+        };
+        let at = |x: usize| drawn[(18 * 64 + x) * 4];
+        assert!(
+            at(4) > 240 && at(60) < 15,
+            "far from the edge stays as it was"
+        );
+        assert!(at(30) < 240 && at(33) > 15, "{} {}", at(30), at(33));
+    }
+
+    #[test]
+    fn blur_fill_covers_the_bars_with_a_blurred_copy() {
+        let still = still_of((64, 36), [200, 120, 60], 255);
+        let Ok(mut compositor) = Compositor::new(64, 36) else {
+            return;
+        };
+        let mut effects = Effects::default();
+        effects.set(EffectKind::BlurFill, true);
+        let mut layer = image_layer(
+            &still,
+            Rect {
+                x: 24.0,
+                y: 0.0,
+                width: 16.0,
+                height: 36.0,
+            },
+        );
+        layer.look.effects = effects.at(
+            bareclip_core::time::Ticks(0),
+            bareclip_core::time::Ticks::from_seconds(5.0),
+            0,
+        );
+        compositor.draw_for_display(&[layer]).expect("it draws");
+        let drawn = compositor.read_display().expect("it reads back");
+        let at = |x: usize| &drawn[(18 * 64 + x) * 4..(18 * 64 + x) * 4 + 3];
+        assert!(
+            at(2)[0] > 150 && at(2)[2] < 100,
+            "the bar is filled: {:?}",
+            at(2)
+        );
+        assert!(at(32)[0] > 190, "the picture is still there: {:?}", at(32));
+    }
+
+    #[test]
+    fn glitch_comes_in_bursts_for_about_a_third_of_the_time() {
+        let still = ramps([200, 150, 90]);
+        let Some(plain) = with_effect(&still, EffectKind::Glitch, 0.0, |effects| {
+            effects.set(EffectKind::Glitch, false);
+        }) else {
+            return;
+        };
+        let frames = 150;
+        let glitched = (0..frames)
+            .filter(|frame| {
+                let seconds = f64::from(*frame) / 30.0;
+                let drawn =
+                    with_effect(&still, EffectKind::Glitch, seconds, |_| {}).expect("it draws");
+                // Any change at all, because a band moved along a smooth ramp barely shows.
+                apart(&drawn, &plain) > 0.01
+            })
+            .count();
+        let share = glitched as f32 / frames as f32;
+        assert!((0.15..0.6).contains(&share), "glitched {share} of the time");
+    }
+
+    #[test]
+    fn a_clip_with_no_effects_draws_exactly_as_before() {
+        let still = ramps([200, 150, 90]);
+        let Some(none) = with_effect(&still, EffectKind::Flash, 0.0, |effects| {
+            effects.set(EffectKind::Flash, false);
+        }) else {
+            return;
+        };
+        let mut compositor = Compositor::new(64, 36).expect("it opened before");
+        compositor
+            .draw_for_display(&[image_layer(&still, whole_canvas())])
+            .expect("it draws");
+        assert_eq!(none, compositor.read_display().expect("it reads back"));
+    }
+
+    #[test]
+    fn flash_goes_black_for_half_of_each_second_as_recorded() {
+        let still = still_of((64, 36), [200, 150, 90], 255);
+        let Some(shown) = with_effect(&still, EffectKind::Flash, 0.1, |_| {}) else {
+            return;
+        };
+        let dark = with_effect(&still, EffectKind::Flash, 0.5, |_| {}).expect("it draws");
+        let back = with_effect(&still, EffectKind::Flash, 0.9, |_| {}).expect("it draws");
+        assert!(average_rgb(&shown)[0] > 190.0, "{:?}", average_rgb(&shown));
+        assert!(average_rgb(&dark)[0] < 2.0, "{:?}", average_rgb(&dark));
+        assert!(average_rgb(&back)[0] > 190.0, "{:?}", average_rgb(&back));
+    }
+
+    #[test]
+    fn green_screen_takes_out_green_and_leaves_the_rest() {
+        let green = still_of((64, 36), [30, 220, 40], 255);
+        let Some(keyed) = with_effect(&green, EffectKind::GreenScreen, 1.0, |_| {}) else {
+            return;
+        };
+        // Over the black background, a see-through picture shows black.
+        assert!(average_rgb(&keyed)[1] < 10.0, "{:?}", average_rgb(&keyed));
+        let skin = still_of((64, 36), [210, 160, 130], 255);
+        let kept = with_effect(&skin, EffectKind::GreenScreen, 1.0, |_| {}).expect("it draws");
+        assert!(average_rgb(&kept)[0] > 200.0, "{:?}", average_rgb(&kept));
+        let blue = with_effect(&green, EffectKind::GreenScreen, 1.0, |effects| {
+            effects.set_value(EffectKind::GreenScreen, 1, 2);
+        })
+        .expect("it draws");
+        assert!(
+            average_rgb(&blue)[1] > 200.0,
+            "a blue screen keeps green: {:?}",
+            average_rgb(&blue)
+        );
+    }
+
+    #[test]
+    fn black_removal_takes_out_black_and_white_removal_takes_out_white() {
+        let black = still_of((64, 36), [5, 5, 5], 255);
+        let white = still_of((64, 36), [250, 250, 250], 255);
+        let Ok(mut compositor) = Compositor::new(64, 36) else {
+            return;
+        };
+        compositor.set_background([255, 0, 0]);
+        let mut effects = Effects::default();
+        effects.set(EffectKind::BlackWhiteRemoval, true);
+        let mut layer = image_layer(&black, whole_canvas());
+        layer.look.effects = effects.at(
+            bareclip_core::time::Ticks(0),
+            bareclip_core::time::Ticks::from_seconds(5.0),
+            0,
+        );
+        compositor.draw_for_display(&[layer]).expect("it draws");
+        let shown = average_rgb(&compositor.read_display().expect("it reads back"));
+        assert!(
+            shown[0] > 240.0,
+            "the red background shows through: {shown:?}"
+        );
+        let kept =
+            with_effect(&white, EffectKind::BlackWhiteRemoval, 1.0, |_| {}).expect("it draws");
+        assert!(average_rgb(&kept)[0] > 240.0);
+        let white_gone = with_effect(&white, EffectKind::BlackWhiteRemoval, 1.0, |effects| {
+            effects.set_value(EffectKind::BlackWhiteRemoval, 1, 1);
+        })
+        .expect("it draws");
+        assert!(average_rgb(&white_gone)[0] < 10.0);
+    }
+
+    #[test]
+    fn one_bit_retro_graphics_is_only_black_and_white() {
+        let still = ramps([200, 150, 90]);
+        let Some(drawn) = with_effect(&still, EffectKind::RetroGraphics, 1.0, |effects| {
+            effects.set_value(EffectKind::RetroGraphics, 1, 1);
+        }) else {
+            return;
+        };
+        for pixel in drawn.as_chunks::<4>().0 {
+            assert!(pixel[0] < 3 || pixel[0] > 252, "{pixel:?}");
+            assert_eq!(pixel[0], pixel[2]);
+        }
+    }
+
+    #[test]
+    fn smoke_is_black_at_the_ends_of_the_clip_and_shows_in_the_middle() {
+        let still = still_of((64, 36), [200, 200, 200], 255);
+        let Some(start) = with_effect(&still, EffectKind::Smoke, 0.3, |_| {}) else {
+            return;
+        };
+        let middle = with_effect(&still, EffectKind::Smoke, 2.5, |_| {}).expect("it draws");
+        let end = with_effect(&still, EffectKind::Smoke, 4.8, |_| {}).expect("it draws");
+        assert!(average_rgb(&start)[0] < 2.0);
+        assert!(average_rgb(&end)[0] < 2.0);
+        let shown = average_rgb(&middle)[0];
+        assert!(shown > 40.0 && shown < 170.0, "{shown}");
+    }
+
+    #[test]
+    fn colour_shift_comes_back_round_every_two_seconds() {
+        let still = ramps([200, 150, 90]);
+        let Some(start) = with_effect(&still, EffectKind::ColourShift, 0.0, |_| {}) else {
+            return;
+        };
+        let half = with_effect(&still, EffectKind::ColourShift, 1.0, |_| {}).expect("it draws");
+        let round = with_effect(&still, EffectKind::ColourShift, 2.0, |_| {}).expect("it draws");
+        assert!(apart(&start, &half) > 20.0);
+        assert!(apart(&start, &round) < 2.0);
+    }
+
     #[test]
     fn every_transition_shows_something_of_a_change_part_way_through() {
         let Ok(mut compositor) = Compositor::new(64, 36) else {
@@ -1928,6 +2589,67 @@ mod tests {
                 println!("{kind:?}: {:?} a frame", started.elapsed() / 30);
             }
         }
+    }
+
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn how_long_effects_take() {
+        let Ok(mut compositor) = Compositor::new(1920, 1080) else {
+            return;
+        };
+        let picture = still_of((1920, 1080), [200, 120, 40], 255);
+        let whole = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+        };
+        let time = |compositor: &mut Compositor, effects: &Effects, rect: Rect| {
+            let started = std::time::Instant::now();
+            for frame in 0..30 {
+                let mut layer = image_layer(&picture, rect);
+                layer.look.effects = effects.at(
+                    bareclip_core::time::Ticks::from_seconds(f64::from(frame) / 30.0),
+                    bareclip_core::time::Ticks::from_seconds(5.0),
+                    0,
+                );
+                compositor.draw(&[layer]).expect("it draws");
+                compositor.wait().expect("it finishes");
+            }
+            started.elapsed() / 30
+        };
+        println!(
+            "none: {:?} a frame",
+            time(&mut compositor, &Effects::default(), whole)
+        );
+        for kind in bareclip_core::picture_effects::EFFECTS {
+            let mut effects = Effects::default();
+            effects.set(kind, true);
+            println!(
+                "{kind:?}: {:?} a frame",
+                time(&mut compositor, &effects, whole)
+            );
+        }
+        let mut all = Effects::default();
+        for kind in bareclip_core::picture_effects::EFFECTS {
+            all.set(kind, true);
+        }
+        println!(
+            "every effect at once: {:?} a frame",
+            time(&mut compositor, &all, whole)
+        );
+        let mut fill = Effects::default();
+        fill.set(EffectKind::BlurFill, true);
+        let small = Rect {
+            x: 660.0,
+            y: 0.0,
+            width: 600.0,
+            height: 1080.0,
+        };
+        println!(
+            "Blur fill behind an upright picture: {:?} a frame",
+            time(&mut compositor, &fill, small)
+        );
     }
 
     #[test]
@@ -2020,6 +2742,66 @@ mod tests {
         ))
     }
 
+    /// A filter at the strength it was measured at.
+    fn full(filter: Filter) -> Grade {
+        Grade {
+            filter: filter.grade(),
+            strength: 1.0,
+            adjust: [0.0; 4],
+        }
+    }
+
+    #[test]
+    fn the_gpu_does_the_same_sum_as_the_measured_filter() {
+        for filter in [
+            Filter::OrangeAndTeal,
+            Filter::PinkPurpleDuotone,
+            Filter::Gloomy,
+        ] {
+            for colour in [[200, 120, 40], [30, 90, 200], [128, 128, 128]] {
+                let Some(got) = graded_colour(full(filter), colour) else {
+                    return;
+                };
+                let wanted = filter
+                    .grade()
+                    .apply(colour.map(|value| f32::from(value) / 255.0))
+                    .map(|value| value * 255.0);
+                for (got, wanted) in got.iter().zip(wanted) {
+                    assert!((got - wanted).abs() < 2.5, "{filter:?} {got:?} {wanted:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn intensity_goes_from_no_filter_to_twice_as_far() {
+        let plain = [180, 120, 60];
+        let filter = Filter::RedOverlay;
+        let at = |strength: f32| {
+            graded_colour(
+                Grade {
+                    strength,
+                    ..full(filter)
+                },
+                plain,
+            )
+        };
+        let Some(none) = at(0.0) else {
+            return;
+        };
+        let usual = at(1.0).expect("it draws");
+        let more = at(2.0).expect("it draws");
+        let away = |found: [f32; 3]| -> f32 {
+            found
+                .iter()
+                .zip(plain)
+                .map(|(got, was)| (got - f32::from(was)).abs())
+                .sum()
+        };
+        assert!(away(none) < 4.0, "{none:?}");
+        assert!(away(more) > away(usual) * 1.5, "{usual:?} {more:?}");
+    }
+
     #[test]
     fn every_filter_changes_the_picture() {
         let plain = [180, 120, 60];
@@ -2027,7 +2809,7 @@ mod tests {
             return;
         };
         for filter in FILTERS {
-            let with = graded_colour(filter.grade(), plain).expect("it draws");
+            let with = graded_colour(full(filter), plain).expect("it draws");
             let apart: f32 = with.iter().zip(without).map(|(a, b)| (a - b).abs()).sum();
             assert!(apart > 3.0, "{filter:?} barely changes it: {with:?}");
         }
@@ -2035,7 +2817,7 @@ mod tests {
 
     #[test]
     fn black_and_white_has_no_colour_in_it() {
-        let Some(got) = graded_colour(Filter::BlackAndWhite1.grade(), [200, 60, 30]) else {
+        let Some(got) = graded_colour(full(Filter::BlackAndWhite1), [200, 60, 30]) else {
             return;
         };
         assert!(
@@ -2072,7 +2854,7 @@ mod tests {
 
     #[test]
     fn a_duotone_turns_dark_and_light_into_its_two_colours() {
-        let filter = Filter::GreenBlueDuotone.grade();
+        let filter = full(Filter::GreenBlueDuotone);
         let Some(dark) = graded_colour(filter, [0, 0, 0]) else {
             return;
         };

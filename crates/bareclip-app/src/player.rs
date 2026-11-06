@@ -21,6 +21,8 @@ use bareclip_media::{DecodeStep, MediaInfo, PreviewFrame, VideoPreview};
 /// Preview pictures are reduced to this size, which is enough for the stage and
 /// keeps each frame cheap to convert and upload.
 pub const PREVIEW_WIDTH: u32 = 1280;
+/// How large a picture a zoomed clip is decoded at, so it stays sharp in the preview.
+const SHARP_SIZE: (u32, u32) = (3840, 2160);
 pub const PREVIEW_HEIGHT: u32 = 720;
 /// Decoded frames waiting between the decoder and the screen.
 const FRAME_CHANNEL: usize = 6;
@@ -78,11 +80,17 @@ fn deliver(
 fn video_worker(
     path: &Path,
     planes: bool,
+    sharp: bool,
     commands: &Receiver<VideoCommand>,
     events: &SyncSender<VideoEvent>,
     notify: &Notify,
 ) {
-    let mut preview = match VideoPreview::open(path, PREVIEW_WIDTH, PREVIEW_HEIGHT) {
+    let (width, height) = if sharp {
+        SHARP_SIZE
+    } else {
+        (PREVIEW_WIDTH, PREVIEW_HEIGHT)
+    };
+    let mut preview = match VideoPreview::open(path, width, height) {
         Ok(preview) if planes => preview.with_planes(),
         Ok(preview) => preview,
         Err(error) => {
@@ -213,11 +221,17 @@ impl Player {
     /// Opens a video for playback.
     #[cfg(test)]
     pub fn open(info: &MediaInfo, notify: Notify) -> Result<Self, String> {
-        Self::open_as(info, false, notify)
+        Self::open_as(info, false, false, notify)
     }
 
-    /// Opens a video, with `planes` asking for pictures the GPU compositor can draw.
-    pub fn open_as(info: &MediaInfo, planes: bool, notify: Notify) -> Result<Self, String> {
+    /// Opens a video, with `planes` asking for pictures the GPU compositor can draw, and `sharp`
+    /// for them at their full size, for a clip that zooms into its picture.
+    pub fn open_as(
+        info: &MediaInfo,
+        planes: bool,
+        sharp: bool,
+        notify: Notify,
+    ) -> Result<Self, String> {
         let path = info.path.clone();
         let (commands, command_receiver) = mpsc::channel();
         let (event_sender, events) = mpsc::sync_channel(FRAME_CHANNEL);
@@ -228,6 +242,7 @@ impl Player {
                 video_worker(
                     &worker_path,
                     planes,
+                    sharp,
                     &command_receiver,
                     &event_sender,
                     &notify,
@@ -565,6 +580,46 @@ mod tests {
             thread::sleep(Duration::from_millis(2));
         }
         panic!("frame {number} never appeared, last was {last:?}");
+    }
+
+    /// The size of the first picture a player opened this way shows, on a 1080p video.
+    fn first_picture_size(sharp: bool) -> (u32, u32) {
+        static CLIP: OnceLock<PathBuf> = OnceLock::new();
+        let path = CLIP.get_or_init(|| {
+            let folder = std::env::temp_dir().join("bareclip-app-tests");
+            std::fs::create_dir_all(&folder).expect("the folder can be created");
+            let path = folder.join(format!("player-big-{}.mp4", std::process::id()));
+            let status = Command::new("ffmpeg")
+                .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi"])
+                .args(["-i", "testsrc2=s=1920x1080:r=30:d=1,format=yuv420p"])
+                .args(["-c:v", "libopenh264", "-b:v", "4M"])
+                .arg(&path)
+                .status()
+                .expect("ffmpeg is on PATH");
+            assert!(status.success());
+            path
+        });
+        let info = probe(path).expect("the clip can be read");
+        let mut player =
+            Player::open_as(&info, true, sharp, Arc::new(|| {})).expect("the player opens");
+        player.seek(Ticks(0));
+        let started = Instant::now();
+        loop {
+            if let Some(frame) = player.update() {
+                return (frame.width, frame.height);
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "no picture came"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn a_zoomed_clip_comes_at_its_full_size_so_it_stays_sharp() {
+        assert_eq!(first_picture_size(false), (1280, 720));
+        assert_eq!(first_picture_size(true), (1920, 1080));
     }
 
     #[test]

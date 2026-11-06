@@ -1,15 +1,19 @@
-//! The Transitions panel, and the Filters, Adjust colours and Fade controls for a selected clip.
+//! The Transitions panel, and the Filters, Effects, Adjust colours and Fade controls for a selected
+//! clip.
 
 use std::sync::mpsc::{Receiver, channel};
 
 use bareclip_core::{
     effects::{
-        ADJUST_RANGE, ClipLook, FILTERS, Filter, LONGEST_TRANSITION_SECONDS,
-        SHORTEST_TRANSITION_SECONDS, TRANSITION_GROUPS, Transition, TransitionKind,
+        ADJUST_RANGE, ClipLook, FILTER_INTENSITY_START, FILTER_INTENSITY_TOP, FILTERS, Filter,
+        LONGEST_TRANSITION_SECONDS, SHORTEST_TRANSITION_SECONDS, TRANSITION_GROUPS, Transition,
+        TransitionKind,
     },
+    picture_effects::{Control, EFFECTS, EffectKind, Effects, SLIDER_TOP},
     timeline::Clip,
 };
 use bareclip_media::DecodedPicture;
+use bareclip_render::LayerPicture;
 
 use super::*;
 use crate::{layers::CardDrawer, timeline::TransitionDrag};
@@ -28,10 +32,27 @@ const CARDS_DRAWN_PER_FRAME: usize = 3;
 const CARD_SHAPE: f32 = 0.625;
 /// The sliders reach this far, and a longer fade can be typed in.
 const LONGEST_FADE_SLIDER_SECONDS: f64 = 2.0;
-const START_TAB_NAMES: [(LookTab, &str); 3] = [
-    (LookTab::Filters, "Filters"),
-    (LookTab::Colours, "Adjust colours"),
-    (LookTab::Fade, "Fade"),
+/// How long an effect's card plays before it starts again.
+const EFFECT_CARD_SECONDS: f64 = 5.0;
+/// How long the clip an effect's card shows is taken to be, the same as a sample recording.
+const EFFECT_CARD_LENGTH: f32 = 5.0;
+const LOOK_TABS: [(LookTab, &str, &str); 4] = [
+    (LookTab::Filters, "Filters", "Filters"),
+    (LookTab::Effects, "Effects", "Effects"),
+    (LookTab::Colours, "Adjust colours", "Colours"),
+    (LookTab::Fade, "Fade", "Fade"),
+];
+/// The 3x3 grid's spots, across and then down.
+const GRID_NAMES: [&str; 9] = [
+    "Top left",
+    "Top",
+    "Top right",
+    "Left",
+    "Middle",
+    "Right",
+    "Bottom left",
+    "Bottom",
+    "Bottom right",
 ];
 
 /// Which of a clip's controls is showing in the right-hand panel.
@@ -39,6 +60,7 @@ const START_TAB_NAMES: [(LookTab, &str); 3] = [
 pub(super) enum LookTab {
     #[default]
     Filters,
+    Effects,
     Colours,
     Fade,
 }
@@ -60,6 +82,55 @@ pub(super) struct TransitionHover {
     seen: bool,
 }
 
+/// An effect card the pointer is resting on.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct EffectHover {
+    kind: EffectKind,
+    since: f64,
+    seen: bool,
+}
+
+/// What was pressed on an effect's card.
+enum CardPress {
+    Nothing,
+    Card,
+    Settings,
+}
+
+fn press_of(card: bool, settings: bool) -> CardPress {
+    if settings {
+        CardPress::Settings
+    } else if card {
+        CardPress::Card
+    } else {
+        CardPress::Nothing
+    }
+}
+
+/// When an effect's card is shown at rest, in seconds into a 5 second clip. Most show a moment
+/// where the effect is plain to see, and Flash is black.
+fn card_moment(kind: EffectKind) -> f32 {
+    match kind {
+        EffectKind::Flash => 0.5,
+        EffectKind::Spin => 1.5,
+        EffectKind::Smoke => 2.5,
+        _ => 1.0,
+    }
+}
+
+/// A card's look with one effect on, at its starting settings, `seconds` into the card's clip.
+fn effect_card_look(kind: EffectKind, seconds: f32) -> bareclip_render::PictureLook {
+    let mut effects = Effects::default();
+    effects.set(kind, true);
+    let mut look = bareclip_render::PictureLook::PLAIN;
+    look.effects = effects.at(
+        Ticks::from_seconds(f64::from(seconds)),
+        Ticks::from_seconds(f64::from(EFFECT_CARD_LENGTH)),
+        0,
+    );
+    look
+}
+
 /// The picture filter cards show, read from the selected clip off to one side.
 pub(super) struct FilterSource {
     media: MediaId,
@@ -76,8 +147,10 @@ pub(super) struct LookPictures {
     drawer_failed: bool,
     transitions: HashMap<TransitionKind, TextureHandle>,
     filters: HashMap<(MediaId, Filter), TextureHandle>,
+    effects: HashMap<(MediaId, EffectKind), TextureHandle>,
     source: Option<FilterSource>,
     hover: Option<TransitionHover>,
+    effect_hover: Option<EffectHover>,
 }
 
 impl Editor {
@@ -463,10 +536,10 @@ impl Editor {
             .frame(frame)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let name = START_TAB_NAMES
+                    let name = LOOK_TABS
                         .iter()
-                        .find(|(tab, _)| *tab == self.look_tab)
-                        .map_or("", |(_, name)| name);
+                        .find(|(tab, ..)| *tab == self.look_tab)
+                        .map_or("", |(_, name, _)| name);
                     ui.label(RichText::new(name).font(fonts::strong(15.0)));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let close = IconButton::new(palette, Kind::Ghost, icons::X, "Close look")
@@ -479,11 +552,7 @@ impl Editor {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
-                    for (tab, name, short) in [
-                        (LookTab::Filters, "Filters", "Filters"),
-                        (LookTab::Colours, "Adjust colours", "Colours"),
-                        (LookTab::Fade, "Fade", "Fade"),
-                    ] {
+                    for (tab, name, short) in LOOK_TABS {
                         let kind = if self.look_tab == tab {
                             Kind::Secondary
                         } else {
@@ -498,6 +567,7 @@ impl Editor {
                 ui.add_space(10.0);
                 match self.look_tab {
                     LookTab::Filters => self.filter_cards(ui, palette, clip),
+                    LookTab::Effects => self.effect_cards(ui, palette, clip),
                     LookTab::Colours => {
                         egui::ScrollArea::vertical()
                             .auto_shrink([false, false])
@@ -603,13 +673,396 @@ impl Editor {
                         }
                     });
                     ui.add_space(CARD_GAP);
+                    // Its Intensity goes under the row it is on.
+                    if clip.look.filter != Filter::None && row.contains(&clip.look.filter) {
+                        let value =
+                            f64::from(clip.look.filter_intensity) / f64::from(FILTER_INTENSITY_TOP);
+                        if let Some(share) = share_slider(ui, palette, "Intensity", value) {
+                            let intensity =
+                                (share * f64::from(FILTER_INTENSITY_TOP)).round() as i32;
+                            self.change_look(clip.id, |look| look.filter_intensity = intensity);
+                        }
+                        ui.add_space(CARD_GAP);
+                    }
                 }
             });
         if left_to_draw == 0 {
             ui.ctx().request_repaint();
         }
-        if let Some(filter) = picked {
-            self.change_look(clip.id, |look| look.filter = filter);
+        // A new filter starts at its usual strength.
+        if let Some(filter) = picked
+            && filter != clip.look.filter
+        {
+            self.change_look(clip.id, |look| {
+                look.filter = filter;
+                look.filter_intensity = FILTER_INTENSITY_START;
+            });
+        }
+    }
+
+    /// The Effects tab: cards that turn effects on and off, several at once, with the open one's
+    /// settings under its row.
+    fn effect_cards(&mut self, ui: &mut egui::Ui, palette: &Palette, clip: Clip) {
+        self.source_for_filters(ui.ctx(), clip);
+        let search = ui.add(
+            egui::TextEdit::singleline(&mut self.effect_search)
+                .hint_text("Search effects")
+                .desired_width(f32::INFINITY),
+        );
+        search.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::Role::TextInput, true, "Search effects")
+        });
+        ui.add_space(8.0);
+        let wanted = self.effect_search.trim().to_lowercase();
+        let mut listed: Vec<Option<EffectKind>> = vec![None];
+        listed.extend(EFFECTS.map(Some));
+        listed.retain(|kind| {
+            kind.map_or("None", EffectKind::name)
+                .to_lowercase()
+                .contains(&wanted)
+        });
+        if let Some(hover) = &mut self.look_pictures.effect_hover {
+            hover.seen = false;
+        }
+        let mut left_to_draw = CARDS_DRAWN_PER_FRAME;
+        let mut pressed = None;
+        let mut settings_pressed = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let width = ui.available_width();
+                let card = (width - CARD_GAP) / CARD_COLUMNS as f32;
+                for row in listed.chunks(CARD_COLUMNS) {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = CARD_GAP;
+                        for kind in row {
+                            match self.effect_card(
+                                ui,
+                                palette,
+                                clip,
+                                *kind,
+                                card,
+                                &mut left_to_draw,
+                            ) {
+                                CardPress::Card => pressed = Some(*kind),
+                                CardPress::Settings => settings_pressed = *kind,
+                                CardPress::Nothing => {}
+                            }
+                        }
+                    });
+                    ui.add_space(CARD_GAP);
+                    if let Some(open) = self.effect_settings
+                        && clip.look.effects.is_on(open)
+                        && row.contains(&Some(open))
+                    {
+                        self.effect_settings(ui, palette, clip, open);
+                        ui.add_space(CARD_GAP);
+                    }
+                }
+            });
+        if self
+            .look_pictures
+            .effect_hover
+            .is_some_and(|hover| !hover.seen)
+        {
+            self.look_pictures.effect_hover = None;
+        }
+        if left_to_draw == 0 {
+            ui.ctx().request_repaint();
+        }
+        if let Some(kind) = settings_pressed {
+            self.effect_settings = (self.effect_settings != Some(kind)).then_some(kind);
+        }
+        match pressed {
+            Some(None) => {
+                self.change_look(clip.id, |look| look.effects = Effects::default());
+                self.effect_settings = None;
+            }
+            Some(Some(kind)) => {
+                let on = !clip.look.effects.is_on(kind);
+                self.change_look(clip.id, |look| look.effects.set(kind, on));
+                // Turning one on shows its settings straight away.
+                if on && !kind.controls().is_empty() {
+                    self.effect_settings = Some(kind);
+                } else if self.effect_settings == Some(kind) {
+                    self.effect_settings = None;
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn effect_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        palette: &Palette,
+        clip: Clip,
+        kind: Option<EffectKind>,
+        width: f32,
+        left_to_draw: &mut usize,
+    ) -> CardPress {
+        let name_height = 30.0;
+        let picture_height = width * CARD_SHAPE;
+        let (whole, response) =
+            ui.allocate_exact_size(vec2(width, picture_height + name_height), Sense::click());
+        let name = kind.map_or("None", EffectKind::name);
+        let on = kind.map_or(!clip.look.effects.any(), |kind| {
+            clip.look.effects.is_on(kind)
+        });
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(egui::Role::Button, true, on, format!("Effect {name}"))
+        });
+        let picture = egui::Rect::from_min_size(whole.min, vec2(width, picture_height));
+        if !ui.is_rect_visible(whole) {
+            return press_of(response.clicked(), false);
+        }
+        let painter = ui.painter_at(whole);
+        painter.rect_filled(picture, 6.0, palette.raised);
+        let full = egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        match kind {
+            None => icons::paint(
+                &painter,
+                icons::square_at(picture.center(), 22.0),
+                &icons::X,
+                palette.text_muted,
+            ),
+            Some(kind) => {
+                let live = if response.hovered() {
+                    self.live_effect_card(ui.ctx(), kind)
+                } else {
+                    None
+                };
+                if let Some(live) = live {
+                    painter.image(live, picture, full, Color32::WHITE);
+                } else {
+                    let key = (clip.media, kind);
+                    if !self.look_pictures.effects.contains_key(&key) && *left_to_draw > 0 {
+                        *left_to_draw -= 1;
+                        self.draw_effect_card(ui.ctx(), key);
+                    }
+                    if let Some(texture) = self.look_pictures.effects.get(&key) {
+                        painter.image(texture.id(), picture, full, Color32::WHITE);
+                    }
+                }
+            }
+        }
+        let outline = if on {
+            Some(palette.accent)
+        } else if response.hovered() {
+            Some(palette.text_muted)
+        } else {
+            None
+        };
+        if let Some(colour) = outline {
+            painter.rect_stroke(
+                picture,
+                6.0,
+                Stroke::new(2.0, colour),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let text = painter.layout(
+            name.to_owned(),
+            egui::FontId::proportional(12.0),
+            palette.text_muted,
+            width - 4.0,
+        );
+        painter.galley(
+            pos2(whole.left() + 2.0, picture.bottom() + 3.0),
+            text,
+            palette.text_muted,
+        );
+        // The settings button sits in the corner of an effect that is on and has settings.
+        let mut settings_clicked = false;
+        if let Some(kind) = kind
+            && on
+            && !kind.controls().is_empty()
+        {
+            let size = 22.0;
+            let spot = egui::Rect::from_min_size(
+                pos2(picture.right() - size - 4.0, picture.top() + 4.0),
+                vec2(size, size),
+            );
+            let open = self.effect_settings == Some(kind);
+            let kind_of_button = if open { Kind::Primary } else { Kind::Secondary };
+            let button = IconButton::new(
+                palette,
+                kind_of_button,
+                icons::SLIDERS_HORIZONTAL,
+                "Effect settings",
+            )
+            .size(size, 14.0);
+            settings_clicked = button
+                .show_at(ui, egui::Id::unique("effect settings").with(kind), spot)
+                .on_hover_text(format!("{} settings", kind.name()))
+                .clicked();
+        }
+        press_of(response.clicked(), settings_clicked)
+    }
+
+    fn draw_effect_card(&mut self, ctx: &egui::Context, (media, kind): (MediaId, EffectKind)) {
+        self.card_drawer();
+        let look = effect_card_look(kind, card_moment(kind));
+        let LookPictures {
+            drawer: Some(drawer),
+            source: Some(source),
+            effects,
+            ..
+        } = &mut self.look_pictures
+        else {
+            return;
+        };
+        let picture: LayerPicture = match (&source.still, &source.picture) {
+            (Some(still), _) => (&**still).into(),
+            (None, Some(picture)) => picture.view().into(),
+            (None, None) => return,
+        };
+        if let Some(drawn) = drawer.look_card(picture, look) {
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [drawn.width as usize, drawn.height as usize],
+                &drawn.rgba,
+            );
+            effects.insert(
+                (media, kind),
+                ctx.load_texture(
+                    format!("effect-{media:?}-{kind:?}"),
+                    image,
+                    TextureOptions::LINEAR,
+                ),
+            );
+        }
+    }
+
+    /// Plays an effect on its card once the pointer has rested on it, looping, and asks for the
+    /// next frame.
+    fn live_effect_card(
+        &mut self,
+        ctx: &egui::Context,
+        kind: EffectKind,
+    ) -> Option<egui::TextureId> {
+        let now = ctx.input(|input| input.time);
+        let hover = &mut self.look_pictures.effect_hover;
+        match hover {
+            Some(hover) if hover.kind == kind => hover.seen = true,
+            _ => {
+                *hover = Some(EffectHover {
+                    kind,
+                    since: now,
+                    seen: true,
+                });
+            }
+        }
+        let since = hover.map_or(now, |hover| hover.since);
+        let waited = now - since;
+        if waited < CARD_HOVER_SECONDS {
+            ctx.request_repaint_after(Duration::from_secs_f64(CARD_HOVER_SECONDS - waited));
+            return None;
+        }
+        ctx.request_repaint();
+        let seconds = ((waited - CARD_HOVER_SECONDS) % EFFECT_CARD_SECONDS) as f32;
+        let look = effect_card_look(kind, seconds);
+        self.card_drawer();
+        let LookPictures {
+            drawer: Some(drawer),
+            source: Some(source),
+            ..
+        } = &mut self.look_pictures
+        else {
+            return None;
+        };
+        let picture: LayerPicture = match (&source.still, &source.picture) {
+            (Some(still), _) => (&**still).into(),
+            (None, Some(picture)) => picture.view().into(),
+            (None, None) => return None,
+        };
+        drawer.live_look_card(picture, look)
+    }
+
+    /// One effect's settings, under the row its card is on.
+    fn effect_settings(
+        &mut self,
+        ui: &mut egui::Ui,
+        palette: &Palette,
+        clip: Clip,
+        kind: EffectKind,
+    ) {
+        let effects = clip.look.effects;
+        for (index, control) in kind.controls().iter().enumerate() {
+            let value = effects.value(kind, index);
+            let changed = match *control {
+                Control::Slider { name, .. } => {
+                    let share = f64::from(value) / f64::from(SLIDER_TOP);
+                    share_slider(ui, palette, name, share)
+                        .map(|share| (share * f64::from(SLIDER_TOP)).round() as i32)
+                }
+                Control::Switch { name, .. } => {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(name).font(fonts::strong(13.0)));
+                    ui.add_space(4.0);
+                    let on = value != 0;
+                    let pressed = ui
+                        .add(components::CheckBox::new(palette, on, name))
+                        .clicked();
+                    ui.add_space(6.0);
+                    pressed.then_some(i32::from(!on))
+                }
+                Control::Choice { name, options, .. } => {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(name).font(fonts::strong(13.0)));
+                    ui.add_space(4.0);
+                    let current = options.get(value as usize).copied().unwrap_or_default();
+                    let label = format!("{name}: {current}");
+                    let button = ui.add(components::Dropdown::new(
+                        palette,
+                        &label,
+                        current,
+                        ui.available_width(),
+                    ));
+                    let mut picked = None;
+                    egui::Popup::menu(&button).show(|ui| {
+                        for (option, option_name) in options.iter().enumerate() {
+                            let chosen = option as i32 == value;
+                            if ui
+                                .add(MenuItem::choice(palette, option_name, chosen))
+                                .clicked()
+                            {
+                                picked = Some(option as i32);
+                            }
+                        }
+                    });
+                    ui.add_space(6.0);
+                    picked
+                }
+                Control::Grid { name, .. } => {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(name).font(fonts::strong(13.0)));
+                    ui.add_space(4.0);
+                    let mut picked = None;
+                    ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
+                    for row in 0..3 {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
+                            for column in 0..3 {
+                                let spot = row * 3 + column;
+                                let spot_name = GRID_NAMES[spot as usize];
+                                let button =
+                                    components::SpotButton::new(palette, spot_name, spot == value);
+                                if ui.add(button).on_hover_text(spot_name).clicked() {
+                                    picked = Some(spot);
+                                }
+                            }
+                        });
+                    }
+                    ui.spacing_mut().item_spacing = vec2(8.0, 4.0);
+                    ui.add_space(6.0);
+                    picked
+                }
+            };
+            if let Some(new) = changed
+                && new != value
+            {
+                self.change_look(clip.id, |look| look.effects.set_value(kind, index, new));
+            }
         }
     }
 
@@ -703,8 +1156,8 @@ impl Editor {
             return;
         };
         let drawn = match (&source.still, &source.picture) {
-            (Some(still), _) => drawer.filter_on_still(still, filter),
-            (None, Some(picture)) => drawer.filter_on_video(picture, filter),
+            (Some(still), _) => drawer.filter_card((&**still).into(), filter),
+            (None, Some(picture)) => drawer.filter_card(picture.view().into(), filter),
             (None, None) => return,
         };
         if let Some(drawn) = drawn {
@@ -821,6 +1274,27 @@ fn set_slider_look(ui: &mut egui::Ui, palette: &Palette) {
     visuals.widgets.hovered.bg_fill = palette.border_strong;
     visuals.widgets.active.bg_fill = palette.border_strong;
     visuals.selection.bg_fill = palette.accent;
+}
+
+/// A named slider from nothing to all, as a share. It gives the new share when moved.
+fn share_slider(ui: &mut egui::Ui, palette: &Palette, name: &str, share: f64) -> Option<f64> {
+    ui.add_space(4.0);
+    ui.label(RichText::new(name).font(fonts::strong(13.0)));
+    ui.add_space(4.0);
+    set_slider_look(ui, palette);
+    ui.spacing_mut().slider_width = ui.available_width();
+    let mut shown = share;
+    let slider = ui.add(
+        egui::Slider::new(&mut shown, 0.0..=1.0)
+            .show_value(false)
+            .trailing_fill(true),
+    );
+    slider.widget_info(|| egui::WidgetInfo::slider(slider.enabled(), shown * 100.0, name));
+    if slider.drag_stopped() || slider.clicked() {
+        slider.surrender_focus();
+    }
+    ui.add_space(6.0);
+    slider.changed().then_some(shown)
 }
 
 /// A named slider running from one end to the other with no change in the middle.
