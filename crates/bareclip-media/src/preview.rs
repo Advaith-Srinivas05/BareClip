@@ -20,6 +20,7 @@ use crate::{
     error::MediaError,
     full::{coefficients_of, is_full_range, matrix_of},
     probe::{discard_other_streams, to_time_base},
+    turn::Orientation,
 };
 
 pub(crate) fn threaded_context(
@@ -116,7 +117,11 @@ pub struct VideoPreview {
     planes: bool,
     time_base: Rational,
     core_time_base: TimeBase,
+    /// The size pictures come out at, the right way up.
     output_size: (u32, u32),
+    /// The size they are scaled to before they are turned the right way up.
+    scaled_size: (u32, u32),
+    orientation: Orientation,
     sent_eof: bool,
 }
 
@@ -130,10 +135,13 @@ impl VideoPreview {
             .ok_or(MediaError::NoVideoStream)?;
         let video_index = stream.index();
         let time_base = stream.time_base();
+        let orientation = Orientation::of_stream(&stream);
         let mut decoder = threaded_context(stream.parameters())?.decoder().video()?;
         decoder.set_packet_time_base(time_base);
-        let output_size =
-            fit_preview_size(decoder.width(), decoder.height(), max_width, max_height);
+        let (upright_width, upright_height) =
+            orientation.turned_size(decoder.width(), decoder.height());
+        let output_size = fit_preview_size(upright_width, upright_height, max_width, max_height);
+        let scaled_size = orientation.turned_size(output_size.0, output_size.1);
         discard_other_streams(&mut input, &[video_index]);
 
         Ok(Self {
@@ -145,6 +153,8 @@ impl VideoPreview {
             time_base,
             core_time_base: to_time_base(time_base),
             output_size,
+            scaled_size,
+            orientation,
             sent_eof: false,
         })
     }
@@ -203,7 +213,7 @@ impl VideoPreview {
         decoded: &frame::Video,
         pts: i64,
     ) -> Result<PreviewFrame, MediaError> {
-        let (out_width, out_height) = self.output_size;
+        let (out_width, out_height) = self.scaled_size;
         let matrix = matrix_of(decoded);
         let full_range = is_full_range(decoded);
         let needs_new = self
@@ -259,16 +269,31 @@ impl VideoPreview {
         };
         let (width, height) = (out_width as usize, out_height as usize);
         let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
+        // The small picture is turned rather than the decoded one, which costs far less.
+        let upright = |values: Vec<u8>, size: (usize, usize)| {
+            if self.orientation.is_upright() {
+                values
+            } else {
+                self.orientation.turn_samples(&values, size, size.0, 1)
+            }
+        };
+        let (shown_width, shown_height) = self.output_size;
         Ok(PreviewFrame {
             pts,
             time: Ticks::from_pts(pts, self.core_time_base),
-            width: out_width,
-            height: out_height,
+            width: shown_width,
+            height: shown_height,
             rgba: Vec::new(),
             planes: Some(PreviewPlanes {
-                y: packed(0, width, height),
-                u: packed(1, chroma_width, chroma_height),
-                v: packed(2, chroma_width, chroma_height),
+                y: upright(packed(0, width, height), (width, height)),
+                u: upright(
+                    packed(1, chroma_width, chroma_height),
+                    (chroma_width, chroma_height),
+                ),
+                v: upright(
+                    packed(2, chroma_width, chroma_height),
+                    (chroma_width, chroma_height),
+                ),
                 color: ColorFormat { matrix, full_range },
             }),
         })
@@ -278,7 +303,7 @@ impl VideoPreview {
         if self.planes {
             return self.convert_to_planes(decoded, pts);
         }
-        let (out_width, out_height) = self.output_size;
+        let (out_width, out_height) = self.scaled_size;
         let needs_new = self
             .scaler
             .as_ref()
@@ -313,13 +338,14 @@ impl VideoPreview {
         for row in 0..out_height as usize {
             rgba.extend_from_slice(&data[stride * row..stride * row + row_bytes]);
         }
+        let (shown_width, shown_height) = self.output_size;
 
         Ok(PreviewFrame {
             pts,
             time: Ticks::from_pts(pts, self.core_time_base),
-            width: out_width,
-            height: out_height,
-            rgba,
+            width: shown_width,
+            height: shown_height,
+            rgba: self.orientation.turn(rgba, out_width, out_height),
             planes: None,
         })
     }

@@ -408,6 +408,7 @@ mod tests {
                 time_base: TimeBase { num: 1, den: 90000 },
                 frame_rate: rate,
                 is_hdr: false,
+                orientation: Default::default(),
             },
             audio: sound,
         }

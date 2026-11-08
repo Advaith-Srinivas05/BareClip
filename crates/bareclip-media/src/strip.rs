@@ -14,6 +14,7 @@ use crate::{
     error::MediaError,
     preview::{AudioPreview, AudioStep, PREVIEW_CHANNELS, fit_preview_size},
     probe::{discard_other_streams, to_time_base},
+    turn::Orientation,
 };
 
 /// One small picture from a video. These come from keyframes, the only frames that can be
@@ -52,14 +53,19 @@ pub fn read_strip_pictures(
         .ok_or(MediaError::NoVideoStream)?;
     let index = stream.index();
     let time_base = to_time_base(stream.time_base());
+    let orientation = Orientation::of_stream(&stream);
     let context = codec::context::Context::from_parameters(stream.parameters())?;
     let mut decoder = context.decoder().video()?;
     decoder.set_packet_time_base(stream.time_base());
     // Only keyframes get decoded at all, which is what makes this cheap.
     decoder.skip_frame(Discard::NonKey);
     discard_other_streams(&mut input, &[index]);
-    let (width, height) =
-        fit_preview_size(decoder.width(), decoder.height(), max_width, max_height);
+    // Pictures are made at the stored shape and then turned the right way up.
+    let (upright_width, upright_height) =
+        orientation.turned_size(decoder.width(), decoder.height());
+    let (shown_width, shown_height) =
+        fit_preview_size(upright_width, upright_height, max_width, max_height);
+    let (width, height) = orientation.turned_size(shown_width, shown_height);
     let mut scaler = None;
     let mut decoded = frame::Video::empty();
     let mut packet = Packet::empty();
@@ -117,9 +123,9 @@ pub fn read_strip_pictures(
             scaler.run(&decoded, &mut rgba_frame)?;
             found(StripPicture {
                 time,
-                width,
-                height,
-                rgba: tightly_packed(&rgba_frame, width, height),
+                width: shown_width,
+                height: shown_height,
+                rgba: orientation.turn(tightly_packed(&rgba_frame, width, height), width, height),
             });
             last_time = Some(time);
         }

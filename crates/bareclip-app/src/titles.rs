@@ -447,6 +447,7 @@ impl Editor {
                     time_base: TimeBase { num: 1, den: 1000 },
                     frame_rate: 0.0,
                     is_hdr: false,
+                    orientation: Default::default(),
                 },
                 audio: Vec::new(),
             },

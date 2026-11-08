@@ -23,6 +23,7 @@ use crate::{
     media_foundation::OpenEncoder,
     preview::{seek_to_seconds, threaded_context},
     probe::{discard_other_streams, to_time_base},
+    turn::Orientation,
 };
 
 /// Hardware first, because a whole video is being encoded, not just a few frames.
@@ -104,6 +105,8 @@ pub struct PictureReader {
     core_time_base: TimeBase,
     converter: Option<(scaling::Context, Pixel, u32, u32)>,
     sent_eof: bool,
+    /// Pictures come out turned this way, so they are the right way up.
+    orientation: Orientation,
 }
 
 impl PictureReader {
@@ -116,6 +119,7 @@ impl PictureReader {
             .ok_or(MediaError::NoVideoStream)?;
         let video_index = stream.index();
         let time_base = stream.time_base();
+        let orientation = Orientation::of_stream(&stream);
         let mut decoder = threaded_context(stream.parameters())?.decoder().video()?;
         decoder.set_packet_time_base(time_base);
         discard_other_streams(&mut input, &[video_index]);
@@ -126,6 +130,7 @@ impl PictureReader {
             core_time_base: to_time_base(time_base),
             converter: None,
             sent_eof: false,
+            orientation,
         })
     }
 
@@ -168,11 +173,11 @@ impl PictureReader {
         let matrix = matrix_of(&decoded);
         let full_range = is_full_range(&decoded);
         if matches!(decoded.format(), Pixel::YUV420P | Pixel::YUVJ420P) {
-            return Ok(DecodedPicture {
+            return Ok(self.upright(DecodedPicture {
                 frame: decoded,
                 time,
                 color: ColorFormat { matrix, full_range },
-            });
+            }));
         }
 
         let (pixel, width, height) = (decoded.format(), decoded.width(), decoded.height());
@@ -212,14 +217,25 @@ impl PictureReader {
         if let Some((context, ..)) = self.converter.as_mut() {
             context.run(&decoded, &mut converted)?;
         }
-        Ok(DecodedPicture {
+        Ok(self.upright(DecodedPicture {
             frame: converted,
             time,
             color: ColorFormat {
                 matrix,
                 full_range: false,
             },
-        })
+        }))
+    }
+
+    /// The picture turned the way its video says to show it.
+    fn upright(&self, picture: DecodedPicture) -> DecodedPicture {
+        if self.orientation.is_upright() {
+            return picture;
+        }
+        DecodedPicture {
+            frame: self.orientation.turn_yuv420(&picture.frame),
+            ..picture
+        }
     }
 }
 

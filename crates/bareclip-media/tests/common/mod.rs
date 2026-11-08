@@ -662,3 +662,71 @@ pub fn beep_times(track: &AudioTrackInfo) -> Vec<f64> {
     }
     times
 }
+
+/// Black with its left half white, as stored, before any turn.
+fn half_white_mp4() -> PathBuf {
+    cached("half-white.mp4", |path| {
+        run_ffmpeg(
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=320x180:r=30:d=3,drawbox=x=0:y=0:w=160:h=180:color=white:t=fill,format=yuv420p",
+                "-f",
+                "lavfi",
+                "-i",
+                &beep_source(3),
+                "-c:v",
+                "libopenh264",
+                "-b:v",
+                "2M",
+                "-g",
+                "30",
+                "-c:a",
+                "aac",
+            ],
+            path,
+        );
+    })
+}
+
+/// The same video noted as needing a quarter turn anticlockwise to show, as a phone held upright
+/// saves it. Shown that way it is 180 x 320, and the white half is at the bottom.
+pub fn phone_mp4() -> PathBuf {
+    // Made first, because the cache holds its lock while it makes a clip.
+    let stored = half_white_mp4();
+    cached("phone.mp4", |path| {
+        run_ffmpeg(
+            &[
+                "-display_rotation",
+                "90",
+                "-i",
+                &stored.to_string_lossy(),
+                "-c",
+                "copy",
+            ],
+            path,
+        );
+    })
+}
+
+/// The same video with no turn noted.
+pub fn unturned_mp4() -> PathBuf {
+    half_white_mp4()
+}
+
+/// How bright the top and bottom halves of a picture's brightness plane are, on average.
+pub fn top_and_bottom(y: &[u8], stride: usize, width: usize, height: usize) -> (f64, f64) {
+    let average = |rows: std::ops::Range<usize>| {
+        let count = rows.len() * width;
+        let total: u64 = rows
+            .flat_map(|row| {
+                y[row * stride..][..width]
+                    .iter()
+                    .map(|value| u64::from(*value))
+            })
+            .sum();
+        total as f64 / count as f64
+    };
+    (average(0..height / 2), average(height / 2..height))
+}

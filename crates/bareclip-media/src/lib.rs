@@ -12,6 +12,7 @@ mod remux;
 mod resample;
 mod still;
 mod strip;
+mod turn;
 
 pub use encoders::SKIP_VARIABLE as SKIP_ENCODERS_VARIABLE;
 pub use error::MediaError;
@@ -32,6 +33,7 @@ pub use remux::{SoundFile, join_picture_and_sound};
 pub use resample::RateChange;
 pub use still::read_still;
 pub use strip::{SoundShape, StripPicture, picture_spacing, read_sound_shape, read_strip_pictures};
+pub use turn::Orientation;
 
 use ffmpeg_next as ffmpeg;
 

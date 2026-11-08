@@ -11,7 +11,7 @@ use ffmpeg_next::{
     software::scaling::{Context as Scaler, Flags},
 };
 
-use crate::error::MediaError;
+use crate::{error::MediaError, turn::Orientation};
 
 /// The longest side kept in memory. It is larger than any finished video can be, so nothing is
 /// lost, and a huge photo doesn't take up gigabytes on the GPU.
@@ -42,99 +42,6 @@ fn premultiply(rgba: &mut [u8]) {
                 *value = ((u32::from(*value) * alpha + 127) / 255) as u8;
             }
         }
-    }
-}
-
-/// How a photo has to be turned to show the right way up. Cameras and phones usually save the
-/// sensor's picture as it came, and note which way up the camera was held.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Orientation {
-    Upright,
-    Mirrored,
-    HalfTurn,
-    Flipped,
-    /// Mirrored across the line from the top left to the bottom right.
-    Transposed,
-    QuarterClockwise,
-    /// Mirrored across the line from the top right to the bottom left.
-    Transversed,
-    QuarterAnticlockwise,
-}
-
-impl Orientation {
-    /// Reads FFmpeg's matrix for a picture, of nine numbers row by row. Only the top left four say
-    /// anything about a turn. Anything but a whole quarter turn or mirror is treated as upright,
-    /// because no photo format can store one.
-    fn from_matrix(matrix: &[i32; 9]) -> Self {
-        match [matrix[0], matrix[1], matrix[3], matrix[4]].map(i32::signum) {
-            [-1, 0, 0, 1] => Self::Mirrored,
-            [-1, 0, 0, -1] => Self::HalfTurn,
-            [1, 0, 0, -1] => Self::Flipped,
-            [0, 1, 1, 0] => Self::Transposed,
-            [0, 1, -1, 0] => Self::QuarterClockwise,
-            [0, -1, -1, 0] => Self::Transversed,
-            [0, -1, 1, 0] => Self::QuarterAnticlockwise,
-            _ => Self::Upright,
-        }
-    }
-
-    fn of(picture: &frame::Video) -> Self {
-        let Some(side_data) = picture.side_data(frame::side_data::Type::DisplayMatrix) else {
-            return Self::Upright;
-        };
-        let (numbers, _) = side_data.data().as_chunks::<4>();
-        if numbers.len() < 9 {
-            return Self::Upright;
-        }
-        let mut matrix = [0; 9];
-        for (number, bytes) in matrix.iter_mut().zip(numbers) {
-            *number = i32::from_ne_bytes(*bytes);
-        }
-        Self::from_matrix(&matrix)
-    }
-
-    /// The size of a picture once it is turned.
-    fn turned_size(self, width: u32, height: u32) -> (u32, u32) {
-        match self {
-            Self::Upright | Self::Mirrored | Self::HalfTurn | Self::Flipped => (width, height),
-            Self::Transposed
-            | Self::QuarterClockwise
-            | Self::Transversed
-            | Self::QuarterAnticlockwise => (height, width),
-        }
-    }
-
-    /// Where the pixel at `x`, `y` lands, in a picture of this size before it is turned.
-    fn place(self, x: usize, y: usize, width: usize, height: usize) -> (usize, usize) {
-        let across = width - 1 - x;
-        let down = height - 1 - y;
-        match self {
-            Self::Upright => (x, y),
-            Self::Mirrored => (across, y),
-            Self::HalfTurn => (across, down),
-            Self::Flipped => (x, down),
-            Self::Transposed => (y, x),
-            Self::QuarterClockwise => (down, x),
-            Self::Transversed => (down, across),
-            Self::QuarterAnticlockwise => (y, across),
-        }
-    }
-
-    /// The pixels of a picture of this size after it is turned.
-    fn turn(self, rgba: Vec<u8>, width: u32, height: u32) -> Vec<u8> {
-        if self == Self::Upright {
-            return rgba;
-        }
-        let (turned_width, _) = self.turned_size(width, height);
-        let (width, height, turned_width) =
-            (width as usize, height as usize, turned_width as usize);
-        let mut turned = vec![0; rgba.len()];
-        let (pixels, _) = rgba.as_chunks::<4>();
-        for (index, pixel) in pixels.iter().enumerate() {
-            let (x, y) = self.place(index % width, index / width, width, height);
-            turned[(y * turned_width + x) * 4..][..4].copy_from_slice(pixel);
-        }
-        turned
     }
 }
 
@@ -221,31 +128,6 @@ mod tests {
     fn a_huge_picture_shrinks_and_keeps_its_shape() {
         assert_eq!(size_to_keep(8192, 4096), (4096, 2048));
         assert_eq!(size_to_keep(1000, 9000), (455, 4096));
-    }
-
-    #[test]
-    fn each_way_up_is_read_from_the_matrix_ffmpeg_gives() {
-        const ONE: i32 = 65536;
-        const LAST: i32 = 1 << 30;
-        for (a, b, c, d, expected) in [
-            (ONE, 0, 0, ONE, Orientation::Upright),
-            (-ONE, 0, 0, ONE, Orientation::Mirrored),
-            (-ONE, 0, 0, -ONE, Orientation::HalfTurn),
-            (ONE, 0, 0, -ONE, Orientation::Flipped),
-            (0, ONE, ONE, 0, Orientation::Transposed),
-            (0, ONE, -ONE, 0, Orientation::QuarterClockwise),
-            (0, -ONE, -ONE, 0, Orientation::Transversed),
-            (0, -ONE, ONE, 0, Orientation::QuarterAnticlockwise),
-        ] {
-            let matrix = [a, b, 0, c, d, 0, 0, 0, LAST];
-            assert_eq!(Orientation::from_matrix(&matrix), expected);
-        }
-    }
-
-    #[test]
-    fn a_matrix_that_is_no_whole_turn_counts_as_upright() {
-        let matrix = [46341, 46341, 0, -46341, 46341, 0, 0, 0, 1 << 30];
-        assert_eq!(Orientation::from_matrix(&matrix), Orientation::Upright);
     }
 
     #[test]

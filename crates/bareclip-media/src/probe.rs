@@ -16,7 +16,7 @@ use ffmpeg_next::{
     util::rational::Rational,
 };
 
-use crate::error::MediaError;
+use crate::{error::MediaError, turn::Orientation};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct VideoInfo {
@@ -29,6 +29,9 @@ pub struct VideoInfo {
     /// Average frames per second.
     pub frame_rate: f64,
     pub is_hdr: bool,
+    /// How the stored pictures are turned to show the right way up. `width` and `height` are
+    /// already the size the right way up.
+    pub orientation: Orientation,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,6 +66,7 @@ impl VideoInfo {
             time_base: TimeBase { num: 1, den: 1000 },
             frame_rate: 0.0,
             is_hdr: false,
+            orientation: Orientation::Upright,
         }
     }
 }
@@ -103,6 +107,9 @@ pub fn join_problem(first: &MediaInfo, other: &MediaInfo) -> Option<String> {
             "is {} x {} instead of {} x {}",
             other.video.width, other.video.height, first.video.width, first.video.height
         )
+    } else if first.video.orientation != other.video.orientation {
+        // A copied file can only say one way up for all of its pictures.
+        "is turned a different way".to_owned()
     } else if first.video.pixel_format != other.video.pixel_format {
         "uses a different colour format".to_owned()
     } else if first.audio.len() != other.audio.len() {
@@ -157,11 +164,17 @@ pub fn probe(path: &Path) -> Result<MediaInfo, MediaError> {
             let codec = context.id();
             let decoder = context.decoder().video()?;
             let rate = video_stream.avg_frame_rate();
-            // A damaged image reports its problem when its picture is read, as it always has.
+            // A photo says which way up it is in its picture, and a video in its stream. A
+            // damaged image reports its problem when its picture is read, as it always has.
+            let orientation = if still {
+                Orientation::Upright
+            } else {
+                Orientation::of_stream(&video_stream)
+            };
             let (width, height) = still
                 .then(|| crate::still::upright_size(path).ok())
                 .flatten()
-                .unwrap_or((decoder.width(), decoder.height()));
+                .unwrap_or_else(|| orientation.turned_size(decoder.width(), decoder.height()));
             VideoInfo {
                 stream_index: video_stream.index(),
                 codec: codec.name().to_owned(),
@@ -178,6 +191,7 @@ pub fn probe(path: &Path) -> Result<MediaInfo, MediaError> {
                     decoder.color_transfer_characteristic(),
                     TransferCharacteristic::SMPTE2084 | TransferCharacteristic::ARIB_STD_B67
                 ),
+                orientation,
             }
         }
         None => VideoInfo::no_picture(),
@@ -350,6 +364,7 @@ mod tests {
                 time_base: TimeBase { num: 1, den: 1000 },
                 frame_rate: 60.0,
                 is_hdr: false,
+                orientation: Orientation::Upright,
             },
             audio: vec![AudioInfo {
                 stream_index: 1,

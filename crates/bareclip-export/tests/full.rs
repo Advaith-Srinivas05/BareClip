@@ -2459,3 +2459,57 @@ fn sound_at_another_speed_goes_in_the_file_for_as_long_as_the_clip_lasts() {
     assert!((info.duration.as_seconds() - 1.0).abs() < 0.1);
     let _ = std::fs::remove_file(&output);
 }
+
+/// A phone video: stored 320 x 180 with its left half white, and noted as needing a quarter turn
+/// anticlockwise, so it shows 180 x 320 with the white at the bottom.
+fn phone_clip() -> PathBuf {
+    let stored = clip(
+        "full-phone-stored.mp4",
+        &encoded(
+            "color=c=black:s=320x180:r=30:d=1,drawbox=x=0:y=0:w=160:h=180:color=white:t=fill,format=yuv420p"
+                .to_owned(),
+            &[beeps(1)],
+        ),
+    );
+    clip(
+        "full-phone.mp4",
+        &to_strings(&[
+            "-display_rotation",
+            "90",
+            "-i",
+            &stored.to_string_lossy(),
+            "-c",
+            "copy",
+        ]),
+    )
+}
+
+#[test]
+fn a_phone_video_redrawn_with_others_stands_the_right_way_up() {
+    let job = request(
+        "phone-joined",
+        vec![
+            part(&phone_clip(), 0.0, 0.5, 0.0),
+            part(&small_clip(), 0.0, 0.5, 0.0),
+        ],
+    );
+
+    let report = run_full(&job);
+
+    // The phone video is the larger, so the project takes its upright shape.
+    assert_eq!((report.width, report.height), (180, 320));
+    let mut reader = PictureReader::open(&job.output).expect("the export opens");
+    let first = reader
+        .next_picture()
+        .expect("it decodes")
+        .expect("it has pictures");
+    let view = first.view();
+    assert!(brightness_at(&view, 90, 40) < 40, "the top is black");
+    assert!(brightness_at(&view, 90, 280) > 200, "the bottom is white");
+    let info = probe(&job.output).expect("the export can be read");
+    assert_eq!(
+        info.video.orientation,
+        bareclip_media::Orientation::Upright,
+        "a redrawn video is stored the right way up, with nothing for a player to turn"
+    );
+}
