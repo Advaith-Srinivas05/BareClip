@@ -202,6 +202,8 @@ pub struct ClipView {
     pub is_still: bool,
     /// Whether it shows a title.
     pub is_title: bool,
+    /// Its picture's full size, if it has one and it is known.
+    pub size: Option<(u32, u32)>,
     pub speed: Speed,
     /// How long its fades really are.
     pub fade_in: Ticks,
@@ -232,6 +234,7 @@ fn source_time_at(clip: &ClipView, scale: &TimeScale, x: f32) -> Ticks {
 /// What the timeline needs to know to draw the project.
 pub struct TimelineView<'a> {
     pub tracks: &'a Tracks,
+    pub canvas: (u32, u32),
     /// Every clip, in the order of its track and then its start.
     pub clips: &'a [ClipView],
     pub faces: &'a HashMap<MediaId, ClipFace<'a>>,
@@ -696,9 +699,10 @@ pub enum MenuAction {
     Paste,
     EditDuration(ClipId),
     Delete(ClipId),
-    ToggleMute(ClipId),
-    ToggleNoiseSuppression(ClipId),
     Detach(ClipId),
+    Crop(ClipId),
+    /// Opens the right-hand panel on one of the clip's tools.
+    OpenPanel(ClipId, stage::LookTab),
     RemoveGap(Ticks),
     RemoveAllGaps,
 }
@@ -708,6 +712,7 @@ pub enum MenuAction {
 enum MenuFlyout {
     Speed,
     Audio,
+    Arrange,
 }
 
 /// What is open beside the clip's menu.
@@ -908,7 +913,7 @@ impl TimelineState {
 }
 
 /// Changes the user made on the timeline this frame.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TimelineEvents {
     /// A clip's speaker was pressed.
     pub toggle_clip_mute: Option<ClipId>,
@@ -938,8 +943,8 @@ pub struct TimelineEvents {
     pub move_clip: Option<(ClipId, Ticks, TrackTarget)>,
     pub drop_media: Option<(MediaId, Ticks, TrackTarget)>,
     pub menu: Option<MenuAction>,
-    /// The clip's menu changed its speed.
-    pub speed: Option<(ClipId, Speed)>,
+    /// What the clip's menu changed, which is what the clip's own controls can change.
+    pub changes: stage::StageEvents,
     pub collapse: bool,
 }
 
@@ -1652,14 +1657,16 @@ fn flyout_item(
     Some(shown.response.rect)
 }
 
-/// Speed and sound for the clip the menu is on, which only offers what the clip can do: an image
-/// has no speed, and a clip with no sound has none to change.
+/// The parts of the clip's menu that open beside it, which only offer what the clip can do: an
+/// image has no speed, a clip with no sound has none to change, and sound has no picture to arrange.
 fn clip_flyouts(
     ui: &mut egui::Ui,
-    palette: &Palette,
+    (palette, view): (&Palette, &TimelineView),
     clip: &ClipView,
+    under_playhead: bool,
     flyouts: &mut MenuFlyouts,
-    events: &mut (Option<(ClipId, Speed)>, Option<MenuAction>),
+    changes: &mut stage::StageEvents,
+    action: &mut Option<MenuAction>,
 ) -> Option<Rect> {
     let mut beside = None;
     if !clip.is_still {
@@ -1673,44 +1680,66 @@ fn clip_flyouts(
             (palette, icons::GAUGE, "Speed"),
             MenuFlyout::Speed,
             flyouts,
-            |ui| stage::speed_menu(ui, palette, &selected, &mut events.0),
+            |ui| {
+                stage::speed_menu(
+                    ui,
+                    palette,
+                    &selected,
+                    stage::ControlSize::MENU,
+                    &mut changes.speed,
+                )
+            },
         ));
     }
-    if clip.has_sound {
+    if clip.has_sound
+        && let Some(sound) = stage::SelectedSound::of(view.tracks, clip.id)
+    {
         beside = beside.or(flyout_item(
             ui,
             (palette, icons::VOLUME_2, "Audio"),
             MenuFlyout::Audio,
             flyouts,
-            |ui| {
-                let (icon, name) = if clip.muted {
-                    (icons::VOLUME_2, "Unmute")
-                } else {
-                    (icons::VOLUME_X, "Mute")
-                };
-                if ui.add(MenuItem::new(palette, icon, name, "")).clicked() {
-                    events.1 = Some(MenuAction::ToggleMute(clip.id));
-                }
-                if !clip.sound_only
-                    && !clip.muted
-                    && ui
-                        .add(MenuItem::new(palette, icons::UNLINK, "Detach sound", ""))
-                        .on_hover_text("Puts this clip's sound on rows of its own, so it can be moved and changed by itself")
-                        .clicked()
-                {
-                    events.1 = Some(MenuAction::Detach(clip.id));
-                }
-                let noise = MenuItem::choice(palette, "Noise suppression", clip.noise_suppression);
-                if ui
-                    .add_enabled(clip.sound_only, noise)
-                    .on_hover_text(text::NOISE_SUPPRESSION_HINT)
-                    .on_disabled_hover_text(text::NOISE_SUPPRESSION_ON_VIDEO)
-                    .clicked()
-                {
-                    events.1 = Some(MenuAction::ToggleNoiseSuppression(clip.id));
-                }
-            },
+            |ui| stage::sound_menu(ui, palette, &sound, stage::ControlSize::MENU, changes),
         ));
+        if changes.detach.take().is_some() {
+            *action = Some(MenuAction::Detach(clip.id));
+        }
+    }
+    if !clip.sound_only {
+        // A title's stored size can only be trusted while it is at the playhead.
+        let arrange = clip
+            .size
+            .zip(view.tracks.clip(clip.id))
+            .filter(|_| under_playhead || !clip.is_title)
+            .map(|(size, placed)| stage::ArrangeView {
+                id: clip.id,
+                placement: placed.placement,
+                size,
+                canvas: view.canvas,
+                is_title: clip.is_title,
+                can_go_forward: view
+                    .tracks
+                    .can_move_in_order(clip.id, bareclip_core::tracks::OrderMove::Forward),
+                can_go_back: view
+                    .tracks
+                    .can_move_in_order(clip.id, bareclip_core::tracks::OrderMove::Backward),
+            });
+        if let Some(arrange) = arrange {
+            let mut crop = false;
+            beside = beside.or(flyout_item(
+                ui,
+                (palette, icons::SCALING, "Arrange"),
+                MenuFlyout::Arrange,
+                flyouts,
+                |ui| crop = stage::arrange_menu(ui, palette, &arrange, under_playhead, changes),
+            ));
+            if crop {
+                *action = Some(MenuAction::Crop(clip.id));
+            }
+        } else {
+            ui.add_enabled(false, MenuItem::new(palette, icons::SCALING, "Arrange", ""))
+                .on_disabled_hover_text("Move the playhead inside this clip to arrange it");
+        }
     }
     beside
 }
@@ -1718,7 +1747,7 @@ fn clip_flyouts(
 /// The menu that opens on a clip or a gap, reporting what was picked from it. Also returns where
 /// any part open beside it is on screen.
 /// The clip's menu, opened from somewhere other than the timeline, such as the picture. Returns
-/// what was picked, a speed change, and whether it is still open.
+/// what was picked and whether it is still open.
 pub fn clip_menu_at(
     ui: &mut egui::Ui,
     palette: &Palette,
@@ -1726,8 +1755,8 @@ pub fn clip_menu_at(
     view: &TimelineView,
     (id, at): (ClipId, Pos2),
     just_opened: bool,
-) -> (Option<MenuAction>, Option<(ClipId, Speed)>, bool) {
-    let mut speed = None;
+    changes: &mut stage::StageEvents,
+) -> (Option<MenuAction>, bool) {
     let mut picked = None;
     let mut beside = None;
     let flyouts = &mut state.menu_flyouts;
@@ -1737,13 +1766,8 @@ pub fn clip_menu_at(
         .constrain(true)
         .show(ui.ctx(), |ui| {
             egui::Frame::menu(ui.style()).show(ui, |ui| {
-                let (action, flyout) = timeline_menu(
-                    ui,
-                    palette,
-                    view,
-                    MenuTarget::Clip(id),
-                    (flyouts, &mut speed),
-                );
+                let (action, flyout) =
+                    timeline_menu(ui, palette, view, MenuTarget::Clip(id), (flyouts, changes));
                 picked = action;
                 beside = flyout;
             })
@@ -1764,7 +1788,7 @@ pub fn clip_menu_at(
     if !open {
         state.menu_flyouts = MenuFlyouts::default();
     }
-    (picked, speed, open)
+    (picked, open)
 }
 
 fn timeline_menu(
@@ -1772,7 +1796,7 @@ fn timeline_menu(
     palette: &Palette,
     view: &TimelineView,
     target: MenuTarget,
-    (flyouts, speed): (&mut MenuFlyouts, &mut Option<(ClipId, Speed)>),
+    (flyouts, changes): (&mut MenuFlyouts, &mut stage::StageEvents),
 ) -> (Option<MenuAction>, Option<Rect>) {
     let mut action = None;
     let mut beside = None;
@@ -1836,10 +1860,50 @@ fn timeline_menu(
                 action = Some(MenuAction::EditDuration(id));
             }
             if let Some(clip) = view.clips.iter().find(|clip| clip.id == id) {
-                let mut picked = (None, None);
-                beside = clip_flyouts(ui, palette, clip, flyouts, &mut picked);
-                *speed = picked.0;
-                action = action.or(picked.1);
+                ui.separator();
+                beside = clip_flyouts(
+                    ui,
+                    (palette, view),
+                    clip,
+                    under_playhead,
+                    flyouts,
+                    changes,
+                    &mut action,
+                );
+                if !clip.sound_only {
+                    ui.separator();
+                    let mut panel =
+                        |ui: &mut egui::Ui, icon, name, tab, flyouts: &mut MenuFlyouts| {
+                            let line = ui.add(MenuItem::new(palette, icon, name, ""));
+                            if plain_line(line, flyouts) {
+                                action = Some(MenuAction::OpenPanel(id, tab));
+                            }
+                        };
+                    if !clip.is_title {
+                        panel(
+                            ui,
+                            icons::APERTURE,
+                            "Filters",
+                            stage::LookTab::Filters,
+                            flyouts,
+                        );
+                        panel(
+                            ui,
+                            icons::SPARKLES,
+                            "Effects",
+                            stage::LookTab::Effects,
+                            flyouts,
+                        );
+                    }
+                    panel(
+                        ui,
+                        icons::SWATCH_BOOK,
+                        "Adjust colours",
+                        stage::LookTab::Colours,
+                        flyouts,
+                    );
+                    panel(ui, icons::CONTRAST, "Fade", stage::LookTab::Fade, flyouts);
+                }
             }
         }
         MenuTarget::Gap(time) => {
@@ -2681,14 +2745,14 @@ pub fn timeline(
     if let Some(target) = state.menu_target {
         let just_opened = response.secondary_clicked();
         let flyouts = &mut state.menu_flyouts;
-        let speed = &mut events.speed;
+        let changes = &mut events.changes;
         let menu = &mut events.menu;
         // The menu has to judge clicks itself. Left to the toolkit, a click beside it on the
         // speed controls would count as outside it.
         Popup::context_menu(&response)
             .close_behavior(PopupCloseBehavior::IgnoreClicks)
             .show(|ui| {
-                let (picked, beside) = timeline_menu(ui, palette, view, target, (flyouts, speed));
+                let (picked, beside) = timeline_menu(ui, palette, view, target, (flyouts, changes));
                 *menu = picked;
                 let frame = ui.min_rect().expand(MENU_FRAME_ROOM);
                 let clicked_at = ui.input(|input| {
@@ -2836,6 +2900,7 @@ mod tests {
             shows_waveform: false,
             is_still: false,
             is_title: false,
+            size: None,
             speed: Speed::default(),
             fade_in: Ticks(0),
             fade_out: Ticks(0),

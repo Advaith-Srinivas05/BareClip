@@ -1844,7 +1844,7 @@ mod tests {
         }
         for (kind, name, at) in [
             (EffectKind::CrashZoom, "crash-zoom", 1.0),
-            (EffectKind::Spin, "spin", 0.8),
+            (EffectKind::Spin, "spin-effect", 0.8),
             (EffectKind::Comic, "comic", 1.0),
             (EffectKind::Glow, "glow", 1.0),
             (EffectKind::Disco, "disco", 1.0),

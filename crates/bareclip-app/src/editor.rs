@@ -402,7 +402,8 @@ enum RatePick {
 mod looks;
 #[path = "titles.rs"]
 mod titles;
-use looks::{LookPictures, LookTab, TitleTab};
+use looks::{LookPictures, TitleTab};
+use stage::LookTab;
 use titles::{CardHover, CopiedClip, DurationEdit, LeftPanel, TitleCard, TitleResize};
 
 struct MediaEntry {
@@ -564,6 +565,8 @@ pub struct Editor {
     effect_settings: Option<EffectKind>,
     look_pictures: LookPictures,
     look_panel_open: bool,
+    /// Whether the right-hand rail is up, which waits for the pointer after a press selects a clip.
+    clip_rail_showing: bool,
     look_tab: LookTab,
     title_tab: TitleTab,
     /// The card the pointer is resting on, which starts moving after a moment.
@@ -733,6 +736,7 @@ impl Editor {
             effect_settings: None,
             look_pictures: LookPictures::default(),
             look_panel_open: false,
+            clip_rail_showing: false,
             look_tab: LookTab::default(),
             title_tab: TitleTab::default(),
             card_hover: None,
@@ -2813,6 +2817,8 @@ impl Editor {
         self.title_strip(ui, palette);
         self.rail(ui, palette);
         self.media_panel(ui, palette);
+        // The rail comes first so it sits at the window's edge, outside the panel it opens.
+        self.clip_rail(ui, palette);
         self.title_panel(ui, palette);
         // The video and the timeline share one card, from here down to the stage.
         self.card_top_row(ui, palette);
@@ -3982,6 +3988,7 @@ impl Editor {
                     .shows_waveform(self.project.tracks.is_sound_row(track)),
                 is_still: clip.is_still(),
                 is_title: clip.is_title(),
+                size: self.video_size(clip.media),
                 speed: clip.speed,
                 fade_in: clip.sound.fade_in_on(clip.duration()),
                 fade_out: clip.sound.fade_out_on(clip.duration()),
@@ -4001,6 +4008,7 @@ impl Editor {
         let joins = self.join_views();
         let view = TimelineView {
             tracks: &self.project.tracks,
+            canvas: self.project.canvas.size(),
             clips: &clips,
             faces: &faces,
             position: self.position(),
@@ -4012,16 +4020,16 @@ impl Editor {
         };
         let mut events = timeline::timeline(ui, palette, &mut self.timeline_state, &view);
         if let Some((id, at, just_opened)) = self.picture_menu {
-            let (picked, speed, open) = timeline::clip_menu_at(
+            let (picked, open) = timeline::clip_menu_at(
                 ui,
                 palette,
                 &mut self.timeline_state,
                 &view,
                 (id, at),
                 just_opened,
+                &mut events.changes,
             );
             events.menu = events.menu.or(picked);
-            events.speed = events.speed.or(speed);
             self.picture_menu = open.then_some((id, at, false));
         }
         let pointer_down = ui.input(|input| input.pointer.any_down());
@@ -4068,33 +4076,13 @@ impl Editor {
         }
     }
 
-    /// Turns noise suppression on or off, for a clip on a row of sound only.
-    fn toggle_noise_suppression(&mut self, id: ClipId) {
-        let tracks = &self.project.tracks;
-        let on_sound_row = tracks
-            .track_of(id)
-            .is_some_and(|row| tracks.is_sound_row(row));
-        if let Some(clip) = tracks.clip(id).filter(|_| on_sound_row) {
-            let sound = ClipSound {
-                noise_suppression: !clip.sound.noise_suppression,
-                ..clip.sound
-            };
-            self.record();
-            self.project.tracks.set_clip_sound(id, sound);
-        }
-    }
-
     fn apply_timeline_events(&mut self, events: timeline::TimelineEvents, pointer_down: bool) {
         if let Some(id) = events.toggle_clip_mute {
             self.toggle_clip_mute(id);
         }
-        // The clip's menu changes speed the same way the toolbar does, as one undo step.
-        if events.speed.is_some() {
-            let speed = stage::StageEvents {
-                speed: events.speed,
-                ..stage::StageEvents::default()
-            };
-            self.apply_stage_events(speed, pointer_down);
+        // The clip's menu changes things the same way the clip's own controls do, as one undo step.
+        if events.changes != stage::StageEvents::default() {
+            self.apply_stage_events(events.changes, pointer_down);
         }
         if events.add_audio {
             self.add_audio_requested = true;
@@ -4173,9 +4161,14 @@ impl Editor {
                 self.selected = Some(id);
                 self.delete_selected();
             }
-            Some(MenuAction::ToggleMute(id)) => self.toggle_clip_mute(id),
-            Some(MenuAction::ToggleNoiseSuppression(id)) => self.toggle_noise_suppression(id),
             Some(MenuAction::Detach(id)) => self.detach_sound(id),
+            Some(MenuAction::Crop(id)) => {
+                self.selected = Some(id);
+                self.selected_gap = None;
+                self.selected_join = None;
+                self.stage_state.begin_crop(id);
+            }
+            Some(MenuAction::OpenPanel(id, tab)) => self.open_clip_panel(id, tab),
             Some(MenuAction::RemoveGap(time)) => self.remove_gap(time),
             Some(MenuAction::RemoveAllGaps) => self.remove_all_gaps(),
             None => {}
@@ -4343,21 +4336,11 @@ impl Editor {
     /// The handles and toolbar on the picture, and what they ask for.
     /// The selected clip's sound, if its file has any.
     fn selected_sound(&self) -> Option<stage::SelectedSound> {
-        let tracks = &self.project.tracks;
         let id = self.selected?;
-        let clip = tracks.clip(id)?;
-        self.has_sound(clip.media).then(|| stage::SelectedSound {
-            id,
-            sound: clip.sound,
-            length: clip.duration(),
-            can_detach: tracks
-                .track_of(id)
-                .is_some_and(|row| !tracks.is_sound_row(row))
-                && !clip.sound.muted,
-            can_clean: tracks
-                .track_of(id)
-                .is_some_and(|row| tracks.is_sound_row(row)),
-        })
+        let clip = self.project.tracks.clip(id)?;
+        self.has_sound(clip.media)
+            .then(|| stage::SelectedSound::of(&self.project.tracks, id))
+            .flatten()
     }
 
     /// The selected clip's speed. An image has no footage to play through.
@@ -4432,8 +4415,6 @@ impl Editor {
                     .tracks
                     .can_move_in_order(id, OrderMove::Backward)
             }),
-            sound: self.selected_sound(),
-            speed: self.selected_speed(),
             selected_is_title: self.selected_title().is_some(),
         };
         let events = stage::show(ui, palette, &mut self.stage_state, &view);
@@ -4484,9 +4465,6 @@ impl Editor {
                 let position = self.position();
                 self.seek(position);
             }
-        }
-        if events.toggle_look {
-            self.look_panel_open = !self.look_panel_open;
         }
         if let Some((id, at)) = events.menu {
             self.picture_menu = Some((id, at, true));
@@ -7543,9 +7521,11 @@ mod tests {
     /// Points at a line of the menu, which opens what is beside it. The toolbar over the picture
     /// has a Speed button too, and the menu's is the lower one.
     fn open_flyout(ctx: &egui::Context, editor: &mut Editor, name: &str) {
+        // The rail at the window's right edge has tools with the same names.
+        let rail = ctx.content_rect().right() - RAIL_WIDTH;
         let line = named_nodes(ctx, editor)
             .into_iter()
-            .filter(|(label, ..)| label == name)
+            .filter(|(label, rect, _)| label == name && rect.right() <= rail)
             .map(|(_, rect, _)| rect)
             .max_by(|a, b| a.top().total_cmp(&b.top()))
             .unwrap_or_else(|| panic!("nothing is named {name}"));
@@ -7684,29 +7664,363 @@ mod tests {
     }
 
     #[test]
-    fn the_clips_menu_mutes_and_detaches_from_audio_and_closes_after() {
+    fn the_clips_menu_mutes_from_audio_staying_open_and_detaching_closes_it() {
         let ctx = context();
         let sound = clip_with_sound();
         let mut editor = with_videos(&ctx, &[&sound]);
         let id = open_clip_menu(&ctx, &mut editor);
         open_flyout(&ctx, &mut editor, "Audio");
 
-        click_named(&ctx, &mut editor, "Mute");
+        click_menu_item(&ctx, &mut editor, "Mute clip");
         run_frame(&ctx, &mut editor, vec![]);
         assert!(picture_clip(&editor).sound.muted);
-        assert_eq!(editor.timeline_state.menu_target, None);
-        editor.undo();
+        assert!(editor.timeline_state.menu_target.is_some());
+        click_menu_item(&ctx, &mut editor, "Unmute clip");
+        run_frame(&ctx, &mut editor, vec![]);
         assert!(!picture_clip(&editor).sound.muted);
 
-        open_clip_menu(&ctx, &mut editor);
-        open_flyout(&ctx, &mut editor, "Audio");
-        click_named(&ctx, &mut editor, "Detach sound");
+        click_menu_item(&ctx, &mut editor, "Detach sound");
         run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.timeline_state.menu_target, None);
         assert_eq!(editor.project.tracks.audio_tracks().len(), 1);
         assert_eq!(
             editor.project.tracks.clip(id).map(|clip| clip.sound.muted),
             Some(true)
         );
+    }
+
+    #[test]
+    fn the_clips_menu_has_volume_and_fades_and_a_change_is_one_undo_step() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        open_clip_menu(&ctx, &mut editor);
+        open_flyout(&ctx, &mut editor, "Audio");
+        for line in [
+            "Volume",
+            "Fade in",
+            "Fade out",
+            "Mute clip",
+            "Noise suppression",
+        ] {
+            assert!(is_named(&ctx, &mut editor, line), "{line}");
+        }
+
+        let slider = named_nodes(&ctx, &mut editor)
+            .into_iter()
+            .find(|(label, ..)| label == "Volume")
+            .expect("the slider is there")
+            .1;
+        click(
+            &ctx,
+            &mut editor,
+            pos2(slider.left() + slider.width() * 0.25, slider.center().y),
+        );
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert!(picture_clip(&editor).sound.volume < bareclip_core::sound::FULL_VOLUME);
+        assert!(editor.timeline_state.menu_target.is_some(), "it stays open");
+        editor.undo();
+        assert_eq!(
+            picture_clip(&editor).sound.volume,
+            bareclip_core::sound::FULL_VOLUME
+        );
+    }
+
+    #[test]
+    fn the_clips_menu_arranges_a_clip_with_everything_on_the_toolbar_and_in_more() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let id = open_clip_menu(&ctx, &mut editor);
+        open_flyout(&ctx, &mut editor, "Arrange");
+        for line in [
+            "Crop",
+            "Rotate by 90 degrees",
+            "Flip left to right",
+            "Flip top to bottom",
+            "Opacity",
+            "Top left",
+            "Bring to front",
+            "Send to back",
+            "Reset size and place",
+        ] {
+            assert!(is_named(&ctx, &mut editor, line), "{line}");
+        }
+
+        click_menu_item(&ctx, &mut editor, "Flip left to right");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(placement_of(&editor, id).flip_x);
+        assert!(editor.timeline_state.menu_target.is_some(), "it stays open");
+        click_menu_item(&ctx, &mut editor, "Rotate by 90 degrees");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_ne!(placement_of(&editor, id).rotation, 0);
+
+        click_menu_item(&ctx, &mut editor, "Reset size and place");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(placement_of(&editor, id), Placement::default());
+        editor.undo();
+        assert_ne!(placement_of(&editor, id).rotation, 0);
+    }
+
+    #[test]
+    fn crop_on_the_clips_menu_starts_cropping_and_waits_for_the_playhead() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let id = open_clip_menu(&ctx, &mut editor);
+        open_flyout(&ctx, &mut editor, "Arrange");
+        click_menu_item(&ctx, &mut editor, "Crop");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.stage_state.cropping(), Some(id));
+        assert_eq!(editor.selected, Some(id));
+        assert_eq!(editor.timeline_state.menu_target, None);
+
+        let mut away = with_videos(&ctx, &[test_clip()]);
+        away.seek(away.project.tracks.duration());
+        run_frame(&ctx, &mut away, vec![]);
+        open_clip_menu(&ctx, &mut away);
+        open_flyout(&ctx, &mut away, "Arrange");
+        let (_, disabled) = menu_item(&ctx, &mut away, "Crop").expect("it is listed");
+        assert!(disabled, "the clip isn't on the picture");
+    }
+
+    #[test]
+    fn the_clips_menu_opens_the_panel_on_each_look_tool() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        editor.selected = None;
+        for (line, tab) in [
+            ("Filters", LookTab::Filters),
+            ("Effects", LookTab::Effects),
+            ("Adjust colours", LookTab::Colours),
+            ("Fade", LookTab::Fade),
+        ] {
+            let id = open_clip_menu(&ctx, &mut editor);
+            click_menu_item(&ctx, &mut editor, line);
+            let_dialog_open(&ctx, &mut editor);
+            assert_eq!(editor.selected, Some(id));
+            assert!(editor.looking_at().is_some(), "{line}");
+            assert_eq!(editor.look_tab, tab);
+            assert_eq!(editor.timeline_state.menu_target, None);
+        }
+    }
+
+    #[test]
+    fn a_sound_clip_has_no_picture_tools_on_its_menu() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[song_file()]);
+        open_clip_menu(&ctx, &mut editor);
+        for line in ["Arrange", "Filters", "Effects", "Adjust colours"] {
+            assert!(menu_item(&ctx, &mut editor, line).is_none(), "{line}");
+        }
+        assert!(menu_item(&ctx, &mut editor, "Audio").is_some());
+    }
+
+    #[test]
+    fn a_title_only_has_colours_and_fade_and_arranges_at_the_playhead() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        let title = with_a_title(&ctx, &mut editor, TitleStyle::Plain);
+
+        right_click_menu_on(&ctx, &mut editor, title);
+        assert!(menu_item(&ctx, &mut editor, "Filters").is_none());
+        assert!(menu_item(&ctx, &mut editor, "Effects").is_none());
+        let (_, disabled) = menu_item(&ctx, &mut editor, "Arrange").expect("it is listed");
+        assert!(!disabled);
+        open_flyout(&ctx, &mut editor, "Arrange");
+        assert!(menu_item(&ctx, &mut editor, "Crop").is_none());
+        assert!(menu_item(&ctx, &mut editor, "Flip left to right").is_none());
+        assert!(menu_item(&ctx, &mut editor, "Rotate by 90 degrees").is_some());
+
+        click_menu_item(&ctx, &mut editor, "Adjust colours");
+        let_dialog_open(&ctx, &mut editor);
+        assert_eq!(editor.title_tab, TitleTab::Colours);
+
+        let end = editor.project.tracks.duration();
+        editor.seek(end);
+        run_frame(&ctx, &mut editor, vec![]);
+        right_click_menu_on(&ctx, &mut editor, title);
+        let (_, disabled) = menu_item(&ctx, &mut editor, "Arrange").expect("it is listed");
+        assert!(disabled, "a title's size is only known at the playhead");
+    }
+
+    #[test]
+    fn the_toolbar_holds_only_crop_rotate_flip_and_more() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        run_frame(&ctx, &mut editor, vec![]);
+        for name in ["Crop", "Rotate by 90 degrees", "Flip", "More"] {
+            assert!(is_named(&ctx, &mut editor, name), "{name}");
+        }
+        assert!(
+            !is_named(&ctx, &mut editor, "Flip left to right"),
+            "it's in Flip's menu"
+        );
+        assert!(!is_named(&ctx, &mut editor, "Filters and colours"));
+        let rail = ctx.content_rect().right() - RAIL_WIDTH;
+        for name in ["Speed", "Audio", "Filters"] {
+            let (_, rect, _) = named_nodes(&ctx, &mut editor)
+                .into_iter()
+                .find(|(label, ..)| label == name)
+                .unwrap_or_else(|| panic!("nothing is named {name}"));
+            assert!(
+                rect.left() >= rail,
+                "{name} is on the rail, not the toolbar"
+            );
+        }
+    }
+
+    #[test]
+    fn the_rail_only_offers_what_the_selected_clip_can_do() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let picture = image_file("rail", "64x64", "red");
+        let mut editor = with_videos(&ctx, &[&sound, test_clip(), &picture, song_file()]);
+        let tabs_of = |editor: &mut Editor, id| {
+            editor.selected = Some(id);
+            editor.clip_tabs()
+        };
+        let look = [
+            LookTab::Filters,
+            LookTab::Effects,
+            LookTab::Colours,
+            LookTab::Fade,
+        ];
+        let picture_clips: Vec<_> = editor.project.tracks.picture_tracks()[0].clips().to_vec();
+        assert_eq!(
+            tabs_of(&mut editor, picture_clips[0].id),
+            [&look[..], &[LookTab::Speed, LookTab::Audio]].concat()
+        );
+        assert_eq!(
+            tabs_of(&mut editor, picture_clips[1].id),
+            [&look[..], &[LookTab::Speed]].concat()
+        );
+        assert_eq!(tabs_of(&mut editor, picture_clips[2].id), look.to_vec());
+        let song = sound_row_clip(&editor).id;
+        assert_eq!(
+            tabs_of(&mut editor, song),
+            vec![LookTab::Speed, LookTab::Audio]
+        );
+
+        let title = with_a_title(&ctx, &mut editor, TitleStyle::Plain);
+        assert_eq!(tabs_of(&mut editor, title), Vec::<LookTab>::new());
+        editor.selected = None;
+        assert!(editor.clip_tabs().is_empty());
+    }
+
+    #[test]
+    fn a_rail_tab_opens_its_panel_and_pressing_it_again_closes_it() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.looking_at().is_none());
+
+        click_named(&ctx, &mut editor, "Audio");
+        let_dialog_open(&ctx, &mut editor);
+        assert_eq!(editor.look_tab, LookTab::Audio);
+        assert!(editor.looking_at().is_some());
+        assert!(is_named(&ctx, &mut editor, "Volume"));
+
+        click_named(&ctx, &mut editor, "Speed");
+        let_dialog_open(&ctx, &mut editor);
+        assert_eq!(editor.look_tab, LookTab::Speed);
+        assert!(is_named(&ctx, &mut editor, "Clip speed"));
+
+        click_named(&ctx, &mut editor, "Speed");
+        let_dialog_open(&ctx, &mut editor);
+        assert!(editor.looking_at().is_none());
+    }
+
+    #[test]
+    fn the_panel_closes_on_a_clip_without_that_tool_and_comes_back_on_one_with_it() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound, test_clip()]);
+        let clips: Vec<_> = editor.project.tracks.picture_tracks()[0].clips().to_vec();
+        editor.selected = Some(clips[0].id);
+        editor.look_panel_open = true;
+        editor.look_tab = LookTab::Audio;
+        assert!(editor.looking_at().is_some());
+
+        editor.selected = Some(clips[1].id);
+        assert!(editor.looking_at().is_none());
+        editor.selected = Some(clips[0].id);
+        assert!(editor.looking_at().is_some());
+    }
+
+    #[test]
+    fn the_rail_waits_for_the_pointer_so_a_press_cant_move_the_picture() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        editor.selected = None;
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(!editor.clip_rail_showing);
+        let middle = editor
+            .stage_state
+            .frame
+            .expect("the picture shows")
+            .center();
+        let frame_before = editor.stage_state.frame;
+
+        let to = middle + vec2(20.0, 0.0);
+        begin_drag(&ctx, &mut editor, middle, to);
+        assert!(editor.selected.is_some(), "the drag selected it");
+        assert!(!editor.clip_rail_showing);
+        assert_eq!(editor.stage_state.frame, frame_before);
+
+        end_drag(&ctx, &mut editor, to);
+        run_frame(&ctx, &mut editor, vec![]);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.clip_rail_showing);
+    }
+
+    #[test]
+    #[ignore = "draws pictures to look at"]
+    fn draw_the_clip_tools_screens() {
+        let folder = std::env::var_os("BARECLIP_SCREENS").map_or_else(
+            || std::env::temp_dir().join("bareclip-screens"),
+            PathBuf::from,
+        );
+        let ctx = context();
+        let mut camera = Camera::new(folder);
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        for _ in 0..60 {
+            run_frame(&ctx, &mut editor, vec![]);
+            thread::sleep(Duration::from_millis(10));
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "tools-01-rail-and-toolbar");
+
+        click_named(&ctx, &mut editor, "Flip");
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "tools-02-flip");
+        run_frame(&ctx, &mut editor, key_event(Key::Escape, Modifiers::NONE));
+
+        click_named(&ctx, &mut editor, "Filters");
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "tools-03-filters");
+        click_named(&ctx, &mut editor, "Speed");
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "tools-04-speed");
+        click_named(&ctx, &mut editor, "Audio");
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "tools-05-audio");
+        click_named(&ctx, &mut editor, "Audio");
+        let_dialog_open(&ctx, &mut editor);
+
+        open_clip_menu(&ctx, &mut editor);
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "tools-06-menu");
+        open_flyout(&ctx, &mut editor, "Audio");
+        let line = named_rect(&ctx, &mut editor, "Volume");
+        let rest = moved(line.center());
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, rest, "tools-07-menu-audio");
+        open_flyout(&ctx, &mut editor, "Arrange");
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "tools-08-menu-arrange");
     }
 
     #[test]
@@ -9399,7 +9713,7 @@ mod tests {
         let mut editor = with_videos(&ctx, &[test_clip()]);
         let scale = editor.timeline_state.scale;
         let before = scale.x_of(editor.project.tracks.duration()) - scale.left;
-        assert!(before < scale.width * 0.8, "{before}");
+        assert!(before < scale.width * 0.9, "{before}");
 
         click_named(&ctx, &mut editor, "Fit");
         run_frame(&ctx, &mut editor, vec![]);
@@ -12346,7 +12660,7 @@ mod tests {
     }
 
     #[test]
-    fn the_toolbar_offers_speed_on_a_video_and_a_press_changes_it_as_one_undo_step() {
+    fn the_rail_offers_speed_on_a_video_and_a_press_changes_it_as_one_undo_step() {
         let ctx = context();
         let sound = clip_with_sound();
         let mut editor = with_videos(&ctx, &[&sound]);
@@ -13112,25 +13426,25 @@ mod tests {
     }
 
     #[test]
-    fn the_toolbar_offers_sound_only_for_a_clip_that_has_some() {
+    fn the_rail_offers_audio_only_for_a_clip_that_has_some() {
         let ctx = context();
         let sound = clip_with_sound();
         let mut with_sound = with_videos(&ctx, &[&sound]);
         run_frame(&ctx, &mut with_sound, vec![]);
-        assert!(is_named(&ctx, &mut with_sound, "Sound"));
+        assert!(is_named(&ctx, &mut with_sound, "Audio"));
 
         let mut silent = with_videos(&ctx, &[test_clip()]);
         run_frame(&ctx, &mut silent, vec![]);
-        assert!(!is_named(&ctx, &mut silent, "Sound"));
+        assert!(!is_named(&ctx, &mut silent, "Audio"));
     }
 
     #[test]
-    fn a_clip_of_nothing_but_sound_gets_a_toolbar_too() {
+    fn a_clip_of_nothing_but_sound_gets_its_tools_on_the_rail() {
         let ctx = context();
         let mut editor = with_videos(&ctx, &[song_file()]);
         run_frame(&ctx, &mut editor, vec![]);
 
-        assert!(is_named(&ctx, &mut editor, "Sound"));
+        assert!(is_named(&ctx, &mut editor, "Audio"));
     }
 
     #[test]
@@ -13160,13 +13474,13 @@ mod tests {
     }
 
     #[test]
-    fn detach_sound_from_the_toolbar_makes_a_clip_in_time_and_one_undo_puts_it_back() {
+    fn detach_sound_from_the_audio_panel_makes_a_clip_in_time_and_one_undo_puts_it_back() {
         let ctx = context();
         let sound = clip_with_sound();
         let mut editor = with_videos(&ctx, &[&sound]);
         run_frame(&ctx, &mut editor, vec![]);
 
-        click_named(&ctx, &mut editor, "Sound");
+        click_named(&ctx, &mut editor, "Audio");
         let_dialog_open(&ctx, &mut editor);
         click_named(&ctx, &mut editor, "Detach sound");
 
@@ -13184,7 +13498,7 @@ mod tests {
     }
 
     #[test]
-    fn noise_suppression_switches_on_from_the_sound_menu_for_detached_sound_as_one_undo_step() {
+    fn noise_suppression_switches_on_from_the_audio_panel_for_detached_sound_as_one_undo_step() {
         let ctx = context();
         let sound = clip_with_sound();
         let mut editor = with_videos(&ctx, &[&sound]);
@@ -13192,7 +13506,7 @@ mod tests {
         editor.selected = Some(sound_row_clip(&editor).id);
         run_frame(&ctx, &mut editor, vec![]);
 
-        click_named(&ctx, &mut editor, "Sound");
+        click_named(&ctx, &mut editor, "Audio");
         let_dialog_open(&ctx, &mut editor);
         click_named(&ctx, &mut editor, "Noise suppression");
         run_frame(&ctx, &mut editor, vec![]);
@@ -13215,7 +13529,7 @@ mod tests {
         let mut editor = with_videos(&ctx, &[&sound]);
         run_frame(&ctx, &mut editor, vec![]);
 
-        click_named(&ctx, &mut editor, "Sound");
+        click_named(&ctx, &mut editor, "Audio");
         let_dialog_open(&ctx, &mut editor);
         let switch = named_nodes(&ctx, &mut editor)
             .into_iter()
@@ -13764,7 +14078,7 @@ mod tests {
     }
 
     #[test]
-    fn the_toolbar_opens_a_clips_look_and_filters_can_be_chosen() {
+    fn the_open_panel_lets_filters_be_chosen() {
         let ctx = context();
         let (mut editor, first, _) = with_two_touching_clips(&ctx);
         editor.selected = Some(first);
@@ -14259,7 +14573,7 @@ mod tests {
         assert!(!is_named(&ctx, &mut editor, "Crop"));
         assert!(!is_named(&ctx, &mut editor, "Flip left to right"));
         assert!(!is_named(&ctx, &mut editor, "Speed"));
-        assert!(!is_named(&ctx, &mut editor, "Sound"));
+        assert!(!is_named(&ctx, &mut editor, "Audio"));
     }
 
     #[test]
@@ -15604,7 +15918,7 @@ mod tests {
         run_frame(&ctx, &mut editor, vec![]);
         camera.shoot(&ctx, &mut editor, vec![], "sound-02-fades");
 
-        click_named(&ctx, &mut editor, "Sound");
+        click_named(&ctx, &mut editor, "Audio");
         let_dialog_open(&ctx, &mut editor);
         camera.shoot(&ctx, &mut editor, vec![], "sound-03-controls");
 
@@ -15622,7 +15936,7 @@ mod tests {
 
         editor.export_state = ExportState::Closed;
         run_frame(&ctx, &mut editor, vec![]);
-        click_named(&ctx, &mut editor, "Sound");
+        click_named(&ctx, &mut editor, "Audio");
         let_dialog_open(&ctx, &mut editor);
         click_named(&ctx, &mut editor, "Noise suppression");
         let_dialog_open(&ctx, &mut editor);
@@ -16611,8 +16925,12 @@ mod tests {
         editor.selected = Some(clip);
         run_frame(&ctx, &mut editor, vec![]);
 
+        click_named(&ctx, &mut editor, "Flip");
+        let_dialog_open(&ctx, &mut editor);
         click_named(&ctx, &mut editor, "Flip left to right");
         assert!(placement_of(&editor, clip).flip_x);
+        click_named(&ctx, &mut editor, "Flip");
+        let_dialog_open(&ctx, &mut editor);
         click_named(&ctx, &mut editor, "Flip top to bottom");
         assert!(placement_of(&editor, clip).flip_y);
 

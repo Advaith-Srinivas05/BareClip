@@ -12,7 +12,7 @@ use bareclip_core::{
     speed::{FASTEST, NORMAL, SLOWEST, Speed},
     time::Ticks,
     timeline::ClipId,
-    tracks::OrderMove,
+    tracks::{OrderMove, Tracks},
 };
 use eframe::egui::{self, CursorIcon, Pos2, Rect, Sense, Shape, Slider, Stroke, pos2, vec2};
 
@@ -609,6 +609,11 @@ pub struct StageState {
 }
 
 impl StageState {
+    /// Starts cropping a clip, which has to be selected and on the picture.
+    pub fn begin_crop(&mut self, id: ClipId) {
+        self.cropping = Some(id);
+    }
+
     /// The clip being cropped, if any. It should be drawn whole, with its crop shown on top.
     pub fn cropping(&self) -> Option<ClipId> {
         self.cropping
@@ -635,8 +640,6 @@ pub struct StageView<'a> {
     /// Whether the selected clip can go further forward, and further back.
     pub can_go_forward: bool,
     pub can_go_back: bool,
-    pub sound: Option<SelectedSound>,
-    pub speed: Option<SelectedSpeed>,
     /// The selected clip is a title, so it has no crop or flips, and its place comes from its
     /// own controls rather than picture-in-picture.
     pub selected_is_title: bool,
@@ -652,13 +655,37 @@ pub struct StageEvents {
     pub sound: Option<(ClipId, ClipSound)>,
     pub speed: Option<(ClipId, Speed)>,
     pub detach: Option<ClipId>,
-    /// The button for the clip's filters, colours and fades was pressed.
-    pub toggle_look: bool,
     /// A clip on the picture was right-clicked, and where, to open its menu there.
     pub menu: Option<(ClipId, Pos2)>,
 }
 
-/// The selected clip's speed, if it can have one, for the toolbar's controls.
+/// Which of a clip's controls is showing in the right-hand panel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LookTab {
+    #[default]
+    Filters,
+    Effects,
+    Colours,
+    Fade,
+    Speed,
+    Audio,
+}
+
+/// What the Arrange controls need to know about a clip, wherever they are opened from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ArrangeView {
+    pub id: ClipId,
+    pub placement: Placement,
+    pub size: (u32, u32),
+    pub canvas: (u32, u32),
+    /// A title has no crop or flips, and its place comes from its own controls rather than
+    /// picture-in-picture.
+    pub is_title: bool,
+    pub can_go_forward: bool,
+    pub can_go_back: bool,
+}
+
+/// The selected clip's speed, if it can have one, for its controls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SelectedSpeed {
     pub id: ClipId,
@@ -667,7 +694,7 @@ pub struct SelectedSpeed {
     pub has_sound: bool,
 }
 
-/// The selected clip's sound, if it has any, for the toolbar's controls.
+/// A clip's sound, if it has any, for its controls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SelectedSound {
     pub id: ClipId,
@@ -677,6 +704,21 @@ pub struct SelectedSound {
     pub can_detach: bool,
     /// Only a clip on a row of sound can have noise taken out.
     pub can_clean: bool,
+}
+
+impl SelectedSound {
+    /// How a clip's sound stands on these rows. Whether its file has any sound is up to the caller.
+    pub fn of(tracks: &Tracks, id: ClipId) -> Option<Self> {
+        let clip = tracks.clip(id)?;
+        let on_sound_row = tracks.track_of(id).map(|row| tracks.is_sound_row(row))?;
+        Some(Self {
+            id,
+            sound: clip.sound,
+            length: clip.duration(),
+            can_detach: !on_sound_row && !clip.sound.muted,
+            can_clean: on_sound_row,
+        })
+    }
 }
 
 /// The crop handle at a place on the screen, on the clip being cropped.
@@ -961,29 +1003,45 @@ pub fn show(
             box_around,
             &mut events,
         );
-    } else if let Some(selected) = &view.sound {
-        // Sound with no picture, or a clip somewhere else on the timeline: nothing shows to put
-        // the toolbar against, so it goes at the top of the picture.
-        sound_toolbar(ui, palette, view, selected, &mut events);
     }
     events
+}
+
+/// How roomy the speed and sound controls are, in a menu or in the narrower right-hand panel.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ControlSize {
+    slider: f32,
+    choice: f32,
+}
+
+impl ControlSize {
+    pub const MENU: Self = Self {
+        slider: MORE_MENU_SLIDER_WIDTH,
+        choice: (SPEED_MENU_WIDTH - SPEED_CHOICE_GAP * 3.0) / 4.0,
+    };
+    pub const PANEL: Self = Self {
+        slider: 84.0,
+        choice: (PANEL_CONTROLS_WIDTH - SPEED_CHOICE_GAP * 3.0) / 4.0,
+    };
 }
 
 /// How wide the sound controls' popup is laid out, leaving room for labels and values.
 const SOUND_LABEL_WIDTH: f32 = 58.0;
 const SPEED_MENU_WIDTH: f32 = 250.0;
+/// What is left of the right-hand panel inside its margins.
+const PANEL_CONTROLS_WIDTH: f32 = 222.0;
 const SPEED_BOX_WIDTH: f32 = 44.0;
 /// As far as the fade sliders go. Longer fades can be typed in.
 const FADE_SLIDER_SECONDS: f64 = 2.0;
 
-fn sound_row_setup(ui: &mut egui::Ui, palette: &Palette) {
+fn sound_row_setup(ui: &mut egui::Ui, palette: &Palette, size: ControlSize) {
     // The theme has no rail colour of its own that shows up on a raised surface.
     let visuals = &mut ui.style_mut().visuals;
     visuals.widgets.inactive.bg_fill = palette.border_strong;
     visuals.widgets.hovered.bg_fill = palette.border_strong;
     visuals.widgets.active.bg_fill = palette.border_strong;
     visuals.selection.bg_fill = palette.accent;
-    ui.spacing_mut().slider_width = MORE_MENU_SLIDER_WIDTH;
+    ui.spacing_mut().slider_width = size.slider;
 }
 
 fn sound_label(ui: &mut egui::Ui, palette: &Palette, text: &str) {
@@ -1001,10 +1059,11 @@ fn fade_row(
     name: &str,
     current: i64,
     longest: Ticks,
+    size: ControlSize,
 ) -> Option<i64> {
     let mut changed = None;
     ui.horizontal(|ui| {
-        sound_row_setup(ui, palette);
+        sound_row_setup(ui, palette, size);
         sound_label(ui, palette, name);
         let longest_seconds = longest.as_seconds();
         let mut seconds = Ticks(current).as_seconds().min(longest_seconds);
@@ -1045,7 +1104,6 @@ fn fade_row(
 const SPEED_CHOICES: [f64; 8] = [0.25, 0.5, 1.0, 1.5, 2.0, 4.0, 8.0, 16.0];
 const SPEED_CHOICES_PER_ROW: usize = 4;
 const SPEED_CHOICE_GAP: f32 = 4.0;
-const SPEED_CHOICE_WIDTH: f32 = (SPEED_MENU_WIDTH - SPEED_CHOICE_GAP * 3.0) / 4.0;
 
 /// A speed from the slider, which moves in tenths. Finer ones can be typed.
 fn slider_factor(factor: f64) -> f64 {
@@ -1118,12 +1176,13 @@ pub fn speed_menu(
     ui: &mut egui::Ui,
     palette: &Palette,
     selected: &SelectedSpeed,
+    size: ControlSize,
     change: &mut Option<(ClipId, Speed)>,
 ) {
     let speed = selected.speed;
     let factor = speed.as_factor();
     ui.horizontal(|ui| {
-        sound_row_setup(ui, palette);
+        sound_row_setup(ui, palette, size);
         sound_label(ui, palette, "Speed");
         // Even steps along the slider are even multiples, so 0.5x and 2x sit either side of 1x.
         let mut along = factor.log2();
@@ -1158,7 +1217,7 @@ pub fn speed_menu(
                 let chosen = (factor - choice).abs() < 0.001;
                 let button = ActionButton::new(palette, Kind::Ghost, &name)
                     .small()
-                    .width(SPEED_CHOICE_WIDTH)
+                    .width(size.choice)
                     .selected(chosen);
                 if ui.add(button).clicked() {
                     *change = Some((selected.id, speed.with_factor(*choice)));
@@ -1186,15 +1245,16 @@ pub fn speed_menu(
 }
 
 /// Volume, fades, mute and taking the sound out of a video.
-fn sound_menu(
+pub fn sound_menu(
     ui: &mut egui::Ui,
     palette: &Palette,
     selected: &SelectedSound,
+    size: ControlSize,
     events: &mut StageEvents,
 ) {
     let sound = selected.sound;
     ui.horizontal(|ui| {
-        sound_row_setup(ui, palette);
+        sound_row_setup(ui, palette, size);
         sound_label(ui, palette, "Volume");
         let percent = (f64::from(sound.volume) * 100.0 / f64::from(FULL_VOLUME)).round();
         let mut volume = percent;
@@ -1227,10 +1287,10 @@ fn sound_menu(
         }
     });
     let longest = Ticks(selected.length.0 / 2);
-    if let Some(fade_in) = fade_row(ui, palette, "Fade in", sound.fade_in, longest) {
+    if let Some(fade_in) = fade_row(ui, palette, "Fade in", sound.fade_in, longest, size) {
         events.sound = Some((selected.id, ClipSound { fade_in, ..sound }));
     }
-    if let Some(fade_out) = fade_row(ui, palette, "Fade out", sound.fade_out, longest) {
+    if let Some(fade_out) = fade_row(ui, palette, "Fade out", sound.fade_out, longest, size) {
         events.sound = Some((selected.id, ClipSound { fade_out, ..sound }));
     }
     let on = sound.noise_suppression;
@@ -1276,60 +1336,7 @@ fn sound_menu(
             .clicked()
     {
         events.detach = Some(selected.id);
-        ui.close();
     }
-}
-
-/// The toolbar for a selected clip with no picture on show, holding only its sound.
-fn sound_toolbar(
-    ui: &mut egui::Ui,
-    palette: &Palette,
-    view: &StageView,
-    selected: &SelectedSound,
-    events: &mut StageEvents,
-) {
-    let speed = view.speed.filter(|speed| speed.id == selected.id);
-    let buttons = if speed.is_some() { 2.0 } else { 1.0 };
-    let width = TOOLBAR_PADDING * 2.0 + TOOLBAR_BUTTON * buttons;
-    let rect = toolbar_rect(width, view.frame, view.area, view.row_above_is_free);
-    let id = ui.scope_id().with("stage-sound-toolbar");
-    egui::Area::new(id)
-        .order(egui::Order::Middle)
-        .fixed_pos(rect.min)
-        .fade_in(false)
-        .constrain(false)
-        .show(ui.ctx(), |ui| {
-            ui.set_min_size(rect.size());
-            ui.painter().rect(
-                rect,
-                8.0,
-                palette.raised,
-                Stroke::new(1.0, palette.border),
-                egui::StrokeKind::Inside,
-            );
-            let spot = Rect::from_min_size(
-                pos2(
-                    rect.left() + TOOLBAR_PADDING,
-                    rect.center().y - TOOLBAR_BUTTON / 2.0,
-                ),
-                vec2(TOOLBAR_BUTTON, TOOLBAR_BUTTON),
-            );
-            let button = IconButton::new(palette, Kind::Ghost, icons::VOLUME_2, "Sound")
-                .show_at(ui, id.with("sound"), spot)
-                .on_hover_text("Volume, fades and mute");
-            egui::Popup::menu(&button)
-                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                .show(|ui| sound_menu(ui, palette, selected, events));
-            if let Some(speed) = &speed {
-                let spot = spot.translate(vec2(TOOLBAR_BUTTON, 0.0));
-                let button = IconButton::new(palette, Kind::Ghost, icons::GAUGE, "Speed")
-                    .show_at(ui, id.with("speed"), spot)
-                    .on_hover_text("Slower or faster");
-                egui::Popup::menu(&button)
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                    .show(|ui| speed_menu(ui, palette, speed, &mut events.speed));
-            }
-        });
 }
 
 /// The rectangle around some points on the screen.
@@ -1461,11 +1468,8 @@ fn toolbar(
     clip_rect: Rect,
     events: &mut StageEvents,
 ) {
-    let sound = view.sound.filter(|sound| sound.id == clip.id);
-    let speed = view.speed.filter(|speed| speed.id == clip.id);
-    let optional = f32::from(u8::from(sound.is_some())) + f32::from(u8::from(speed.is_some()));
     let is_title = view.selected_is_title;
-    let buttons = if is_title { 2.0 } else { 6.0 + optional };
+    let buttons = if is_title { 2.0 } else { 4.0 };
     let width = TOOLBAR_PADDING * 2.0 + TOOLBAR_BUTTON * buttons;
     let rect = toolbar_rect(width, clip_rect, view.area, view.row_above_is_free);
     let id = ui.scope_id().with("stage-toolbar");
@@ -1502,21 +1506,6 @@ fn toolbar(
             if !is_title && button(ui, 0.0, icons::CROP, "Crop", "Crop").clicked() {
                 state.cropping = Some(clip.id);
             }
-            if !is_title {
-                let hint = "Filters, colours and fade";
-                let look_spot = 4.0 + optional;
-                if button(
-                    ui,
-                    look_spot,
-                    icons::SLIDERS_HORIZONTAL,
-                    "Filters and colours",
-                    hint,
-                )
-                .clicked()
-                {
-                    events.toggle_look = true;
-                }
-            }
             if button(
                 ui,
                 if is_title { 0.0 } else { 1.0 },
@@ -1528,54 +1517,26 @@ fn toolbar(
             {
                 events.place = Some((clip.id, placement.turned_quarter(clip.size, view.canvas)));
             }
-            if !is_title
-                && button(
-                    ui,
-                    2.0,
-                    icons::FLIP_HORIZONTAL_2,
-                    "Flip left to right",
-                    "Flip left to right",
-                )
-                .clicked()
-            {
-                events.place = Some((clip.id, placement.flipped_across()));
-            }
-            if !is_title
-                && button(
-                    ui,
-                    3.0,
-                    icons::FLIP_VERTICAL_2,
-                    "Flip top to bottom",
-                    "Flip top to bottom",
-                )
-                .clicked()
-            {
-                events.place = Some((clip.id, placement.flipped_down()));
-            }
-            if let Some(speed) = &speed {
-                let opened = button(ui, 4.0, icons::GAUGE, "Speed", "Slower or faster");
-                egui::Popup::menu(&opened)
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                    .show(|ui| speed_menu(ui, palette, speed, &mut events.speed));
-            }
-            if let Some(sound) = &sound {
-                let place = if speed.is_some() { 5.0 } else { 4.0 };
-                let opened = button(
-                    ui,
-                    place,
-                    icons::VOLUME_2,
-                    "Sound",
-                    "Volume, fades and mute",
-                );
-                egui::Popup::menu(&opened)
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                    .show(|ui| sound_menu(ui, palette, sound, events));
+            if !is_title {
+                let flip = button(ui, 2.0, icons::FLIP_VERTICAL_2, "Flip", "Flip");
+                egui::Popup::menu(&flip)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+                    .show(|ui| flip_lines(ui, palette, clip.id, placement, events));
             }
             let more = button(ui, buttons - 1.0, icons::ELLIPSIS, "More", "More");
             egui::Popup::menu(&more)
                 .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                 .show(|ui| {
-                    more_menu(ui, palette, view, clip, placement, events);
+                    let arrange = ArrangeView {
+                        id: clip.id,
+                        placement,
+                        size: clip.size,
+                        canvas: view.canvas,
+                        is_title,
+                        can_go_forward: view.can_go_forward,
+                        can_go_back: view.can_go_back,
+                    };
+                    arrange_controls(ui, palette, &arrange, events);
                 });
         });
 }
@@ -1591,15 +1552,63 @@ fn menu_heading(ui: &mut egui::Ui, palette: &Palette, text: &str) {
     });
 }
 
-/// What doesn't fit on the bar, or isn't needed as often.
-fn more_menu(
+/// The two ways to flip a clip.
+fn flip_lines(
     ui: &mut egui::Ui,
     palette: &Palette,
-    view: &StageView,
-    clip: &StageClip,
+    id: ClipId,
     placement: Placement,
     events: &mut StageEvents,
 ) {
+    let across = MenuItem::new(palette, icons::FLIP_VERTICAL_2, "Flip left to right", "");
+    if ui.add(across).clicked() {
+        events.place = Some((id, placement.flipped_across()));
+    }
+    let down = MenuItem::new(palette, icons::FLIP_HORIZONTAL_2, "Flip top to bottom", "");
+    if ui.add(down).clicked() {
+        events.place = Some((id, placement.flipped_down()));
+    }
+}
+
+/// Everything in the Arrange part of a clip's right-click menu, which is the toolbar's choices
+/// and its More menu together. Returns whether Crop was pressed.
+pub fn arrange_menu(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    arrange: &ArrangeView,
+    can_crop: bool,
+    events: &mut StageEvents,
+) -> bool {
+    let mut crop = false;
+    if !arrange.is_title {
+        crop = ui
+            .add_enabled(can_crop, MenuItem::new(palette, icons::CROP, "Crop", ""))
+            .on_disabled_hover_text("Move the playhead inside this clip to crop it")
+            .clicked();
+    }
+    let rotate = MenuItem::new(palette, icons::ROTATE_CW, "Rotate by 90 degrees", "");
+    if ui.add(rotate).clicked() {
+        let turned = arrange
+            .placement
+            .turned_quarter(arrange.size, arrange.canvas);
+        events.place = Some((arrange.id, turned));
+    }
+    if !arrange.is_title {
+        flip_lines(ui, palette, arrange.id, arrange.placement, events);
+    }
+    ui.separator();
+    arrange_controls(ui, palette, arrange, events);
+    crop
+}
+
+/// What doesn't fit on the bar, or isn't needed as often.
+fn arrange_controls(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    arrange: &ArrangeView,
+    events: &mut StageEvents,
+) {
+    let placement = arrange.placement;
     ui.horizontal(|ui| {
         ui.add_space(8.0);
         ui.label(
@@ -1632,7 +1641,7 @@ fn more_menu(
         );
         if slider.changed() {
             events.place = Some((
-                clip.id,
+                arrange.id,
                 Placement {
                     opacity: (opacity * f64::from(WHOLE) / 100.0).round() as i32,
                     ..placement
@@ -1644,7 +1653,7 @@ fn more_menu(
             slider.surrender_focus();
         }
     });
-    if !view.selected_is_title {
+    if !arrange.is_title {
         ui.separator();
         menu_heading(ui, palette, "Picture in picture");
         for (corner, name) in CanvasCorner::ALL {
@@ -1657,8 +1666,8 @@ fn more_menu(
                 ))
                 .clicked()
             {
-                let placed = placement.in_corner(corner, clip.size, view.canvas);
-                events.place = Some((clip.id, placed));
+                let placed = placement.in_corner(corner, arrange.size, arrange.canvas);
+                events.place = Some((arrange.id, placed));
             }
         }
     }
@@ -1669,25 +1678,25 @@ fn more_menu(
             OrderMove::ToFront,
             icons::CHEVRONS_UP,
             "Bring to front",
-            view.can_go_forward,
+            arrange.can_go_forward,
         ),
         (
             OrderMove::Forward,
             icons::ARROW_UP,
             "Bring forward",
-            view.can_go_forward,
+            arrange.can_go_forward,
         ),
         (
             OrderMove::Backward,
             icons::ARROW_DOWN,
             "Send backward",
-            view.can_go_back,
+            arrange.can_go_back,
         ),
         (
             OrderMove::ToBack,
             icons::CHEVRONS_DOWN,
             "Send to back",
-            view.can_go_back,
+            arrange.can_go_back,
         ),
     ];
     for (order, icon, name, allowed) in orders {
@@ -1695,7 +1704,7 @@ fn more_menu(
             .add_enabled(allowed, MenuItem::new(palette, icon, name, ""))
             .clicked()
         {
-            events.order = Some((clip.id, order));
+            events.order = Some((arrange.id, order));
         }
     }
     ui.separator();
@@ -1708,7 +1717,7 @@ fn more_menu(
         ))
         .clicked()
     {
-        events.place = Some((clip.id, Placement::default()));
+        events.place = Some((arrange.id, Placement::default()));
     }
 }
 

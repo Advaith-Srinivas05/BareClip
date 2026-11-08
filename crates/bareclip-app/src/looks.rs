@@ -36,11 +36,19 @@ const LONGEST_FADE_SLIDER_SECONDS: f64 = 2.0;
 const EFFECT_CARD_SECONDS: f64 = 5.0;
 /// How long the clip an effect's card shows is taken to be, the same as a sample recording.
 const EFFECT_CARD_LENGTH: f32 = 5.0;
-const LOOK_TABS: [(LookTab, &str, &str); 4] = [
-    (LookTab::Filters, "Filters", "Filters"),
-    (LookTab::Effects, "Effects", "Effects"),
-    (LookTab::Colours, "Adjust colours", "Colours"),
-    (LookTab::Fade, "Fade", "Fade"),
+/// The right-hand rail's tools: its tab, the panel's heading, the tab's name and its symbol.
+const LOOK_TABS: [(LookTab, &str, &str, icons::Icon); 6] = [
+    (LookTab::Filters, "Filters", "Filters", icons::APERTURE),
+    (LookTab::Effects, "Effects", "Effects", icons::SPARKLES),
+    (
+        LookTab::Colours,
+        "Adjust colours",
+        "Colours",
+        icons::SWATCH_BOOK,
+    ),
+    (LookTab::Fade, "Fade", "Fade", icons::CONTRAST),
+    (LookTab::Speed, "Speed", "Speed", icons::GAUGE),
+    (LookTab::Audio, "Audio", "Audio", icons::VOLUME_2),
 ];
 /// The 3x3 grid's spots, across and then down.
 const GRID_NAMES: [&str; 9] = [
@@ -54,16 +62,6 @@ const GRID_NAMES: [&str; 9] = [
     "Bottom",
     "Bottom right",
 ];
-
-/// Which of a clip's controls is showing in the right-hand panel.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) enum LookTab {
-    #[default]
-    Filters,
-    Effects,
-    Colours,
-    Fade,
-}
 
 /// Which of a title's controls is showing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -512,18 +510,138 @@ impl Editor {
         self.card_drawer()?.live_transition(kind, progress)
     }
 
-    /// Whether the right-hand panel has a clip's look to show.
+    /// The tools the selected clip has on the right-hand rail. A title has its own panel instead.
+    pub(super) fn clip_tabs(&self) -> Vec<LookTab> {
+        let tracks = &self.project.tracks;
+        let Some(clip) = self.selected.and_then(|id| tracks.clip(id)) else {
+            return Vec::new();
+        };
+        if clip.is_title() {
+            return Vec::new();
+        }
+        let on_pictures = tracks
+            .track_of(clip.id)
+            .is_some_and(|row| row < tracks.picture_tracks().len());
+        let mut tabs = Vec::new();
+        if on_pictures {
+            tabs.extend([
+                LookTab::Filters,
+                LookTab::Effects,
+                LookTab::Colours,
+                LookTab::Fade,
+            ]);
+        }
+        if !clip.is_still() {
+            tabs.push(LookTab::Speed);
+        }
+        if self.has_sound(clip.media) {
+            tabs.push(LookTab::Audio);
+        }
+        tabs
+    }
+
+    /// Whether the right-hand panel has a clip's controls to show. Moving on to a clip without
+    /// the open tool closes it, rather than showing a different tool nobody asked for.
     pub(super) fn looking_at(&self) -> Option<Clip> {
-        if !self.look_panel_open {
+        if !self.look_panel_open || !self.clip_tabs().contains(&self.look_tab) {
             return None;
         }
-        let clip = self.selected.and_then(|id| self.project.tracks.clip(id))?;
-        let on_pictures = self
-            .project
-            .tracks
-            .track_of(clip.id)
-            .is_some_and(|row| row < self.project.tracks.picture_tracks().len());
-        (on_pictures && !clip.is_title()).then_some(clip)
+        self.selected.and_then(|id| self.project.tracks.clip(id))
+    }
+
+    /// Opens the right-hand panel on one of a clip's tools, from its right-click menu.
+    pub(super) fn open_clip_panel(&mut self, id: ClipId, tab: LookTab) {
+        self.selected = Some(id);
+        self.selected_gap = None;
+        self.selected_join = None;
+        self.look_panel_open = true;
+        self.look_tab = tab;
+        self.title_tab = match tab {
+            LookTab::Colours => TitleTab::Colours,
+            LookTab::Fade => TitleTab::Fade,
+            _ => TitleTab::Text,
+        };
+    }
+
+    /// The labelled tools for the selected clip, down the right of the window, so its filters,
+    /// colours and sound can be seen without opening anything.
+    pub(super) fn clip_rail(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        let tabs = self.clip_tabs();
+        // Pressing a clip selects it, and the picture must not move out from under that press
+        // and whatever drag comes next, so the rail waits for the pointer to come up.
+        let settled = ui.input(|input| !input.pointer.any_down() && !input.pointer.any_released());
+        let wanted = !tabs.is_empty();
+        self.clip_rail_showing = wanted && (self.clip_rail_showing || settled);
+        if wanted && !self.clip_rail_showing {
+            ui.ctx().request_repaint();
+        }
+        if !self.clip_rail_showing {
+            // A panel counts as one widget, as `title_panel` explains.
+            ui.skip_ahead_auto_ids(1);
+            return;
+        }
+        let frame = Frame::new().fill(palette.bg_app).inner_margin(Margin {
+            left: 8,
+            right: 8,
+            top: 0,
+            bottom: 8,
+        });
+        egui::Panel::right("clip_rail")
+            .exact_size(RAIL_WIDTH)
+            .show_separator_line(false)
+            .frame(frame)
+            .show(ui, |ui| {
+                for (tab, name, short, icon) in &LOOK_TABS {
+                    if !tabs.contains(tab) {
+                        continue;
+                    }
+                    let open = self.look_panel_open && self.look_tab == *tab;
+                    let hint = if open {
+                        format!("Close {name}")
+                    } else {
+                        format!("Open {name}")
+                    };
+                    if components::rail_tab(ui, palette, icon, short, open)
+                        .on_hover_text(hint)
+                        .clicked()
+                    {
+                        self.look_panel_open = !open;
+                        self.look_tab = *tab;
+                    }
+                }
+            });
+    }
+
+    /// Speed, in the right-hand panel. Its changes count the same as on the clip's menu.
+    fn speed_controls(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        let mut events = stage::StageEvents::default();
+        if let Some(selected) = self.selected_speed() {
+            stage::speed_menu(
+                ui,
+                palette,
+                &selected,
+                stage::ControlSize::PANEL,
+                &mut events.speed,
+            );
+        }
+        let pointer_down = ui.input(|input| input.pointer.any_down());
+        self.apply_stage_events(events, pointer_down);
+    }
+
+    /// Volume, fades and the rest of a clip's sound, in the right-hand panel.
+    fn audio_controls(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        let mut events = stage::StageEvents::default();
+        if let Some(selected) = self.selected_sound() {
+            stage::sound_menu(
+                ui,
+                palette,
+                &selected,
+                stage::ControlSize::PANEL,
+                &mut events,
+            );
+        }
+        let pointer_down = ui.input(|input| input.pointer.any_down());
+        self.apply_stage_events(events, pointer_down);
     }
 
     /// The panel with a selected clip's look on it.
@@ -539,7 +657,7 @@ impl Editor {
                     let name = LOOK_TABS
                         .iter()
                         .find(|(tab, ..)| *tab == self.look_tab)
-                        .map_or("", |(_, name, _)| name);
+                        .map_or("", |(_, name, ..)| name);
                     ui.label(RichText::new(name).font(fonts::strong(15.0)));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let close = IconButton::new(palette, Kind::Ghost, icons::X, "Close look")
@@ -548,21 +666,6 @@ impl Editor {
                             self.look_panel_open = false;
                         }
                     });
-                });
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    for (tab, name, short) in LOOK_TABS {
-                        let kind = if self.look_tab == tab {
-                            Kind::Secondary
-                        } else {
-                            Kind::Ghost
-                        };
-                        let button = ActionButton::new(palette, kind, short).small();
-                        if ui.add(button).on_hover_text(name).clicked() {
-                            self.look_tab = tab;
-                        }
-                    }
                 });
                 ui.add_space(10.0);
                 match self.look_tab {
@@ -574,6 +677,8 @@ impl Editor {
                             .show(ui, |ui| self.colour_controls(ui, palette, clip));
                     }
                     LookTab::Fade => self.fade_controls(ui, palette, clip),
+                    LookTab::Speed => self.speed_controls(ui, palette),
+                    LookTab::Audio => self.audio_controls(ui, palette),
                 }
             });
     }

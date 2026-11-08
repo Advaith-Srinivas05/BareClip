@@ -1168,7 +1168,9 @@ impl Editor {
     /// because they have more to set than fits on the toolbar.
     pub(super) fn title_panel(&mut self, ui: &mut egui::Ui, palette: &Palette) {
         let Some((id, title)) = self.selected_title() else {
-            if let Some(clip) = self.looking_at() {
+            if self.clip_rail_showing
+                && let Some(clip) = self.looking_at()
+            {
                 self.look_panel(ui, palette, clip);
                 return;
             }
