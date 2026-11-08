@@ -6,9 +6,76 @@
 //! as `h264_amf`, the part after its codec, such as `amf`, or the name without `lib`, such as
 //! `openh264`.
 
-use std::env;
+use std::{
+    env,
+    sync::atomic::{AtomicU8, Ordering},
+};
 
 pub const SKIP_VARIABLE: &str = "BARECLIP_SKIP_ENCODERS";
+
+/// Whose graphics chip an encoder runs on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChipMaker {
+    Nvidia,
+    Amd,
+    Intel,
+}
+
+impl ChipMaker {
+    /// Who made a chip, from the PCI vendor number Windows reports for it.
+    pub fn from_vendor(vendor: u32) -> Option<Self> {
+        match vendor {
+            0x10de => Some(Self::Nvidia),
+            0x1002 | 0x1022 => Some(Self::Amd),
+            0x8086 => Some(Self::Intel),
+            _ => None,
+        }
+    }
+
+    fn of_encoder(encoder: &str) -> Option<Self> {
+        if encoder.ends_with("_nvenc") {
+            Some(Self::Nvidia)
+        } else if encoder.ends_with("_amf") {
+            Some(Self::Amd)
+        } else if encoder.ends_with("_qsv") {
+            Some(Self::Intel)
+        } else {
+            None
+        }
+    }
+
+    const fn code(maker: Option<Self>) -> u8 {
+        match maker {
+            None => 0,
+            Some(Self::Nvidia) => 1,
+            Some(Self::Amd) => 2,
+            Some(Self::Intel) => 3,
+        }
+    }
+
+    const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Nvidia),
+            2 => Some(Self::Amd),
+            3 => Some(Self::Intel),
+            _ => None,
+        }
+    }
+}
+
+static FOLLOWED: AtomicU8 = AtomicU8::new(ChipMaker::code(None));
+
+/// Makes exports use only this maker's graphics encoders, plus those that need no graphics chip,
+/// because someone who picks a chip in Settings doesn't expect another chip to wake up for an
+/// export. `None` tries every encoder, which is the Automatic setting.
+pub fn follow_chip(maker: Option<ChipMaker>) {
+    FOLLOWED.store(ChipMaker::code(maker), Ordering::Relaxed);
+}
+
+/// Whether following this maker's chip leaves this encoder in.
+fn follows(maker: Option<ChipMaker>, encoder: &str) -> bool {
+    maker.is_none_or(|maker| ChipMaker::of_encoder(encoder).is_none_or(|own| own == maker))
+}
 
 /// Whether a word in the switch names this encoder.
 fn names(word: &str, encoder: &str) -> bool {
@@ -27,18 +94,56 @@ pub(crate) fn is_skipped_by(list: &str, encoder: &str) -> bool {
         .any(|word| names(&word.to_ascii_lowercase(), encoder))
 }
 
-/// The encoders in the order given, less any the switch leaves out.
+/// The encoders in the order given, less any the switch or the chip picked in Settings leaves out.
 pub(crate) fn usable<'a>(encoders: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
     let list = env::var(SKIP_VARIABLE).unwrap_or_default();
+    let followed = ChipMaker::from_code(FOLLOWED.load(Ordering::Relaxed));
     encoders
         .into_iter()
-        .filter(|encoder| !is_skipped_by(&list, encoder))
+        .filter(|encoder| !is_skipped_by(&list, encoder) && follows(followed, encoder))
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_keeps_every_encoder() {
+        for encoder in [
+            "h264_nvenc",
+            "h264_amf",
+            "h264_qsv",
+            "h264_mf",
+            "libopenh264",
+        ] {
+            assert!(follows(None, encoder), "{encoder}");
+        }
+    }
+
+    #[test]
+    fn a_picked_chip_keeps_its_own_encoders_and_those_that_need_no_chip() {
+        let kept: Vec<&str> = [
+            "h264_nvenc",
+            "h264_amf",
+            "h264_qsv",
+            "h264_mf",
+            "libopenh264",
+        ]
+        .into_iter()
+        .filter(|encoder| follows(Some(ChipMaker::Amd), encoder))
+        .collect();
+
+        assert_eq!(kept, ["h264_amf", "h264_mf", "libopenh264"]);
+    }
+
+    #[test]
+    fn makers_are_known_by_their_vendor_numbers() {
+        assert_eq!(ChipMaker::from_vendor(0x10de), Some(ChipMaker::Nvidia));
+        assert_eq!(ChipMaker::from_vendor(0x1002), Some(ChipMaker::Amd));
+        assert_eq!(ChipMaker::from_vendor(0x8086), Some(ChipMaker::Intel));
+        assert_eq!(ChipMaker::from_vendor(0x1414), None);
+    }
 
     #[test]
     fn a_family_name_leaves_out_every_codec_of_it() {

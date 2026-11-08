@@ -161,6 +161,7 @@ fn export_style(sources: &[PathBuf], frames: u32, output: &Path) -> (f64, String
             bit_rate: 20_000_000,
             sound_tracks: Vec::new(),
             quality: bareclip_media::Quality::default(),
+            format: bareclip_media::VideoFormat::H264,
         },
     )
     .expect("the file can be written");
@@ -188,6 +189,7 @@ fn scaled_export(source: &Path, frames: u32, output: &Path) -> f64 {
             bit_rate: 20_000_000,
             sound_tracks: Vec::new(),
             quality: bareclip_media::Quality::default(),
+            format: bareclip_media::VideoFormat::H264,
         },
     )
     .expect("the file can be written");
@@ -218,6 +220,7 @@ fn single_export(source: &Path, frames: u32, output: &Path) -> f64 {
             bit_rate: 20_000_000,
             sound_tracks: Vec::new(),
             quality: bareclip_media::Quality::default(),
+            format: bareclip_media::VideoFormat::H264,
         },
     )
     .expect("the file can be written");

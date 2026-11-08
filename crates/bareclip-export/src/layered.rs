@@ -19,7 +19,7 @@ use bareclip_core::{
     timeline::TimeRange,
     title::Title,
 };
-use bareclip_media::{MediaError, MediaInfo, Quality, probe, read_still, same_file};
+use bareclip_media::{MediaError, MediaInfo, Quality, VideoFormat, probe, read_still, same_file};
 use bareclip_render::{Compositor, Layer, LayerPicture, needs_compositor};
 
 use crate::{
@@ -241,16 +241,33 @@ fn videos_of(stretches: &[LayeredStretch]) -> Result<Vec<MediaInfo>, MediaError>
     Ok(videos)
 }
 
-/// Exports a project that takes layers.
+/// Exports a project that takes layers, as an H.264 MP4.
 pub fn export_layered(
     request: &LayeredRequest,
+    cancel: &AtomicBool,
+    progress: &dyn Fn(f32),
+) -> Result<FullReport, MediaError> {
+    export_layered_as(request, VideoFormat::H264, cancel, progress)
+}
+
+/// Exports a project that takes layers, as this kind of file.
+pub fn export_layered_as(
+    request: &LayeredRequest,
+    format: VideoFormat,
     cancel: &AtomicBool,
     progress: &dyn Fn(f32),
 ) -> Result<FullReport, MediaError> {
     bareclip_media::init()?;
     let started = Instant::now();
     let stretches = &request.stretches;
-    if stretches.is_empty() && request.sound.spans.is_empty() {
+    // A GIF has no sound, so sound can't keep it going past the last picture.
+    let no_sound = SoundPlan::default();
+    let sound_plan = if format == VideoFormat::Gif {
+        &no_sound
+    } else {
+        &request.sound
+    };
+    if stretches.is_empty() && sound_plan.spans.is_empty() {
         return Err(MediaError::NothingToExport);
     }
     let writes_over_a_source = stretches
@@ -258,7 +275,7 @@ pub fn export_layered(
         .flat_map(|stretch| &stretch.stack)
         .filter(|clip| clip.title.is_none())
         .map(|clip| &clip.input)
-        .chain(request.sound.spans.iter().map(|span| &span.path))
+        .chain(sound_plan.spans.iter().map(|span| &span.path))
         .any(|input| same_file(input, &request.output));
     if writes_over_a_source {
         return Err(MediaError::SameInputAndOutput);
@@ -274,14 +291,15 @@ pub fn export_layered(
         None => FullPlan::for_videos(&videos),
     };
     plan = plan.with_choices(request.quality, request.rate);
-    plan.settings.sound_tracks = request.sound.tracks.clone();
+    plan.settings.sound_tracks = sound_plan.tracks.clone();
+    plan = plan.with_format(format);
     let settings = &plan.settings;
     let canvas = (settings.width, settings.height);
     let rate = settings.frame_rate;
     let length = stretches
         .last()
         .map_or(Ticks(0), |stretch| stretch.end)
-        .max(request.sound.end());
+        .max(sound_plan.end());
     let frames = frame_count(length, rate);
     if frames == 0 {
         return Err(MediaError::NothingToExport);
@@ -291,7 +309,7 @@ pub fn export_layered(
     let encoder = writer.encoder_name().to_owned();
     let mut compositor: Option<Compositor> = None;
     let black = BlackPicture::new(settings.width, settings.height);
-    let mut sound = SoundFeed::new(&request.sound);
+    let mut sound = SoundFeed::new(sound_plan);
 
     let mut stills: HashMap<PathBuf, StillPicture> = HashMap::new();
     for clip in stretches.iter().flat_map(|stretch| &stretch.stack) {
@@ -322,6 +340,7 @@ pub fn export_layered(
         gpu: None,
         audio_tracks: settings.sound_tracks.len(),
         elapsed: started.elapsed(),
+        file_bytes: None,
     };
     let half_frame = Ticks(frame_time(1, rate).0 / 2);
 
@@ -484,6 +503,9 @@ pub fn export_layered(
     writer.finish()?;
     progress(1.0);
     report.elapsed = started.elapsed();
+    report.file_bytes = std::fs::metadata(&request.output)
+        .ok()
+        .map(|file| file.len());
     Ok(report)
 }
 

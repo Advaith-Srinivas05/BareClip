@@ -8,8 +8,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bareclip_core::picture::BlackPicture;
-use bareclip_media::{PictureReader, SoundLabel, VideoSettings, VideoWriter, probe};
+use bareclip_core::picture::{BlackPicture, ColorFormat, Yuv420};
+use bareclip_media::{
+    GifWriter, PictureReader, Quality, SoundLabel, VideoFormat, VideoSettings, VideoWriter, probe,
+};
 
 const FRAMES: u32 = 90;
 
@@ -21,6 +23,7 @@ fn settings() -> VideoSettings {
         bit_rate: 4_000_000,
         sound_tracks: vec![SoundLabel::default()],
         quality: bareclip_media::Quality::default(),
+        format: bareclip_media::VideoFormat::H264,
     }
 }
 
@@ -118,4 +121,73 @@ fn encoders_used_at_the_same_time_all_finish() {
             .recv_timeout(Duration::from_secs(120))
             .expect("every thread finishes without freezing");
     }
+}
+
+/// A width that isn't a multiple of what memory rows get rounded to, which is what caught a GIF
+/// keeping its first frame's row length after the encoder took new memory. Each row is checked,
+/// because a picture can have every frame and still be scrambled.
+#[test]
+fn a_gif_keeps_its_picture_on_every_frame() {
+    const WIDTH: usize = 854;
+    const HEIGHT: usize = 200;
+    const FRAMES: usize = 6;
+    let folder = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("bareclip-gif");
+    std::fs::create_dir_all(&folder).expect("the folder can be created");
+    let path = folder.join("bars.gif");
+    let settings = VideoSettings {
+        width: WIDTH as u32,
+        height: HEIGHT as u32,
+        frame_rate: (15, 1),
+        bit_rate: 0,
+        sound_tracks: Vec::new(),
+        quality: Quality::default(),
+        format: VideoFormat::Gif,
+    };
+    // Dark on the left and bright on the right.
+    let y: Vec<u8> = (0..HEIGHT)
+        .flat_map(|_| (0..WIDTH).map(|x| if x < WIDTH / 2 { 40 } else { 200 }))
+        .collect();
+    let chroma = vec![128; WIDTH.div_ceil(2) * HEIGHT.div_ceil(2)];
+    let picture = Yuv420 {
+        width: WIDTH as u32,
+        height: HEIGHT as u32,
+        y: &y,
+        y_stride: WIDTH,
+        u: &chroma,
+        v: &chroma,
+        uv_stride: WIDTH.div_ceil(2),
+        color: ColorFormat::OUTPUT,
+    };
+
+    let mut writer = GifWriter::create(&path, &settings).expect("it starts");
+    for _ in 0..FRAMES {
+        writer.write_picture(&picture).expect("a picture is taken");
+    }
+    writer.finish().expect("it finishes");
+
+    let mut reader = PictureReader::open(&path).expect("it opens");
+    let mut frames = 0;
+    while let Some(decoded) = reader.next_picture().expect("it decodes") {
+        frames += 1;
+        let view = decoded.view();
+        assert_eq!((view.width as usize, view.height as usize), (WIDTH, HEIGHT));
+        for row in 0..HEIGHT {
+            let line = &view.y[row * view.y_stride..][..WIDTH];
+            assert!(
+                (i32::from(line[40]) - 40).abs() < 30,
+                "frame {frames} row {row}: {}",
+                line[40]
+            );
+            assert!(
+                (i32::from(line[WIDTH - 40]) - 200).abs() < 30,
+                "frame {frames} row {row}: {}",
+                line[WIDTH - 40]
+            );
+        }
+    }
+    assert_eq!(frames, FRAMES);
+    assert!(
+        !folder.join("bars.partial.pictures").exists(),
+        "its working file is gone"
+    );
 }

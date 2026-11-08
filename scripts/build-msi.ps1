@@ -30,7 +30,7 @@ New-Item -ItemType Directory -Force $Dist, $Work | Out-Null
 $Object = Join-Path $Work 'bareclip.wixobj'
 $Msi = Join-Path $Dist "BareClip-$Version.msi"
 
-& (Join-Path $Wix 'candle.exe') -nologo -arch x64 -ext WixUIExtension `
+& (Join-Path $Wix 'candle.exe') -nologo -arch x64 -ext WixUIExtension -ext WixUtilExtension `
     "-dVersion=$Version" `
     "-dRepoDir=$Root" `
     "-dBrandDir=$(Join-Path $Root 'assets\brand')" `
@@ -42,7 +42,7 @@ $Msi = Join-Path $Dist "BareClip-$Version.msi"
 if ($LASTEXITCODE -ne 0) { throw 'WiX could not compile the installer.' }
 
 # ICE38, ICE43 and ICE57 assume an install is for one user or for everyone, never either.
-& (Join-Path $Wix 'light.exe') -nologo -ext WixUIExtension -cultures:en-us `
+& (Join-Path $Wix 'light.exe') -nologo -ext WixUIExtension -ext WixUtilExtension -cultures:en-us `
     -sice:ICE38 -sice:ICE43 -sice:ICE57 `
     -out $Msi $Object
 if ($LASTEXITCODE -ne 0) { throw 'WiX could not link the installer.' }

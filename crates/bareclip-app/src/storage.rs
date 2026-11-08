@@ -12,6 +12,7 @@ use bareclip_core::{
     project::{ProjectFile, write_atomic},
     splice::CutMode,
 };
+use bareclip_render::GpuId;
 use eframe::egui::ThemePreference;
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +70,31 @@ impl From<ExportCuts> for CutMode {
     }
 }
 
+/// A graphics chip picked in Settings, by its maker's numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuChoice {
+    pub vendor: u32,
+    pub device: u32,
+}
+
+impl From<GpuChoice> for GpuId {
+    fn from(chip: GpuChoice) -> Self {
+        Self {
+            vendor: chip.vendor,
+            device: chip.device,
+        }
+    }
+}
+
+impl From<GpuId> for GpuChoice {
+    fn from(chip: GpuId) -> Self {
+        Self {
+            vendor: chip.vendor,
+            device: chip.device,
+        }
+    }
+}
+
 /// The user's choices. Anything missing from the file takes its default, so settings written
 /// by another version still load.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +109,8 @@ pub struct Settings {
     pub waveforms_on_clips: bool,
     /// The same for sound rows, which holds sound files and sound detached from a video.
     pub waveforms_on_audio: bool,
+    /// The graphics chip to run on. `None` is Automatic.
+    pub gpu: Option<GpuChoice>,
 }
 
 impl Default for Settings {
@@ -93,6 +121,7 @@ impl Default for Settings {
             export_cuts: ExportCuts::FrameExact,
             waveforms_on_clips: false,
             waveforms_on_audio: false,
+            gpu: None,
         }
     }
 }
@@ -320,6 +349,10 @@ mod tests {
             export_cuts: ExportCuts::Fastest,
             waveforms_on_clips: true,
             waveforms_on_audio: true,
+            gpu: Some(GpuChoice {
+                vendor: 0x1002,
+                device: 0x1638,
+            }),
         };
 
         settings.save(&folder).expect("they can be saved");
@@ -344,6 +377,7 @@ mod tests {
 
         assert_eq!(settings.theme, ThemeSetting::Dark);
         assert!(!settings.auto_save);
+        assert_eq!(settings.gpu, None, "the chip starts on Automatic");
     }
 
     #[test]

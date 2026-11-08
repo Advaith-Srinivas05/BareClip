@@ -85,6 +85,28 @@ function Get-Tick([string]$Name) {
     [BareClipTest.Native]::SendMessage([IntPtr]$Box.Current.NativeWindowHandle, $BM_GETCHECK, [IntPtr]::Zero, [IntPtr]::Zero) -eq [IntPtr]1
 }
 
+# The tick box on the last page should have started the app, from where it was just put.
+function Assert-Launched([string]$Folder) {
+    $Exe = Join-Path $Folder 'bareclip.exe'
+    $Clock = [Diagnostics.Stopwatch]::StartNew()
+    $Found = $null
+    while (-not $Found -and $Clock.Elapsed.TotalSeconds -lt 20) {
+        $Found = Get-Process bareclip -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $Exe }
+        if (-not $Found) { Start-Sleep -Milliseconds 200 }
+    }
+    Assert-That ($null -ne $Found) "the tick box started the app from $Folder"
+    $Found | Stop-Process -Force
+    Start-Sleep -Seconds 2
+}
+
+function Assert-NotLaunched([string]$Folder) {
+    Start-Sleep -Seconds 5
+    $Exe = Join-Path $Folder 'bareclip.exe'
+    $Found = Get-Process bareclip -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $Exe }
+    Assert-That ($null -eq $Found) 'an unticked box leaves the app closed'
+    if ($Found) { $Found | Stop-Process -Force }
+}
+
 function Get-AllText($Page) {
     $Found = $Page.FindAll($Tree::Descendants, [Windows.Automation.Condition]::TrueCondition)
     @($Found | ForEach-Object {
@@ -161,9 +183,11 @@ try {
         try {
             Invoke-Button 'Install'
             [void](Wait-Control 'Finish')
+            Assert-That (Get-Tick 'Launch BareClip') 'the launch box starts ticked for everyone'
             Invoke-Button 'Finish'
             Assert-That ($Installer.WaitForExit(30000)) 'the installer closes'
             Assert-That ($Installer.ExitCode -eq 0) "the installer succeeded (exit $($Installer.ExitCode))"
+            Assert-Launched $ProgramFilesDir
             Assert-That (Test-Path (Join-Path $ProgramFilesDir 'bareclip.exe')) 'the app is in Program Files'
             Assert-That (Test-Path 'HKLM:\Software\BareClip') 'its choices are in the machine registry'
             Assert-That (-not (Test-Path 'HKCU:\Software\BareClip')) 'and not in this user''s'
@@ -188,9 +212,11 @@ try {
             Assert-That ((Get-AllText (Get-Page)) -like '*available to everyone*') 'the upgrade says it is for everyone'
             Invoke-Button 'Install'
             [void](Wait-Control 'Finish')
+            Set-Tick 'Launch BareClip' $false
             Invoke-Button 'Finish'
             Assert-That ($Installer.WaitForExit(30000)) 'the upgrade closes'
             Assert-That ($Installer.ExitCode -eq 0) "the upgrade succeeded (exit $($Installer.ExitCode))"
+            Assert-NotLaunched $ProgramFilesDir
             $Windows = New-Object -ComObject WindowsInstaller.Installer
             $Installed = @($Windows.RelatedProducts('{6F2B7C1E-3A94-4D58-9E21-7C0D5A8B4F13}'))
             Assert-That ($Installed.Count -eq 1) 'there is still only one copy'
@@ -313,9 +339,11 @@ try {
 
     [void](Wait-Control 'Finish')
     Save-Picture '7-finished'
+    Assert-That (Get-Tick 'Launch BareClip') 'the launch box starts ticked'
     Invoke-Button 'Finish'
     Assert-That ($Installer.WaitForExit(30000)) 'the installer closes'
     Assert-That ($Installer.ExitCode -eq 0) "the installer succeeded without administrator rights (exit $($Installer.ExitCode))"
+    Assert-Launched $InstallDir
 
     $Logged = Get-Content $Log -Encoding Unicode -Raw
     Assert-That ($Logged -match 'dual mode package and is being installed in Per-User mode') 'Windows did not ask for administrator permission'

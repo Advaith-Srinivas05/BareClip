@@ -11,7 +11,7 @@ use bareclip_core::{
     time::{Ticks, format_timecode},
 };
 use bareclip_export::{FullPlan, FullReport, ProjectReport};
-use bareclip_media::{AudioInfo, ExportReport, MediaInfo, Quality};
+use bareclip_media::{AudioInfo, ExportReport, MediaInfo, Quality, VideoFormat};
 
 pub const VIDEO_EXTENSIONS: [&str; 6] = ["mp4", "mkv", "mov", "webm", "avi", "ts"];
 /// Sound with no picture.
@@ -250,6 +250,26 @@ pub fn gap_warning(gaps: usize, total: Ticks) -> String {
     }
 }
 
+/// Which version this is, read from the build so that it can't go out of date.
+pub fn version_line() -> String {
+    format!("Version {}", env!("CARGO_PKG_VERSION"))
+}
+
+/// The choice that leaves the graphics chip to BareClip.
+pub const AUTOMATIC_GPU: &str = "Automatic";
+
+/// The line under the graphics chip choice. `pending` names a choice not yet in use, and `gone`
+/// says the picked chip isn't in this PC any more.
+pub fn gpu_note(running: &str, pending: Option<&str>, gone: bool) -> String {
+    if gone {
+        return format!("The chip you picked isn't in this PC now, so this is using {running}.");
+    }
+    match pending {
+        Some(chip) => format!("Restart BareClip to switch to {chip}. It's using {running} now."),
+        None => format!("Using {running}. A change here needs a restart."),
+    }
+}
+
 pub fn encoder_name(encoder: &str) -> &str {
     match encoder {
         name if name.ends_with("_nvenc") => "your NVIDIA GPU",
@@ -263,12 +283,41 @@ pub fn encoder_name(encoder: &str) -> &str {
 /// What a full export is going to write.
 pub fn full_export_plan(plan: &FullPlan) -> String {
     let settings = &plan.settings;
-    format!(
-        "Every frame is redrawn and saved as an H.264 MP4 at {} x {} and {} fps. This takes longer than copying. {}",
+    let (width, height, rate) = (
         settings.width,
         settings.height,
         frame_rate(plan.frame_rate()),
-        quality_note(settings.quality),
+    );
+    match settings.format {
+        VideoFormat::H264 => format!(
+            "Every frame is redrawn and saved as an H.264 MP4 at {width} x {height} and {rate} fps. This takes longer than copying. {}",
+            quality_note(settings.quality),
+        ),
+        VideoFormat::Av1 => format!(
+            "Every frame is redrawn and saved as an AV1 MP4 at {width} x {height} and {rate} fps. This takes much longer: without a graphics chip that makes AV1, about as long as the video itself, or longer. {}",
+            quality_note(settings.quality),
+        ),
+        VideoFormat::Gif => format!(
+            "Every frame is redrawn and saved as a GIF at {width} x {height} and {rate} fps. It has no sound, and loops forever."
+        ),
+    }
+}
+
+/// What a format is called in the export window. A copied video stays as it was, so the choice
+/// that doesn't re-encode unless it has to is named like the others that start the same way.
+pub fn format_name(format: VideoFormat) -> &'static str {
+    match format {
+        VideoFormat::H264 => "Match source",
+        VideoFormat::Av1 => "AV1",
+        VideoFormat::Gif => "GIF",
+    }
+}
+
+/// The warning for a long GIF, because they grow so quickly.
+pub fn gif_length_warning(seconds: f64) -> String {
+    format!(
+        "This GIF will run for {}. GIFs get very large quickly, so expect a big file, or trim the project first.",
+        elapsed(seconds)
     )
 }
 
@@ -310,6 +359,22 @@ fn frame_rate(rate: f64) -> String {
 
 /// What happened in a finished export that redrew every frame.
 fn full_export_summary(report: &FullReport) -> Vec<String> {
+    if report.encoder == "gif" {
+        let mut lines = vec![
+            format!("Finished in {}.", elapsed(report.elapsed.as_secs_f64())),
+            format!(
+                "{} frames at {} x {} and {} fps, looping forever.",
+                report.frames,
+                report.width,
+                report.height,
+                frame_rate(report.frame_rate)
+            ),
+        ];
+        if let Some(bytes) = report.file_bytes {
+            lines.push(format!("The GIF is {}.", file_size(bytes)));
+        }
+        return lines;
+    }
     let mut lines = vec![
         format!("Finished in {}.", elapsed(report.elapsed.as_secs_f64())),
         format!(
@@ -476,6 +541,98 @@ pub fn typed_duration(typed: &str) -> Option<f64> {
 mod tests {
     use super::*;
 
+    /// `scripts/build-msi.ps1` gives the installer the first version number in this file.
+    #[test]
+    fn the_version_shown_is_the_one_the_installer_gets() {
+        let manifest = include_str!("../../../Cargo.toml");
+        let installer_gets = manifest
+            .lines()
+            .find_map(|line| line.strip_prefix("version = \""))
+            .and_then(|rest| rest.strip_suffix('"'))
+            .expect("the workspace has a version");
+
+        assert_eq!(version_line(), format!("Version {installer_gets}"));
+    }
+
+    #[test]
+    fn the_export_window_says_what_each_format_will_write() {
+        let plan = |format| FullPlan::on_canvas(&[], (1920, 1080)).with_format(format);
+
+        assert!(full_export_plan(&plan(VideoFormat::H264)).contains("H.264 MP4"));
+        let av1 = full_export_plan(&plan(VideoFormat::Av1));
+        assert!(av1.contains("AV1 MP4"));
+        assert!(av1.contains("much longer"), "{av1}");
+        let gif = full_export_plan(&plan(VideoFormat::Gif));
+        assert!(gif.contains("GIF"));
+        assert!(gif.contains("no sound"), "{gif}");
+    }
+
+    #[test]
+    fn a_finished_gif_reports_its_size() {
+        let report = FullReport {
+            width: 854,
+            height: 480,
+            frame_rate: 15.0,
+            frames: 150,
+            composited_frames: 150,
+            direct_frames: 0,
+            repeated_frames: 0,
+            black_frames: 0,
+            encoder: "gif".to_owned(),
+            gpu: None,
+            audio_tracks: 0,
+            elapsed: Duration::from_millis(2500),
+            file_bytes: Some(12_400_000),
+        };
+
+        let summary = export_summary(&ProjectReport::Full(report));
+
+        assert!(
+            summary.contains(&"The GIF is 11.8 MB.".to_owned()),
+            "{summary:?}"
+        );
+    }
+
+    #[test]
+    fn a_long_gif_is_warned_about() {
+        assert_eq!(
+            gif_length_warning(65.0),
+            "This GIF will run for 1 min 5 s. GIFs get very large quickly, so expect a big file, or trim the project first."
+        );
+    }
+
+    #[test]
+    fn the_chip_note_says_what_is_running_and_when_a_restart_is_owed() {
+        assert_eq!(
+            gpu_note("the NVIDIA chip", None, false),
+            "Using the NVIDIA chip. A change here needs a restart."
+        );
+        assert_eq!(
+            gpu_note("the NVIDIA chip", Some("the AMD chip"), false),
+            "Restart BareClip to switch to the AMD chip. It's using the NVIDIA chip now."
+        );
+        assert_eq!(
+            gpu_note("the NVIDIA chip", None, true),
+            "The chip you picked isn't in this PC now, so this is using the NVIDIA chip."
+        );
+    }
+
+    #[test]
+    fn the_installer_offers_to_launch_the_app_after_a_fresh_install_only() {
+        let installer = include_str!("../../../installer/bareclip.wxs");
+
+        assert!(
+            installer
+                .contains(r#"Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch BareClip""#)
+        );
+        assert!(installer.contains(r#"Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1""#));
+        assert!(
+            installer
+                .contains(r#"Property="WixShellExecTarget" Value="[INSTALLFOLDER]bareclip.exe""#)
+        );
+        assert!(installer.contains("WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed"));
+    }
+
     /// The installer's "Edit with BareClip" goes on every video and sound type the app takes,
     /// apart from .ts, which TypeScript uses too, and never on images or projects.
     #[test]
@@ -617,6 +774,7 @@ mod tests {
             gpu: Some("NVIDIA GeForce RTX 3060".to_owned()),
             audio_tracks: 2,
             elapsed: Duration::from_millis(4000),
+            file_bytes: None,
         }
     }
 

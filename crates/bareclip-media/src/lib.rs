@@ -4,6 +4,7 @@ mod encoders;
 mod error;
 mod export;
 mod full;
+mod gif;
 mod media_foundation;
 mod nal;
 mod preview;
@@ -14,16 +15,17 @@ mod still;
 mod strip;
 mod turn;
 
-pub use encoders::SKIP_VARIABLE as SKIP_ENCODERS_VARIABLE;
+pub use encoders::{ChipMaker, SKIP_VARIABLE as SKIP_ENCODERS_VARIABLE, follow_chip};
 pub use error::MediaError;
 pub use export::{
     ExportPart, ExportReport, ExportRequest, can_write_gaps, export, export_picture_only,
     plan_export, same_file,
 };
 pub use full::{
-    DecodedPicture, PictureReader, Quality, SOUND_CHANNELS, SOUND_RATE, SoundLabel, VideoSettings,
-    VideoWriter,
+    DecodedPicture, PictureReader, Quality, SOUND_CHANNELS, SOUND_RATE, SoundLabel, VideoFormat,
+    VideoSettings, VideoWriter,
 };
+pub use gif::GifWriter;
 pub use preview::{
     AudioChunk, AudioPreview, AudioStep, DecodeStep, PreviewFrame, PreviewPlanes, VideoPreview,
     fit_preview_size,

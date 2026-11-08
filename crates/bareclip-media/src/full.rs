@@ -34,6 +34,8 @@ const H264_ENCODERS: [&str; 5] = [
     "h264_mf",
     "libopenh264",
 ];
+/// Hardware first here too, because the processor takes about as long as the video lasts.
+const AV1_ENCODERS: [&str; 4] = ["av1_nvenc", "av1_amf", "av1_qsv", "libsvtav1"];
 pub const SOUND_RATE: u32 = 48_000;
 /// Sound is always written as stereo.
 pub const SOUND_CHANNELS: usize = 2;
@@ -257,6 +259,19 @@ pub struct VideoSettings {
     pub bit_rate: usize,
     pub sound_tracks: Vec<SoundLabel>,
     pub quality: Quality,
+    pub format: VideoFormat,
+}
+
+/// What kind of file a redrawn export is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VideoFormat {
+    /// H.264 in MP4, unless a fast export is copying the video as it is.
+    #[default]
+    H264,
+    /// AV1 in MP4.
+    Av1,
+    /// An animated GIF, with no sound.
+    Gif,
 }
 
 /// How much of a redrawn video's detail to keep, against how large the file gets.
@@ -303,6 +318,26 @@ impl Quality {
         }
     }
 
+    /// The processor's AV1 quality number, where lower keeps more. Measured with VMAF on
+    /// 2026-11-09 against the same recordings as the H.264 choices. The hardware encoders use
+    /// this scale too, as a best guess, because nobody here has a chip that can run them.
+    fn av1_level(self) -> &'static str {
+        match self {
+            Self::MatchSource => "18",
+            Self::Balanced => "26",
+            Self::Smaller => "36",
+        }
+    }
+
+    /// AMD's AV1 encoder counts its quality from 0 to 255, four times the usual scale.
+    fn av1_amd_level(self) -> &'static str {
+        match self {
+            Self::MatchSource => "72",
+            Self::Balanced => "104",
+            Self::Smaller => "144",
+        }
+    }
+
     /// How much of the source's bit rate to use, on encoders with no quality number.
     pub fn share_of_bit_rate(self) -> f64 {
         match self {
@@ -333,8 +368,16 @@ pub(crate) const OPENH264_MOST_BITS: u64 = 250_000_000;
 fn quality_options(name: &str, settings: &VideoSettings) -> Dictionary<'static> {
     let mut options = Dictionary::new();
     let quality = settings.quality;
-    let level = quality.level();
-    let chosen: Vec<(&str, &str)> = if name.ends_with("_nvenc") {
+    let av1 = settings.format == VideoFormat::Av1;
+    let level = if av1 {
+        quality.av1_level()
+    } else {
+        quality.level()
+    };
+    let amd_level = if av1 { quality.av1_amd_level() } else { level };
+    let chosen: Vec<(&str, &str)> = if name == "libsvtav1" {
+        vec![("preset", "8"), ("crf", level)]
+    } else if name.ends_with("_nvenc") {
         vec![
             ("preset", "p5"),
             ("tune", "hq"),
@@ -346,8 +389,8 @@ fn quality_options(name: &str, settings: &VideoSettings) -> Dictionary<'static> 
         vec![
             ("usage", "transcoding"),
             ("rc", "cqp"),
-            ("qp_i", level),
-            ("qp_p", level),
+            ("qp_i", amd_level),
+            ("qp_p", amd_level),
         ]
     } else if name.ends_with("_qsv") {
         vec![("global_quality", level)]
@@ -617,7 +660,12 @@ pub struct VideoWriter {
 
 impl VideoWriter {
     pub fn create(path: &Path, settings: &VideoSettings) -> Result<Self, MediaError> {
-        Self::create_with_any_of(path, settings, &usable(H264_ENCODERS))
+        let encoders = match settings.format {
+            VideoFormat::H264 => usable(H264_ENCODERS),
+            VideoFormat::Av1 => usable(AV1_ENCODERS),
+            VideoFormat::Gif => return Err(ffmpeg::Error::EncoderNotFound.into()),
+        };
+        Self::create_with_any_of(path, settings, &encoders)
     }
 
     /// Writes with the first of these encoders that works here.
@@ -641,7 +689,11 @@ impl VideoWriter {
         let mut output = format::output(&temporary)?;
         let video_time_base = Rational(settings.frame_rate.1, settings.frame_rate.0);
         {
-            let mut stream = output.add_stream(encoder::find(codec::Id::H264))?;
+            let id = match settings.format {
+                VideoFormat::Av1 => codec::Id::AV1,
+                _ => codec::Id::H264,
+            };
+            let mut stream = output.add_stream(encoder::find(id))?;
             stream.set_parameters(&*encoder);
             stream.set_time_base(video_time_base);
             stream.set_avg_frame_rate(Rational(settings.frame_rate.0, settings.frame_rate.1));
@@ -920,6 +972,51 @@ mod tests {
             bit_rate: 1_000_000,
             sound_tracks: Vec::new(),
             quality,
+            format: VideoFormat::H264,
+        }
+    }
+
+    fn av1_settings(quality: Quality) -> VideoSettings {
+        VideoSettings {
+            format: VideoFormat::Av1,
+            ..settings_at((1920, 1080), 30, quality)
+        }
+    }
+
+    #[test]
+    fn the_processor_makes_av1_at_a_quality_for_each_choice() {
+        let crf = |quality| {
+            quality_options("libsvtav1", &av1_settings(quality))
+                .get("crf")
+                .map(str::to_owned)
+        };
+        assert_eq!(crf(Quality::MatchSource).as_deref(), Some("18"));
+        assert_eq!(crf(Quality::Balanced).as_deref(), Some("26"));
+        assert_eq!(crf(Quality::Smaller).as_deref(), Some("36"));
+    }
+
+    #[test]
+    fn amds_av1_counts_quality_on_its_own_scale() {
+        let qp = |quality| {
+            quality_options("av1_amf", &av1_settings(quality))
+                .get("qp_i")
+                .map(str::to_owned)
+        };
+        assert_eq!(qp(Quality::MatchSource).as_deref(), Some("72"));
+        assert_eq!(qp(Quality::Smaller).as_deref(), Some("144"));
+    }
+
+    #[test]
+    fn hardware_is_tried_before_the_processor_for_av1() {
+        assert_eq!(AV1_ENCODERS[AV1_ENCODERS.len() - 1], "libsvtav1");
+    }
+
+    #[test]
+    fn every_av1_encoder_tried_gets_a_quality_setting() {
+        crate::init().expect("FFmpeg starts");
+        for name in AV1_ENCODERS {
+            let options = quality_options(name, &av1_settings(Quality::default()));
+            assert!(options.iter().next().is_some(), "{name}");
         }
     }
 

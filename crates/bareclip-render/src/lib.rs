@@ -3,9 +3,11 @@
 
 mod color;
 mod compositor;
+mod gpu_choice;
 mod scene;
 
 pub use compositor::{Compositor, RenderError};
+pub use gpu_choice::{GpuId, automatic_gpu, choose_gpu, find_gpu, is_real_chip};
 pub use scene::{Layer, LayerPicture, PictureLook, Rect, fit_inside, needs_compositor};
 
 #[cfg(test)]

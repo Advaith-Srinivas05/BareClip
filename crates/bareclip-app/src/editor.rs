@@ -30,16 +30,18 @@ use bareclip_core::{
     tracks::{OrderMove, TrackTarget, Tracks},
 };
 use bareclip_export::{
-    CHOICES_REASON, ExportChoices, ExportRate, ExportSize, FullPlan, LAYERED_REASON, LayeredClip,
-    LayeredRequest, LayeredStretch, ProjectReport, Route, SIZES, SPEED_REASON, STILLS_REASON,
-    SoundPlan, TITLES_REASON, copying_suits, export_layered, export_sound_only,
-    export_with_new_sound, full_output_path, mixed_rates, rates_on_offer, route_for, size_problem,
+    CHOICES_REASON, ExportChoices, ExportRate, ExportSize, FullPlan, GIF_RATES,
+    GIF_WARNING_SECONDS, LAYERED_REASON, LayeredClip, LayeredRequest, LayeredStretch,
+    ProjectReport, Route, SIZES, SPEED_REASON, STILLS_REASON, SoundPlan, TITLES_REASON,
+    copying_suits, export_layered_as, export_sound_only, export_with_new_sound, full_output_path,
+    gif_size_for, gif_sizes_on_offer, mixed_rates, rates_on_offer, route_for, size_problem,
     size_with_shorter_side, sizes_on_offer, sound_labels,
 };
 use bareclip_media::{
     DecodeStep, ExportPart, ExportRequest, MediaError, MediaInfo, PreviewFrame, Quality,
-    SoundLabel, SoundShape, StripPicture, VideoPreview, can_write_gaps, export, picture_spacing,
-    plan_export, probe, read_sound_shape, read_still, read_strip_pictures, scan_frames,
+    SoundLabel, SoundShape, StripPicture, VideoFormat, VideoPreview, can_write_gaps, export,
+    picture_spacing, plan_export, probe, read_sound_shape, read_still, read_strip_pictures,
+    scan_frames,
 };
 use bareclip_text::FontList;
 use eframe::egui::{
@@ -56,7 +58,7 @@ use crate::{
     layers::{LayerDisplay, LayerPictures, Moment},
     preview::{PREPARE_AHEAD_SECONDS, Preview},
     stage::{self, StageClip, StageState, StageView},
-    storage::{self, ExportCuts, Recovery, RecoveryRecord, Settings},
+    storage::{self, ExportCuts, GpuChoice, Recovery, RecoveryRecord, Settings},
     text,
     theme::{self, Palette},
     timeline::{
@@ -135,6 +137,27 @@ const SKIP_NUMBER_SIZE: f32 = 12.0;
 const SKIP_NUMBER_DROP: f32 = 7.0;
 const SETTINGS_WIDTH: f32 = 440.0;
 const SETTINGS_CHOICE_WIDTH: f32 = 96.0;
+/// Room for a whole chip name, such as NVIDIA GeForce RTX 3060 Laptop GPU.
+const GPU_DROPDOWN_WIDTH: f32 = 240.0;
+
+/// A graphics chip, as Settings lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpuEntry {
+    pub id: GpuChoice,
+    pub name: String,
+}
+
+impl GpuEntry {
+    pub fn of(info: &eframe::wgpu::AdapterInfo) -> Self {
+        Self {
+            id: GpuChoice {
+                vendor: info.vendor,
+                device: info.device,
+            },
+            name: info.name.clone(),
+        }
+    }
+}
 
 /// A shape in the Size menu: what it is called, and what it is for, which shows when the pointer
 /// rests on it.
@@ -491,6 +514,12 @@ pub struct Editor {
     layer_pictures: LayerPictures,
     /// Where layers get drawn. Without it, only the top clip shows.
     layer_display: Option<LayerDisplay>,
+    /// The graphics chips this PC has. Empty until the window has opened.
+    gpu_chips: Vec<GpuEntry>,
+    /// The chip the window really runs on.
+    running_gpu: Option<GpuEntry>,
+    /// What Settings said when the app started, which is what this run is using.
+    gpu_at_start: Option<GpuChoice>,
     stage_state: StageState,
     /// The project from before a change on the stage began, until it becomes one undo step.
     stage_before: Option<Snapshot>,
@@ -701,6 +730,9 @@ impl Editor {
             picture: None,
             layer_pictures: LayerPictures::default(),
             layer_display: None,
+            gpu_chips: Vec::new(),
+            running_gpu: None,
+            gpu_at_start: None,
             stage_state: StageState::default(),
             stage_before: None,
             background_text: None,
@@ -2520,17 +2552,35 @@ impl Editor {
     /// The finished video's size, with the export window's choice applied.
     fn export_size(&self) -> Option<(u32, u32)> {
         let canvas = self.final_canvas()?;
+        if self.export_choices.format == VideoFormat::Gif {
+            return Some(gif_size_for(canvas, self.export_choices.gif_size));
+        }
         Some(match self.export_choices.size {
             ExportSize::MatchSource => canvas,
             ExportSize::Shorter(shorter) => size_with_shorter_side(canvas, shorter),
         })
     }
 
+    /// The finished video's frame rate. A GIF has its own choice of those.
+    fn export_rate(&self) -> ExportRate {
+        if self.export_choices.format == VideoFormat::Gif {
+            ExportRate::Fps(self.export_choices.gif_rate)
+        } else {
+            self.export_choices.rate
+        }
+    }
+
     /// The plan a redrawn export would follow, with the export window's choices applied.
     fn export_plan(&self) -> FullPlan {
         let (width, height) = self.export_size().unwrap_or(self.project.canvas.size());
         FullPlan::on_canvas(&self.videos_on_timeline(), (width, height))
-            .with_choices(self.export_choices.quality, self.export_choices.rate)
+            .with_choices(self.export_choices.quality, self.export_rate())
+            .with_format(self.export_choices.format)
+    }
+
+    /// How long a GIF of this project would run: only the pictures count, because it has no sound.
+    fn gif_seconds(&self) -> f64 {
+        self.project.tracks.played().duration().as_seconds()
     }
 
     /// Which sizes the export window offers.
@@ -2569,6 +2619,8 @@ impl Editor {
         let suggested = self.suggested_fast_output()?;
         Some(if self.sound_only {
             suggested.with_extension("m4a")
+        } else if self.export_choices.format == VideoFormat::Gif {
+            suggested.with_extension("gif")
         } else if matches!(self.export_route(), Route::Full(_)) {
             full_output_path(&suggested)
         } else {
@@ -2622,8 +2674,9 @@ impl Editor {
             canvas: self.export_size(),
             background: self.project.canvas.background,
             quality: self.export_choices.quality,
-            rate: self.export_choices.rate,
+            rate: self.export_rate(),
         });
+        let format = self.export_choices.format;
         let request = ExportRequest {
             output: output.clone(),
             parts,
@@ -2645,9 +2698,8 @@ impl Editor {
                     export_sound_only(&sound, &request.output, &worker_cancel, &progress)
                         .map(ProjectReport::Sound)
                 }
-                Some(layered) => {
-                    export_layered(layered, &worker_cancel, &progress).map(ProjectReport::Full)
-                }
+                Some(layered) => export_layered_as(layered, format, &worker_cancel, &progress)
+                    .map(ProjectReport::Full),
                 None if copy_sound => {
                     export(&request, &worker_cancel, &progress).map(ProjectReport::Fast)
                 }
@@ -2848,6 +2900,19 @@ impl Editor {
     /// Gives the editor a GPU to draw layers on.
     pub fn use_gpu(&mut self, display: LayerDisplay) {
         self.layer_display = Some(display);
+    }
+
+    /// Fills in the graphics chip setting. Call this after the settings have been read.
+    pub fn list_gpus(&mut self, running: GpuEntry, mut chips: Vec<GpuEntry>) {
+        let mut seen = Vec::new();
+        chips.retain(|chip| {
+            let fresh = !seen.contains(&chip.id);
+            seen.push(chip.id);
+            fresh
+        });
+        self.gpu_chips = chips;
+        self.running_gpu = Some(running);
+        self.gpu_at_start = self.settings.gpu;
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui) {
@@ -3139,6 +3204,11 @@ impl Editor {
                 });
                 ui.add_space(SETTINGS_ROW_GAP);
 
+                if !self.gpu_chips.is_empty() {
+                    changed |= self.gpu_setting(ui, palette);
+                    ui.add_space(SETTINGS_ROW_GAP);
+                }
+
                 components::settings_group(ui, palette, "Waveforms", |ui| {
                     let on_clips = self.settings.waveforms_on_clips;
                     let row = SwitchRow::new(palette, "Waveforms on clips", on_clips);
@@ -3155,6 +3225,8 @@ impl Editor {
                     }
                 });
                 ui.add_space(20.0);
+                ui.colored_label(palette.text_muted, text::version_line());
+                ui.add_space(12.0);
                 components::dialog_buttons(ui, |ui| {
                     close = ui.add(dialog_button(palette, "Done")).clicked();
                 });
@@ -3167,6 +3239,69 @@ impl Editor {
         }
         if close || modal.should_close() {
             self.settings_open = false;
+        }
+    }
+
+    /// The graphics chip choice in Settings. Returns whether it changed.
+    fn gpu_setting(&mut self, ui: &mut egui::Ui, palette: &Palette) -> bool {
+        let mut picked = None;
+        let chosen = self.settings.gpu;
+        let name_of = |id| {
+            self.gpu_chips
+                .iter()
+                .find(|chip| chip.id == id)
+                .map(|chip| chip.name.as_str())
+        };
+        let shown = chosen.and_then(name_of).unwrap_or(text::AUTOMATIC_GPU);
+        let running = self
+            .running_gpu
+            .as_ref()
+            .map_or("", |chip| chip.name.as_str());
+        let note = text::gpu_note(
+            running,
+            (chosen != self.gpu_at_start).then_some(shown),
+            chosen.is_some_and(|id| name_of(id).is_none()),
+        );
+        let chips = self.gpu_chips.clone();
+        components::settings_group(ui, palette, "Graphics", |ui| {
+            components::settings_row(
+                ui,
+                palette,
+                ("Graphics chip", None),
+                GPU_DROPDOWN_WIDTH,
+                |ui| {
+                    let name = format!("Graphics chip: {shown}");
+                    let button = ui.add(components::Dropdown::new(
+                        palette,
+                        &name,
+                        shown,
+                        GPU_DROPDOWN_WIDTH,
+                    ));
+                    egui::Popup::menu(&button).show(|ui| {
+                        let automatic =
+                            MenuItem::choice(palette, text::AUTOMATIC_GPU, chosen.is_none());
+                        if ui.add(automatic).clicked() {
+                            picked = Some(None);
+                        }
+                        for chip in &chips {
+                            let item =
+                                MenuItem::choice(palette, &chip.name, chosen == Some(chip.id));
+                            if ui.add(item).clicked() {
+                                picked = Some(Some(chip.id));
+                            }
+                        }
+                    });
+                },
+            );
+            ui.colored_label(palette.text_muted, note);
+            ui.add_space(4.0);
+        });
+        match picked {
+            Some(choice) if choice != chosen => {
+                self.settings.gpu = choice;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -4627,8 +4762,12 @@ impl Editor {
         let summary = self.plan_description();
         let rate_choice = self.rate_choice();
         let rate_pick = self.current_rate_pick();
-        let can_keep_apart = self.can_keep_sound_apart();
+        let making_gif = self.export_choices.format == VideoFormat::Gif;
+        let can_keep_apart = self.can_keep_sound_apart() && !making_gif;
         let plain_sound = self.sound_is_plain();
+        let has_picture = !self.project.tracks.played().clips().is_empty();
+        let canvas = self.final_canvas();
+        let gif_seconds = self.gif_seconds();
 
         egui::Modal::new(egui::Id::unique("export_dialog")).frame(dialog_frame(ctx)).show(ctx, |ui| {
             ui.set_width(440.0);
@@ -4698,8 +4837,20 @@ impl Editor {
                         });
                         return;
                     }
-                    export_choice_row(ui, palette, &mut self.export_choices, &sizes, &rates);
+                    export_format_row(ui, palette, &mut self.export_choices, has_picture);
+                    ui.add_space(10.0);
+                    if self.export_choices.format == VideoFormat::Gif {
+                        gif_choice_row(ui, palette, &mut self.export_choices, canvas);
+                    } else {
+                        export_choice_row(ui, palette, &mut self.export_choices, &sizes, &rates);
+                    }
                     ui.add_space(14.0);
+                    if self.export_choices.format == VideoFormat::Gif
+                        && gif_seconds > GIF_WARNING_SECONDS
+                    {
+                        ui.colored_label(palette.accent, text::gif_length_warning(gif_seconds));
+                        ui.add_space(14.0);
+                    }
                     if let Some(reason) = &rate_choice {
                         ui.label(
                             RichText::new("These videos have different frame rates")
@@ -4963,6 +5114,74 @@ fn export_dropdown(
             EXPORT_DROPDOWN_WIDTH,
         ));
         egui::Popup::menu(&button).show(choices);
+    });
+}
+
+/// The kind of file to make. A sound-only project has no pictures to make a GIF from.
+fn export_format_row(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    choices: &mut ExportChoices,
+    has_picture: bool,
+) {
+    export_dropdown(
+        ui,
+        palette,
+        "Format",
+        text::format_name(choices.format),
+        |ui| {
+            for format in [VideoFormat::H264, VideoFormat::Av1, VideoFormat::Gif] {
+                if format == VideoFormat::Gif && !has_picture {
+                    continue;
+                }
+                let name = text::format_name(format);
+                if ui
+                    .add(MenuItem::choice(palette, name, choices.format == format))
+                    .clicked()
+                {
+                    choices.format = format;
+                }
+            }
+        },
+    );
+}
+
+/// The Size and Frame rate choices a GIF has.
+fn gif_choice_row(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    choices: &mut ExportChoices,
+    canvas: Option<(u32, u32)>,
+) {
+    let offered = canvas.map_or_else(Vec::new, gif_sizes_on_offer);
+    // A project smaller than the chosen size stays at its own.
+    let shown = canvas.map_or(choices.gif_size, |size| {
+        choices.gif_size.min(size.0.min(size.1))
+    });
+    ui.horizontal_top(|ui| {
+        export_dropdown(ui, palette, "Resolution", &format!("{shown}p"), |ui| {
+            for shorter in offered {
+                let name = format!("{shorter}p");
+                if ui
+                    .add(MenuItem::choice(palette, &name, shorter == shown))
+                    .clicked()
+                {
+                    choices.gif_size = shorter;
+                }
+            }
+        });
+        let rate_name = format!("{} fps", choices.gif_rate);
+        export_dropdown(ui, palette, "Frame rate", &rate_name, |ui| {
+            for fps in GIF_RATES {
+                let name = format!("{fps} fps");
+                if ui
+                    .add(MenuItem::choice(palette, &name, fps == choices.gif_rate))
+                    .clicked()
+                {
+                    choices.gif_rate = fps;
+                }
+            }
+        });
     });
 }
 
@@ -11404,6 +11623,92 @@ mod tests {
         assert!(!saved.waveforms_on_clips && saved.waveforms_on_audio);
     }
 
+    fn laptop_chips(editor: &mut Editor) -> (GpuChoice, GpuChoice) {
+        let nvidia = GpuEntry {
+            id: GpuChoice {
+                vendor: 0x10de,
+                device: 0x2520,
+            },
+            name: "NVIDIA test chip".to_owned(),
+        };
+        let amd = GpuEntry {
+            id: GpuChoice {
+                vendor: 0x1002,
+                device: 0x1638,
+            },
+            name: "AMD test chip".to_owned(),
+        };
+        let ids = (nvidia.id, amd.id);
+        editor.list_gpus(nvidia.clone(), vec![nvidia, amd]);
+        ids
+    }
+
+    #[test]
+    fn a_chip_picked_in_settings_is_remembered_and_needs_a_restart() {
+        let ctx = context();
+        let folder = project_folder("gpu-setting");
+        let mut editor = with_storage(&ctx, &folder);
+        let (_, amd) = laptop_chips(&mut editor);
+
+        click_named(&ctx, &mut editor, "Settings");
+        let_dialog_open(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Graphics chip: Automatic");
+        settle_animations(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "AMD test chip");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert_eq!(editor.settings.gpu, Some(amd));
+        assert_eq!(with_storage(&ctx, &folder).settings.gpu, Some(amd));
+        assert!(is_named(&ctx, &mut editor, "Graphics chip: AMD test chip"));
+    }
+
+    #[test]
+    fn going_back_to_automatic_saves_that_too() {
+        let ctx = context();
+        let folder = project_folder("gpu-automatic");
+        let mut editor = with_storage(&ctx, &folder);
+        let (_, amd) = laptop_chips(&mut editor);
+        editor.settings.gpu = Some(amd);
+
+        click_named(&ctx, &mut editor, "Settings");
+        let_dialog_open(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Graphics chip: AMD test chip");
+        settle_animations(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Automatic");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert_eq!(editor.settings.gpu, None);
+        assert_eq!(with_storage(&ctx, &folder).settings.gpu, None);
+    }
+
+    #[test]
+    fn a_picked_chip_that_is_gone_reads_automatic() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        laptop_chips(&mut editor);
+        editor.settings.gpu = Some(GpuChoice {
+            vendor: 0x8086,
+            device: 0x46a6,
+        });
+
+        click_named(&ctx, &mut editor, "Settings");
+        let_dialog_open(&ctx, &mut editor);
+
+        assert!(is_named(&ctx, &mut editor, "Graphics chip: Automatic"));
+    }
+
+    #[test]
+    fn the_settings_window_says_which_version_this_is() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+
+        click_named(&ctx, &mut editor, "Settings");
+        let_dialog_open(&ctx, &mut editor);
+
+        let output = run_frame(&ctx, &mut editor, vec![]);
+        assert!(text_in(&output, egui::Rect::EVERYTHING).contains(&text::version_line()));
+    }
+
     #[test]
     fn closing_a_project_stops_reading_its_videos() {
         let ctx = context();
@@ -13843,6 +14148,125 @@ mod tests {
     }
 
     #[test]
+    fn choosing_av1_or_gif_redraws_the_video() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+
+        for format in [VideoFormat::Av1, VideoFormat::Gif] {
+            editor.export_choices.format = format;
+            assert_eq!(
+                editor.export_route(),
+                Route::Full(CHOICES_REASON.to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn a_gif_uses_its_own_size_and_rate_and_a_gif_file_name() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        let canvas = editor.project.canvas.size();
+        editor.export_choices.format = VideoFormat::Gif;
+        editor.export_choices.gif_size = 120;
+        editor.export_choices.gif_rate = 10;
+
+        assert_eq!(editor.export_size(), Some(gif_size_for(canvas, 120)));
+        assert_eq!(editor.export_plan().settings.frame_rate, (10, 1));
+        let output = editor
+            .suggested_output()
+            .expect("there's a file to suggest");
+        assert_eq!(output.extension().unwrap(), "gif");
+    }
+
+    #[test]
+    fn a_gif_comes_out_silent_at_what_was_chosen() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        let canvas = editor.project.canvas.size();
+        editor.export_choices.format = VideoFormat::Gif;
+        editor.export_choices.gif_size = 120;
+        editor.export_choices.gif_rate = 10;
+        let length = editor.gif_seconds();
+
+        let output = output_called("as-a-gif").with_extension("gif");
+        let report = exported_report(&ctx, &mut editor, &output);
+
+        assert!(matches!(report, ProjectReport::Full(_)), "{report:?}");
+        let info = probe(&output).expect("it can be read");
+        assert_eq!(info.video.codec, "gif");
+        assert_eq!(
+            (info.video.width, info.video.height),
+            gif_size_for(canvas, 120)
+        );
+        assert!(info.audio.is_empty(), "a GIF has no sound");
+        // BareClip reads a GIF as a picture when adding one, so its frames are counted here.
+        let mut reader = bareclip_media::PictureReader::open(&output).expect("it opens");
+        let (mut frames, mut last) = (0, Ticks(0));
+        while let Some(picture) = reader.next_picture().expect("it decodes") {
+            frames += 1;
+            last = picture.time();
+        }
+        assert_eq!(
+            frames,
+            (length * 10.0).round() as i32,
+            "one for each tenth of a second"
+        );
+        assert!(
+            (last.as_seconds() - (length - 0.1)).abs() < 0.05,
+            "{last:?}"
+        );
+        let bytes = std::fs::read(&output).expect("it can be read");
+        let loops = bytes.windows(11).any(|part| part == b"NETSCAPE2.0");
+        assert!(loops, "it says to loop");
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn av1_comes_out_as_av1_at_the_chosen_size() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        let canvas = editor.project.canvas.size();
+        let wanted = size_with_shorter_side(canvas, canvas.0.min(canvas.1) / 2);
+        editor.export_choices.format = VideoFormat::Av1;
+        editor.export_choices.size = ExportSize::Shorter(canvas.0.min(canvas.1) / 2);
+
+        let output = output_called("as-av1");
+        let report = exported_report(&ctx, &mut editor, &output);
+
+        assert!(matches!(report, ProjectReport::Full(_)), "{report:?}");
+        let info = probe(&output).expect("it can be read");
+        assert_eq!(info.video.codec, "av1");
+        assert_eq!((info.video.width, info.video.height), wanted);
+        assert!(!info.audio.is_empty(), "the sound comes along");
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn the_export_window_warns_about_a_long_gif_only() {
+        let ctx = context();
+        let sound = clip_with_sound();
+        let mut editor = with_videos(&ctx, &[&sound]);
+        editor.open_export();
+        editor.export_choices.format = VideoFormat::Gif;
+        let_dialog_open(&ctx, &mut editor);
+        let warning = text::gif_length_warning(editor.gif_seconds());
+        let output = run_frame(&ctx, &mut editor, vec![]);
+        assert!(!text_in(&output, egui::Rect::EVERYTHING).contains(&warning));
+
+        let id = editor.media[0].id;
+        while editor.gif_seconds() <= GIF_WARNING_SECONDS {
+            editor.add_to_timeline(id);
+        }
+        let warning = text::gif_length_warning(editor.gif_seconds());
+        let output = run_frame(&ctx, &mut editor, vec![]);
+        assert!(text_in(&output, egui::Rect::EVERYTHING).contains(&warning));
+    }
+
+    #[test]
     fn the_export_window_starts_on_match_source_every_time() {
         let ctx = context();
         let sound = clip_with_sound();
@@ -13881,6 +14305,7 @@ mod tests {
             size: ExportSize::Shorter(canvas.0.min(canvas.1) / 2),
             quality: Quality::Balanced,
             rate: ExportRate::Fps(15),
+            ..ExportChoices::default()
         };
 
         let output = output_called("chosen-choices");

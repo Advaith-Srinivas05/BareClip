@@ -2,7 +2,9 @@
 
 pub use bareclip_core::placement::final_size;
 use bareclip_core::splice::FrameIndex;
-use bareclip_media::{MediaInfo, Quality, SoundLabel, VideoSettings, can_write_gaps, join_problem};
+use bareclip_media::{
+    MediaInfo, Quality, SoundLabel, VideoFormat, VideoSettings, can_write_gaps, join_problem,
+};
 
 /// How an export will work.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -180,8 +182,18 @@ impl FullPlan {
                 bit_rate: bit_rate as usize,
                 sound_tracks,
                 quality: Quality::default(),
+                format: VideoFormat::default(),
             },
         }
+    }
+
+    /// The same plan as this kind of file. A GIF has no sound.
+    pub fn with_format(mut self, format: VideoFormat) -> Self {
+        self.settings.format = format;
+        if format == VideoFormat::Gif {
+            self.settings.sound_tracks.clear();
+        }
+        self
     }
 
     /// The same plan with the export window's choice of quality and frame rate.
@@ -221,18 +233,61 @@ pub enum ExportRate {
 }
 
 /// What the export window can change about a finished video.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExportChoices {
     pub size: ExportSize,
     pub quality: Quality,
     pub rate: ExportRate,
+    pub format: VideoFormat,
+    /// The shorter side of a GIF, kept apart so that trying GIF doesn't change the video's choices.
+    pub gif_size: u32,
+    pub gif_rate: u32,
+}
+
+impl Default for ExportChoices {
+    fn default() -> Self {
+        Self {
+            size: ExportSize::default(),
+            quality: Quality::default(),
+            rate: ExportRate::default(),
+            format: VideoFormat::default(),
+            gif_size: 480,
+            gif_rate: 15,
+        }
+    }
 }
 
 impl ExportChoices {
     /// Whether these ask for anything a copy of the video can't give.
     pub fn need_redrawing(&self) -> bool {
-        *self != Self::default()
+        self.format != VideoFormat::default()
+            || self.size != ExportSize::default()
+            || self.quality != Quality::default()
+            || self.rate != ExportRate::default()
     }
+}
+
+/// Shorter sides a GIF can be made at.
+pub const GIF_SIZES: [u32; 4] = [720, 480, 360, 240];
+/// Frame rates a GIF can be made at.
+pub const GIF_RATES: [u32; 3] = [24, 15, 10];
+/// How long a GIF can run before the export window warns about its size.
+pub const GIF_WARNING_SECONDS: f64 = 15.0;
+
+/// The sizes worth offering for a GIF: never larger than the project.
+pub fn gif_sizes_on_offer(canvas: (u32, u32)) -> Vec<u32> {
+    let own = canvas.0.min(canvas.1);
+    let offered: Vec<u32> = GIF_SIZES.into_iter().filter(|side| *side <= own).collect();
+    if offered.is_empty() {
+        vec![own]
+    } else {
+        offered
+    }
+}
+
+/// A GIF's finished size, at the chosen shorter side unless that would blow the project up.
+pub fn gif_size_for(canvas: (u32, u32), chosen: u32) -> (u32, u32) {
+    size_with_shorter_side(canvas, chosen.min(canvas.0.min(canvas.1)))
 }
 
 /// Why choices in the export window mean every frame is redrawn.
@@ -319,6 +374,53 @@ mod tests {
         time::{Ticks, TimeBase},
     };
     use bareclip_media::{AudioInfo, VideoInfo};
+
+    #[test]
+    fn asking_for_av1_or_a_gif_means_redrawing() {
+        assert!(!ExportChoices::default().need_redrawing());
+        for format in [VideoFormat::Av1, VideoFormat::Gif] {
+            let choices = ExportChoices {
+                format,
+                ..ExportChoices::default()
+            };
+            assert!(choices.need_redrawing(), "{format:?}");
+        }
+    }
+
+    #[test]
+    fn changing_only_a_gifs_own_choices_leaves_a_video_copied() {
+        let choices = ExportChoices {
+            gif_size: 240,
+            gif_rate: 10,
+            ..ExportChoices::default()
+        };
+
+        assert!(!choices.need_redrawing());
+    }
+
+    #[test]
+    fn gifs_are_only_offered_at_or_below_the_projects_size() {
+        assert_eq!(gif_sizes_on_offer((1920, 1080)), [720, 480, 360, 240]);
+        assert_eq!(gif_sizes_on_offer((640, 360)), [360, 240]);
+        assert_eq!(gif_sizes_on_offer((320, 180)), [180]);
+    }
+
+    #[test]
+    fn a_gif_is_never_blown_up_past_the_project() {
+        assert_eq!(gif_size_for((1920, 1080), 480), (854, 480));
+        assert_eq!(gif_size_for((640, 360), 480), (640, 360));
+    }
+
+    #[test]
+    fn a_gif_keeps_no_sound_tracks() {
+        let mut plan = FullPlan::on_canvas(&[], (640, 360));
+        plan.settings.sound_tracks = vec![SoundLabel::default()];
+
+        let plan = plan.with_format(VideoFormat::Gif);
+
+        assert!(plan.settings.sound_tracks.is_empty());
+        assert_eq!(plan.settings.format, VideoFormat::Gif);
+    }
 
     #[test]
     fn a_chosen_size_keeps_the_projects_shape_in_even_numbers() {

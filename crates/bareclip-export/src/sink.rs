@@ -8,7 +8,7 @@ use std::{
 };
 
 use bareclip_core::picture::{ColorFormat, Yuv420};
-use bareclip_media::{MediaError, VideoSettings, VideoWriter};
+use bareclip_media::{GifWriter, MediaError, VideoFormat, VideoSettings, VideoWriter};
 
 /// Pictures waiting to be encoded. A few is enough to smooth out uneven frames, and each one
 /// takes memory.
@@ -78,8 +78,67 @@ enum Job {
     Finish,
 }
 
+/// Whatever is making the file.
+enum Writer {
+    Video(Box<VideoWriter>),
+    Gif(Box<GifWriter>),
+}
+
+impl Writer {
+    fn create(path: &Path, settings: &VideoSettings) -> Result<Self, MediaError> {
+        Ok(if settings.format == VideoFormat::Gif {
+            Self::Gif(Box::new(GifWriter::create(path, settings)?))
+        } else {
+            Self::Video(Box::new(VideoWriter::create(path, settings)?))
+        })
+    }
+
+    fn encoder_name(&self) -> String {
+        match self {
+            Self::Video(writer) => writer.encoder_name().to_owned(),
+            Self::Gif(writer) => writer.encoder_name().to_owned(),
+        }
+    }
+
+    fn write_picture(&mut self, picture: &Yuv420) -> Result<(), MediaError> {
+        match self {
+            Self::Video(writer) => writer.write_picture(picture),
+            Self::Gif(writer) => writer.write_picture(picture),
+        }
+    }
+
+    fn repeat_picture(&mut self) -> Result<(), MediaError> {
+        match self {
+            Self::Video(writer) => writer.repeat_picture(),
+            Self::Gif(writer) => writer.repeat_picture(),
+        }
+    }
+
+    /// A GIF has nowhere to keep sound.
+    fn write_sound(&mut self, track: usize, samples: &[f32]) -> Result<(), MediaError> {
+        match self {
+            Self::Video(writer) => writer.write_sound(track, samples),
+            Self::Gif(_) => Ok(()),
+        }
+    }
+
+    fn write_silence(&mut self, track: usize, frames: usize) -> Result<(), MediaError> {
+        match self {
+            Self::Video(writer) => writer.write_silence(track, frames),
+            Self::Gif(_) => Ok(()),
+        }
+    }
+
+    fn finish(self) -> Result<(), MediaError> {
+        match self {
+            Self::Video(writer) => writer.finish(),
+            Self::Gif(writer) => writer.finish(),
+        }
+    }
+}
+
 fn run_jobs(
-    mut writer: VideoWriter,
+    mut writer: Writer,
     jobs: &Receiver<Job>,
     spare: &SyncSender<PictureCopy>,
 ) -> Result<(), MediaError> {
@@ -109,8 +168,8 @@ pub struct VideoSink {
 
 impl VideoSink {
     pub fn create(path: &Path, settings: &VideoSettings) -> Result<Self, MediaError> {
-        let writer = VideoWriter::create(path, settings)?;
-        let encoder_name = writer.encoder_name().to_owned();
+        let writer = Writer::create(path, settings)?;
+        let encoder_name = writer.encoder_name();
         let (jobs, received) = mpsc::sync_channel(PICTURES_WAITING);
         let (returned, spare) = mpsc::sync_channel(PICTURES_WAITING + 1);
         let worker = thread::Builder::new()

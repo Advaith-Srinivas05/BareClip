@@ -258,19 +258,28 @@ fn open_gpu() -> Result<Gpu, RenderError> {
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     descriptor.backends = wgpu::Backends::DX12;
     let instance = wgpu::Instance::new(descriptor);
-    // The fast graphics chip by name, then whatever Windows offers in software, so a machine
-    // without a usable chip exports slowly rather than not at all.
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        ..Default::default()
-    }))
-    .or_else(|_| {
-        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            force_fallback_adapter: true,
+    // The chip picked in Settings if it's still here. Otherwise the fast graphics chip by name,
+    // then whatever Windows offers in software, so a machine without a usable chip exports
+    // slowly rather than not at all.
+    let picked = crate::gpu_choice::chosen().and_then(|wanted| {
+        let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::DX12));
+        let infos: Vec<wgpu::AdapterInfo> = adapters.iter().map(wgpu::Adapter::get_info).collect();
+        crate::gpu_choice::find_gpu(&infos, wanted).map(|index| adapters[index].clone())
+    });
+    let adapter = match picked {
+        Some(adapter) => adapter,
+        None => pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
             ..Default::default()
         }))
-    })
-    .map_err(|error| RenderError::NoGpu(error.to_string()))?;
+        .or_else(|_| {
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                force_fallback_adapter: true,
+                ..Default::default()
+            }))
+        })
+        .map_err(|error| RenderError::NoGpu(error.to_string()))?,
+    };
     let name = adapter.get_info().name;
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("compositor"),

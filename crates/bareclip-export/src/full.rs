@@ -232,6 +232,7 @@ pub fn export_full(
         gpu: None,
         audio_tracks: settings.sound_tracks.len(),
         elapsed: started.elapsed(),
+        file_bytes: None,
     };
     let mut current_span = None;
     let half_frame = Ticks(frame_time(1, rate).0 / 2);

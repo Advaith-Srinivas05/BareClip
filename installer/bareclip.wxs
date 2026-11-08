@@ -35,6 +35,12 @@
     <Property Id="LAST_SCOPE" Value="user" Secure="yes" />
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
 
+    <!-- The tick box on the last page, which starts the app as the person who ran the installer,
+         even when installing for everyone. It only shows after a fresh install or upgrade. -->
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch BareClip" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <CustomAction Id="LaunchBareClip" BinaryKey="WixCA" DllEntry="WixShellExec" Impersonate="yes" Return="ignore" />
+
     <!-- An upgrade keeps the earlier choices, and stays in the same place so there is only
          ever one copy. Windows only finds an earlier copy installed the same way. -->
     <Property Id="SAVED_PARENT_USER" Secure="yes">
@@ -257,6 +263,8 @@
       <Publish Dialog="BrowseDlg" Control="OK" Event="SetTargetPath" Value="INSTALLFOLDER" Order="4">1</Publish>
 
       <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="PrepareDlg">1</Publish>
+      <Publish Dialog="ExitDialog" Control="Finish" Property="WixShellExecTarget" Value="[INSTALLFOLDER]bareclip.exe" Order="997">WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed</Publish>
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchBareClip" Order="998">WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed</Publish>
       <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999">1</Publish>
       <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg">1</Publish>
       <Publish Dialog="MaintenanceWelcomeDlg" Control="Next" Event="NewDialog" Value="MaintenanceTypeDlg">1</Publish>

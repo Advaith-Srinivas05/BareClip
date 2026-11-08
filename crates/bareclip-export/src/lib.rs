@@ -11,13 +11,15 @@ use std::{path::Path, sync::atomic::AtomicBool, time::Duration};
 
 use bareclip_media::{ExportReport, ExportRequest, MediaError, MediaInfo, export, probe};
 
-pub use layered::{ExportJoin, LayeredClip, LayeredRequest, LayeredStretch, export_layered};
+pub use layered::{
+    ExportJoin, LayeredClip, LayeredRequest, LayeredStretch, export_layered, export_layered_as,
+};
 pub use mixed::{SoundPlan, SoundReport, export_sound_only, export_with_new_sound};
 pub use plan::{
-    CHOICES_REASON, ExportChoices, ExportRate, ExportSize, FullPlan, LAYERED_REASON, Route, SIZES,
-    SPEED_REASON, STILLS_REASON, TITLES_REASON, copying_suits, final_size, frame_rate_for,
-    mixed_rates, rates_on_offer, route_for, size_problem, size_with_shorter_side, sizes_on_offer,
-    sound_labels,
+    CHOICES_REASON, ExportChoices, ExportRate, ExportSize, FullPlan, GIF_RATES, GIF_SIZES,
+    GIF_WARNING_SECONDS, LAYERED_REASON, Route, SIZES, SPEED_REASON, STILLS_REASON, TITLES_REASON,
+    copying_suits, final_size, frame_rate_for, gif_size_for, gif_sizes_on_offer, mixed_rates,
+    rates_on_offer, route_for, size_problem, size_with_shorter_side, sizes_on_offer, sound_labels,
 };
 pub use sink::VideoSink;
 
@@ -40,6 +42,8 @@ pub struct FullReport {
     pub gpu: Option<String>,
     pub audio_tracks: usize,
     pub elapsed: Duration,
+    /// How big the finished file is.
+    pub file_bytes: Option<u64>,
 }
 
 /// What happened in an export, by the route it took.
