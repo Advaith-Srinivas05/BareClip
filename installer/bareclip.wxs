@@ -406,6 +406,8 @@
       <Component Id="Licenses" Guid="3C7E0F92-1B64-47AD-B8D5-6E2A90F1C347">
         <File Id="BareClipLicense" Name="BareClip-MIT.txt" Source="$(var.RepoDir)\LICENSE" KeyPath="yes" />
         <File Id="ThirdPartyNotices" Name="THIRD-PARTY-NOTICES.txt" Source="$(var.RepoDir)\assets\licenses\THIRD-PARTY-NOTICES.txt" />
+        <File Id="RustLibraries" Name="RUST-LIBRARIES.txt" Source="$(var.RepoDir)\assets\licenses\RUST-LIBRARIES.txt" />
+        <File Id="FfmpegLibraries" Name="FFMPEG-LIBRARIES.txt" Source="$(var.RepoDir)\assets\licenses\FFMPEG-LIBRARIES.txt" />
         <File Id="FfmpegLgpl" Name="FFmpeg-LGPL-3.0.txt" Source="$(var.FfmpegDir)\LICENSE.txt" />
         <File Id="Gpl3" Name="GPL-3.0.txt" Source="$(var.RepoDir)\assets\licenses\GPL-3.0.txt" />
         <File Id="FontLicense" Name="HankenGrotesk-OFL.txt" Source="$(var.RepoDir)\assets\fonts\OFL.txt" />

@@ -17,7 +17,8 @@ Source code:   https://github.com/FFmpeg/FFmpeg/tree/d7643a0fe3
 Build scripts: https://github.com/BtbN/FFmpeg-Builds/releases/tag/autobuild-2026-11-01-12-49
 
 These FFmpeg DLLs also contain other open-source libraries compiled into them, such
-as dav1d and SVT-AV1. The build scripts above list them and how they were built.
+as dav1d, SVT-AV1 and Opus. FFMPEG-LIBRARIES.txt lists every one with where its source
+is and the exact version built, followed by the full text of each licence.
 
 
 Hanken Grotesk
@@ -91,6 +92,5 @@ Rust libraries
 --------------
 BareClip is built with open-source Rust libraries, including egui, eframe, wgpu,
 cpal, rtrb, rfd, serde and ffmpeg-next, and the libraries they depend on. These are
-mainly under the MIT and Apache 2.0 licenses. The project's Cargo.lock file lists
-every library and version used:
-https://github.com/Advaith-Srinivas05/BareClip/blob/release/Cargo.lock
+mainly under the MIT and Apache 2.0 licenses. RUST-LIBRARIES.txt lists every one
+with its version, licence and source, followed by the full text of each licence.

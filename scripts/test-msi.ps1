@@ -64,7 +64,7 @@ try {
     foreach ($File in 'bareclip.exe', 'avcodec-63.dll', 'avformat-63.dll', 'avutil-61.dll', 'swresample-7.dll', 'swscale-10.dll') {
         Assert-That (Test-Path (Join-Path $InstallDir $File)) "$File is installed"
     }
-    foreach ($File in 'BareClip-MIT.txt', 'THIRD-PARTY-NOTICES.txt', 'FFmpeg-LGPL-3.0.txt', 'GPL-3.0.txt', 'HankenGrotesk-OFL.txt', 'Lucide-ISC.txt') {
+    foreach ($File in 'BareClip-MIT.txt', 'THIRD-PARTY-NOTICES.txt', 'RUST-LIBRARIES.txt', 'FFMPEG-LIBRARIES.txt', 'FFmpeg-LGPL-3.0.txt', 'GPL-3.0.txt', 'HankenGrotesk-OFL.txt', 'Lucide-ISC.txt') {
         Assert-That (Test-Path (Join-Path $InstallDir "licenses\$File")) "the licence $File is installed"
     }
     Assert-That (Test-Path $Shortcut) 'the Start menu shortcut exists'

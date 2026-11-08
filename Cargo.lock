@@ -415,7 +415,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "bareclip-app"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "bareclip-audio",
  "bareclip-core",
@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "bareclip-audio"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "bareclip-core",
  "bareclip-media",
@@ -446,7 +446,7 @@ dependencies = [
 
 [[package]]
 name = "bareclip-core"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -454,7 +454,7 @@ dependencies = [
 
 [[package]]
 name = "bareclip-export"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "bareclip-audio",
  "bareclip-core",
@@ -466,7 +466,7 @@ dependencies = [
 
 [[package]]
 name = "bareclip-media"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "bareclip-core",
  "ffmpeg-next",
@@ -474,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "bareclip-render"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "bareclip-core",
  "bytemuck",
@@ -485,7 +485,7 @@ dependencies = [
 
 [[package]]
 name = "bareclip-text"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "bareclip-core",
  "cosmic-text",

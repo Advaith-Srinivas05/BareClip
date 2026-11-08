@@ -45,8 +45,56 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+      - name: Check the Rust licence list is up to date
+        run: python scripts/rust-licenses.py --check
+
       - name: Run lints
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Run tests
         run: cargo test --workspace --locked
+
+  # Only code that passed the tests is packaged, and only on the branches releases come from.
+  # The installer is kept on the run's page: test that file and attach the same one
+  # to the GitHub release, so what was tested is what ships.
+  installer:
+    needs: test
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/release-candidate' || github.ref == 'refs/heads/release')
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache FFmpeg and WiX
+        uses: actions/cache@v6
+        with:
+          path: |
+            vendor/ffmpeg
+            vendor/wix
+          key: installer-tools-${{ hashFiles('scripts/setup-ffmpeg.ps1', 'scripts/setup-wix.ps1') }}
+
+      - name: Cache Rust build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: installer-rust-${{ hashFiles('Cargo.lock') }}
+          restore-keys: installer-rust-
+
+      - name: Build the installer
+        shell: pwsh
+        run: ./scripts/build-msi.ps1
+
+      - name: Keep the installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: BareClip-installer
+          path: |
+            dist/BareClip-*.msi
+            dist/BareClip.msi
+          if-no-files-found: error
+          retention-days: 90
