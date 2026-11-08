@@ -7,7 +7,7 @@ use eframe::egui::{
 pub use shadcn_egui_core::Icon;
 use shadcn_egui_core::Seg;
 pub use shadcn_egui_icons_lucide::{
-    APERTURE, ARROW_DOWN, ARROW_LEFT, ARROW_UP, ARROW_UP_DOWN, AUDIO_LINES, BLEND, CHECK,
+    APERTURE, ARROW_DOWN, ARROW_LEFT, ARROW_UP, ARROW_UP_DOWN, AUDIO_LINES, BLEND, CAPTIONS, CHECK,
     CHEVRON_DOWN, CHEVRON_RIGHT, CHEVRONS_DOWN, CHEVRONS_UP, CIRCLE_ALERT, CIRCLE_CHECK,
     CLIPBOARD_PASTE, CLOCK, CONTRAST, COPY, COPY_PLUS, CROP, ELLIPSIS, FILE_PLUS, FILM,
     FLIP_HORIZONTAL_2, FLIP_VERTICAL_2, FOLD_HORIZONTAL, FOLDER_OPEN, GAUGE, IMAGE, INFO,
@@ -142,10 +142,11 @@ pub fn square_at(center: Pos2, side: f32) -> Rect {
 mod tests {
     use super::*;
 
-    const USED: [Icon; 74] = [
+    const USED: [Icon; 75] = [
         APERTURE,
         CONTRAST,
         SWATCH_BOOK,
+        CAPTIONS,
         SCALING,
         SPARKLES,
         ARROW_UP_DOWN,

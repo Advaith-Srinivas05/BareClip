@@ -398,12 +398,14 @@ enum RatePick {
     Redraw,
 }
 
+#[path = "captions.rs"]
+mod captions;
 #[path = "looks.rs"]
 mod looks;
 #[path = "titles.rs"]
 mod titles;
-use looks::{LookPictures, TitleTab};
-use stage::LookTab;
+use looks::LookPictures;
+use stage::{LookTab, RightPanel};
 use titles::{CardHover, CopiedClip, DurationEdit, LeftPanel, TitleCard, TitleResize};
 
 struct MediaEntry {
@@ -411,7 +413,9 @@ struct MediaEntry {
     /// What a title's picture was last drawn from, for what canvas, and the scale that shows it.
     title_drawn: Option<(Title, (u32, u32), i32)>,
     info: MediaInfo,
+    /// What it is called on screen: a name given in this project, or else `file_name`.
     name: String,
+    file_name: String,
     /// When the file was created, on file systems that record it.
     created: Option<SystemTime>,
     index: Option<Arc<FrameIndex>>,
@@ -444,6 +448,8 @@ struct Snapshot {
     canvas: Canvas,
     /// What each title says and how it looks, under the id its clip refers to.
     titles: BTreeMap<MediaId, Title>,
+    /// Names given to videos in this project. The files themselves are never renamed.
+    names: BTreeMap<MediaId, String>,
 }
 
 /// A trim in progress: where the clip's edge and the playhead were when the drag started.
@@ -518,6 +524,8 @@ pub struct Editor {
     missing_videos: Option<MissingVideos>,
     /// The name being typed, while the project is being renamed.
     renaming: Option<String>,
+    /// The video being renamed in the panel, and what has been typed so far.
+    media_rename: Option<(MediaId, String)>,
     window_title: String,
     closing: bool,
     settings: Settings,
@@ -564,11 +572,8 @@ pub struct Editor {
     /// The effect whose settings are open in the Effects tab.
     effect_settings: Option<EffectKind>,
     look_pictures: LookPictures,
-    look_panel_open: bool,
-    /// Whether the right-hand rail is up, which waits for the pointer after a press selects a clip.
-    clip_rail_showing: bool,
-    look_tab: LookTab,
-    title_tab: TitleTab,
+    /// What the panel on the right is showing, or `None` while it is closed.
+    right_panel: Option<RightPanel>,
     /// The card the pointer is resting on, which starts moving after a moment.
     card_hover: Option<CardHover>,
     /// Whether all the text styles are showing, after "See all" was pressed.
@@ -582,6 +587,9 @@ pub struct Editor {
     /// The text box should take the keyboard when it next shows.
     focus_title_text: bool,
     pick_captions_requested: bool,
+    save_captions_requested: bool,
+    /// The caption whose box should take the keyboard next, and the row to scroll to for it.
+    captions_focus: Option<(ClipId, usize)>,
     font_list: Option<FontList>,
     font_search: String,
     /// Each font's name drawn in itself, or `None` if it can't show it.
@@ -649,6 +657,15 @@ struct CardActions {
     add: Option<MediaId>,
     remove: Option<MediaId>,
     toggle: Option<MediaId>,
+    rename: Option<(MediaId, String)>,
+}
+
+/// How a media card is drawn just now.
+struct CardMode {
+    /// Squeezed cards keep only their thumbnail and name.
+    compact: bool,
+    /// Something is ticked, so every card shows its box.
+    selecting: bool,
 }
 
 /// Whether two paths name one file, however each was written.
@@ -677,6 +694,7 @@ impl Editor {
                 hidden: Vec::new(),
                 canvas: Canvas::default(),
                 titles: BTreeMap::new(),
+                names: BTreeMap::new(),
             },
             history: History::default(),
             preview: Preview::new(use_sound, Arc::new(move || repaint.request_repaint())),
@@ -705,6 +723,7 @@ impl Editor {
             leave_for: None,
             missing_videos: None,
             renaming: None,
+            media_rename: None,
             window_title: String::new(),
             closing: false,
             settings: Settings::default(),
@@ -735,10 +754,7 @@ impl Editor {
             effect_search: String::new(),
             effect_settings: None,
             look_pictures: LookPictures::default(),
-            look_panel_open: false,
-            clip_rail_showing: false,
-            look_tab: LookTab::default(),
-            title_tab: TitleTab::default(),
+            right_panel: None,
             card_hover: None,
             all_text_styles: false,
             title_frames: crate::title_frames::TitleFrames::default(),
@@ -747,6 +763,8 @@ impl Editor {
             style_whole_row: true,
             focus_title_text: false,
             pick_captions_requested: false,
+            save_captions_requested: false,
+            captions_focus: None,
             font_list: None,
             font_search: String::new(),
             font_faces: HashMap::new(),
@@ -803,6 +821,9 @@ impl Editor {
             .collect();
         let mut file = ProjectFile::capture(&self.project_name, media, &self.project.tracks);
         file.canvas = self.project.canvas;
+        for saved in &mut file.media {
+            saved.name = self.project.names.get(&MediaId(saved.id)).cloned();
+        }
         self.write_titles_to(&mut file);
         file
     }
@@ -855,6 +876,7 @@ impl Editor {
             hidden: Vec::new(),
             canvas: Canvas::default(),
             titles: BTreeMap::new(),
+            names: BTreeMap::new(),
         };
         self.history = History::default();
         self.selected = None;
@@ -865,6 +887,7 @@ impl Editor {
         self.card_thumbnails.clear();
         self.notice = None;
         self.renaming = None;
+        self.media_rename = None;
         let (height_kept, keep) = (self.timeline_height, self.timeline_open);
         self.timeline_state = TimelineState::default();
         self.timeline_height = height_kept;
@@ -1011,6 +1034,9 @@ impl Editor {
                 Ok(entry) => {
                     new_ids.insert(media.id, entry.id);
                     durations.insert(media.id, entry.info.duration);
+                    if let Some(name) = &media.name {
+                        self.project.names.insert(entry.id, name.clone());
+                    }
                     self.media.push(entry);
                 }
                 Err(error) => {
@@ -1020,6 +1046,7 @@ impl Editor {
                 }
             }
         }
+        self.sync_media_names();
         self.restore_titles(&file.titles);
         for title in self.project.titles.keys() {
             new_ids.insert(title.0, *title);
@@ -1463,6 +1490,7 @@ impl Editor {
         Ok(MediaEntry {
             id,
             info,
+            file_name: name.clone(),
             name,
             created,
             index: None,
@@ -1536,6 +1564,39 @@ impl Editor {
     }
 
     /// Ticks a video, or unticks it if it already is.
+    /// Makes every video's name on screen what the project says it is.
+    fn sync_media_names(&mut self) {
+        for entry in &mut self.media {
+            let name = self
+                .project
+                .names
+                .get(&entry.id)
+                .unwrap_or(&entry.file_name);
+            if entry.name != *name {
+                entry.name.clone_from(name);
+            }
+        }
+    }
+
+    /// Gives a video a name in this project, as one undo step. Nothing typed, or its file's own
+    /// name, goes back to going by the file.
+    fn rename_media(&mut self, id: MediaId, typed: &str) {
+        let Some(entry) = self.media.iter().find(|entry| entry.id == id) else {
+            return;
+        };
+        let typed = typed.trim();
+        let wanted = (!typed.is_empty() && typed != entry.file_name).then(|| typed.to_owned());
+        if wanted.as_ref() == self.project.names.get(&id) {
+            return;
+        }
+        self.record();
+        match wanted {
+            Some(name) => self.project.names.insert(id, name),
+            None => self.project.names.remove(&id),
+        };
+        self.sync_media_names();
+    }
+
     fn toggle_media(&mut self, id: MediaId) {
         if self.selected_media.contains(&id) {
             self.selected_media.retain(|chosen| *chosen != id);
@@ -1730,6 +1791,7 @@ impl Editor {
         let current = self.project.clone();
         if let Ok(previous) = self.history.undo(current) {
             self.project = previous;
+            self.sync_media_names();
             self.after_timeline_change();
         }
     }
@@ -1738,6 +1800,7 @@ impl Editor {
         let current = self.project.clone();
         if let Ok(next) = self.history.redo(current) {
             self.project = next;
+            self.sync_media_names();
             self.after_timeline_change();
         }
     }
@@ -2795,6 +2858,9 @@ impl Editor {
         if std::mem::take(&mut self.pick_captions_requested) {
             self.pick_captions();
         }
+        if std::mem::take(&mut self.save_captions_requested) {
+            self.save_captions();
+        }
         if let Some(title) = self.pick_logo_for.take() {
             self.pick_logo(title);
         }
@@ -2819,7 +2885,7 @@ impl Editor {
         self.media_panel(ui, palette);
         // The rail comes first so it sits at the window's edge, outside the panel it opens.
         self.clip_rail(ui, palette);
-        self.title_panel(ui, palette);
+        self.show_right_panel(ui, palette);
         // The video and the timeline share one card, from here down to the stage.
         self.card_top_row(ui, palette);
         self.seek_bar_held = false;
@@ -3466,7 +3532,7 @@ impl Editor {
                     } else {
                         format!("Open {name}")
                     };
-                    if components::rail_tab(ui, palette, icon, name, open)
+                    if components::rail_tab(ui, palette, icon, name, name, open)
                         .on_hover_text(hint)
                         .clicked()
                     {
@@ -3555,6 +3621,7 @@ impl Editor {
                 ui.add_space(10.0);
 
                 let mut actions = CardActions::default();
+                let mut rename = self.media_rename.take();
                 let mut thumbnails = Vec::new();
                 egui::ScrollArea::vertical()
                     .auto_shrink(false)
@@ -3570,6 +3637,7 @@ impl Editor {
                             .sum();
                         let columns = media_columns(width, stacked, ui.available_height());
                         let compact = cards_are_compact(width, columns);
+                        let selecting = !self.selected_media.is_empty();
                         for row in entries.chunks(columns) {
                             ui.columns(columns, |cells| {
                                 for (cell, entry) in cells.iter_mut().zip(row) {
@@ -3579,7 +3647,8 @@ impl Editor {
                                         palette,
                                         entry,
                                         state,
-                                        compact,
+                                        CardMode { compact, selecting },
+                                        &mut rename,
                                         &mut actions,
                                     );
                                     thumbnails.push((entry.id, thumbnail));
@@ -3594,6 +3663,10 @@ impl Editor {
                 }
                 if let Some(id) = actions.remove {
                     self.request_remove(id);
+                }
+                self.media_rename = rename;
+                if let Some((id, typed)) = actions.rename {
+                    self.rename_media(id, &typed);
                 }
                 if let Some(id) = actions.toggle {
                     self.toggle_media(id);
@@ -3616,8 +3689,9 @@ impl Editor {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             let name = if all { "Deselect all" } else { "Select all" };
+            let some = chosen > 0 && !all;
             if ui
-                .add(CheckBox::new(palette, all, name))
+                .add(CheckBox::new(palette, all, name).partly(some))
                 .on_hover_text(name)
                 .clicked()
             {
@@ -3632,9 +3706,7 @@ impl Editor {
                     }
                 }
             }
-            if chosen == 0 {
-                ui.colored_label(palette.text_muted, "Select all");
-            } else {
+            if chosen > 0 {
                 ui.colored_label(palette.text_muted, format!("{chosen} selected"));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -5316,9 +5388,11 @@ fn media_card(
     palette: &Palette,
     entry: &MediaEntry,
     state: CardState,
-    compact: bool,
+    mode: CardMode,
+    rename: &mut Option<(MediaId, String)>,
     actions: &mut CardActions,
 ) -> egui::Rect {
+    let CardMode { compact, selecting } = mode;
     let mut thumbnail_rect = egui::Rect::NOTHING;
     let outline = if state.order.is_some() {
         Stroke::new(2.0, palette.accent)
@@ -5389,7 +5463,7 @@ fn media_card(
             .response
             .on_hover_text(card_hint(entry, compact));
             ui.add_space(6.0);
-            card_name(ui, palette, entry, state);
+            card_name(ui, palette, entry, state, rename, actions);
             let details = card_details(entry);
             for (position, (line, warning)) in details.into_iter().enumerate() {
                 // A squeezed card still says if its video isn't ready, and the rest moves
@@ -5444,38 +5518,57 @@ fn media_card(
     if added.clicked() {
         actions.add = Some(entry.id);
     }
-    let removed = IconButton::new(
-        palette,
-        Kind::Secondary,
-        icons::X,
-        "Remove from this project",
-    )
-    .size(button_size, icon_size)
-    .hidden(!hovered)
-    .show_at(
-        ui,
-        egui::Id::unique(("media-card-remove", entry.id.0)),
-        remove_rect,
-    )
-    .on_hover_text("Remove from this project")
-    .on_hover_cursor(egui::CursorIcon::Default);
-    if removed.clicked() {
-        actions.remove = Some(entry.id);
-    }
-    let select_name = format!("Select {}", entry.name);
-    let ticked = state.order.is_some();
-    let select = CheckBox::new(palette, ticked, &select_name)
-        .number(state.order)
-        .hidden(!hovered && !ticked)
-        .show_in_corner(
+    let more = IconButton::new(palette, Kind::Secondary, icons::ELLIPSIS, "Video options")
+        .size(button_size, icon_size)
+        .hidden(!hovered)
+        .show_at(
             ui,
-            egui::Id::unique(("media-card-select", entry.id.0)),
-            thumbnail_rect,
-            SELECT_BOX_MARGIN,
+            egui::Id::unique(("media-card-more", entry.id.0)),
+            remove_rect,
         )
-        .on_hover_text(if ticked { "Deselect" } else { "Select" })
+        .on_hover_text("Options")
         .on_hover_cursor(egui::CursorIcon::Default);
-    if select.clicked() {
+    egui::Popup::menu(&more).show(|ui| {
+        if ui
+            .add(MenuItem::new(palette, icons::PENCIL, "Rename", ""))
+            .clicked()
+        {
+            *rename = Some((entry.id, entry.name.clone()));
+        }
+        if ui
+            .add(MenuItem::new(
+                palette,
+                icons::TRASH_2,
+                "Remove from this project",
+                "",
+            ))
+            .clicked()
+        {
+            actions.remove = Some(entry.id);
+        }
+    });
+    let mut over_a_button = added.hovered() || more.hovered();
+    // The boxes only exist once something is ticked, and they number what is.
+    if selecting {
+        let select_name = format!("Select {}", entry.name);
+        let ticked = state.order.is_some();
+        let select = CheckBox::new(palette, ticked, &select_name)
+            .number(state.order)
+            .show_in_corner(
+                ui,
+                egui::Id::unique(("media-card-select", entry.id.0)),
+                thumbnail_rect,
+                SELECT_BOX_MARGIN,
+            )
+            .on_hover_text(if ticked { "Deselect" } else { "Select" })
+            .on_hover_cursor(egui::CursorIcon::Default);
+        over_a_button |= select.hovered();
+        if select.clicked() {
+            actions.toggle = Some(entry.id);
+        }
+    }
+    let ctrl_clicked = ui.input(|input| input.pointer.primary_clicked() && input.modifiers.ctrl);
+    if hovered && ctrl_clicked && !over_a_button {
         actions.toggle = Some(entry.id);
     }
     thumbnail_rect
@@ -5483,7 +5576,7 @@ fn media_card(
 
 /// What hovering a thumbnail says. Squeezed cards keep their details here instead.
 fn card_hint(entry: &MediaEntry, compact: bool) -> String {
-    let drag = "Drag onto the timeline";
+    let drag = "Drag onto the timeline\nCtrl+click to select";
     if !compact {
         return drag.to_owned();
     }
@@ -5498,9 +5591,36 @@ fn card_hint(entry: &MediaEntry, compact: bool) -> String {
 
 /// A video's name, and a tick if it is on the timeline. Both stand out while one of its
 /// clips is selected.
-fn card_name(ui: &mut egui::Ui, palette: &Palette, entry: &MediaEntry, state: CardState) {
+fn card_name(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    entry: &MediaEntry,
+    state: CardState,
+    rename: &mut Option<(MediaId, String)>,
+    actions: &mut CardActions,
+) {
     let (row, _) =
         ui.allocate_exact_size(vec2(ui.available_width(), CARD_NAME_HEIGHT), Sense::hover());
+    if let Some((_, typed)) = rename.as_mut().filter(|(id, _)| *id == entry.id) {
+        let edit = ui.put(
+            row,
+            egui::TextEdit::singleline(typed)
+                .id(egui::Id::unique(("media-rename", entry.id)))
+                .margin(Margin::symmetric(4, 0))
+                .desired_width(row.width()),
+        );
+        edit.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, "Video name"));
+        let cancelled = ui.input(|input| input.key_pressed(Key::Escape));
+        if edit.lost_focus() {
+            if !cancelled {
+                actions.rename = Some((entry.id, typed.clone()));
+            }
+            *rename = None;
+        } else if !edit.has_focus() {
+            edit.request_focus();
+        }
+        return;
+    }
     let room = if state.used { CARD_TICK_ROOM } else { 0.0 };
     let name = if state.linked {
         RichText::new(&entry.name).font(fonts::strong(13.0))
@@ -6525,6 +6645,7 @@ mod tests {
         named.missing_videos = Some(MissingVideos {
             project: ProjectFile {
                 media: vec![project::SavedMedia {
+                    name: None,
                     id: 1,
                     path: PathBuf::from(r"D:\Recordings\2026\ranked-match-final.mkv"),
                 }],
@@ -7110,27 +7231,246 @@ mod tests {
         assert_eq!(editor.card_state(ids[1]).order, None);
     }
 
+    fn ctrl_click(ctx: &egui::Context, editor: &mut Editor, at: egui::Pos2) {
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::CTRL,
+        };
+        run_frame(ctx, editor, vec![egui::Event::PointerMoved(at)]);
+        let held = egui::Event::ModifiersChanged(Modifiers::CTRL);
+        run_frame(ctx, editor, vec![held, button(true)]);
+        run_frame(ctx, editor, vec![button(false)]);
+        let released = egui::Event::ModifiersChanged(Modifiers::NONE);
+        run_frame(ctx, editor, vec![released]);
+    }
+
+    fn card_box_named(editor: &Editor, index: usize) -> String {
+        format!("Select {}", editor.media[index].name)
+    }
+
     #[test]
-    fn ticking_one_card_at_a_time_numbers_them_in_that_order() {
+    fn cards_have_no_boxes_until_something_is_ticked() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip(), second_clip()]);
+        let name = card_box_named(&editor, 0);
+        assert!(!is_named(&ctx, &mut editor, &name));
+
+        let (_, thumbnail) = editor.card_thumbnails[0];
+        run_frame(&ctx, &mut editor, moved(thumbnail.center()));
+        assert!(!is_named(&ctx, &mut editor, &name), "not on hover either");
+        // Where the box would be does nothing while it isn't there.
+        click(&ctx, &mut editor, thumbnail.min + vec2(12.0, 12.0));
+        assert!(editor.selected_media.is_empty());
+
+        click_named(&ctx, &mut editor, "Select all");
+        assert!(is_named(&ctx, &mut editor, &name));
+
+        let ids: Vec<MediaId> = editor.media.iter().map(|entry| entry.id).collect();
+        for id in ids {
+            editor.toggle_media(id);
+        }
+        assert!(!is_named(&ctx, &mut editor, &name), "nothing is ticked now");
+    }
+
+    #[test]
+    fn the_box_above_says_select_all_with_no_words_beside_it_until_some_are_ticked() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip(), second_clip()]);
+        let area = editor.media_panel_rect;
+        let output = run_frame(&ctx, &mut editor, vec![]);
+        assert!(
+            !text_in(&output, area)
+                .iter()
+                .any(|text| text == "Select all")
+        );
+        click_named(&ctx, &mut editor, "Select all");
+        let output = run_frame(&ctx, &mut editor, vec![]);
+        assert!(
+            text_in(&output, area)
+                .iter()
+                .any(|text| text == "2 selected")
+        );
+    }
+
+    #[test]
+    fn a_part_filled_box_ticks_the_rest() {
         let ctx = context();
         let mut editor = in_panel_only(&ctx, &[test_clip(), second_clip()]);
         let ids: Vec<MediaId> = editor.media.iter().map(|entry| entry.id).collect();
-        let boxes: Vec<egui::Pos2> = editor
+        editor.toggle_media(ids[1]);
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Select all");
+        assert_eq!(editor.selected_media, [ids[1], ids[0]]);
+    }
+
+    #[test]
+    fn ctrl_click_ticks_a_card_and_numbers_them_in_that_order() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip(), second_clip()]);
+        let ids: Vec<MediaId> = editor.media.iter().map(|entry| entry.id).collect();
+        let middles: Vec<egui::Pos2> = editor
             .card_thumbnails
             .iter()
-            .map(|(_, thumbnail)| thumbnail.min + vec2(12.0, 12.0))
+            .map(|(_, thumbnail)| thumbnail.center())
             .collect();
 
-        click(&ctx, &mut editor, boxes[1]);
-        click(&ctx, &mut editor, boxes[0]);
-
+        ctrl_click(&ctx, &mut editor, middles[1]);
+        ctrl_click(&ctx, &mut editor, middles[0]);
         assert_eq!(editor.selected_media, [ids[1], ids[0]]);
         assert_eq!(editor.card_state(ids[1]).order, Some(1));
         assert_eq!(editor.card_state(ids[0]).order, Some(2));
 
-        click(&ctx, &mut editor, boxes[1]);
+        ctrl_click(&ctx, &mut editor, middles[1]);
         assert_eq!(editor.selected_media, [ids[0]]);
         assert_eq!(editor.card_state(ids[0]).order, Some(1));
+    }
+
+    #[test]
+    fn a_plain_click_on_a_card_ticks_nothing() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip()]);
+        let (_, thumbnail) = editor.card_thumbnails[0];
+        click(&ctx, &mut editor, thumbnail.center());
+        assert!(editor.selected_media.is_empty());
+    }
+
+    #[test]
+    fn a_ticked_cards_box_unticks_it() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip(), second_clip()]);
+        let ids: Vec<MediaId> = editor.media.iter().map(|entry| entry.id).collect();
+        click_named(&ctx, &mut editor, "Select all");
+        let name = card_box_named(&editor, 0);
+        click_named(&ctx, &mut editor, &name);
+        assert_eq!(editor.selected_media, [ids[1]]);
+    }
+
+    // Renaming.
+
+    #[test]
+    fn a_new_name_shows_everywhere_and_leaves_the_file_alone() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let id = editor.media[0].id;
+        let path = editor.media[0].info.path.clone();
+        editor.rename_media(id, "  Boss fight ");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.media[0].name, "Boss fight");
+        assert_eq!(editor.media[0].info.path, path);
+        assert!(path.exists());
+        assert_eq!(
+            editor.current_file().media[0].path.file_name(),
+            path.file_name()
+        );
+    }
+
+    #[test]
+    fn renaming_is_one_undo_step() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let (id, original) = (editor.media[0].id, editor.media[0].name.clone());
+        editor.rename_media(id, "Boss fight");
+        editor.undo();
+        assert_eq!(editor.media[0].name, original);
+        editor.redo();
+        assert_eq!(editor.media[0].name, "Boss fight");
+    }
+
+    #[test]
+    fn nothing_typed_or_the_files_own_name_goes_back_to_the_file() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let (id, original) = (editor.media[0].id, editor.media[0].name.clone());
+        editor.rename_media(id, "Boss fight");
+        editor.rename_media(id, "   ");
+        assert_eq!(editor.media[0].name, original);
+        assert!(editor.project.names.is_empty());
+        editor.rename_media(id, "Boss fight");
+        editor.rename_media(id, &original);
+        assert!(editor.project.names.is_empty());
+    }
+
+    #[test]
+    fn typing_the_same_name_makes_no_undo_step() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let id = editor.media[0].id;
+        editor.rename_media(id, "Boss fight");
+        let before = editor.project.clone();
+        editor.rename_media(id, "Boss fight");
+        editor.undo();
+        assert_ne!(editor.project, before, "the undo went back past the rename");
+    }
+
+    #[test]
+    fn a_name_is_saved_with_the_project_and_comes_back() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let id = editor.media[0].id;
+        editor.rename_media(id, "Boss fight");
+        assert!(editor.has_unsaved_changes());
+        let file = editor.current_file();
+        assert_eq!(file.media[0].name.as_deref(), Some("Boss fight"));
+
+        let mut opened = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut opened, vec![]);
+        opened.begin_loading(&ctx, file, None, None);
+        settle(&ctx, &mut opened);
+        run_frame(&ctx, &mut opened, vec![]);
+        assert_eq!(opened.media[0].name, "Boss fight");
+        assert!(!opened.has_unsaved_changes());
+    }
+
+    #[test]
+    fn a_video_with_no_new_name_saves_nothing_extra() {
+        let ctx = context();
+        let editor = with_videos(&ctx, &[test_clip()]);
+        let file = editor.current_file();
+        let written = serde_json::to_string(&file.media[0]).expect("it can be written");
+        assert!(!written.contains("\"name\""), "{written}");
+    }
+
+    #[test]
+    fn the_cards_menu_renames_and_removes() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip()]);
+        click_named(&ctx, &mut editor, "Video options");
+        let_dialog_open(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Rename");
+        let_dialog_open(&ctx, &mut editor);
+        assert!(is_named(&ctx, &mut editor, "Video name"));
+        run_frame(&ctx, &mut editor, press(Key::End));
+        run_frame(&ctx, &mut editor, typed("!"));
+        run_frame(&ctx, &mut editor, press(Key::Enter));
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(
+            editor.media[0].name.ends_with('!'),
+            "{}",
+            editor.media[0].name
+        );
+        assert!(!is_named(&ctx, &mut editor, "Video name"));
+
+        click_named(&ctx, &mut editor, "Video options");
+        let_dialog_open(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Remove from this project");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.visible_media().count(), 0);
+    }
+
+    #[test]
+    fn escape_leaves_the_name_as_it_was() {
+        let ctx = context();
+        let mut editor = in_panel_only(&ctx, &[test_clip()]);
+        let original = editor.media[0].name.clone();
+        editor.media_rename = Some((editor.media[0].id, original.clone()));
+        let_dialog_open(&ctx, &mut editor);
+        run_frame(&ctx, &mut editor, typed("zzz"));
+        run_frame(&ctx, &mut editor, press(Key::Escape));
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.media[0].name, original);
+        assert!(editor.media_rename.is_none());
     }
 
     #[test]
@@ -7799,7 +8139,7 @@ mod tests {
             let_dialog_open(&ctx, &mut editor);
             assert_eq!(editor.selected, Some(id));
             assert!(editor.looking_at().is_some(), "{line}");
-            assert_eq!(editor.look_tab, tab);
+            assert_eq!(editor.right_panel, Some(RightPanel::Tool(tab)));
             assert_eq!(editor.timeline_state.menu_target, None);
         }
     }
@@ -7834,7 +8174,7 @@ mod tests {
 
         click_menu_item(&ctx, &mut editor, "Adjust colours");
         let_dialog_open(&ctx, &mut editor);
-        assert_eq!(editor.title_tab, TitleTab::Colours);
+        assert_eq!(editor.right_panel, Some(RightPanel::Tool(LookTab::Colours)));
 
         let end = editor.project.tracks.duration();
         editor.seek(end);
@@ -7904,7 +8244,10 @@ mod tests {
         );
 
         let title = with_a_title(&ctx, &mut editor, TitleStyle::Plain);
-        assert_eq!(tabs_of(&mut editor, title), Vec::<LookTab>::new());
+        assert_eq!(
+            tabs_of(&mut editor, title),
+            vec![LookTab::Text, LookTab::Colours, LookTab::Fade]
+        );
         editor.selected = None;
         assert!(editor.clip_tabs().is_empty());
     }
@@ -7919,13 +8262,13 @@ mod tests {
 
         click_named(&ctx, &mut editor, "Audio");
         let_dialog_open(&ctx, &mut editor);
-        assert_eq!(editor.look_tab, LookTab::Audio);
+        assert_eq!(editor.right_panel, Some(RightPanel::Tool(LookTab::Audio)));
         assert!(editor.looking_at().is_some());
         assert!(is_named(&ctx, &mut editor, "Volume"));
 
         click_named(&ctx, &mut editor, "Speed");
         let_dialog_open(&ctx, &mut editor);
-        assert_eq!(editor.look_tab, LookTab::Speed);
+        assert_eq!(editor.right_panel, Some(RightPanel::Tool(LookTab::Speed)));
         assert!(is_named(&ctx, &mut editor, "Clip speed"));
 
         click_named(&ctx, &mut editor, "Speed");
@@ -7934,29 +8277,126 @@ mod tests {
     }
 
     #[test]
-    fn the_panel_closes_on_a_clip_without_that_tool_and_comes_back_on_one_with_it() {
+    fn the_panel_goes_to_captions_on_a_clip_without_that_tool_and_stays_there() {
         let ctx = context();
         let sound = clip_with_sound();
         let mut editor = with_videos(&ctx, &[&sound, test_clip()]);
         let clips: Vec<_> = editor.project.tracks.picture_tracks()[0].clips().to_vec();
         editor.selected = Some(clips[0].id);
-        editor.look_panel_open = true;
-        editor.look_tab = LookTab::Audio;
+        editor.right_panel = Some(RightPanel::Tool(LookTab::Audio));
+        run_frame(&ctx, &mut editor, vec![]);
         assert!(editor.looking_at().is_some());
 
         editor.selected = Some(clips[1].id);
-        assert!(editor.looking_at().is_none());
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.right_panel, Some(RightPanel::Captions));
+
         editor.selected = Some(clips[0].id);
-        assert!(editor.looking_at().is_some());
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.right_panel, Some(RightPanel::Captions));
     }
 
     #[test]
-    fn the_rail_waits_for_the_pointer_so_a_press_cant_move_the_picture() {
+    fn the_panel_stays_on_a_tool_the_next_clip_also_has() {
+        let ctx = context();
+        let (mut editor, first, second) = with_two_touching_clips(&ctx);
+        editor.selected = Some(first);
+        editor.right_panel = Some(RightPanel::Tool(LookTab::Effects));
+        run_frame(&ctx, &mut editor, vec![]);
+        editor.selected = Some(second);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.right_panel, Some(RightPanel::Tool(LookTab::Effects)));
+    }
+
+    #[test]
+    fn deselecting_goes_to_captions_and_selecting_again_doesnt_go_back() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let clip = editor.selected.expect("a new clip is selected");
+        editor.right_panel = Some(RightPanel::Tool(LookTab::Filters));
+        run_frame(&ctx, &mut editor, vec![]);
+
+        editor.selected = None;
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.right_panel, Some(RightPanel::Captions));
+        assert!(is_named(&ctx, &mut editor, "Close captions"));
+
+        editor.selected = Some(clip);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.right_panel, Some(RightPanel::Captions));
+    }
+
+    #[test]
+    fn selecting_never_opens_a_closed_panel_and_only_a_close_closes_one() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let clip = editor.selected.expect("a new clip is selected");
+        editor.selected = None;
+        run_frame(&ctx, &mut editor, vec![]);
+        editor.selected = Some(clip);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.right_panel, None);
+
+        click_named(&ctx, &mut editor, "Captions");
+        assert_eq!(editor.right_panel, Some(RightPanel::Captions));
+        click_named(&ctx, &mut editor, "Close captions");
+        assert_eq!(editor.right_panel, None);
+
+        click_named(&ctx, &mut editor, "Filters");
+        assert_eq!(editor.right_panel, Some(RightPanel::Tool(LookTab::Filters)));
+        click_named(&ctx, &mut editor, "Close look");
+        assert_eq!(editor.right_panel, None);
+    }
+
+    #[test]
+    fn the_rail_is_there_with_nothing_selected_and_tools_go_under_captions() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let clip = editor.selected.expect("a new clip is selected");
+        editor.selected = None;
+        let rail = ctx.content_rect().right() - RAIL_WIDTH;
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(named_rect(&ctx, &mut editor, "Captions").left() >= rail);
+        assert!(!is_named(&ctx, &mut editor, "Filters"));
+
+        editor.selected = Some(clip);
+        let captions = named_rect(&ctx, &mut editor, "Captions");
+        let filters = named_rect(&ctx, &mut editor, "Filters");
+        assert!(filters.top() > captions.bottom());
+    }
+
+    #[test]
+    fn selecting_and_deselecting_never_moves_the_picture() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let clip = editor.selected.expect("a new clip is selected");
+        let frame = |ctx: &egui::Context, editor: &mut Editor| {
+            run_frame(ctx, editor, vec![]);
+            run_frame(ctx, editor, vec![]);
+            editor.stage_state.frame.expect("the picture shows")
+        };
+
+        editor.selected = None;
+        let without = frame(&ctx, &mut editor);
+        editor.selected = Some(clip);
+        assert_eq!(frame(&ctx, &mut editor), without);
+
+        // With a tool open, deselecting swaps it for Captions at the same width.
+        editor.right_panel = Some(RightPanel::Tool(LookTab::Filters));
+        let open = frame(&ctx, &mut editor);
+        editor.selected = None;
+        assert_eq!(frame(&ctx, &mut editor), open);
+        assert_eq!(editor.right_panel, Some(RightPanel::Captions));
+        editor.selected = Some(clip);
+        assert_eq!(frame(&ctx, &mut editor), open);
+    }
+
+    #[test]
+    fn a_press_that_selects_a_clip_doesnt_move_the_picture_under_its_drag() {
         let ctx = context();
         let mut editor = with_videos(&ctx, &[test_clip()]);
         editor.selected = None;
         run_frame(&ctx, &mut editor, vec![]);
-        assert!(!editor.clip_rail_showing);
         let middle = editor
             .stage_state
             .frame
@@ -7967,13 +8407,174 @@ mod tests {
         let to = middle + vec2(20.0, 0.0);
         begin_drag(&ctx, &mut editor, middle, to);
         assert!(editor.selected.is_some(), "the drag selected it");
-        assert!(!editor.clip_rail_showing);
         assert_eq!(editor.stage_state.frame, frame_before);
-
         end_drag(&ctx, &mut editor, to);
+    }
+
+    #[test]
+    fn a_new_title_opens_text_but_clicking_one_opens_nothing() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let title = with_a_title(&ctx, &mut editor, TitleStyle::Plain);
+        assert_eq!(editor.right_panel, Some(RightPanel::Tool(LookTab::Text)));
+        assert!(is_named(&ctx, &mut editor, "Title text"));
+
+        click_named(&ctx, &mut editor, "Close look");
+        editor.selected = None;
+        run_frame(&ctx, &mut editor, vec![]);
+        editor.selected = Some(title);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.right_panel, None);
+        assert!(!is_named(&ctx, &mut editor, "Title text"));
+
+        click_named(&ctx, &mut editor, "Edit text");
+        assert!(is_named(&ctx, &mut editor, "Title text"));
+    }
+
+    // The Captions panel.
+
+    const OUT_OF_ORDER_CAPTIONS: &str = "1\n00:00:03,000 --> 00:00:04,000\nSecond\n\n\
+                                2\n00:00:01,000 --> 00:00:02,000\nFirst\n\n";
+
+    fn with_captions_open(ctx: &egui::Context, name: &str) -> Editor {
+        let mut editor = with_videos(ctx, &[test_clip()]);
+        let path = subtitle_file(name, OUT_OF_ORDER_CAPTIONS);
+        editor.import_captions(&path);
+        let _ = std::fs::remove_file(&path);
+        editor.right_panel = Some(RightPanel::Captions);
+        run_frame(ctx, &mut editor, vec![]);
+        editor
+    }
+
+    fn at(seconds: f64) -> Ticks {
+        Ticks::from_seconds(seconds)
+    }
+
+    #[test]
+    fn the_list_has_captions_in_time_order_and_no_other_titles() {
+        let ctx = context();
+        let mut editor = with_captions_open(&ctx, "panel-list");
+        with_a_title(&ctx, &mut editor, TitleStyle::Plain);
+        let starts: Vec<Ticks> = editor.caption_rows().iter().map(|row| row.start).collect();
+        assert_eq!(starts, [at(1.0), at(3.0)]);
+    }
+
+    #[test]
+    fn an_empty_project_says_how_to_get_captions_and_cant_save() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        editor.right_panel = Some(RightPanel::Captions);
+        let nodes = named_nodes(&ctx, &mut editor);
+        let (.., disabled) = nodes
+            .iter()
+            .find(|(label, ..)| label == "Save SRT file")
+            .expect("it is there");
+        assert!(*disabled);
+        assert!(is_named(&ctx, &mut editor, "Import SRT file"));
+    }
+
+    #[test]
+    fn pressing_a_caption_selects_it_and_moves_the_playhead() {
+        let ctx = context();
+        let mut editor = with_captions_open(&ctx, "panel-jump");
+        let second = editor.caption_rows()[1];
+        let name = format!(
+            "Go to caption {}",
+            bareclip_core::time::format_timecode(second.start)
+        );
+        let box_top = named_rect(&ctx, &mut editor, &name).left_top() + vec2(20.0, 8.0);
+        click(&ctx, &mut editor, box_top);
+        assert_eq!(editor.selected, Some(second.clip));
+        assert_eq!(editor.position(), second.start);
+        assert_eq!(editor.right_panel, Some(RightPanel::Captions));
+    }
+
+    fn focus_caption(ctx: &egui::Context, editor: &mut Editor, row: usize) {
+        let start = editor.caption_rows()[row].start;
+        let name = format!("Caption {}", bareclip_core::time::format_timecode(start));
+        click_named(ctx, editor, &name);
+    }
+
+    fn typed(words: &str) -> Vec<egui::Event> {
+        vec![egui::Event::Text(words.to_owned())]
+    }
+
+    fn caption_words(editor: &Editor, row: usize) -> String {
+        let row = editor.caption_rows()[row];
+        editor.project.titles[&row.media].text.clone()
+    }
+
+    #[test]
+    fn typing_in_the_list_changes_that_caption_as_one_undo_step() {
+        let ctx = context();
+        let mut editor = with_captions_open(&ctx, "panel-type");
+        focus_caption(&ctx, &mut editor, 0);
+        assert_eq!(editor.selected, Some(editor.caption_rows()[0].clip));
+        run_frame(&ctx, &mut editor, typed("A"));
+        run_frame(&ctx, &mut editor, typed("B"));
+        assert!(caption_words(&editor, 0).contains("AB"));
+
+        run_frame(&ctx, &mut editor, press(Key::Escape));
+        run_frame(&ctx, &mut editor, vec![]);
+        editor.undo();
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(caption_words(&editor, 0), "First");
+    }
+
+    #[test]
+    fn enter_goes_to_the_next_caption_and_keeps_their_undo_steps_apart() {
+        let ctx = context();
+        let mut editor = with_captions_open(&ctx, "panel-enter");
+        focus_caption(&ctx, &mut editor, 0);
+        run_frame(&ctx, &mut editor, typed("A"));
+        run_frame(&ctx, &mut editor, press(Key::Enter));
         run_frame(&ctx, &mut editor, vec![]);
         run_frame(&ctx, &mut editor, vec![]);
-        assert!(editor.clip_rail_showing);
+        let second = editor.caption_rows()[1];
+        assert_eq!(editor.selected, Some(second.clip));
+        assert_eq!(editor.position(), second.start);
+        run_frame(&ctx, &mut editor, typed("B"));
+        assert!(caption_words(&editor, 1).contains('B'));
+        assert!(caption_words(&editor, 0).contains('A'));
+
+        run_frame(&ctx, &mut editor, press(Key::Escape));
+        run_frame(&ctx, &mut editor, vec![]);
+        editor.undo();
+        assert_eq!(caption_words(&editor, 1), "Second");
+        assert!(caption_words(&editor, 0).contains('A'));
+    }
+
+    #[test]
+    fn the_saved_file_follows_the_timeline_and_reads_back() {
+        let ctx = context();
+        let mut editor = with_captions_open(&ctx, "panel-save");
+        let cues = bareclip_core::srt::parse_srt(&editor.captions_file());
+        assert_eq!(cues.len(), 2);
+        assert_eq!(
+            (cues[0].start, cues[0].end, cues[0].text.as_str()),
+            (at(1.0), at(2.0), "First")
+        );
+        assert_eq!(cues[1].text, "Second");
+        let row = editor.caption_rows()[0];
+        editor.change_title(row.media, |title| title.text = "Changed".to_owned());
+        let cues = bareclip_core::srt::parse_srt(&editor.captions_file());
+        assert_eq!(cues[0].text, "Changed");
+    }
+
+    #[test]
+    fn thousands_of_captions_only_lay_out_what_shows() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let path = subtitle_file("panel-many", &long_subtitles(3000));
+        editor.import_captions(&path);
+        let _ = std::fs::remove_file(&path);
+        editor.right_panel = Some(RightPanel::Captions);
+        let nodes = named_nodes(&ctx, &mut editor);
+        let shown = nodes
+            .iter()
+            .filter(|(label, ..)| label.starts_with("Go to caption"))
+            .count();
+        assert!(shown > 0 && shown < 40, "{shown} rows were laid out");
     }
 
     #[test]
@@ -7992,6 +8593,32 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         camera.shoot(&ctx, &mut editor, vec![], "tools-01-rail-and-toolbar");
+        let selected = editor.selected;
+        editor.selected = None;
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "tools-00-rail-nothing-selected");
+        let path = subtitle_file("screens", OUT_OF_ORDER_CAPTIONS);
+        editor.import_captions(&path);
+        let _ = std::fs::remove_file(&path);
+        click_named(&ctx, &mut editor, "Captions");
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "tools-00-captions");
+        click_named(&ctx, &mut editor, "Close captions");
+        editor.undo();
+        editor.selected = selected;
+        let_dialog_open(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Select all");
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "tools-00-ticking");
+        click_named(&ctx, &mut editor, "Deselect all");
+        click_named(&ctx, &mut editor, "Video options");
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "tools-00-card-menu");
+        click_named(&ctx, &mut editor, "Rename");
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "tools-00-renaming");
+        run_frame(&ctx, &mut editor, press(Key::Escape));
+        let_dialog_open(&ctx, &mut editor);
 
         click_named(&ctx, &mut editor, "Flip");
         let_dialog_open(&ctx, &mut editor);
@@ -8483,17 +9110,6 @@ mod tests {
     }
 
     #[test]
-    fn the_cross_on_a_card_removes_the_video_from_the_project() {
-        let ctx = context();
-        let mut editor = in_panel_only(&ctx, &[test_clip()]);
-        let thumbnail = editor.card_thumbnails[0].1;
-
-        click(&ctx, &mut editor, thumbnail.right_top() + vec2(-20.0, 20.0));
-
-        assert_eq!(editor.visible_media().count(), 0);
-    }
-
-    #[test]
     fn clicking_the_middle_of_a_thumbnail_does_not_add_the_video() {
         let ctx = context();
         let mut editor = in_panel_only(&ctx, &[test_clip()]);
@@ -8733,7 +9349,7 @@ mod tests {
             "Zoom in",
             "Fit",
             "Add to timeline",
-            "Remove from this project",
+            "Video options",
             "Close media panel",
             "My media",
         ] {
@@ -10469,12 +11085,22 @@ mod tests {
         );
         for (name, at) in [
             ("add", card.right_bottom() - vec2(20.0, 20.0)),
-            ("remove", card.right_top() + vec2(-20.0, 20.0)),
-            ("select", card.left_top() + vec2(16.0, 16.0)),
+            ("options", card.right_top() + vec2(-20.0, 20.0)),
         ] {
             let cursor = cursor_over(&ctx, &mut editor, at);
             assert_eq!(cursor, egui::CursorIcon::Default, "{name}");
         }
+        assert_eq!(
+            cursor_over(&ctx, &mut editor, card.left_top() + vec2(16.0, 16.0)),
+            egui::CursorIcon::Grab,
+            "there is no box until something is ticked"
+        );
+        click_named(&ctx, &mut editor, "Select all");
+        assert_eq!(
+            cursor_over(&ctx, &mut editor, card.left_top() + vec2(16.0, 16.0)),
+            egui::CursorIcon::Default,
+            "select"
+        );
     }
 
     #[test]
@@ -13790,7 +14416,7 @@ mod tests {
 
         editor.selected_join = None;
         editor.selected = Some(first);
-        editor.look_panel_open = true;
+        editor.right_panel = Some(RightPanel::Tool(LookTab::Filters));
         editor.seek(Ticks::from_seconds(0.5));
         for _ in 0..80 {
             run_frame(&ctx, &mut editor, vec![]);
@@ -13798,22 +14424,22 @@ mod tests {
         }
         camera.shoot(&ctx, &mut editor, vec![], "look-03-filters");
 
-        editor.look_tab = LookTab::Colours;
+        editor.right_panel = Some(RightPanel::Tool(LookTab::Colours));
         editor.change_filter_for_screen(first);
         settle(&ctx, &mut editor);
         camera.shoot(&ctx, &mut editor, vec![], "look-04-colours");
 
-        editor.look_tab = LookTab::Fade;
+        editor.right_panel = Some(RightPanel::Tool(LookTab::Fade));
         settle(&ctx, &mut editor);
         camera.shoot(&ctx, &mut editor, vec![], "look-05-fade");
 
-        editor.look_tab = LookTab::Filters;
+        editor.right_panel = Some(RightPanel::Tool(LookTab::Filters));
         settle(&ctx, &mut editor);
         click_named(&ctx, &mut editor, "Filter Bold and blue");
         settle(&ctx, &mut editor);
         camera.shoot(&ctx, &mut editor, vec![], "look-06-filter-intensity");
 
-        editor.look_tab = LookTab::Effects;
+        editor.right_panel = Some(RightPanel::Tool(LookTab::Effects));
         for _ in 0..120 {
             run_frame(&ctx, &mut editor, vec![]);
             thread::sleep(Duration::from_millis(10));
@@ -14082,7 +14708,7 @@ mod tests {
         let ctx = context();
         let (mut editor, first, _) = with_two_touching_clips(&ctx);
         editor.selected = Some(first);
-        editor.look_panel_open = true;
+        editor.right_panel = Some(RightPanel::Tool(LookTab::Filters));
         run_frame(&ctx, &mut editor, vec![]);
         assert!(editor.looking_at().is_some());
         click_named(&ctx, &mut editor, "Filter Winter");
@@ -14102,7 +14728,7 @@ mod tests {
         let ctx = context();
         let (mut editor, first, _) = with_two_touching_clips(&ctx);
         editor.selected = Some(first);
-        editor.look_panel_open = true;
+        editor.right_panel = Some(RightPanel::Tool(LookTab::Filters));
         run_frame(&ctx, &mut editor, vec![]);
         assert!(!has_named(&ctx, &mut editor, "Intensity"));
         click_named(&ctx, &mut editor, "Filter Orange and teal");
@@ -14120,8 +14746,8 @@ mod tests {
         let ctx = context();
         let (mut editor, first, _) = with_two_touching_clips(&ctx);
         editor.selected = Some(first);
-        editor.look_panel_open = true;
-        editor.look_tab = LookTab::Effects;
+        editor.right_panel = Some(RightPanel::Tool(LookTab::Filters));
+        editor.right_panel = Some(RightPanel::Tool(LookTab::Effects));
         run_frame(&ctx, &mut editor, vec![]);
         let effects = |editor: &Editor| {
             editor
@@ -14155,8 +14781,8 @@ mod tests {
         let ctx = context();
         let (mut editor, first, _) = with_two_touching_clips(&ctx);
         editor.selected = Some(first);
-        editor.look_panel_open = true;
-        editor.look_tab = LookTab::Effects;
+        editor.right_panel = Some(RightPanel::Tool(LookTab::Filters));
+        editor.right_panel = Some(RightPanel::Tool(LookTab::Effects));
         run_frame(&ctx, &mut editor, vec![]);
         click_named(&ctx, &mut editor, "Effect Crash zoom");
         run_frame(&ctx, &mut editor, vec![]);
@@ -14184,8 +14810,8 @@ mod tests {
             .expect("it is there")
             .media;
         editor.selected = Some(first);
-        editor.look_panel_open = true;
-        editor.look_tab = LookTab::Effects;
+        editor.right_panel = Some(RightPanel::Tool(LookTab::Filters));
+        editor.right_panel = Some(RightPanel::Tool(LookTab::Effects));
         run_frame(&ctx, &mut editor, vec![]);
         assert!(!editor.preview.is_sharp(media));
         click_named(&ctx, &mut editor, "Effect Pulse");
@@ -14201,8 +14827,8 @@ mod tests {
         let ctx = context();
         let (mut editor, first, _) = with_two_touching_clips(&ctx);
         editor.selected = Some(first);
-        editor.look_panel_open = true;
-        editor.look_tab = LookTab::Effects;
+        editor.right_panel = Some(RightPanel::Tool(LookTab::Filters));
+        editor.right_panel = Some(RightPanel::Tool(LookTab::Effects));
         run_frame(&ctx, &mut editor, vec![]);
         click_named(&ctx, &mut editor, "Effect Pulse");
         run_frame(&ctx, &mut editor, vec![]);
@@ -14216,16 +14842,15 @@ mod tests {
     }
 
     #[test]
-    fn a_title_does_not_open_the_look_panel_but_has_its_own_tabs() {
+    fn a_title_has_its_own_tools_on_the_rail() {
         let ctx = context();
         let mut editor = Editor::new(&ctx, false);
         run_frame(&ctx, &mut editor, vec![]);
-        editor.look_panel_open = true;
         with_a_title(&ctx, &mut editor, TitleStyle::Plain);
-        assert!(editor.looking_at().is_none());
+        assert!(is_named(&ctx, &mut editor, "Edit text"));
         click_named(&ctx, &mut editor, "Fade");
         run_frame(&ctx, &mut editor, vec![]);
-        assert_eq!(editor.title_tab, TitleTab::Fade);
+        assert_eq!(editor.right_panel, Some(RightPanel::Tool(LookTab::Fade)));
     }
 
     #[test]
@@ -15263,6 +15888,7 @@ mod tests {
         editor.import_captions(&path);
         let captions = captions_on_top(&editor);
         editor.selected = Some(captions[0].id);
+        editor.right_panel = Some(RightPanel::Tool(LookTab::Text));
         editor.focus_title_text = true;
         run_frame(&ctx, &mut editor, vec![]);
         run_frame(&ctx, &mut editor, vec![]);
@@ -15325,6 +15951,7 @@ mod tests {
         editor.import_captions(&path);
         let captions = captions_on_top(&editor);
         editor.selected = Some(captions[0].id);
+        editor.right_panel = Some(RightPanel::Tool(LookTab::Text));
         run_frame(&ctx, &mut editor, vec![]);
         assert!(is_named(
             &ctx,
@@ -16873,10 +17500,12 @@ mod tests {
             name: "old".to_owned(),
             media: vec![
                 project::SavedMedia {
+                    name: None,
                     id: 1,
                     path: small_clip().to_path_buf(),
                 },
                 project::SavedMedia {
+                    name: None,
                     id: 2,
                     path: test_clip().to_path_buf(),
                 },

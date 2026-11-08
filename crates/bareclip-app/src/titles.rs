@@ -18,7 +18,6 @@ use bareclip_text::{MovingTitle, draw_font_name, draw_title, draw_title_with_log
 use super::*;
 
 /// As wide as the media panel.
-const TITLE_PANEL_WIDTH: f32 = 250.0;
 /// The canvas the Text panel's cards draw their styles for. Only the shape matters, and these are
 /// shown smaller than they are drawn so they stay sharp on any display.
 const CARD_CANVAS: (u32, u32) = (640, 360);
@@ -319,6 +318,8 @@ impl Editor {
         };
         self.settle_canvas();
         self.selected = Some(placed);
+        // The one time a panel opens by itself: a new title is there to be typed in.
+        self.right_panel = Some(RightPanel::Tool(LookTab::Text));
         self.sync_titles();
         self.after_clip_added();
     }
@@ -451,6 +452,7 @@ impl Editor {
                 },
                 audio: Vec::new(),
             },
+            file_name: String::new(),
             name: Self::title_label(title),
             created: None,
             index: None,
@@ -620,11 +622,7 @@ impl Editor {
             .find(|other| other.start >= clip.end())
             .copied();
         let room = next.map(|next| Ticks(next.start.0 - clip.end().0));
-        if let Some(before) = self.title_before.take()
-            && before != self.project
-        {
-            self.history.record(before);
-        }
+        self.finish_title_edit();
         self.focus_title_text = true;
         let touching = Ticks::from_seconds(CAPTIONS_TOUCHING_SECONDS);
         if let (Some(next), Some(room)) = (next, room)
@@ -730,8 +728,14 @@ impl Editor {
     /// Finishes the undo step for a change to a title, once nothing is being held or typed in.
     pub(super) fn settle_title_edit(&mut self, ctx: &egui::Context) {
         let busy = ctx.input(|input| input.pointer.any_down()) || ctx.egui_wants_keyboard_input();
-        if !busy
-            && let Some(before) = self.title_before.take()
+        if !busy {
+            self.finish_title_edit();
+        }
+    }
+
+    /// Closes off the changes made to a title so far as one undo step.
+    pub(super) fn finish_title_edit(&mut self) {
+        if let Some(before) = self.title_before.take()
             && before != self.project
         {
             self.history.record(before);
@@ -1164,70 +1168,13 @@ impl Editor {
         Some((clip.media, self.title_of(clip)?.clone()))
     }
 
-    /// The controls for the selected title, down the right of the window. Only titles have this,
-    /// because they have more to set than fits on the toolbar.
-    pub(super) fn title_panel(&mut self, ui: &mut egui::Ui, palette: &Palette) {
-        let Some((id, title)) = self.selected_title() else {
-            if self.clip_rail_showing
-                && let Some(clip) = self.looking_at()
-            {
-                self.look_panel(ui, palette, clip);
-                return;
-            }
-            // A panel counts as one widget, and everything after it is numbered from there. Without
-            // this, its coming and going would renumber the timeline, cancelling any drag and
-            // closing any menu that was open on it at the time.
-            ui.skip_ahead_auto_ids(1);
-            return;
-        };
-        let frame = panel_card(palette.surface, Margin::same(14))
-            .corner_radius(CornerRadius::same(PANEL_RADIUS));
-        egui::Panel::right("title_panel")
-            .exact_size(TITLE_PANEL_WIDTH)
-            .show_separator_line(false)
-            .frame(frame)
-            .show(ui, |ui| {
-                let heading = match self.title_tab {
-                    TitleTab::Text => "Text",
-                    TitleTab::Colours => "Adjust colours",
-                    TitleTab::Fade => "Fade",
-                };
-                ui.label(RichText::new(heading).font(fonts::strong(15.0)));
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    for (tab, name) in [
-                        (TitleTab::Text, "Text"),
-                        (TitleTab::Colours, "Colours"),
-                        (TitleTab::Fade, "Fade"),
-                    ] {
-                        let kind = if self.title_tab == tab {
-                            Kind::Secondary
-                        } else {
-                            Kind::Ghost
-                        };
-                        if ui
-                            .add(ActionButton::new(palette, kind, name).small())
-                            .clicked()
-                        {
-                            self.title_tab = tab;
-                        }
-                    }
-                });
-                ui.add_space(10.0);
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        if self.title_tab == TitleTab::Text {
-                            self.title_controls(ui, palette, id, &title);
-                        } else {
-                            self.title_look(ui, palette);
-                        }
-                    });
-            });
-    }
-
-    fn title_controls(&mut self, ui: &mut egui::Ui, palette: &Palette, id: MediaId, title: &Title) {
+    pub(super) fn title_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        palette: &Palette,
+        id: MediaId,
+        title: &Title,
+    ) {
         let width = ui.available_width();
         let heading = |ui: &mut egui::Ui, words: &str| {
             ui.add_space(6.0);
@@ -1235,7 +1182,6 @@ impl Editor {
             ui.add_space(4.0);
         };
 
-        heading(ui, "Text");
         let is_caption = title.style == TitleStyle::Subtitle;
         let counts_down = title.style == TitleStyle::Countdown;
         if counts_down {

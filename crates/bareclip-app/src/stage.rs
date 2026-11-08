@@ -669,6 +669,17 @@ pub enum LookTab {
     Fade,
     Speed,
     Audio,
+    /// A title's words and how they look.
+    Text,
+}
+
+/// What the panel on the right of the window is showing, when it is open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RightPanel {
+    /// The project's captions, which need nothing selected.
+    Captions,
+    /// One of the selected clip's tools.
+    Tool(LookTab),
 }
 
 /// What the Arrange controls need to know about a clip, wherever they are opened from.

@@ -401,7 +401,7 @@ pub struct CheckBox<'a> {
     checked: bool,
     name: &'a str,
     number: Option<usize>,
-    hidden: bool,
+    partly: bool,
 }
 
 impl<'a> CheckBox<'a> {
@@ -411,18 +411,18 @@ impl<'a> CheckBox<'a> {
             checked,
             name,
             number: None,
-            hidden: false,
+            partly: false,
         }
+    }
+
+    /// Shows that some of what this box stands for is ticked, but not all of it.
+    pub fn partly(mut self, partly: bool) -> Self {
+        self.partly = partly;
+        self
     }
 
     pub fn number(mut self, number: Option<usize>) -> Self {
         self.number = number;
-        self
-    }
-
-    /// Draws nothing unless focused, while the box can still be clicked.
-    pub fn hidden(mut self, hidden: bool) -> Self {
-        self.hidden = hidden;
         self
     }
 
@@ -444,7 +444,7 @@ impl<'a> CheckBox<'a> {
         response.widget_info(|| {
             egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, checked, name)
         });
-        if (self.hidden && !response.has_focus()) || !ui.is_rect_visible(rect) {
+        if !ui.is_rect_visible(rect) {
             return response;
         }
         let palette = self.palette;
@@ -469,6 +469,10 @@ impl<'a> CheckBox<'a> {
             }
         };
         paint_box(ui, rect, 4.0, &look, &response, palette);
+        if self.partly && !checked {
+            let inner = Rect::from_center_size(rect.center(), rect.size() * 0.5);
+            ui.painter().rect_filled(inner, 2.0, palette.accent);
+        }
         if checked {
             match self.number {
                 Some(number) => {
@@ -1112,17 +1116,18 @@ impl Widget for Dropdown<'_> {
     }
 }
 
-/// A tab on the tool rail, with its symbol above its name.
+/// A tab on a tool rail, with its symbol above its label. `name` is what screen readers are told.
 pub fn rail_tab(
     ui: &mut Ui,
     palette: &Palette,
     icon: &Icon,
     label: &str,
+    name: &str,
     selected: bool,
 ) -> Response {
     let size = vec2(ui.available_width(), RAIL_TAB_HEIGHT);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, label));
+    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, name));
     if !ui.is_rect_visible(rect) {
         return response;
     }
@@ -1370,6 +1375,7 @@ mod tests {
             ui,
             &DARK,
             &icons::FILM,
+            "Tool",
             "Tool",
             true
         )));

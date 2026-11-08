@@ -119,9 +119,92 @@ pub fn parse_srt(text: &str) -> Vec<Cue> {
     cues
 }
 
+/// A time as an SRT file writes it, such as 00:01:02,500, from a whole number of milliseconds.
+fn write_time(milliseconds: i64) -> String {
+    let (seconds, thousandths) = (milliseconds / 1000, milliseconds % 1000);
+    let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    format!("{hours:02}:{minutes:02}:{seconds:02},{thousandths:03}")
+}
+
+/// Writes captions as an SRT file. One with no words is left out, and a blank line within one is
+/// too, because a blank line is what ends a caption in the file.
+pub fn write_srt(cues: &[Cue]) -> String {
+    let per_thousandth = TICKS_PER_SECOND / 1000;
+    let thousandths = |time: Ticks| (time.0.max(0) + per_thousandth / 2) / per_thousandth;
+    let mut file = String::new();
+    let mut number = 0;
+    for cue in cues {
+        let lines: Vec<&str> = cue
+            .text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        if lines.is_empty() {
+            continue;
+        }
+        number += 1;
+        let start = thousandths(cue.start);
+        // Anything shorter than a thousandth of a second would be dropped when read back.
+        let end = thousandths(cue.end).max(start + 1);
+        file.push_str(&format!(
+            "{number}\r\n{} --> {}\r\n{}\r\n\r\n",
+            write_time(start),
+            write_time(end),
+            lines.join("\r\n")
+        ));
+    }
+    file
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cue(start: f64, end: f64, text: &str) -> Cue {
+        Cue {
+            start: seconds(start),
+            end: seconds(end),
+            text: text.to_owned(),
+        }
+    }
+
+    #[test]
+    fn captions_are_written_in_the_files_usual_form() {
+        assert_eq!(
+            write_srt(&[cue(1.0, 2.5, "Hello"), cue(3661.25, 3662.0, "Two\nlines")]),
+            "1\r\n00:00:01,000 --> 00:00:02,500\r\nHello\r\n\r\n\
+             2\r\n01:01:01,250 --> 01:01:02,000\r\nTwo\r\nlines\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn what_is_written_reads_back_the_same() {
+        let cues = vec![cue(0.5, 1.25, "First"), cue(2.0, 3.75, "Second\nline")];
+        assert_eq!(parse_srt(&write_srt(&cues)), cues);
+    }
+
+    #[test]
+    fn a_caption_with_no_words_is_left_out_and_the_numbers_carry_on() {
+        let file = write_srt(&[cue(1.0, 2.0, "  \n "), cue(3.0, 4.0, "Kept")]);
+        assert!(file.starts_with("1\r\n00:00:03,000"), "{file}");
+    }
+
+    #[test]
+    fn a_blank_line_inside_a_caption_doesnt_cut_it_short() {
+        let cues = parse_srt(&write_srt(&[cue(1.0, 2.0, "Top\n\nBottom")]));
+        assert_eq!(cues[0].text, "Top\nBottom");
+    }
+
+    #[test]
+    fn a_tiny_caption_still_lasts_long_enough_to_read_back() {
+        let tiny = Cue {
+            start: seconds(1.0),
+            end: Ticks(seconds(1.0).0 + 1),
+            text: "Blink".to_owned(),
+        };
+        assert_eq!(parse_srt(&write_srt(&[tiny])).len(), 1);
+    }
 
     fn seconds(value: f64) -> Ticks {
         Ticks((value * TICKS_PER_SECOND as f64).round() as i64)

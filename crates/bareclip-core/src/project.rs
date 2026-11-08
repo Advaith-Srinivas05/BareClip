@@ -32,6 +32,9 @@ pub const DEFAULT_NAME: &str = "untitled";
 pub struct SavedMedia {
     pub id: u64,
     pub path: PathBuf,
+    /// A name given to it in this project, if it isn't going by its file's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// A title as it is written down, under the id its clip refers to.
@@ -146,7 +149,11 @@ impl ProjectFile {
             name: name.to_owned(),
             media: media
                 .into_iter()
-                .map(|(id, path)| SavedMedia { id: id.0, path })
+                .map(|(id, path)| SavedMedia {
+                    id: id.0,
+                    path,
+                    name: None,
+                })
                 .collect(),
             titles: Vec::new(),
             tracks: saved_rows(tracks.picture_tracks()),
