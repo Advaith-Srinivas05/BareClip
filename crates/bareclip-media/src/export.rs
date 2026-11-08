@@ -15,18 +15,22 @@ use bareclip_core::{
 };
 use ffmpeg_next as ffmpeg;
 use ffmpeg_next::{
-    Dictionary, Packet, Rational, codec, codec::Id, decoder, encoder, ffi, format, frame,
-    media::Type, picture,
+    Dictionary, Packet, Rational, codec, codec::Id, decoder, encoder, ffi, format, format::Pixel,
+    frame, media::Type, picture,
 };
 
 use crate::{
+    encoders::usable,
     error::MediaError,
+    full::{OPENH264_MOST_BITS, collect},
     media_foundation::OpenEncoder,
     nal,
     probe::{discard_other_streams, join_problem, probe, to_time_base},
 };
 
 const SEEK_MARGIN_SECONDS: i64 = 2;
+/// How many pictures an encoder is tried on before an export trusts it.
+const TRIAL_FRAMES: i64 = 3;
 /// How far past a section to keep reading while waiting for its last audio.
 const AUDIO_READ_AHEAD_SECONDS: f64 = 10.0;
 
@@ -80,15 +84,15 @@ fn rescale(value: i64, from: Rational, to: Rational) -> i64 {
 /// Only codecs proven to join cleanly with re-encoded parts are listed. MPEG-4 Part
 /// 2, for one, repeats and drops frames at the join when it has B-frames, so other
 /// codecs get keyframe cuts instead.
-fn encoder_candidates(codec: Id) -> Vec<String> {
-    let names: &[&str] = match codec {
-        Id::H264 => &[
-            "h264_nvenc",
-            "h264_amf",
-            "h264_qsv",
-            "h264_mf",
-            "libopenh264",
-        ],
+///
+/// AMD's and Intel's H.264 encoders are left out. On 2026-11-08 a frame-exact cut of a real
+/// recording made with AMD's lost the 26 copied frames after its section, which FFmpeg's decoder
+/// threw away as out of order, while NVIDIA's, Windows' and OpenH264's joined cleanly. Intel's
+/// numbers its pictures the same way as AMD's and couldn't be tried. A section is a second or so,
+/// so Windows' encoder is barely slower: 1.2 s against AMD's 1.4 s for that cut.
+fn every_encoder_for(codec: Id) -> &'static [&'static str] {
+    match codec {
+        Id::H264 => &["h264_nvenc", "h264_mf", "libopenh264"],
         Id::HEVC => &[
             "hevc_nvenc",
             "hevc_amf",
@@ -98,8 +102,107 @@ fn encoder_candidates(codec: Id) -> Vec<String> {
         ],
         Id::AV1 => &["av1_nvenc", "av1_amf", "av1_qsv", "libsvtav1"],
         _ => &[],
+    }
+}
+
+/// The same, less any the hidden switch leaves out.
+fn encoder_candidates(codec: Id) -> Vec<String> {
+    usable(every_encoder_for(codec).iter().copied())
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The format to give an encoder for pictures decoded as `decoded`: the same one, or the same
+/// picture with its two colour planes woven together, which is all some encoders take, Intel's
+/// among them. Anything else would change the picture itself, and the section would no longer
+/// join the copied video around it.
+fn format_for_encoder(decoded: Pixel, offered: &[Pixel]) -> Option<Pixel> {
+    if offered.is_empty() || offered.contains(&decoded) {
+        return Some(decoded);
+    }
+    let woven = match decoded {
+        Pixel::YUV420P | Pixel::YUVJ420P => Pixel::NV12,
+        Pixel::YUV420P10LE => Pixel::P010LE,
+        _ => return None,
     };
-    names.iter().map(|name| (*name).to_owned()).collect()
+    offered.contains(&woven).then_some(woven)
+}
+
+/// Moves a ten-bit value to the top of its 16 bits, where the woven layout keeps it.
+fn to_top_bits(sample: &[u8]) -> [u8; 2] {
+    (u16::from_le_bytes([sample[0], sample[1]]) << 6).to_le_bytes()
+}
+
+/// The same picture with its colour planes woven together, for an encoder that only takes it that
+/// way. Every value stays the same.
+fn weave(decoded: &frame::Video, into: Pixel) -> frame::Video {
+    let (width, height) = (decoded.width() as usize, decoded.height() as usize);
+    let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
+    let mut woven = frame::Video::new(into, decoded.width(), decoded.height());
+    let ten_bit = into == Pixel::P010LE;
+    let bytes = if ten_bit { 2 } else { 1 };
+
+    let (from_stride, into_stride) = (decoded.stride(0), woven.stride(0));
+    for row in 0..height {
+        let from = &decoded.data(0)[row * from_stride..][..width * bytes];
+        let into = &mut woven.data_mut(0)[row * into_stride..][..width * bytes];
+        if ten_bit {
+            for (into, from) in into
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(from.as_chunks::<2>().0)
+            {
+                *into = to_top_bits(from);
+            }
+        } else {
+            into.copy_from_slice(from);
+        }
+    }
+
+    let (u_stride, v_stride) = (decoded.stride(1), decoded.stride(2));
+    let into_stride = woven.stride(1);
+    for row in 0..chroma_height {
+        let u = &decoded.data(1)[row * u_stride..][..chroma_width * bytes];
+        let v = &decoded.data(2)[row * v_stride..][..chroma_width * bytes];
+        let into = &mut woven.data_mut(1)[row * into_stride..][..chroma_width * bytes * 2];
+        for (pair, (u, v)) in into
+            .chunks_exact_mut(bytes * 2)
+            .zip(u.chunks_exact(bytes).zip(v.chunks_exact(bytes)))
+        {
+            if ten_bit {
+                pair[..2].copy_from_slice(&to_top_bits(u));
+                pair[2..].copy_from_slice(&to_top_bits(v));
+            } else {
+                pair[0] = u[0];
+                pair[1] = v[0];
+            }
+        }
+    }
+    woven
+}
+
+/// Tries the chosen encoder, then the ones after it in the usual order. One that opened when the
+/// export started can still refuse later, such as when another program takes the last of
+/// NVIDIA's encoding sessions, and a short section can come from any encoder of the same codec.
+fn first_that_opens<T, E>(
+    chosen: &str,
+    candidates: &[String],
+    mut open: impl FnMut(&str) -> Result<T, E>,
+) -> Result<T, E> {
+    let later = candidates
+        .iter()
+        .position(|name| name == chosen)
+        .map_or(candidates.len(), |place| place + 1);
+    let mut result = open(chosen);
+    for name in &candidates[later..] {
+        if result.is_ok() {
+            break;
+        }
+        result = open(name);
+    }
+    result
 }
 
 /// Settings that aim to keep re-encoded sections close to the source's quality,
@@ -126,6 +229,11 @@ fn encoder_options(name: &str) -> Dictionary<'static> {
         &[("crf", "24"), ("preset", "8")]
     } else if name == "libkvazaar" {
         &[("kvazaar-params", "qp=18,bipred=0,gop=0")]
+    } else if name.ends_with("_mf") {
+        // Its usual mode keeps a steady bit rate, which fell apart on hard frames when measured.
+        &[("rate_control", "quality"), ("quality", "85")]
+    } else if name == "libopenh264" {
+        &[("rc_mode", "quality"), ("qmin", "18"), ("qmax", "18")]
     } else {
         &[]
     };
@@ -147,14 +255,20 @@ fn open_encoder(
     name: &str,
     source: &SourceVideo,
     decoder: &decoder::Video,
-) -> Result<OpenEncoder, ffmpeg::Error> {
+) -> Result<(OpenEncoder, Pixel), ffmpeg::Error> {
     let found = encoder::find_by_name(name).ok_or(ffmpeg::Error::EncoderNotFound)?;
+    let offered: Vec<Pixel> = found
+        .video()?
+        .formats()
+        .map(Iterator::collect)
+        .unwrap_or_default();
+    let pixel = format_for_encoder(decoder.format(), &offered).ok_or(ffmpeg::Error::InvalidData)?;
     let mut video = codec::context::Context::new_with_codec(found)
         .encoder()
         .video()?;
     video.set_width(decoder.width());
     video.set_height(decoder.height());
-    video.set_format(decoder.format());
+    video.set_format(pixel);
     video.set_aspect_ratio(decoder.aspect_ratio());
     video.set_time_base(source.time_base);
     video.set_frame_rate(Some(source.frame_rate));
@@ -172,10 +286,16 @@ fn open_encoder(
     let options = encoder_options(name);
     if options.iter().next().is_none() {
         video.set_bit_rate(source.bit_rate);
+    } else if name == "libopenh264" {
+        // OpenH264 still wants one. Well above the source, so its fixed quality number decides.
+        let target = (source.bit_rate as u64)
+            .saturating_mul(4)
+            .min(OPENH264_MOST_BITS);
+        video.set_bit_rate(target as usize);
     }
     // Leaving global headers off puts the settings inside the stream, so each
     // re-encoded section carries what a decoder needs to read it.
-    OpenEncoder::open(video, name, options)
+    Ok((OpenEncoder::open(video, name, options)?, pixel))
 }
 
 fn new_decoder(source: &SourceVideo) -> Result<decoder::Video, ffmpeg::Error> {
@@ -189,13 +309,43 @@ fn new_decoder(source: &SourceVideo) -> Result<decoder::Video, ffmpeg::Error> {
     Ok(video)
 }
 
-/// Finds the first encoder that accepts this video. Returns its name, or `None`
+/// Finds the first encoder that really encodes this video. Returns its name, or `None`
 /// if nothing here can match the source.
 fn choose_encoder(codec: Id, source: &SourceVideo) -> Option<String> {
     let decoder = new_decoder(source).ok()?;
     encoder_candidates(codec)
         .into_iter()
-        .find(|name| open_encoder(name, source, &decoder).is_ok())
+        .find(|name| encodes(name, source, &decoder))
+}
+
+/// Whether an encoder turns a few pictures of this video's size and format into video. Opening is
+/// not enough: the HEVC encoder from Microsoft's HEVC Video Extensions opens, and then fails on its
+/// first picture on a machine whose graphics can't do the work.
+fn encodes(name: &str, source: &SourceVideo, decoder: &decoder::Video) -> bool {
+    let Ok((mut encoder, pixel)) = open_encoder(name, source, decoder) else {
+        return false;
+    };
+    let Ok(mut black) = black_frame(decoder, pixel) else {
+        return false;
+    };
+    let frame_rate = source.frame_rate;
+    let frame_seconds = Rational(frame_rate.denominator(), frame_rate.numerator());
+    let mut written = 0;
+    for number in 0..TRIAL_FRAMES {
+        black.set_pts(Some(rescale(number, frame_seconds, source.time_base)));
+        if encoder.send_frame(&black).is_err() {
+            return false;
+        }
+        // Some encoders take nothing more until what they finished is collected.
+        let Some(more) = collect(&mut encoder) else {
+            return false;
+        };
+        written += more;
+    }
+    if encoder.send_eof().is_err() {
+        return false;
+    }
+    collect(&mut encoder).is_some_and(|more| written + more > 0)
 }
 
 /// How re-encoded data is packaged to match the copied stream around it.
@@ -307,6 +457,8 @@ impl Writer {
 struct EncodeRun {
     decoder: decoder::Video,
     encoder: OpenEncoder,
+    /// The format the encoder takes pictures in.
+    pixel: Pixel,
     pts_start: i64,
     pts_end: i64,
     first_frame: bool,
@@ -320,10 +472,14 @@ impl EncodeRun {
         pts_end: i64,
     ) -> Result<Self, ffmpeg::Error> {
         let decoder = new_decoder(source)?;
-        let encoder = open_encoder(encoder_name, source, &decoder)?;
+        let candidates = encoder_candidates(source.parameters.id());
+        let (encoder, pixel) = first_that_opens(encoder_name, &candidates, |name| {
+            open_encoder(name, source, &decoder)
+        })?;
         Ok(Self {
             decoder,
             encoder,
+            pixel,
             pts_start,
             pts_end,
             first_frame: true,
@@ -422,14 +578,16 @@ impl SectionWriter<'_> {
             if pts < run.pts_start || pts >= run.pts_end {
                 continue;
             }
-            decoded.set_pts(Some(pts));
-            decoded.set_kind(if run.first_frame {
+            let mut woven = (decoded.format() != run.pixel).then(|| weave(&decoded, run.pixel));
+            let sending = woven.as_mut().unwrap_or(&mut decoded);
+            sending.set_pts(Some(pts));
+            sending.set_kind(if run.first_frame {
                 picture::Type::I
             } else {
                 picture::Type::None
             });
             run.first_frame = false;
-            run.encoder.send_frame(&decoded)?;
+            run.encoder.send_frame(sending)?;
             self.write_encoded(writer)?;
         }
     }
@@ -496,8 +654,8 @@ impl SectionWriter<'_> {
 }
 
 /// A picture of pure black in the video's own format, whatever that is.
-fn black_frame(decoder: &decoder::Video) -> Result<frame::Video, ffmpeg::Error> {
-    let mut black = frame::Video::new(decoder.format(), decoder.width(), decoder.height());
+fn black_frame(decoder: &decoder::Video, pixel: Pixel) -> Result<frame::Video, ffmpeg::Error> {
+    let mut black = frame::Video::new(pixel, decoder.width(), decoder.height());
     let mut line_sizes = [0isize; 4];
     // SAFETY: the frame was just allocated for this format and size, and FFmpeg writes
     // only inside its planes.
@@ -509,7 +667,7 @@ fn black_frame(decoder: &decoder::Video) -> Result<frame::Video, ffmpeg::Error> 
         ffi::av_image_fill_black(
             (*raw).data.as_ptr().cast(),
             line_sizes.as_ptr(),
-            decoder.format().into(),
+            pixel.into(),
             decoder.color_range().into(),
             decoder.width() as i32,
             decoder.height() as i32,
@@ -545,7 +703,7 @@ fn write_black(
         .map(|number| (pts_of(number), (pts_of(number + 1) - pts_of(number)).max(1)))
         .collect();
     let run = EncodeRun::new(source, encoder_name, 0, pts_of(frames))?;
-    let mut black = black_frame(&run.decoder)?;
+    let mut black = black_frame(&run.decoder, run.pixel)?;
     let output_time_base = writer.output_time_base[0];
     let mut section_writer = SectionWriter {
         source,
@@ -1382,20 +1540,167 @@ mod tests {
     }
 
     #[test]
-    fn hardware_encoders_are_tried_before_software() {
-        let candidates = encoder_candidates(Id::H264);
+    fn only_encoders_that_join_real_recordings_cleanly_cut_h264() {
+        let candidates = every_encoder_for(Id::H264);
 
-        assert_eq!(candidates[0], "h264_nvenc");
-        assert!(
-            candidates.iter().position(|name| name == "libopenh264")
-                > candidates.iter().position(|name| name == "h264_nvenc")
-        );
+        assert_eq!(candidates, ["h264_nvenc", "h264_mf", "libopenh264"]);
     }
 
     #[test]
     fn codecs_not_proven_to_join_cleanly_have_no_encoders() {
         assert!(encoder_candidates(Id::MPEG4).is_empty());
         assert!(encoder_candidates(Id::VP9).is_empty());
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    #[test]
+    fn an_encoder_that_refuses_later_hands_over_to_the_next_one() {
+        let candidates = names(&["h264_nvenc", "h264_amf", "h264_qsv", "libopenh264"]);
+        let mut tried = Vec::new();
+
+        let opened = first_that_opens("h264_nvenc", &candidates, |name| {
+            tried.push(name.to_owned());
+            if name == "h264_qsv" {
+                Ok(name.to_owned())
+            } else {
+                Err(())
+            }
+        });
+
+        assert_eq!(opened, Ok("h264_qsv".to_owned()));
+        assert_eq!(tried, ["h264_nvenc", "h264_amf", "h264_qsv"]);
+    }
+
+    #[test]
+    fn encoders_before_the_chosen_one_are_never_tried() {
+        // They already failed when the export chose, and trying again only costs time.
+        let candidates = names(&["h264_nvenc", "h264_amf", "h264_mf"]);
+        let mut tried = Vec::new();
+
+        let opened: Result<(), ()> = first_that_opens("h264_amf", &candidates, |name| {
+            tried.push(name.to_owned());
+            Err(())
+        });
+
+        assert!(opened.is_err());
+        assert_eq!(tried, ["h264_amf", "h264_mf"]);
+    }
+
+    #[test]
+    fn the_chosen_encoder_is_used_when_it_opens() {
+        let candidates = names(&["h264_nvenc", "h264_amf"]);
+        let mut tried = 0;
+
+        let opened: Result<&str, ()> = first_that_opens("h264_nvenc", &candidates, |name| {
+            tried += 1;
+            Ok(if name == "h264_nvenc" {
+                "nvenc"
+            } else {
+                "other"
+            })
+        });
+
+        assert_eq!(opened, Ok("nvenc"));
+        assert_eq!(tried, 1);
+    }
+
+    #[test]
+    fn an_encoder_that_takes_only_woven_pictures_gets_them_woven() {
+        // Intel's H.264 encoder offers these two.
+        let intel = [Pixel::NV12, Pixel::QSV];
+
+        assert_eq!(
+            format_for_encoder(Pixel::YUV420P, &intel),
+            Some(Pixel::NV12)
+        );
+        assert_eq!(
+            format_for_encoder(Pixel::YUVJ420P, &intel),
+            Some(Pixel::NV12)
+        );
+        assert_eq!(
+            format_for_encoder(Pixel::YUV420P10LE, &[Pixel::P010LE]),
+            Some(Pixel::P010LE)
+        );
+    }
+
+    #[test]
+    fn a_format_the_encoder_takes_is_left_alone() {
+        let amd = [Pixel::NV12, Pixel::YUV420P, Pixel::P010LE];
+
+        assert_eq!(
+            format_for_encoder(Pixel::YUV420P, &amd),
+            Some(Pixel::YUV420P)
+        );
+        assert_eq!(
+            format_for_encoder(Pixel::YUV444P, &[]),
+            Some(Pixel::YUV444P)
+        );
+    }
+
+    #[test]
+    fn a_picture_that_would_have_to_change_is_never_given() {
+        // Fewer colour details, or fewer bits, would show at the join with the copied video.
+        assert_eq!(format_for_encoder(Pixel::YUV444P, &[Pixel::NV12]), None);
+        assert_eq!(format_for_encoder(Pixel::YUV420P10LE, &[Pixel::NV12]), None);
+    }
+
+    /// A picture whose every value is different, with an odd size so the colour planes round up.
+    fn numbered_picture(format: Pixel, ten_bit: bool) -> frame::Video {
+        let mut picture = frame::Video::new(format, 5, 3);
+        for plane in 0..3 {
+            let stride = picture.stride(plane);
+            let (width, height) = if plane == 0 { (5, 3) } else { (3, 2) };
+            let data = picture.data_mut(plane);
+            for row in 0..height {
+                for column in 0..width {
+                    let value = (plane * 100 + row * 10 + column) as u16;
+                    if ten_bit {
+                        let at = row * stride + column * 2;
+                        data[at..at + 2].copy_from_slice(&value.to_le_bytes());
+                    } else {
+                        data[row * stride + column] = value as u8;
+                    }
+                }
+            }
+        }
+        picture
+    }
+
+    #[test]
+    fn weaving_keeps_every_value() {
+        let picture = numbered_picture(Pixel::YUV420P, false);
+
+        let woven = weave(&picture, Pixel::NV12);
+
+        assert_eq!(woven.format(), Pixel::NV12);
+        assert_eq!(&woven.data(0)[..5], [0, 1, 2, 3, 4]);
+        assert_eq!(
+            &woven.data(0)[woven.stride(0) * 2..][..5],
+            [20, 21, 22, 23, 24]
+        );
+        assert_eq!(&woven.data(1)[..6], [100, 200, 101, 201, 102, 202]);
+        assert_eq!(
+            &woven.data(1)[woven.stride(1)..][..6],
+            [110, 210, 111, 211, 112, 212]
+        );
+    }
+
+    #[test]
+    fn ten_bit_values_move_to_the_top_of_their_sixteen_bits() {
+        let picture = numbered_picture(Pixel::YUV420P10LE, true);
+
+        let woven = weave(&picture, Pixel::P010LE);
+        let sample = |plane: usize, at: usize| {
+            u16::from_le_bytes([woven.data(plane)[at], woven.data(plane)[at + 1]])
+        };
+
+        assert_eq!(sample(0, 2), 1 << 6);
+        assert_eq!(sample(1, 0), 100 << 6);
+        assert_eq!(sample(1, 2), 200 << 6);
+        assert_eq!(sample(1, woven.stride(1) + 4), 111 << 6);
     }
 
     #[test]

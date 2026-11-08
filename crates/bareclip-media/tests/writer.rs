@@ -74,6 +74,8 @@ fn every_encoder_here_finishes_a_whole_video() {
                 assert_eq!(pictures, FRAMES, "{encoder}");
                 println!("{encoder}: finished in {:?}", started.elapsed());
             }
+            // The processor's encoder is built in, so it is the one that must always work.
+            Ok(Ok(false)) if encoder == "libopenh264" => panic!("{encoder} wouldn't start"),
             Ok(Ok(false)) => println!("{encoder}: not available here"),
             Ok(Err(error)) => panic!("{encoder} failed: {error}"),
             Err(_) => panic!("{encoder} never finished"),

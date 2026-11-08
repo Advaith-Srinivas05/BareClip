@@ -1,5 +1,6 @@
 //! The only crate that calls FFmpeg.
 
+mod encoders;
 mod error;
 mod export;
 mod full;
@@ -12,6 +13,7 @@ mod resample;
 mod still;
 mod strip;
 
+pub use encoders::SKIP_VARIABLE as SKIP_ENCODERS_VARIABLE;
 pub use error::MediaError;
 pub use export::{
     ExportPart, ExportReport, ExportRequest, can_write_gaps, export, export_picture_only,

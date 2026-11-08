@@ -17,6 +17,7 @@ use ffmpeg_next::{
 };
 
 use crate::{
+    encoders::usable,
     error::MediaError,
     export::temporary_path,
     media_foundation::OpenEncoder,
@@ -266,6 +267,26 @@ impl Quality {
         }
     }
 
+    /// Windows' own encoder's quality, out of 100, where higher keeps more. Measured on 2026-11-08
+    /// to land each choice near NVIDIA's score for it. Files come out 1.3 to 1.9 times larger than
+    /// NVIDIA's, because it's a less efficient encoder, and the look matters more than the size.
+    fn windows_level(self) -> &'static str {
+        match self {
+            Self::MatchSource => "85",
+            Self::Balanced => "75",
+            Self::Smaller => "60",
+        }
+    }
+
+    /// OpenH264's quality number, held fixed, where lower keeps more. Measured the same way.
+    fn processor_level(self) -> &'static str {
+        match self {
+            Self::MatchSource => "18",
+            Self::Balanced => "22",
+            Self::Smaller => "27",
+        }
+    }
+
     /// How much of the source's bit rate to use, on encoders with no quality number.
     pub fn share_of_bit_rate(self) -> f64 {
         match self {
@@ -287,6 +308,9 @@ fn no_real_limit(settings: &VideoSettings) -> u64 {
     let pixels = f64::from(settings.width) * f64::from(settings.height);
     ((pixels * rate) as u64).clamp(10_000_000, 300_000_000)
 }
+
+/// OpenH264 refuses to open with a target over 288 Mb/s.
+pub(crate) const OPENH264_MOST_BITS: u64 = 250_000_000;
 
 /// Settings for a whole video at a chosen quality. Unlike the short sections of the fast route,
 /// these care about file size too, unless the choice is to match the source.
@@ -311,11 +335,34 @@ fn quality_options(name: &str, settings: &VideoSettings) -> Dictionary<'static> 
         ]
     } else if name.ends_with("_qsv") {
         vec![("global_quality", level)]
+    } else if name.ends_with("_mf") {
+        // Its usual mode keeps a steady bit rate, which fell apart on hard frames when measured.
+        vec![
+            ("rate_control", "quality"),
+            ("quality", quality.windows_level()),
+        ]
+    } else if name == "libopenh264" {
+        let level = quality.processor_level();
+        // High profile with CABAC came out 10% smaller than its usual Baseline, for the same score.
+        vec![
+            ("rc_mode", "quality"),
+            ("qmin", level),
+            ("qmax", level),
+            // As numbers, because FFmpeg's general profile setting sees these too and has no
+            // names for them: 100 is High, and 1 is CABAC.
+            ("profile", "100"),
+            ("coder", "1"),
+        ]
     } else {
         Vec::new()
     };
     for (key, value) in chosen {
         options.set(key, value);
+    }
+    if name == "libopenh264" {
+        // A target it never reaches, so the fixed quality number decides.
+        let limit = no_real_limit(settings).min(OPENH264_MOST_BITS);
+        options.set("b", &limit.to_string());
     }
     if quality == Quality::MatchSource && name.ends_with("_nvenc") {
         let limit = no_real_limit(settings);
@@ -372,6 +419,52 @@ fn open_video_encoder(
     }
     let opened = OpenEncoder::open(video, name, options)?;
     Ok((opened, pixel))
+}
+
+/// Whether an encoder turns a few plain pictures of this size into video. Opening is not enough,
+/// because some open and then fail on their first picture, as Windows' HEVC encoder from the
+/// Store does on this laptop.
+fn encodes(name: &str, settings: &VideoSettings) -> bool {
+    const TRIAL_FRAMES: i64 = 3;
+    let Ok((mut encoder, pixel)) = open_video_encoder(name, settings) else {
+        return false;
+    };
+    let mut picture = frame::Video::new(pixel, settings.width, settings.height);
+    for plane in 0..picture.planes() {
+        picture
+            .data_mut(plane)
+            .fill(if plane == 0 { 16 } else { 128 });
+    }
+    let mut written = 0;
+    for number in 0..TRIAL_FRAMES {
+        picture.set_pts(Some(number));
+        if encoder.send_frame(&picture).is_err() {
+            return false;
+        }
+        // Some encoders take nothing more until what they finished is collected.
+        let Some(more) = collect(&mut encoder) else {
+            return false;
+        };
+        written += more;
+    }
+    if encoder.send_eof().is_err() {
+        return false;
+    }
+    collect(&mut encoder).is_some_and(|more| written + more > 0)
+}
+
+/// Takes what an encoder has finished. The number of pieces, or `None` if it failed.
+pub(crate) fn collect(encoder: &mut encoder::Video) -> Option<usize> {
+    let mut packet = Packet::empty();
+    let mut taken = 0;
+    loop {
+        match encoder.receive_packet(&mut packet) {
+            Ok(()) => taken += 1,
+            Err(ffmpeg::Error::Eof) => return Some(taken),
+            Err(ffmpeg::Error::Other { errno }) if errno == ffi::EAGAIN => return Some(taken),
+            Err(_) => return None,
+        }
+    }
 }
 
 fn open_sound_encoder() -> Result<encoder::Audio, ffmpeg::Error> {
@@ -508,7 +601,7 @@ pub struct VideoWriter {
 
 impl VideoWriter {
     pub fn create(path: &Path, settings: &VideoSettings) -> Result<Self, MediaError> {
-        Self::create_with_any_of(path, settings, &H264_ENCODERS)
+        Self::create_with_any_of(path, settings, &usable(H264_ENCODERS))
     }
 
     /// Writes with the first of these encoders that works here.
@@ -520,6 +613,7 @@ impl VideoWriter {
         crate::init()?;
         let (encoder, encoder_name, pixel) = encoders
             .iter()
+            .filter(|name| encodes(name, settings))
             .find_map(|name| {
                 open_video_encoder(name, settings)
                     .ok()
@@ -754,27 +848,52 @@ mod tests {
     }
 
     #[test]
-    fn encoders_with_a_quality_setting_get_one() {
+    fn every_encoder_tried_gets_a_quality_setting() {
         crate::init().expect("FFmpeg starts");
 
-        assert!(
+        for name in H264_ENCODERS {
+            let options = quality_options(name, &settings_at((1920, 1080), 30, Quality::default()));
+            assert!(options.iter().next().is_some(), "{name}");
+        }
+    }
+
+    #[test]
+    fn windows_own_encoder_aims_at_a_quality_not_a_bit_rate() {
+        let quality = |quality| {
+            let options = quality_options("h264_mf", &settings_at((1920, 1080), 30, quality));
+            assert_eq!(options.get("rate_control"), Some("quality"));
+            options.get("quality").map(str::to_owned)
+        };
+        assert_eq!(quality(Quality::MatchSource).as_deref(), Some("85"));
+        assert_eq!(quality(Quality::Balanced).as_deref(), Some("75"));
+        assert_eq!(quality(Quality::Smaller).as_deref(), Some("60"));
+    }
+
+    #[test]
+    fn the_processor_holds_one_quality_number_for_each_choice() {
+        let held = |quality| {
+            let options = quality_options("libopenh264", &settings_at((1920, 1080), 30, quality));
+            assert_eq!(options.get("qmin"), options.get("qmax"));
+            assert_eq!(options.get("profile"), Some("100"));
+            options.get("qmin").map(str::to_owned)
+        };
+        assert_eq!(held(Quality::MatchSource).as_deref(), Some("18"));
+        assert_eq!(held(Quality::Balanced).as_deref(), Some("22"));
+        assert_eq!(held(Quality::Smaller).as_deref(), Some("27"));
+    }
+
+    #[test]
+    fn the_processors_target_stays_under_what_it_accepts() {
+        let target = |size, rate| {
             quality_options(
-                "h264_nvenc",
-                &settings_at((1920, 1080), 30, Quality::default())
+                "libopenh264",
+                &settings_at(size, rate, Quality::MatchSource),
             )
-            .iter()
-            .next()
-            .is_some()
-        );
-        assert!(
-            quality_options(
-                "h264_mf",
-                &settings_at((1920, 1080), 30, Quality::default())
-            )
-            .iter()
-            .next()
-            .is_none()
-        );
+            .get("b")
+            .and_then(|bits| bits.parse::<u64>().ok())
+        };
+        assert_eq!(target((1920, 1080), 30), Some(62_208_000));
+        assert_eq!(target((3840, 2160), 60), Some(OPENH264_MOST_BITS));
     }
 
     fn settings_at(size: (u32, u32), rate: i32, quality: Quality) -> VideoSettings {
