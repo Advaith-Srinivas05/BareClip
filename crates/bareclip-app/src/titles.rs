@@ -56,6 +56,13 @@ pub(super) struct CopiedClip {
     sound_only: bool,
 }
 
+impl CopiedClip {
+    /// Whether it is a clip of one of these videos, rather than a title of its own.
+    pub(super) fn is_from_any(&self, media: &[MediaId]) -> bool {
+        self.title.is_none() && media.contains(&self.clip.media)
+    }
+}
+
 /// A corner of a title being dragged. The title is redrawn at its new size when it is let go.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct TitleResize {
@@ -787,11 +794,7 @@ impl Editor {
                 self.project.titles.insert(own, title);
                 own
             }
-            None => {
-                // It may have been removed from the media panel since.
-                self.project.hidden.retain(|id| *id != copied.clip.media);
-                copied.clip.media
-            }
+            None => copied.clip.media,
         };
         let time = self.position();
         let pasted = self.project.tracks.place_copy(

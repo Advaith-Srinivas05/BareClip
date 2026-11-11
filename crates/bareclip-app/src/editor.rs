@@ -470,8 +470,6 @@ impl Drop for MediaEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Snapshot {
     tracks: Tracks,
-    /// Videos removed from the panel. They stay loaded so undo can restore them.
-    hidden: Vec<MediaId>,
     /// The finished video's size.
     canvas: Canvas,
     /// What each title says and how it looks, under the id its clip refers to.
@@ -750,7 +748,6 @@ impl Editor {
             next_media: 1,
             project: Snapshot {
                 tracks: Tracks::default(),
-                hidden: Vec::new(),
                 canvas: Canvas::default(),
                 titles: BTreeMap::new(),
                 names: BTreeMap::new(),
@@ -951,7 +948,6 @@ impl Editor {
         self.media.clear();
         self.project = Snapshot {
             tracks: Tracks::default(),
-            hidden: Vec::new(),
             canvas: Canvas::default(),
             titles: BTreeMap::new(),
             names: BTreeMap::new(),
@@ -1364,9 +1360,7 @@ impl Editor {
     }
 
     fn visible_media(&self) -> impl Iterator<Item = &MediaEntry> {
-        self.media
-            .iter()
-            .filter(|entry| !entry.id.is_title() && !self.project.hidden.contains(&entry.id))
+        self.media.iter().filter(|entry| !entry.id.is_title())
     }
 
     /// The videos the panel lists, filtered and in order.
@@ -1764,14 +1758,43 @@ impl Editor {
         self.remove_many(&[id]);
     }
 
-    /// Removes videos from the project, as one step to undo.
+    /// Takes videos out of the project for good, with their clips. Undo and redo never bring them
+    /// back, as if they had never been added, so their files are closed and free straight away.
     fn remove_many(&mut self, ids: &[MediaId]) {
-        self.record();
+        // The size each video left would give the project, the way `settle_canvas` sees it.
+        let sizes: HashMap<MediaId, (u32, u32)> = self
+            .media
+            .iter()
+            .filter(|entry| !ids.contains(&entry.id) && !entry.info.is_still())
+            .map(|entry| (entry.id, (entry.info.video.width, entry.info.video.height)))
+            .collect();
+        let size_of = |id: MediaId| sizes.get(&id).copied();
+        let forget = |snapshot: &mut Snapshot| {
+            for id in ids {
+                snapshot.tracks.remove_media(*id);
+                snapshot.names.remove(id);
+            }
+            snapshot.canvas.settle(&snapshot.tracks, &size_of);
+        };
+        forget(&mut self.project);
         for id in ids {
-            self.project.tracks.remove_media(*id);
-            self.project.hidden.push(*id);
+            self.preview.close(*id);
         }
+        // Dropping a video stops whatever is still reading it in the background.
+        self.media.retain(|entry| !ids.contains(&entry.id));
+        self.selected_media.retain(|id| !ids.contains(id));
+        if self
+            .clipboard
+            .as_ref()
+            .is_some_and(|copied| copied.is_from_any(ids))
+        {
+            self.clipboard = None;
+        }
+        let tracks = &self.project.tracks;
+        self.layer_pictures
+            .keep_clips(|clip| tracks.clip(clip).is_some());
         self.after_timeline_change();
+        self.history.rewrite(&self.project, forget);
     }
 
     /// Tidies up after clips changed, so nothing points at a clip that has gone.
@@ -1787,8 +1810,6 @@ impl Editor {
         {
             self.selected_gap = None;
         }
-        let hidden = &self.project.hidden;
-        self.selected_media.retain(|id| !hidden.contains(id));
         let position = self.position();
         self.seek(position);
     }
@@ -7861,11 +7882,15 @@ mod tests {
         assert!(editor.selected_media.is_empty());
 
         editor.undo();
-        assert_eq!(editor.visible_media().count(), 2);
+        assert_eq!(
+            editor.visible_media().count(),
+            0,
+            "removing can't be undone"
+        );
     }
 
     #[test]
-    fn removing_ticked_videos_in_use_asks_first_and_goes_as_one_undo_step() {
+    fn removing_ticked_videos_in_use_asks_first_and_cant_be_undone() {
         let ctx = context();
         let mut editor = with_videos(&ctx, &[test_clip(), second_clip()]);
         click_named(&ctx, &mut editor, "Select all");
@@ -7882,8 +7907,12 @@ mod tests {
         assert_eq!(editor.visible_media().count(), 0);
 
         editor.undo();
-        assert_eq!(clip_count(&editor), 2);
-        assert_eq!(editor.visible_media().count(), 2);
+        assert_eq!(clip_count(&editor), 0);
+        assert_eq!(editor.visible_media().count(), 0);
+        assert!(
+            !editor.history.can_undo(),
+            "only those videos were ever added"
+        );
     }
 
     #[test]
@@ -11142,19 +11171,87 @@ mod tests {
         assert_eq!(editor.visible_media().count(), 1);
     }
 
+    fn clips_of(editor: &Editor, media: MediaId) -> usize {
+        editor
+            .project
+            .tracks
+            .tracks()
+            .iter()
+            .flat_map(Timeline::clips)
+            .filter(|clip| clip.media == media)
+            .count()
+    }
+
     #[test]
-    fn removing_a_video_takes_its_clips_and_undo_restores_both() {
+    fn removing_a_video_takes_its_clips_for_good_and_undo_skips_what_only_it_was_in() {
         let ctx = context();
         let mut editor = with_videos(&ctx, &[test_clip(), second_clip()]);
+        let gone = editor.media[0].id;
+        let kept = editor.media[1].id;
+        let gone_clip = editor
+            .project
+            .tracks
+            .played()
+            .clips()
+            .iter()
+            .find(|clip| clip.media == gone)
+            .expect("it's on the timeline")
+            .id;
+        editor.toggle_clip_mute(gone_clip);
+        let kept_clips = clips_of(&editor, kept);
+
+        editor.remove_media(gone);
+        assert_eq!(clips_of(&editor, gone), 0);
+        assert_eq!(clips_of(&editor, kept), kept_clips);
+        assert!(editor.entry(gone).is_none(), "it's gone from the project");
+
+        // Going all the way back and forward again, it never returns, and every step changes
+        // something: muting it, which only it was in, is no longer a step.
+        let mut before = editor.project.clone();
+        while editor.history.can_undo() {
+            editor.undo();
+            assert_eq!(clips_of(&editor, gone), 0);
+            assert_ne!(editor.project, before, "an undo changed nothing");
+            before = editor.project.clone();
+        }
+        while editor.history.can_redo() {
+            editor.redo();
+            assert_eq!(clips_of(&editor, gone), 0);
+            assert_ne!(editor.project, before, "a redo changed nothing");
+            before = editor.project.clone();
+        }
+        assert_eq!(clips_of(&editor, kept), kept_clips);
+        assert_eq!(editor.visible_media().count(), 1);
+    }
+
+    #[test]
+    fn a_removed_video_can_be_deleted_straight_away() {
+        let ctx = context();
+        let folder = std::env::temp_dir().join("bareclip-app-tests");
+        std::fs::create_dir_all(&folder).expect("the folder exists");
+        let copy = folder.join(format!("removed-{}.mp4", std::process::id()));
+        std::fs::copy(test_clip(), &copy).expect("the video copies");
+        let mut editor = with_videos(&ctx, &[&copy]);
         let id = editor.media[0].id;
+        editor.seek(Ticks::from_seconds(0.5));
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.preview.has_open(id), "playing it opened the file");
 
         editor.remove_media(id);
-        assert_eq!(clip_count(&editor), 1);
-        assert_eq!(editor.visible_media().count(), 1);
 
+        assert!(!editor.preview.has_open(id));
+        // Reading in the background stops at its next step, which is a moment away at most.
+        let started = Instant::now();
+        while let Err(error) = std::fs::remove_file(&copy) {
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "the file is still held: {error}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
         editor.undo();
-        assert_eq!(clip_count(&editor), 2);
-        assert_eq!(editor.visible_media().count(), 2);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.notice.is_none(), "{:?}", editor.notice);
     }
 
     #[test]
@@ -16805,7 +16902,7 @@ mod tests {
     }
 
     #[test]
-    fn a_copied_clip_can_come_back_after_its_video_was_removed_from_the_panel() {
+    fn a_copied_clip_goes_with_its_video_when_that_is_removed() {
         let ctx = context();
         let mut editor = with_videos(&ctx, &[test_clip()]);
         run_frame(&ctx, &mut editor, vec![]);
@@ -16816,7 +16913,8 @@ mod tests {
         editor.remove_media(media);
         assert_eq!(editor.visible_media().count(), 0);
         editor.paste_clip();
-        assert_eq!(editor.visible_media().count(), 1);
+        assert_eq!(editor.visible_media().count(), 0);
+        assert!(editor.project.tracks.is_empty());
     }
 
     #[test]

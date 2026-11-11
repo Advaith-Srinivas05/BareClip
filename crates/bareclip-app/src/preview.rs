@@ -297,6 +297,30 @@ impl Preview {
         }
     }
 
+    /// Closes every player of this video, so that its file is free to be deleted or moved.
+    pub fn close(&mut self, media: MediaId) {
+        self.slots.retain(|slot| slot.media != media);
+        if self
+            .prepared
+            .as_ref()
+            .is_some_and(|prepared| prepared.media == media)
+        {
+            self.prepared = None;
+        }
+        if self.current.is_some_and(|(_, current)| current == media) {
+            self.current = None;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn has_open(&self, media: MediaId) -> bool {
+        self.slots.iter().any(|slot| slot.media == media)
+            || self
+                .prepared
+                .as_ref()
+                .is_some_and(|prepared| prepared.media == media)
+    }
+
     /// Switches between plain pictures and ones ready for the GPU compositor. Open players can't
     /// change over, so they close, and playback picks up from the same place.
     pub fn set_planes(

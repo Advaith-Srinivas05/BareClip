@@ -52,6 +52,18 @@ impl<T> History<T> {
         }
     }
 
+    /// Changes every remembered state the same way, as if it had always been so. A step that is
+    /// left changing nothing goes, so undo and redo never seem to do nothing.
+    pub fn rewrite(&mut self, current: &T, mut change: impl FnMut(&mut T))
+    where
+        T: PartialEq,
+    {
+        self.past.iter_mut().for_each(&mut change);
+        self.future.iter_mut().for_each(&mut change);
+        self.past = without_repeats(std::mem::take(&mut self.past), current);
+        self.future = without_repeats(std::mem::take(&mut self.future), current);
+    }
+
     pub fn can_undo(&self) -> bool {
         !self.past.is_empty()
     }
@@ -61,9 +73,44 @@ impl<T> History<T> {
     }
 }
 
+/// Drops states the same as the one nearer `current`. Both lists end nearest it.
+fn without_repeats<T: PartialEq>(states: Vec<T>, current: &T) -> Vec<T> {
+    let mut kept: Vec<T> = Vec::with_capacity(states.len());
+    for state in states.into_iter().rev() {
+        let repeat = kept
+            .last()
+            .map_or(state == *current, |nearer| state == *nearer);
+        if !repeat {
+            kept.push(state);
+        }
+    }
+    kept.reverse();
+    kept
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rewriting_drops_the_steps_that_no_longer_change_anything() {
+        let mut history = History::default();
+        // Each state is a list of things; 9 is about to go for good.
+        for state in [vec![1], vec![1, 9], vec![1, 9, 2], vec![1, 2, 9]] {
+            history.record(state);
+        }
+        let current = vec![1, 2, 9, 3];
+        assert_eq!(history.undo(current), Ok(vec![1, 2, 9]));
+        assert_eq!(history.undo(vec![1, 2, 9]), Ok(vec![1, 9, 2]));
+        let current = vec![1, 2];
+
+        history.rewrite(&current, |state| state.retain(|thing| *thing != 9));
+
+        assert_eq!(history.undo(current.clone()), Ok(vec![1]));
+        assert_eq!(history.redo(vec![1]), Ok(vec![1, 2]));
+        assert_eq!(history.redo(vec![1, 2]), Ok(vec![1, 2, 3]));
+        assert!(!history.can_redo());
+    }
 
     #[test]
     fn undo_and_redo_walk_through_the_changes() {

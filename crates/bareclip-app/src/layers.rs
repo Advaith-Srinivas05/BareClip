@@ -292,6 +292,11 @@ impl LayerPictures {
         problem
     }
 
+    /// Closes the players of clips that have gone, so their files are free straight away.
+    pub fn keep_clips(&mut self, kept: impl Fn(ClipId) -> bool) {
+        self.followers.retain(|follower| kept(follower.clip));
+    }
+
     /// Says an image has just finished loading, so the canvas is out of date.
     pub fn picture_arrived(&mut self) {
         self.changed = true;
