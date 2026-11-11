@@ -112,6 +112,8 @@ pub(super) struct DurationEdit {
 pub(super) enum LeftPanel {
     #[default]
     Media,
+    /// Ways of recording straight into the project.
+    Record,
     /// Things BareClip draws itself to drop into a video.
     Library,
     Text,

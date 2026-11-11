@@ -20,6 +20,8 @@ const SETTINGS_FILE: &str = "settings.json";
 const RECOVERY_FOLDER: &str = "recovery";
 const RECOVERY_EXTENSION: &str = "recovery";
 const LOCK_EXTENSION: &str = "lock";
+const RECORDING_FOLDER: &str = "recording";
+const RECORDING_EXTENSION: &str = "recording";
 
 /// Where the app keeps its files, or `None` if Windows doesn't say.
 pub fn app_folder() -> Option<PathBuf> {
@@ -97,7 +99,7 @@ impl From<GpuId> for GpuChoice {
 
 /// The user's choices. Anything missing from the file takes its default, so settings written
 /// by another version still load.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub theme: ThemeSetting,
@@ -111,6 +113,19 @@ pub struct Settings {
     pub waveforms_on_audio: bool,
     /// The graphics chip to run on. `None` is Automatic.
     pub gpu: Option<GpuChoice>,
+    /// Where recordings are saved. `None` is `BareClip recordings` in Windows' Videos folder.
+    pub recordings_folder: Option<PathBuf>,
+    /// The microphone last recorded with, by name. `None` is Windows' default.
+    pub microphone: Option<String>,
+    /// Whether a recording counts down from 3 before it starts.
+    pub countdown: bool,
+    /// Whether the timeline plays from the playhead while recording, for a voice-over.
+    pub play_while_recording: bool,
+    /// What a screen recording takes besides the picture, and how.
+    pub screen_pc_sound: bool,
+    pub screen_microphone: bool,
+    pub screen_frame_rate: u32,
+    pub screen_pointer: bool,
 }
 
 impl Default for Settings {
@@ -122,6 +137,14 @@ impl Default for Settings {
             waveforms_on_clips: false,
             waveforms_on_audio: false,
             gpu: None,
+            recordings_folder: None,
+            microphone: None,
+            countdown: true,
+            play_while_recording: true,
+            screen_pc_sound: true,
+            screen_microphone: false,
+            screen_frame_rate: 30,
+            screen_pointer: true,
         }
     }
 }
@@ -306,6 +329,92 @@ pub fn discard_recovery(path: &Path) {
     let _ = fs::remove_file(lock_path(path));
 }
 
+/// Says a recording is under way, for as long as this lives, so that if BareClip ends without
+/// stopping it the next run can offer to add what was recorded. It holds a lock that Windows lets
+/// go of however the process ends, like a recovery copy's.
+pub struct RecordingMarker {
+    path: PathBuf,
+    lock: Option<File>,
+}
+
+impl RecordingMarker {
+    pub fn start(app_folder: &Path, recording: &Path) -> io::Result<Self> {
+        let folder = app_folder.join(RECORDING_FOLDER);
+        fs::create_dir_all(&folder)?;
+        let started = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis());
+        let path = folder.join(format!(
+            "{}-{started}.{RECORDING_EXTENSION}",
+            std::process::id()
+        ));
+        let lock = open_lock(&lock_path(&path))?;
+        lock.lock()?;
+        write_atomic(&path, recording.to_string_lossy().as_bytes())?;
+        Ok(Self {
+            path,
+            lock: Some(lock),
+        })
+    }
+
+    /// The recording stopped properly, so there is nothing to offer.
+    pub fn finish(mut self) {
+        self.lock = None;
+        discard_recovery(&self.path);
+    }
+
+    /// Lets go of the lock without tidying up, as a crash would.
+    #[cfg(test)]
+    pub fn abandon(mut self) {
+        self.lock = None;
+    }
+}
+
+impl Drop for RecordingMarker {
+    fn drop(&mut self) {
+        self.lock = None;
+    }
+}
+
+/// A recording a run didn't stop, because it crashed or was closed mid-recording: the marker,
+/// and the file it was writing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CutShort {
+    pub marker: PathBuf,
+    pub file: PathBuf,
+}
+
+/// Recordings left by runs that ended without stopping them, whose files are still there.
+pub fn cut_short_recordings(app_folder: &Path) -> Vec<CutShort> {
+    let Ok(entries) = fs::read_dir(app_folder.join(RECORDING_FOLDER)) else {
+        return Vec::new();
+    };
+    let mut found: Vec<CutShort> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == RECORDING_EXTENSION)
+        })
+        .filter(|path| {
+            open_lock(&lock_path(path))
+                .is_ok_and(|lock| !matches!(lock.try_lock(), Err(TryLockError::WouldBlock)))
+        })
+        .filter_map(|marker| {
+            let file = PathBuf::from(fs::read_to_string(&marker).ok()?);
+            if file.is_file() {
+                Some(CutShort { marker, file })
+            } else {
+                // Nothing was kept, so there is nothing to offer.
+                discard_recovery(&marker);
+                None
+            }
+        })
+        .collect();
+    found.sort_by(|a, b| a.file.cmp(&b.file));
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,6 +462,14 @@ mod tests {
                 vendor: 0x1002,
                 device: 0x1638,
             }),
+            recordings_folder: Some(PathBuf::from(r"D:\Recordings")),
+            microphone: Some("Headset microphone".to_owned()),
+            countdown: false,
+            play_while_recording: false,
+            screen_pc_sound: false,
+            screen_microphone: true,
+            screen_frame_rate: 60,
+            screen_pointer: false,
         };
 
         settings.save(&folder).expect("they can be saved");
@@ -518,6 +635,53 @@ mod tests {
 
         assert!(recovery.take_problem().is_some());
         assert!(recovery.take_problem().is_none());
+    }
+
+    #[test]
+    fn a_recording_stopped_properly_is_not_offered() {
+        let folder = temporary_folder("recording-stopped");
+        let file = folder.join("Microphone.m4a");
+        fs::write(&file, "sound").expect("written");
+        let marker = RecordingMarker::start(&folder, &file).expect("it starts");
+        assert!(cut_short_recordings(&folder).is_empty(), "still recording");
+        marker.finish();
+        assert!(cut_short_recordings(&folder).is_empty());
+        assert!(file.exists(), "the recording itself is never touched");
+    }
+
+    #[test]
+    fn a_recording_a_run_never_stopped_is_offered_once_its_lock_is_gone() {
+        let folder = temporary_folder("recording-cut-short");
+        let file = folder.join("Microphone.m4a");
+        fs::write(&file, "sound").expect("written");
+        RecordingMarker::start(&folder, &file)
+            .expect("it starts")
+            .abandon();
+        let found = cut_short_recordings(&folder);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].file, file);
+        discard_recovery(&found[0].marker);
+        assert!(cut_short_recordings(&folder).is_empty());
+    }
+
+    #[test]
+    fn a_cut_short_recording_with_no_file_is_forgotten() {
+        let folder = temporary_folder("recording-no-file");
+        RecordingMarker::start(&folder, &folder.join("never made.m4a"))
+            .expect("it starts")
+            .abandon();
+        assert!(cut_short_recordings(&folder).is_empty());
+        let left = fs::read_dir(folder.join(RECORDING_FOLDER))
+            .expect("the folder is there")
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == RECORDING_EXTENSION)
+            })
+            .count();
+        assert_eq!(left, 0, "the marker was tidied away");
     }
 
     const HOLDER_FOLDER: &str = "BARECLIP_RECOVERY_HOLDER";

@@ -20,6 +20,17 @@ pub struct SoundFile {
 
 impl SoundFile {
     pub fn create(path: &Path, labels: &[SoundLabel]) -> Result<Self, MediaError> {
+        Self::open(path, labels, false)
+    }
+
+    /// A file that can be read at any moment while it is written, as a recording needs, so a
+    /// crash keeps everything up to about the last second. It is an MP4 written in pieces of a
+    /// second each, which players read like any other.
+    pub fn create_growing(path: &Path, labels: &[SoundLabel]) -> Result<Self, MediaError> {
+        Self::open(path, labels, true)
+    }
+
+    fn open(path: &Path, labels: &[SoundLabel], growing: bool) -> Result<Self, MediaError> {
         crate::init()?;
         let mut output = format::output(path)?;
         let tracks = labels
@@ -27,7 +38,11 @@ impl SoundFile {
             .enumerate()
             .map(|(index, label)| SoundOutput::add_to(&mut output, index, label))
             .collect::<Result<Vec<_>, MediaError>>()?;
-        output.write_header()?;
+        if growing {
+            output.write_header_with(crate::full::growing_options())?;
+        } else {
+            output.write_header()?;
+        }
         let time_bases = (0..tracks.len())
             .map(|index| {
                 output

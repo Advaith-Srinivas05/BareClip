@@ -222,7 +222,11 @@ pub fn probe(path: &Path) -> Result<MediaInfo, MediaError> {
             codec: codec.name().to_owned(),
             channels: decoder.channels(),
             sample_rate: decoder.rate(),
-            title: metadata.get("title").map(str::to_owned),
+            // An MP4 written in pieces, as recordings are, keeps the name as "name".
+            title: metadata
+                .get("title")
+                .or_else(|| metadata.get("name"))
+                .map(str::to_owned),
             language: metadata.get("language").map(str::to_owned),
         });
     }

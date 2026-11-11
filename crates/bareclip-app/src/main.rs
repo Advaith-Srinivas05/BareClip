@@ -4,6 +4,7 @@ mod components;
 mod editor;
 mod fonts;
 mod handoff;
+mod hotkeys;
 mod icons;
 mod layers;
 mod player;

@@ -96,6 +96,17 @@ struct Look {
     content: Color32,
 }
 
+/// A kind's look, with the symbol in `tint` when one is given and the button isn't disabled.
+fn tinted_look(palette: &Palette, kind: Kind, state: State, tint: Option<Color32>) -> Look {
+    let mut look = look(palette, kind, state);
+    if let Some(tint) = tint
+        && state != State::Disabled
+    {
+        look.content = tint;
+    }
+    look
+}
+
 fn look(palette: &Palette, kind: Kind, state: State) -> Look {
     let plain = |fill, stroke, content| Look {
         fill,
@@ -315,6 +326,7 @@ pub struct IconButton<'a> {
     round: bool,
     solid: bool,
     hidden: bool,
+    tint: Option<Color32>,
 }
 
 impl<'a> IconButton<'a> {
@@ -330,6 +342,7 @@ impl<'a> IconButton<'a> {
             round: false,
             solid: false,
             hidden: false,
+            tint: None,
         }
     }
 
@@ -356,6 +369,13 @@ impl<'a> IconButton<'a> {
         self
     }
 
+    /// Draws the symbol in its own colour rather than the kind's, unless disabled. Only for a
+    /// colour that stays clear on the kind's fills, as [`tinted_look`] is tested for.
+    pub fn tint(mut self, color: Color32) -> Self {
+        self.tint = Some(color);
+        self
+    }
+
     /// Draws nothing unless focused, while the button can still be clicked.
     pub fn hidden(mut self, hidden: bool) -> Self {
         self.hidden = hidden;
@@ -375,7 +395,7 @@ impl<'a> IconButton<'a> {
         response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, name));
         let shown = !self.hidden || response.has_focus();
         if shown && ui.is_rect_visible(rect) {
-            let look = look(self.palette, self.kind, state_of(&response));
+            let look = tinted_look(self.palette, self.kind, state_of(&response), self.tint);
             let radius = if self.round {
                 rect.height() / 2.0
             } else {
@@ -1627,6 +1647,26 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_red_symbol_on_a_quiet_button_stands_out_in_both_themes() {
+        const SHAPE_MINIMUM: f64 = 3.0;
+        for (theme, palette) in [("dark", &DARK), ("light", &LIGHT)] {
+            for state in [State::Rest, State::Hover, State::Pressed] {
+                let look = tinted_look(palette, Kind::Ghost, state, Some(palette.danger));
+                assert_eq!(look.content, palette.danger);
+                for background in [palette.surface, palette.raised] {
+                    let ratio = contrast(look.content, over(look.fill, background));
+                    assert!(ratio >= SHAPE_MINIMUM, "{theme} {state:?} is {ratio:.2}:1");
+                }
+            }
+            let disabled = tinted_look(palette, Kind::Ghost, State::Disabled, Some(palette.danger));
+            assert_ne!(
+                disabled.content, palette.danger,
+                "{theme} disabled stays red"
+            );
         }
     }
 

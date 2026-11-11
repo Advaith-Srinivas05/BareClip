@@ -426,6 +426,10 @@ mod captions;
 mod library;
 #[path = "looks.rs"]
 mod looks;
+#[path = "recording.rs"]
+mod recording;
+#[path = "screen_recording.rs"]
+mod screen_recording;
 #[path = "titles.rs"]
 mod titles;
 use looks::LookPictures;
@@ -581,6 +585,23 @@ pub struct Editor {
     auto_save_held: bool,
     /// Recovery copies from runs that never closed properly, waiting to be offered.
     recovery_offers: Vec<PathBuf>,
+    /// Recordings that runs didn't stop, waiting to be offered.
+    cut_short: Vec<storage::CutShort>,
+    /// The recording bar, while it is open.
+    record_bar: Option<recording::RecordBar>,
+    /// Where the picture's area was last drawn, which the recording bar floats over.
+    stage_rect: egui::Rect,
+    /// How microphones are found and opened, which tests replace with made-up sound.
+    open_microphone: recording::OpenMicrophone,
+    list_microphones: recording::ListMicrophones,
+    /// The screen recording bar, while it is open, and how screens and the PC's sound are opened,
+    /// which tests replace too.
+    screen_bar: Option<screen_recording::ScreenBar>,
+    open_screen: screen_recording::OpenScreen,
+    open_pc_sound: screen_recording::OpenPcSound,
+    list_sources: screen_recording::ListSources,
+    /// How a folder to save recordings in is picked, which tests replace too.
+    pick_folder: recording::PickFolder,
     /// Files from "Edit with BareClip", waiting for any dialog that decides what the project is.
     waiting_edits: Vec<PathBuf>,
     /// Videos ticked in the panel, in the order they were ticked.
@@ -781,6 +802,16 @@ impl Editor {
             auto_save_failed: None,
             auto_save_held: false,
             recovery_offers: Vec::new(),
+            cut_short: Vec::new(),
+            record_bar: None,
+            stage_rect: egui::Rect::NOTHING,
+            open_microphone: recording::open_real_microphone,
+            list_microphones: bareclip_audio::microphones,
+            screen_bar: None,
+            open_screen: screen_recording::open_real_screen,
+            open_pc_sound: screen_recording::open_real_pc_sound,
+            list_sources: screen_recording::list_real_sources,
+            pick_folder: recording::pick_real_folder,
             waiting_edits: Vec::new(),
             selected_media: Vec::new(),
             media_panel_open: true,
@@ -837,6 +868,7 @@ impl Editor {
         ctx.set_theme(egui::ThemePreference::from(self.settings.theme));
         self.mode = self.settings.export_cuts.into();
         self.recovery_offers = storage::orphaned_recoveries(&folder);
+        self.cut_short = storage::cut_short_recordings(&folder);
         match Recovery::start(&folder) {
             Ok(recovery) => self.recovery = Some(recovery),
             Err(error) => {
@@ -1298,6 +1330,22 @@ impl Editor {
         if self.closing {
             return;
         }
+        // A recording is finished and added first, so it is in the project the save question
+        // asks about.
+        if self
+            .record_bar
+            .as_ref()
+            .is_some_and(recording::RecordBar::is_recording)
+        {
+            self.stop_recording(ctx);
+        }
+        if self
+            .screen_bar
+            .as_ref()
+            .is_some_and(screen_recording::ScreenBar::is_recording)
+        {
+            self.stop_screen_recording(ctx);
+        }
         self.flush_auto_save();
         if self.has_unsaved_changes() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1436,6 +1484,8 @@ impl Editor {
 
     fn take_waiting_edits(&mut self, ctx: &egui::Context) {
         let deciding = self.leave_for.is_some()
+            || self.record_bar.is_some()
+            || self.screen_bar.is_some()
             || self.missing_videos.is_some()
             || !self.recovery_offers.is_empty()
             || !matches!(self.export_state, ExportState::Closed);
@@ -2152,7 +2202,7 @@ impl Editor {
     /// forgets what nothing needs any more. Pictures carry on from where they had got to, and are
     /// always wanted.
     fn apply_strip_settings(&mut self, ctx: &egui::Context) {
-        let settings = self.settings;
+        let settings = self.settings.clone();
         for entry in &mut self.media {
             entry.strip_reader = None;
             // An image is its own picture, already in memory, with nothing to read.
@@ -2775,6 +2825,9 @@ impl Editor {
             || !self.recovery_offers.is_empty()
             || self.settings_open
             || self.duration_edit.is_some()
+            || self.record_bar.as_ref().is_some_and(recording::RecordBar::is_recording)
+            || self.screen_bar.as_ref().is_some_and(screen_recording::ScreenBar::is_recording)
+            || !self.cut_short.is_empty()
             // Letters typed into a name are not commands.
             || ctx.egui_wants_keyboard_input();
         if blocked {
@@ -2980,6 +3033,9 @@ impl Editor {
         self.settings_dialog(&ctx, palette);
         self.missing_videos_dialog(&ctx, palette);
         self.recovery_dialog(&ctx, palette);
+        self.record_bar_dialog(&ctx, palette);
+        self.screen_bar_dialog(&ctx, palette);
+        self.cut_short_dialog(&ctx, palette);
         self.unsaved_changes_dialog(&ctx, palette);
         drop_overlay(&ctx, palette);
         window_edges(&ctx);
@@ -3224,6 +3280,9 @@ impl Editor {
                     changed |= self.gpu_setting(ui, palette);
                     ui.add_space(SETTINGS_ROW_GAP);
                 }
+
+                changed |= self.recording_settings(ui, palette);
+                ui.add_space(SETTINGS_ROW_GAP);
 
                 components::settings_group(ui, palette, "Waveforms", |ui| {
                     let on_clips = self.settings.waveforms_on_clips;
@@ -3675,6 +3734,7 @@ impl Editor {
             .show(ui, |ui| {
                 for (tab, icon, name) in [
                     (LeftPanel::Media, &icons::FILM, "My media"),
+                    (LeftPanel::Record, &icons::CIRCLE_DOT, "Record"),
                     (LeftPanel::Library, &icons::LIBRARY_BIG, "Content library"),
                     (LeftPanel::Text, &icons::TYPE, "Text"),
                     (LeftPanel::Transitions, &icons::BLEND, "Transitions"),
@@ -3717,6 +3777,7 @@ impl Editor {
                 ui.horizontal(|ui| {
                     let heading = match self.left_panel {
                         LeftPanel::Media => "My media",
+                        LeftPanel::Record => "Record",
                         LeftPanel::Library => "Content library",
                         LeftPanel::Text => "Text",
                         LeftPanel::Transitions => "Transitions",
@@ -3748,6 +3809,10 @@ impl Editor {
                 }
                 if on_library {
                     self.library_panel(ui, palette);
+                    return;
+                }
+                if self.left_panel == LeftPanel::Record {
+                    self.record_panel(ui, palette);
                     return;
                 }
                 let width = ui.available_width();
@@ -4492,6 +4557,7 @@ impl Editor {
             });
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             let rect = ui.available_rect_before_wrap();
+            self.stage_rect = rect;
             self.take_art_dropped_on_picture(ui, palette, rect);
             let canvas = self.canvas_size();
             let played = self.project.tracks.played();
@@ -19147,5 +19213,855 @@ mod tests {
         with_a_title(&ctx, &mut editor, TitleStyle::Rating);
         settle_frames(&ctx, &mut editor, 40);
         camera.shoot(&ctx, &mut editor, vec![], "library-10-rating-stars");
+    }
+
+    /// Stands in for a microphone: a quiet tone, arriving in real time, until the bar lets go.
+    fn made_up_microphone(_name: Option<&str>) -> Result<recording::MicSource, String> {
+        struct StopFeeding(Arc<AtomicBool>);
+        impl Drop for StopFeeding {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        const RATE: u32 = 44_100;
+        let (mut producer, queue) = rtrb::RingBuffer::new(RATE as usize * 8);
+        let level = Arc::new(bareclip_audio::Level::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let (feeding, heard) = (stop.clone(), level.clone());
+        thread::spawn(move || {
+            let mut frame = 0_u64;
+            let started = Instant::now();
+            while !feeding.load(Ordering::Acquire) {
+                let due = (started.elapsed().as_secs_f64() * f64::from(RATE)) as u64;
+                let mut block = Vec::new();
+                while frame < due {
+                    let sample = (frame as f32 * 0.06).sin() * 0.25;
+                    block.extend([sample, sample]);
+                    frame += 1;
+                }
+                heard.note(&block);
+                for sample in block {
+                    let _ = producer.push(sample);
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        Ok(recording::MicSource {
+            queue: Some(queue),
+            rate: RATE,
+            level,
+            _keep: Box::new(StopFeeding(stop)),
+        })
+    }
+
+    fn no_microphone(_name: Option<&str>) -> Result<recording::MicSource, String> {
+        Err("No microphone was found.".to_owned())
+    }
+
+    fn made_up_microphones() -> Vec<bareclip_audio::Microphone> {
+        ["Desk microphone", "Headset microphone"]
+            .iter()
+            .enumerate()
+            .map(|(index, name)| bareclip_audio::Microphone {
+                name: (*name).to_owned(),
+                is_default: index == 0,
+            })
+            .collect()
+    }
+
+    /// An editor with a video whose recordings go to a folder of their own and come from a
+    /// made-up microphone, with no countdown and the video kept still.
+    fn ready_to_record(ctx: &egui::Context, name: &str) -> (Editor, PathBuf) {
+        let mut editor = with_videos(ctx, &[test_clip()]);
+        let folder = std::env::temp_dir()
+            .join("bareclip-app-recordings")
+            .join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        editor.settings.recordings_folder = Some(folder.clone());
+        editor.settings.countdown = false;
+        editor.settings.play_while_recording = false;
+        editor.open_microphone = made_up_microphone;
+        editor.list_microphones = made_up_microphones;
+        run_frame(ctx, &mut editor, vec![]);
+        (editor, folder)
+    }
+
+    /// Runs frames for about this long, as the bar would be watched.
+    fn run_for(ctx: &egui::Context, editor: &mut Editor, seconds: f64) {
+        let started = Instant::now();
+        while started.elapsed().as_secs_f64() < seconds {
+            run_frame(ctx, editor, vec![]);
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn open_record_bar_by_hand(ctx: &egui::Context, editor: &mut Editor) {
+        // Pressing Record again would close the panel.
+        if !is_named(ctx, editor, "Microphone") {
+            click_named(ctx, editor, "Record");
+            run_frame(ctx, editor, vec![]);
+        }
+        click_named(ctx, editor, "Microphone");
+        for _ in 0..3 {
+            run_frame(ctx, editor, vec![]);
+        }
+    }
+
+    fn recorded_files(folder: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(folder)
+            .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_microphone_recording_lands_at_the_playhead_on_a_new_row_as_one_undo_step() {
+        let ctx = context();
+        let (mut editor, folder) = ready_to_record(&ctx, "lands");
+        let rows_before = editor.project.tracks.tracks().len();
+        let tracks_before = editor.project.tracks.clone();
+        editor.seek(Ticks::from_seconds(1.0));
+        run_frame(&ctx, &mut editor, vec![]);
+
+        open_record_bar_by_hand(&ctx, &mut editor);
+        assert!(editor.record_bar.is_some());
+        assert!(is_named(&ctx, &mut editor, "Microphone: Desk microphone"));
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 1.5);
+        assert!(is_named(&ctx, &mut editor, "Pause recording"));
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert!(editor.record_bar.is_none());
+        let files = recorded_files(&folder);
+        assert_eq!(files.len(), 1);
+        let name = files[0].file_name().expect("named").to_string_lossy();
+        assert!(
+            name.starts_with("Microphone ") && name.ends_with(".m4a"),
+            "{name}"
+        );
+
+        let entry = editor.media.last().expect("it is in My media");
+        assert!(entry.info.is_sound_only());
+        let id = editor.selected.expect("the new clip is selected");
+        let clip = editor
+            .project
+            .tracks
+            .clip(id)
+            .expect("it is on the timeline");
+        assert_eq!(clip.media, entry.id);
+        assert_eq!(clip.start, Ticks::from_seconds(1.0));
+        let row = editor.project.tracks.track_of(id).expect("on a row");
+        assert!(editor.project.tracks.is_sound_row(row));
+        assert_eq!(editor.project.tracks.tracks().len(), rows_before + 1);
+        let seconds = clip.duration().as_seconds();
+        assert!(seconds > 1.0 && seconds < 2.5, "{seconds}");
+
+        editor.undo();
+        assert_eq!(
+            editor.project.tracks, tracks_before,
+            "one step, and nothing moved"
+        );
+    }
+
+    #[test]
+    fn recording_with_the_video_playing_lands_where_the_video_was_when_it_began() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record(&ctx, "play-along");
+        editor.settings.play_while_recording = true;
+        editor.seek(Ticks::from_seconds(0.5));
+        run_frame(&ctx, &mut editor, vec![]);
+        open_record_bar_by_hand(&ctx, &mut editor);
+        assert!(is_named(
+            &ctx,
+            &mut editor,
+            "Play the video while recording"
+        ));
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 1.2);
+
+        assert!(editor.preview.is_playing());
+        assert!(
+            !is_named(&ctx, &mut editor, "Pause recording"),
+            "pausing would lose step"
+        );
+        let lands = match editor.record_bar.as_ref().map(|bar| &bar.stage) {
+            Some(recording::BarStage::Recording(live)) => live.lands_at(),
+            _ => panic!("it is recording"),
+        };
+        assert!(
+            lands >= Ticks::from_seconds(0.5) && lands < Ticks::from_seconds(1.0),
+            "{lands:?}"
+        );
+        // The video under the playhead has moved on as long as the recording has run.
+        let recorded = match editor.record_bar.as_ref().map(|bar| &bar.stage) {
+            Some(recording::BarStage::Recording(live)) => live.seconds(),
+            _ => 0.0,
+        };
+        let moved = (editor.position().0 - lands.0) as f64 / Ticks::from_seconds(1.0).0 as f64;
+        assert!(
+            (moved - recorded).abs() < 0.15,
+            "{moved} against {recorded}"
+        );
+
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(!editor.preview.is_playing(), "stopping stops the video too");
+        let id = editor.selected.expect("the recording is selected");
+        assert_eq!(editor.project.tracks.clip(id).expect("placed").start, lands);
+    }
+
+    #[test]
+    fn pausing_leaves_the_paused_stretch_out() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record(&ctx, "paused");
+        open_record_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.8);
+        click_named(&ctx, &mut editor, "Pause recording");
+        run_for(&ctx, &mut editor, 1.5);
+        assert!(is_named(&ctx, &mut editor, "Resume recording"));
+        click_named(&ctx, &mut editor, "Resume recording");
+        run_for(&ctx, &mut editor, 0.8);
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let id = editor.selected.expect("the new clip is selected");
+        let seconds = editor
+            .project
+            .tracks
+            .clip(id)
+            .expect("on the timeline")
+            .duration()
+            .as_seconds();
+        assert!(seconds > 1.2 && seconds < 2.4, "{seconds}");
+    }
+
+    #[test]
+    fn the_countdown_comes_before_the_recording() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record(&ctx, "countdown");
+        editor.settings.countdown = true;
+        open_record_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Start recording");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(matches!(
+            editor.record_bar.as_ref().map(|bar| &bar.stage),
+            Some(recording::BarStage::Counting(_))
+        ));
+        assert!(!is_named(&ctx, &mut editor, "Stop"));
+
+        // Rather than wait three seconds, the countdown is let run out.
+        if let Some(bar) = &mut editor.record_bar {
+            bar.stage = recording::BarStage::Counting(0.0);
+        }
+        run_frame(&ctx, &mut editor, vec![]);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(is_named(&ctx, &mut editor, "Stop"));
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.record_bar.is_none());
+    }
+
+    #[test]
+    fn escape_closes_the_bar_only_before_recording() {
+        let ctx = context();
+        let (mut editor, folder) = ready_to_record(&ctx, "escape");
+        open_record_bar_by_hand(&ctx, &mut editor);
+        run_frame(&ctx, &mut editor, key_event(Key::Escape, Modifiers::NONE));
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.record_bar.is_none());
+        assert!(recorded_files(&folder).is_empty(), "nothing was recorded");
+
+        open_record_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.3);
+        run_frame(&ctx, &mut editor, key_event(Key::Escape, Modifiers::NONE));
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.record_bar.is_some(), "a recording isn't thrown away");
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+    }
+
+    #[test]
+    fn a_missing_microphone_says_so_and_cant_start() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record(&ctx, "missing");
+        editor.open_microphone = no_microphone;
+        open_record_bar_by_hand(&ctx, &mut editor);
+        assert!(
+            editor
+                .record_bar
+                .as_ref()
+                .is_some_and(|bar| bar.problem().is_some())
+        );
+        let disabled = named_nodes(&ctx, &mut editor)
+            .into_iter()
+            .find(|(label, ..)| label == "Start recording")
+            .map(|(.., disabled)| disabled)
+            .expect("the button is there");
+        assert!(disabled);
+    }
+
+    #[test]
+    fn choosing_a_microphone_is_remembered() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record(&ctx, "choose");
+        open_record_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Microphone: Desk microphone");
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Headset microphone");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(
+            editor.settings.microphone.as_deref(),
+            Some("Headset microphone")
+        );
+        assert!(is_named(
+            &ctx,
+            &mut editor,
+            "Microphone: Headset microphone"
+        ));
+    }
+
+    #[test]
+    fn closing_the_window_while_recording_keeps_the_recording_in_the_project() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record(&ctx, "closing");
+        open_record_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.6);
+        editor.handle_close_request(&ctx);
+        assert!(editor.record_bar.is_none());
+        let id = editor.selected.expect("the recording is selected");
+        assert!(editor.project.tracks.clip(id).is_some());
+        assert!(
+            editor.leave_for.is_some(),
+            "it asks about saving the project"
+        );
+    }
+
+    #[test]
+    fn a_recording_cut_short_is_offered_and_added() {
+        let ctx = context();
+        let (mut editor, folder) = ready_to_record(&ctx, "cut-short");
+        // A real recording to offer, made the same way.
+        open_record_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.6);
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+        editor.undo();
+        let file = recorded_files(&folder).pop().expect("a file");
+        let marker = folder.join("marker.recording");
+        std::fs::write(&marker, file.to_string_lossy().as_bytes()).expect("written");
+        editor.cut_short = vec![storage::CutShort {
+            marker: marker.clone(),
+            file: file.clone(),
+        }];
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(is_named(&ctx, &mut editor, "Add to project"));
+        click_named(&ctx, &mut editor, "Add to project");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.cut_short.is_empty());
+        assert!(!marker.exists());
+        let id = editor.selected.expect("it was added");
+        let clip = editor.project.tracks.clip(id).expect("on the timeline");
+        assert_eq!(
+            editor
+                .entry(clip.media)
+                .map(|entry| entry.info.path.clone()),
+            Some(file)
+        );
+    }
+
+    #[test]
+    #[ignore = "draws pictures to look at rather than checking anything"]
+    fn draw_the_record_screens() {
+        let folder = std::env::var_os("BARECLIP_SCREENS").map_or_else(
+            || std::env::temp_dir().join("bareclip-screens"),
+            PathBuf::from,
+        );
+        let ctx = context();
+        let mut camera = Camera::new(folder);
+        let (mut editor, _) = ready_to_record(&ctx, "screens");
+        editor.settings.play_while_recording = true;
+        for _ in 0..30 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        click_named(&ctx, &mut editor, "Record");
+        for _ in 0..12 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "record-01-panel");
+        open_record_bar_by_hand(&ctx, &mut editor);
+        run_for(&ctx, &mut editor, 0.4);
+        camera.shoot(&ctx, &mut editor, vec![], "record-02-bar");
+        editor.settings.countdown = true;
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.3);
+        camera.shoot(&ctx, &mut editor, vec![], "record-03-countdown");
+        if let Some(bar) = &mut editor.record_bar {
+            bar.stage = recording::BarStage::Counting(0.0);
+        }
+        run_for(&ctx, &mut editor, 1.2);
+        camera.shoot(&ctx, &mut editor, vec![], "record-04-recording");
+        click_named(&ctx, &mut editor, "Stop");
+        for _ in 0..12 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "record-06-added");
+        editor.settings_open = true;
+        for _ in 0..12 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "record-07-settings");
+        editor.settings_open = false;
+        editor.open_screen = made_up_screen;
+        editor.open_pc_sound = made_up_pc_sound;
+        editor.list_sources = made_up_sources;
+        editor.settings.countdown = false;
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        run_for(&ctx, &mut editor, 0.5);
+        camera.shoot(&ctx, &mut editor, vec![], "record-08-screen-bar");
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.8);
+        camera.shoot(&ctx, &mut editor, vec![], "record-09-screen-recording");
+        click_named(&ctx, &mut editor, "Show only Pause and Stop");
+        run_for(&ctx, &mut editor, 0.3);
+        camera.shoot(&ctx, &mut editor, vec![], "record-10-screen-folded");
+        click_named(&ctx, &mut editor, "Stop");
+        run_for(&ctx, &mut editor, 0.3);
+        // Pictures still arriving from the video leave texture changes nobody will draw.
+        KEPT_TEXTURES.with_borrow_mut(|kept| {
+            for delta in kept.iter_mut().flatten() {
+                delta.clear();
+            }
+            *kept = None;
+        });
+    }
+
+    /// Stands in for the screen: a picture that changes colour every so often.
+    struct MadeUpScreen {
+        started: Instant,
+    }
+
+    impl bareclip_capture::PictureSource for MadeUpScreen {
+        fn latest(&self) -> Option<(bareclip_capture::Picture, u64)> {
+            let tick = (self.started.elapsed().as_millis() / 250) as u64;
+            let shade = (tick * 40 % 200) as u8;
+            Some((
+                bareclip_capture::Picture {
+                    width: 640,
+                    height: 360,
+                    bgra: [shade, 80, 200, 255].repeat(640 * 360),
+                    shown_at: 0,
+                },
+                tick + 1,
+            ))
+        }
+
+        fn size(&self) -> (u32, u32) {
+            (640, 360)
+        }
+    }
+
+    fn made_up_screen(
+        _source: bareclip_capture::Source,
+        _pointer: bool,
+    ) -> Result<Box<dyn bareclip_capture::PictureSource>, String> {
+        Ok(Box::new(MadeUpScreen {
+            started: Instant::now(),
+        }))
+    }
+
+    fn made_up_pc_sound() -> Result<recording::MicSource, String> {
+        made_up_microphone(None)
+    }
+
+    fn made_up_sources() -> Vec<bareclip_capture::Offered> {
+        vec![
+            bareclip_capture::Offered {
+                source: bareclip_capture::Source::Screen(1),
+                name: "Screen 1 (main), 640 x 360".to_owned(),
+                size: (640, 360),
+                is_main: true,
+            },
+            bareclip_capture::Offered {
+                source: bareclip_capture::Source::Window(2),
+                name: "A game".to_owned(),
+                size: (640, 360),
+                is_main: false,
+            },
+        ]
+    }
+
+    /// An editor ready to record a made-up screen with made-up PC sound and no microphone.
+    fn ready_to_record_the_screen(ctx: &egui::Context, name: &str) -> (Editor, PathBuf) {
+        let (mut editor, folder) = ready_to_record(ctx, name);
+        editor.open_screen = made_up_screen;
+        editor.open_pc_sound = made_up_pc_sound;
+        editor.list_sources = made_up_sources;
+        editor.settings.screen_pc_sound = true;
+        editor.settings.screen_microphone = false;
+        (editor, folder)
+    }
+
+    fn open_screen_bar_by_hand(ctx: &egui::Context, editor: &mut Editor) {
+        if !is_named(ctx, editor, "Screen") {
+            click_named(ctx, editor, "Record");
+            run_frame(ctx, editor, vec![]);
+        }
+        click_named(ctx, editor, "Screen");
+        for _ in 0..3 {
+            run_frame(ctx, editor, vec![]);
+        }
+    }
+
+    #[test]
+    fn a_screen_recording_lands_as_a_video_at_the_playhead_on_a_new_top_row() {
+        let ctx = context();
+        let (mut editor, folder) = ready_to_record_the_screen(&ctx, "screen-lands");
+        let tracks_before = editor.project.tracks.clone();
+        editor.seek(Ticks::from_seconds(1.0));
+        run_frame(&ctx, &mut editor, vec![]);
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        assert!(editor.screen_bar.is_some());
+        assert!(is_named(
+            &ctx,
+            &mut editor,
+            "Record: Screen 1 (main), 640 x 360"
+        ));
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 1.5);
+        assert!(is_named(&ctx, &mut editor, "Pause recording"));
+        assert!(
+            is_named(&ctx, &mut editor, "Turn the microphone on"),
+            "the microphone was switched off, so it starts silenced"
+        );
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert!(editor.screen_bar.is_none());
+        let files = recorded_files(&folder);
+        assert_eq!(files.len(), 1);
+        let name = files[0].file_name().expect("named").to_string_lossy();
+        assert!(
+            name.starts_with("Screen ") && name.ends_with(".mp4"),
+            "{name}"
+        );
+        let info = bareclip_media::probe(&files[0]).expect("it can be read");
+        assert_eq!((info.video.width, info.video.height), (640, 360));
+        let titles: Vec<_> = info
+            .audio
+            .iter()
+            .map(|track| track.title.as_deref())
+            .collect();
+        assert_eq!(titles, [Some("PC sound"), Some("Microphone")]);
+
+        let id = editor.selected.expect("the recording is selected");
+        let clip = editor.project.tracks.clip(id).expect("on the timeline");
+        assert_eq!(clip.start, Ticks::from_seconds(1.0));
+        assert_eq!(
+            editor.project.tracks.track_of(id),
+            Some(0),
+            "a new row on top"
+        );
+        let seconds = clip.duration().as_seconds();
+        assert!(seconds > 1.0 && seconds < 2.3, "{seconds}");
+        editor.undo();
+        assert_eq!(
+            editor.project.tracks, tracks_before,
+            "one step, and nothing moved"
+        );
+    }
+
+    #[test]
+    fn a_window_can_be_chosen_instead_of_the_screen() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record_the_screen(&ctx, "screen-window");
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Record: Screen 1 (main), 640 x 360");
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "A game");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(is_named(&ctx, &mut editor, "Record: A game"));
+    }
+
+    #[test]
+    fn pausing_a_screen_recording_from_its_overlay_leaves_the_stretch_out() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record_the_screen(&ctx, "screen-paused");
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.8);
+        click_named(&ctx, &mut editor, "Pause recording");
+        run_for(&ctx, &mut editor, 1.2);
+        assert!(is_named(&ctx, &mut editor, "Resume recording"));
+        click_named(&ctx, &mut editor, "Resume recording");
+        run_for(&ctx, &mut editor, 0.8);
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+        let id = editor.selected.expect("the recording is selected");
+        let seconds = editor
+            .project
+            .tracks
+            .clip(id)
+            .expect("on the timeline")
+            .duration()
+            .as_seconds();
+        assert!(seconds > 1.2 && seconds < 2.4, "{seconds}");
+    }
+
+    #[test]
+    fn closing_the_window_while_recording_the_screen_keeps_it() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record_the_screen(&ctx, "screen-closing");
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.6);
+        editor.handle_close_request(&ctx);
+        assert!(editor.screen_bar.is_none());
+        let id = editor.selected.expect("the recording is selected");
+        assert!(editor.project.tracks.clip(id).is_some());
+    }
+
+    /// How loud a recording is between two moments, from 0 to 1 against its loudest.
+    fn loudness_between(path: &Path, from: f64, to: f64) -> f32 {
+        let shape = bareclip_media::read_sound_shape(path, &AtomicBool::new(false), |_| {})
+            .expect("the sound can be read")
+            .expect("not cancelled");
+        shape.peak_between(Ticks::from_seconds(from), Ticks::from_seconds(to))
+    }
+
+    #[test]
+    fn turning_the_microphone_on_midway_is_heard_from_then_on() {
+        let ctx = context();
+        let (mut editor, folder) = ready_to_record_the_screen(&ctx, "screen-mic-midway");
+        editor.settings.screen_pc_sound = false;
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 1.0);
+        click_named(&ctx, &mut editor, "Turn the microphone on");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(is_named(&ctx, &mut editor, "Turn the microphone off"));
+        run_for(&ctx, &mut editor, 1.0);
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let file = recorded_files(&folder).pop().expect("a file");
+        let info = bareclip_media::probe(&file).expect("it can be read");
+        assert_eq!(info.audio.len(), 1);
+        let silent = loudness_between(&file, 0.1, 0.7);
+        let heard = loudness_between(&file, 1.4, 1.8);
+        assert!(silent < 0.05, "{silent} before it was turned on");
+        assert!(heard > 0.5, "{heard} after it was turned on");
+    }
+
+    #[test]
+    fn turning_the_microphone_off_midway_silences_it() {
+        let ctx = context();
+        let (mut editor, folder) = ready_to_record_the_screen(&ctx, "screen-mic-off");
+        editor.settings.screen_pc_sound = false;
+        editor.settings.screen_microphone = true;
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 1.0);
+        click_named(&ctx, &mut editor, "Turn the microphone off");
+        run_for(&ctx, &mut editor, 1.0);
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let file = recorded_files(&folder).pop().expect("a file");
+        let heard = loudness_between(&file, 0.2, 0.7);
+        let silent = loudness_between(&file, 1.4, 1.8);
+        assert!(heard > 0.5, "{heard} while on");
+        assert!(silent < 0.05, "{silent} once turned off");
+    }
+
+    #[test]
+    fn without_a_microphone_its_button_is_greyed_out() {
+        let ctx = context();
+        let (mut editor, folder) = ready_to_record_the_screen(&ctx, "screen-no-mic");
+        editor.open_microphone = no_microphone;
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.5);
+        let disabled = named_nodes(&ctx, &mut editor)
+            .into_iter()
+            .filter(|(label, ..)| label == "No microphone")
+            .map(|(.., disabled)| disabled)
+            .collect::<Vec<_>>();
+        assert!(!disabled.is_empty() && disabled.iter().all(|disabled| *disabled));
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+        let file = recorded_files(&folder).pop().expect("a file");
+        let info = bareclip_media::probe(&file).expect("it can be read");
+        assert_eq!(info.audio.len(), 1, "only the PC's sound");
+    }
+
+    /// How many controls have this name, in the bar and the overlay together.
+    fn count_named(ctx: &egui::Context, editor: &mut Editor, name: &str) -> usize {
+        named_nodes(ctx, editor)
+            .iter()
+            .filter(|(label, ..)| label == name)
+            .count()
+    }
+
+    #[test]
+    fn the_overlay_folds_down_to_pause_and_stop_and_back() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record_the_screen(&ctx, "screen-fold");
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.4);
+        // The bar in BareClip's window and the overlay, both with every control.
+        assert_eq!(count_named(&ctx, &mut editor, "Turn the microphone on"), 2);
+        assert_eq!(count_named(&ctx, &mut editor, "Pause recording"), 2);
+        assert!(is_named(&ctx, &mut editor, "Move the recording bar"));
+
+        click_named(&ctx, &mut editor, "Show only Pause and Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(count_named(&ctx, &mut editor, "Turn the microphone on"), 1);
+        assert_eq!(count_named(&ctx, &mut editor, "Pause recording"), 2);
+        assert_eq!(count_named(&ctx, &mut editor, "Stop"), 2);
+        assert!(is_named(&ctx, &mut editor, "Move the recording bar"));
+        // Folded, it still pauses.
+        let pauses: Vec<_> = named_nodes(&ctx, &mut editor)
+            .into_iter()
+            .filter(|(label, ..)| label == "Pause recording")
+            .map(|(_, rect, _)| rect)
+            .collect();
+        let grip = named_rect(&ctx, &mut editor, "Move the recording bar");
+        let overlay_pause = pauses
+            .into_iter()
+            .min_by(|a, b| {
+                (a.center().distance(grip.center())).total_cmp(&b.center().distance(grip.center()))
+            })
+            .expect("a pause button");
+        click(&ctx, &mut editor, overlay_pause.center());
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(count_named(&ctx, &mut editor, "Resume recording"), 2);
+
+        click_named(&ctx, &mut editor, "Show all controls");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(count_named(&ctx, &mut editor, "Turn the microphone on"), 2);
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        // The next recording starts unfolded again.
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.3);
+        assert!(is_named(&ctx, &mut editor, "Show only Pause and Stop"));
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+    }
+
+    #[test]
+    fn the_overlay_is_exactly_as_wide_as_its_controls() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record_the_screen(&ctx, "screen-overlay-size");
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.3);
+        let padding = 2.0 * f32::from(screen_recording::OVERLAY_PADDING);
+        for (fold, folded) in [
+            ("Show only Pause and Stop", false),
+            ("Show all controls", true),
+        ] {
+            let grip = named_rect(&ctx, &mut editor, "Move the recording bar");
+            let end = named_rect(&ctx, &mut editor, fold);
+            let wanted = screen_recording::overlay_size(folded);
+            let width = end.right() - grip.left() + padding;
+            assert!((width - wanted.x).abs() < 0.5, "{width} against {wanted:?}");
+            assert!(grip.height() + padding <= wanted.y + 0.5);
+            click_named(&ctx, &mut editor, fold);
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+    }
+
+    /// Stands in for the folder picker, always picking the same folder.
+    fn picks_another_folder(_from: &Path) -> Option<PathBuf> {
+        Some(
+            std::env::temp_dir()
+                .join("bareclip-app-recordings")
+                .join(format!("browsed-{}", std::process::id())),
+        )
+    }
+
+    #[test]
+    fn browse_saves_one_screen_recording_elsewhere_and_leaves_the_default() {
+        let ctx = context();
+        let (mut editor, folder) = ready_to_record_the_screen(&ctx, "screen-browse");
+        fn picks_screen_folder(from: &Path) -> Option<PathBuf> {
+            picks_another_folder(from).map(|folder| folder.join("screen"))
+        }
+        let browsed = picks_screen_folder(Path::new("")).expect("a folder");
+        let _ = std::fs::remove_dir_all(&browsed);
+        editor.pick_folder = picks_screen_folder;
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Browse");
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.5);
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(recorded_files(&browsed).len(), 1);
+        assert!(recorded_files(&folder).is_empty());
+        assert_eq!(editor.settings.recordings_folder.as_ref(), Some(&folder));
+
+        // The next recording goes back to the default.
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        assert!(
+            editor
+                .screen_bar
+                .as_ref()
+                .is_some_and(|bar| bar.folder.is_none())
+        );
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.3);
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(recorded_files(&folder).len(), 1);
+    }
+
+    #[test]
+    fn browse_saves_one_microphone_recording_elsewhere() {
+        let ctx = context();
+        let (mut editor, folder) = ready_to_record(&ctx, "mic-browse");
+        fn picks_microphone_folder(from: &Path) -> Option<PathBuf> {
+            picks_another_folder(from).map(|folder| folder.join("microphone"))
+        }
+        let browsed = picks_microphone_folder(Path::new("")).expect("a folder");
+        let _ = std::fs::remove_dir_all(&browsed);
+        editor.pick_folder = picks_microphone_folder;
+        open_record_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Browse");
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.5);
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(recorded_files(&browsed).len(), 1);
+        assert!(recorded_files(&folder).is_empty());
+        open_record_bar_by_hand(&ctx, &mut editor);
+        assert!(
+            editor
+                .record_bar
+                .as_ref()
+                .is_some_and(|bar| bar.folder.is_none())
+        );
+    }
+
+    #[test]
+    fn escape_closes_the_screen_bar_before_recording() {
+        let ctx = context();
+        let (mut editor, folder) = ready_to_record_the_screen(&ctx, "screen-escape");
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        run_frame(&ctx, &mut editor, key_event(Key::Escape, Modifiers::NONE));
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.screen_bar.is_none());
+        assert!(recorded_files(&folder).is_empty());
     }
 }

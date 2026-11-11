@@ -91,6 +91,16 @@ pub(crate) fn is_full_range(decoded: &frame::Video) -> bool {
     decoded.color_range() == color::Range::JPEG || decoded.format() == Pixel::YUVJ420P
 }
 
+/// How an MP4 is written so that it can be read at any moment: in pieces of about a second, each
+/// on disk as soon as it is finished.
+pub(crate) fn growing_options() -> ffmpeg::Dictionary<'static> {
+    let mut options = ffmpeg::Dictionary::new();
+    options.set("movflags", "empty_moov+default_base_moof");
+    options.set("frag_duration", "1000000");
+    options.set("flush_packets", "1");
+    options
+}
+
 pub(crate) fn coefficients_of(matrix: ColorMatrix) -> i32 {
     match matrix {
         ColorMatrix::Bt601 => ffi::SWS_CS_ITU601,
@@ -431,9 +441,12 @@ fn quality_options(name: &str, settings: &VideoSettings) -> Dictionary<'static> 
     options
 }
 
+/// `b_frames` lets an encoder that can reorder pictures do so. A growing file has nowhere to say
+/// that reordered pictures start late, so its picture would start a few frames after its sound.
 fn open_video_encoder(
     name: &str,
     settings: &VideoSettings,
+    b_frames: bool,
 ) -> Result<(OpenEncoder, Pixel), ffmpeg::Error> {
     let found = encoder::find_by_name(name).ok_or(ffmpeg::Error::EncoderNotFound)?;
     let offered: Vec<Pixel> = found
@@ -465,7 +478,7 @@ fn open_video_encoder(
     }
     let seconds = f64::from(rate_num) / f64::from(rate_den) * SECONDS_BETWEEN_KEYFRAMES;
     video.set_gop(seconds.round() as u32);
-    video.set_max_b_frames(if name.ends_with("_nvenc") {
+    video.set_max_b_frames(if b_frames && name.ends_with("_nvenc") {
         B_FRAMES as usize
     } else {
         0
@@ -483,9 +496,9 @@ fn open_video_encoder(
 /// Whether an encoder turns a few plain pictures of this size into video. Opening is not enough,
 /// because some open and then fail on their first picture, as Windows' HEVC encoder from the
 /// Store does on this laptop.
-fn encodes(name: &str, settings: &VideoSettings) -> bool {
+fn encodes(name: &str, settings: &VideoSettings, b_frames: bool) -> bool {
     const TRIAL_FRAMES: i64 = 3;
-    let Ok((mut encoder, pixel)) = open_video_encoder(name, settings) else {
+    let Ok((mut encoder, pixel)) = open_video_encoder(name, settings, b_frames) else {
         return false;
     };
     let mut picture = frame::Video::new(pixel, settings.width, settings.height);
@@ -655,6 +668,9 @@ pub struct VideoWriter {
     video_time_base: Rational,
     stream_time_base: Rational,
     sound: Vec<SoundOutput>,
+    /// Written straight to its own name in pieces, as a recording is, so it is kept as far as it
+    /// got if anything goes wrong.
+    growing: bool,
     sound_time_bases: Vec<Rational>,
 }
 
@@ -674,18 +690,43 @@ impl VideoWriter {
         settings: &VideoSettings,
         encoders: &[&str],
     ) -> Result<Self, MediaError> {
+        Self::open(path, settings, encoders, false)
+    }
+
+    /// A video that can be read at any moment while it is written, as a recording needs. It goes
+    /// straight to `path` as an MP4 in pieces of about a second, so a crash keeps everything up to
+    /// about the last second, and a failure part way leaves what was written.
+    pub fn create_growing(path: &Path, settings: &VideoSettings) -> Result<Self, MediaError> {
+        let encoders = match settings.format {
+            VideoFormat::H264 => usable(H264_ENCODERS),
+            VideoFormat::Av1 => usable(AV1_ENCODERS),
+            VideoFormat::Gif => return Err(ffmpeg::Error::EncoderNotFound.into()),
+        };
+        Self::open(path, settings, &encoders, true)
+    }
+
+    fn open(
+        path: &Path,
+        settings: &VideoSettings,
+        encoders: &[&str],
+        growing: bool,
+    ) -> Result<Self, MediaError> {
         crate::init()?;
         let (encoder, encoder_name, pixel) = encoders
             .iter()
-            .filter(|name| encodes(name, settings))
+            .filter(|name| encodes(name, settings, !growing))
             .find_map(|name| {
-                open_video_encoder(name, settings)
+                open_video_encoder(name, settings, !growing)
                     .ok()
                     .map(|(encoder, pixel)| (encoder, (*name).to_owned(), pixel))
             })
             .ok_or(ffmpeg::Error::EncoderNotFound)?;
 
-        let temporary = temporary_path(path);
+        let temporary = if growing {
+            path.to_owned()
+        } else {
+            temporary_path(path)
+        };
         let mut output = format::output(&temporary)?;
         let video_time_base = Rational(settings.frame_rate.1, settings.frame_rate.0);
         {
@@ -702,7 +743,11 @@ impl VideoWriter {
         for (index, label) in settings.sound_tracks.iter().enumerate() {
             sound.push(SoundOutput::add_to(&mut output, index + 1, label)?);
         }
-        output.write_header()?;
+        if growing {
+            output.write_header_with(growing_options())?;
+        } else {
+            output.write_header()?;
+        }
 
         let stream_time_base = output
             .stream(0)
@@ -729,6 +774,7 @@ impl VideoWriter {
             stream_time_base,
             sound,
             sound_time_bases,
+            growing,
         })
     }
 
@@ -882,14 +928,17 @@ impl VideoWriter {
         self.output()?.write_trailer()?;
         // The file has to be closed before it can be moved.
         self.output = None;
-        std::fs::rename(&self.temporary, &self.target)?;
+        if !self.growing {
+            std::fs::rename(&self.temporary, &self.target)?;
+        }
         Ok(())
     }
 }
 
 impl Drop for VideoWriter {
     fn drop(&mut self) {
-        if self.output.take().is_some() {
+        // A growing file keeps what it has, which is the point of it.
+        if self.output.take().is_some() && !self.growing {
             let _ = std::fs::remove_file(&self.temporary);
         }
     }
@@ -974,6 +1023,57 @@ mod tests {
             quality,
             format: VideoFormat::H264,
         }
+    }
+
+    #[test]
+    fn a_growing_video_can_be_read_before_it_is_finished_and_after() {
+        let folder = std::env::temp_dir().join("bareclip-growing-video");
+        std::fs::create_dir_all(&folder).expect("the folder can be made");
+        let settings = VideoSettings {
+            sound_tracks: vec![SoundLabel {
+                title: Some("PC sound".to_owned()),
+                language: None,
+            }],
+            ..settings_at((320, 180), 30, Quality::default())
+        };
+        let write = |path: &Path, finish: bool| {
+            let mut writer = VideoWriter::create_growing(path, &settings).expect("it opens");
+            let mut converter =
+                crate::BgraConverter::new((320, 180), (320, 180)).expect("it converts");
+            let picture = converter
+                .convert(&[40, 90, 200, 255].repeat(320 * 180), 320 * 4)
+                .expect("it converts");
+            for _ in 0..90 {
+                writer.write_picture(&picture.view()).expect("written");
+                writer
+                    .write_sound(0, &[0.1; SOUND_RATE as usize / 30 * SOUND_CHANNELS])
+                    .expect("written");
+            }
+            if finish {
+                writer.finish().expect("it finishes");
+            } else {
+                // As if the program stopped here, with nothing tidied up.
+                std::mem::forget(writer);
+            }
+        };
+
+        let cut_short = folder.join(format!("cut-short-{}.mp4", std::process::id()));
+        write(&cut_short, false);
+        let info = crate::probe(&cut_short).expect("it can be read while unfinished");
+        let seconds = info.duration.as_seconds();
+        assert!(seconds > 1.9 && seconds <= 3.05, "{seconds}");
+        assert_eq!(info.audio.len(), 1);
+
+        let finished = folder.join(format!("finished-{}.mp4", std::process::id()));
+        write(&finished, true);
+        let info = crate::probe(&finished).expect("it can be read");
+        let seconds = info.duration.as_seconds();
+        assert!((seconds - 3.0).abs() < 0.05, "{seconds}");
+        assert!(
+            !folder
+                .join(format!("finished-{}.mp4.part", std::process::id()))
+                .exists()
+        );
     }
 
     fn av1_settings(quality: Quality) -> VideoSettings {

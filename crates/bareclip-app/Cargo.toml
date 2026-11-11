@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 bareclip-audio.workspace = true
+bareclip-capture.workspace = true
 bareclip-core.workspace = true
 bareclip-export.workspace = true
 bareclip-media.workspace = true
@@ -18,6 +19,7 @@ bareclip-render.workspace = true
 bareclip-text.workspace = true
 eframe.workspace = true
 rfd.workspace = true
+rtrb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 shadcn-egui-core.workspace = true
