@@ -489,6 +489,7 @@ version = "1.0.0"
 dependencies = [
  "bareclip-core",
  "cosmic-text",
+ "zeno",
 ]
 
 [[package]]

@@ -36,9 +36,14 @@ impl TimeRange {
 
     /// The stretch a new title starts on.
     pub fn new_title() -> Self {
+        Self::new_still_lasting(Ticks(TITLE_CLIP_SECONDS * TICKS_PER_SECOND))
+    }
+
+    /// The stretch a new title or drawn item lasting this long starts on.
+    pub fn new_still_lasting(length: Ticks) -> Self {
         Self {
             start: Ticks(STILL_START),
-            end: Ticks(STILL_START + TITLE_CLIP_SECONDS * TICKS_PER_SECOND),
+            end: Ticks(STILL_START + length.0.max(1)),
         }
     }
 }

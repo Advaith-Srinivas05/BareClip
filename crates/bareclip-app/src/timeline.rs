@@ -1,6 +1,7 @@
 //! Converts between timeline time and screen position, and draws the timeline.
 
 use bareclip_core::{
+    art::ArtKind,
     effects::TransitionKind,
     speed::Speed,
     time::{Ticks, format_timecode},
@@ -202,6 +203,8 @@ pub struct ClipView {
     pub is_still: bool,
     /// Whether it shows a title.
     pub is_title: bool,
+    /// What kind of thing from the Content library that title is, if it is one.
+    pub art: Option<ArtKind>,
     /// Its picture's full size, if it has one and it is known.
     pub size: Option<(u32, u32)>,
     pub speed: Speed,
@@ -412,6 +415,8 @@ pub struct MediaDrag {
     pub sound_only: bool,
     /// A style being dragged from the Text panel, which makes a new title where it lands.
     pub title: Option<TitleStyle>,
+    /// Something from the Content library, by its key, which is added where it lands.
+    pub art: Option<&'static str>,
 }
 
 /// The part of a clip under the pointer.
@@ -923,6 +928,8 @@ pub struct TimelineEvents {
     pub add_text: bool,
     /// A style from the Text panel was dropped here.
     pub drop_title: Option<(TitleStyle, Ticks, TrackTarget)>,
+    /// Something from the Content library was dropped here.
+    pub drop_art: Option<(&'static str, Ticks, TrackTarget)>,
     /// A transition from its panel was dropped on a join.
     pub drop_transition: Option<(ClipId, TransitionKind)>,
     /// A transition from its panel was dropped away from any join.
@@ -1318,7 +1325,9 @@ fn draw_clip(
     (face, scale): (Option<&ClipFace>, &TimeScale),
     look: ClipLook,
 ) {
-    let fill = if clip.is_title {
+    let fill = if clip.art.is_some() {
+        palette.clip_shape
+    } else if clip.is_title {
         palette.clip_overlay
     } else if clip.sound_only {
         palette.clip_audio
@@ -1449,7 +1458,9 @@ fn draw_clip_name(
                 pos2(text_left + CLIP_ICON_SIZE / 2.0, label.center().y),
                 CLIP_ICON_SIZE,
             ),
-            if clip.is_title {
+            if clip.art.is_some() {
+                &icons::SHAPES
+            } else if clip.is_title {
                 &icons::TYPE
             } else if clip.sound_only {
                 &icons::MUSIC
@@ -1726,13 +1737,19 @@ fn clip_flyouts(
             });
         if let Some(arrange) = arrange {
             let mut crop = false;
-            beside = beside.or(flyout_item(
+            let mut further = None;
+            let shown = flyout_item(
                 ui,
                 (palette, icons::SCALING, "Arrange"),
                 MenuFlyout::Arrange,
                 flyouts,
-                |ui| crop = stage::arrange_menu(ui, palette, &arrange, under_playhead, changes),
-            ));
+                |ui| {
+                    (crop, further) =
+                        stage::arrange_menu(ui, palette, &arrange, under_playhead, changes);
+                },
+            );
+            // A click on a side menu of Arrange counts as inside the menu.
+            beside = beside.or(shown.map(|rect| further.map_or(rect, |more| rect.union(more))));
             if crop {
                 *action = Some(MenuAction::Crop(clip.id));
             }
@@ -1872,37 +1889,12 @@ fn timeline_menu(
                 );
                 if !clip.sound_only {
                     ui.separator();
-                    let mut panel =
-                        |ui: &mut egui::Ui, icon, name, tab, flyouts: &mut MenuFlyouts| {
-                            let line = ui.add(MenuItem::new(palette, icon, name, ""));
-                            if plain_line(line, flyouts) {
-                                action = Some(MenuAction::OpenPanel(id, tab));
-                            }
-                        };
-                    if !clip.is_title {
-                        panel(
-                            ui,
-                            icons::APERTURE,
-                            "Filters",
-                            stage::LookTab::Filters,
-                            flyouts,
-                        );
-                        panel(
-                            ui,
-                            icons::SPARKLES,
-                            "Effects",
-                            stage::LookTab::Effects,
-                            flyouts,
-                        );
+                    for (icon, name, tab) in menu_tools(clip.is_title, clip.art) {
+                        let line = ui.add(MenuItem::new(palette, icon, name, ""));
+                        if plain_line(line, flyouts) {
+                            action = Some(MenuAction::OpenPanel(id, tab));
+                        }
                     }
-                    panel(
-                        ui,
-                        icons::SWATCH_BOOK,
-                        "Adjust colours",
-                        stage::LookTab::Colours,
-                        flyouts,
-                    );
-                    panel(ui, icons::CONTRAST, "Fade", stage::LookTab::Fade, flyouts);
                 }
             }
         }
@@ -1924,6 +1916,28 @@ fn timeline_menu(
     }
     flyouts.rect = beside;
     (action, beside)
+}
+
+/// The tools a clip's menu opens in the right-hand panel, the same ones its rail shows.
+pub(crate) fn menu_tools(
+    is_title: bool,
+    art: Option<ArtKind>,
+) -> Vec<(icons::Icon, &'static str, stage::LookTab)> {
+    use stage::LookTab;
+    let shape = (icons::SHAPES, "Shape", LookTab::Shape);
+    let animate = (icons::WAND_SPARKLES, "Animate", LookTab::Animate);
+    let filters = (icons::APERTURE, "Filters", LookTab::Filters);
+    let effects = (icons::SPARKLES, "Effects", LookTab::Effects);
+    let colours = (icons::SWATCH_BOOK, "Adjust colours", LookTab::Colours);
+    let fade = (icons::CONTRAST, "Fade", LookTab::Fade);
+    match art {
+        Some(ArtKind::Shape) => vec![shape, animate, effects, colours],
+        Some(ArtKind::Annotation | ArtKind::Frame) => vec![filters, effects, colours, fade],
+        Some(ArtKind::Overlay) => vec![effects, colours, fade],
+        Some(ArtKind::Background) => vec![shape, filters, effects, colours, fade],
+        None if is_title => vec![colours, fade],
+        None => vec![filters, effects, colours, fade],
+    }
 }
 
 /// Draws the scrollbar, which shows how much of the whole timeline is in view.
@@ -2588,9 +2602,10 @@ pub fn timeline(
         dragged_pointer,
     ) {
         let place = (drop_at(&drag, time), layout.target_at(pointer.y));
-        match drag.title {
-            Some(style) => events.drop_title = Some((style, place.0, place.1)),
-            None => events.drop_media = Some((drag.media, place.0, place.1)),
+        match (drag.title, drag.art) {
+            (Some(style), _) => events.drop_title = Some((style, place.0, place.1)),
+            (None, Some(key)) => events.drop_art = Some((key, place.0, place.1)),
+            (None, None) => events.drop_media = Some((drag.media, place.0, place.1)),
         }
     }
 
@@ -2900,6 +2915,7 @@ mod tests {
             shows_waveform: false,
             is_still: false,
             is_title: false,
+            art: None,
             size: None,
             speed: Speed::default(),
             fade_in: Ticks(0),

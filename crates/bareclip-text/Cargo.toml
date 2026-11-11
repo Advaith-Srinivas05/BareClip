@@ -8,3 +8,4 @@ publish.workspace = true
 [dependencies]
 bareclip-core.workspace = true
 cosmic-text.workspace = true
+zeno.workspace = true

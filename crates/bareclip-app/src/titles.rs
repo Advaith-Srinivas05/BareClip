@@ -112,6 +112,8 @@ pub(super) struct DurationEdit {
 pub(super) enum LeftPanel {
     #[default]
     Media,
+    /// Things BareClip draws itself to drop into a video.
+    Library,
     Text,
     Transitions,
 }
@@ -148,7 +150,11 @@ fn font_rows(list: &FontList, search: &str) -> Vec<FontRow> {
 }
 
 /// A picture ready for the screen, whose colours are already scaled by how see-through they are.
-fn texture_of(ctx: &egui::Context, name: String, picture: &StillPicture) -> TextureHandle {
+pub(super) fn texture_of(
+    ctx: &egui::Context,
+    name: String,
+    picture: &StillPicture,
+) -> TextureHandle {
     let image = egui::ColorImage::from_rgba_premultiplied(
         [picture.width as usize, picture.height as usize],
         &picture.rgba,
@@ -236,13 +242,22 @@ fn round_off_corners(painter: &egui::Painter, rect: egui::Rect, radius: f32, col
 }
 
 /// Gets a slider ready to fill the panel, in BareClip's colours.
-fn style_slider(ui: &mut egui::Ui, palette: &Palette) {
+pub(super) fn style_slider(ui: &mut egui::Ui, palette: &Palette) {
     let visuals = &mut ui.style_mut().visuals;
     visuals.widgets.inactive.bg_fill = palette.border_strong;
     visuals.widgets.hovered.bg_fill = palette.border_strong;
     visuals.widgets.active.bg_fill = palette.border_strong;
     visuals.selection.bg_fill = palette.accent;
     ui.spacing_mut().slider_width = ui.available_width();
+}
+
+/// How much of a row the number beside a slider takes.
+const SLIDER_NUMBER_ROOM: f32 = 56.0;
+
+/// Shortens a slider that shows its number beside it, so the two fit the row. A slider as wide as
+/// the row pushed its number past the panel's edge, which pushed the whole panel sideways.
+pub(super) fn leave_room_for_number(ui: &mut egui::Ui) {
+    ui.spacing_mut().slider_width = (ui.available_width() - SLIDER_NUMBER_ROOM).max(40.0);
 }
 
 /// Paints part of a picture, turned about its middle and partly see-through.
@@ -287,6 +302,9 @@ impl Editor {
 
     /// The words a title's clip has on it on the timeline.
     pub(super) fn title_label(title: &Title) -> String {
+        if let Some(art) = &title.art {
+            return art.entry().name.to_owned();
+        }
         title
             .text
             .lines()
@@ -294,7 +312,7 @@ impl Editor {
             .map_or_else(|| title.style.name().to_owned(), str::to_owned)
     }
 
-    fn new_title_id(&mut self) -> MediaId {
+    pub(super) fn new_title_id(&mut self) -> MediaId {
         self.next_title += 1;
         MediaId::for_title(self.next_title)
     }
@@ -525,8 +543,8 @@ impl Editor {
             return placement;
         };
         if placement.is_default() {
-            title.size = title.style.starting_size();
-            title.spot = Some(title.style.spot());
+            title.size = title.starting_size();
+            title.spot = Some(title.starting_spot());
             self.title_resize = None;
             // The next look at the title works out its scale and place from these.
             return placement;
@@ -543,8 +561,8 @@ impl Editor {
                 scale: clip.placement.scale,
             });
             let grown = f64::from(placement.scale) / f64::from(resize.scale.max(1));
-            title.size = ((f64::from(resize.size) * grown).round() as i32)
-                .clamp(SMALLEST_SIZE, LARGEST_SIZE);
+            let (smallest, largest) = title.size_limits();
+            title.size = ((f64::from(resize.size) * grown).round() as i32).clamp(smallest, largest);
         }
         placement
     }
@@ -983,6 +1001,7 @@ impl Editor {
                 length: TimeRange::new_title().duration(),
                 sound_only: false,
                 title: Some(style),
+                art: None,
             });
         }
         if !ui.is_rect_visible(rect) {
@@ -1294,6 +1313,7 @@ impl Editor {
 
     fn stars_slider(&mut self, ui: &mut egui::Ui, palette: &Palette, id: MediaId, title: &Title) {
         style_slider(ui, palette);
+        leave_room_for_number(ui);
         let mut stars = u32::from(title.stars);
         let slider = ui.add(
             egui::Slider::new(&mut stars, 0..=5)
@@ -1402,7 +1422,7 @@ impl Editor {
 
     /// A named colour with a swatch that opens the choices. The outer `Option` says whether a
     /// colour was picked, and the inner one is `None` for no colour at all.
-    fn colour_row(
+    pub(super) fn colour_row(
         &mut self,
         ui: &mut egui::Ui,
         palette: &Palette,
@@ -1436,9 +1456,12 @@ impl Editor {
                             picked = Some(None);
                         }
                         let start = current.unwrap_or([0, 0, 0]);
-                        if let Some(colour) =
-                            colour_choices(ui, palette, start, &mut self.title_colour_text)
-                        {
+                        if let Some(colour) = components::colour_choices(
+                            ui,
+                            palette,
+                            start,
+                            &mut self.title_colour_text,
+                        ) {
                             picked = Some(Some(colour));
                         }
                     });

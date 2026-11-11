@@ -5,6 +5,7 @@
 //! Turning only makes sense in pixels, because a canvas's width and height aren't equal.
 
 use bareclip_core::{
+    canvas::Colour,
     placement::{
         CanvasCorner, CropSides, FULL_TURN, LARGEST_SCALE, Placement, SMALLEST_SCALE, WHOLE,
     },
@@ -12,12 +13,13 @@ use bareclip_core::{
     speed::{FASTEST, NORMAL, SLOWEST, Speed},
     time::Ticks,
     timeline::ClipId,
+    title::{TitleSpot, Way},
     tracks::{OrderMove, Tracks},
 };
 use eframe::egui::{self, CursorIcon, Pos2, Rect, Sense, Shape, Slider, Stroke, pos2, vec2};
 
 use crate::{
-    components::{ActionButton, IconButton, Kind, MenuItem, SwitchRow},
+    components::{ActionButton, ColourSwatch, IconButton, Kind, MenuItem, SwitchRow},
     icons, text,
     theme::Palette,
 };
@@ -606,6 +608,8 @@ pub struct StageState {
     pub rotate_handle: Option<Pos2>,
     /// The clip being cropped, which shows whole until cropping ends.
     cropping: Option<ClipId>,
+    /// A colour code partway through being typed in the bar's colour choices.
+    art_colour_text: Option<String>,
 }
 
 impl StageState {
@@ -643,6 +647,31 @@ pub struct StageView<'a> {
     /// The selected clip is a title, so it has no crop or flips, and its place comes from its
     /// own controls rather than picture-in-picture.
     pub selected_is_title: bool,
+    /// The selected clip is something from the Content library, with its own bar.
+    pub art: Option<ArtBar>,
+}
+
+/// What the bar above something from the Content library needs to know.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArtBar {
+    /// What it is filled with, or its lines' colour if it is only lines.
+    pub fill: Option<Colour>,
+    /// How thick a shape's outline is. Only shapes have one to choose.
+    pub outline: Option<u8>,
+    /// It has a Shape panel for More options to open.
+    pub has_more: bool,
+    /// It covers the canvas, so it has no position to choose.
+    pub places_itself: bool,
+}
+
+/// A change asked for on the bar above something from the Content library.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArtChange {
+    /// `None` leaves a shape empty.
+    Fill(Option<Colour>),
+    Outline(u8),
+    Spot(TitleSpot),
+    MoreOptions,
 }
 
 /// What happened on the stage this frame.
@@ -657,6 +686,8 @@ pub struct StageEvents {
     pub detach: Option<ClipId>,
     /// A clip on the picture was right-clicked, and where, to open its menu there.
     pub menu: Option<(ClipId, Pos2)>,
+    /// Something from the Content library was changed on its bar.
+    pub art: Option<(ClipId, ArtChange)>,
 }
 
 /// Which of a clip's controls is showing in the right-hand panel.
@@ -671,6 +702,10 @@ pub enum LookTab {
     Audio,
     /// A title's words and how they look.
     Text,
+    /// A shape's colours and outline, or a background's colours.
+    Shape,
+    /// How a shape comes in and goes out.
+    Animate,
 }
 
 /// What the panel on the right of the window is showing, when it is open.
@@ -1479,6 +1514,12 @@ fn toolbar(
     clip_rect: Rect,
     events: &mut StageEvents,
 ) {
+    if let Some(bar) = view.art {
+        art_toolbar(
+            ui, palette, state, view, clip, placement, clip_rect, bar, events,
+        );
+        return;
+    }
     let is_title = view.selected_is_title;
     let buttons = if is_title { 2.0 } else { 4.0 };
     let width = TOOLBAR_PADDING * 2.0 + TOOLBAR_BUTTON * buttons;
@@ -1552,15 +1593,232 @@ fn toolbar(
         });
 }
 
-fn menu_heading(ui: &mut egui::Ui, palette: &Palette, text: &str) {
-    ui.horizontal(|ui| {
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new(text)
-                .size(12.0)
-                .color(palette.text_muted),
-        );
-    });
+/// The bar above something from the Content library: its colour, a shape's outline, turning,
+/// flipping, and the rest under More.
+#[allow(clippy::too_many_arguments)]
+fn art_toolbar(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    state: &mut StageState,
+    view: &StageView,
+    clip: &StageClip,
+    placement: Placement,
+    clip_rect: Rect,
+    bar: ArtBar,
+    events: &mut StageEvents,
+) {
+    let has_outline = bar.outline.is_some();
+    let buttons = if has_outline { 5.0 } else { 4.0 };
+    let width = TOOLBAR_PADDING * 2.0 + TOOLBAR_BUTTON * buttons;
+    let rect = toolbar_rect(width, clip_rect, view.area, view.row_above_is_free);
+    let id = ui.scope_id().with("stage-art-toolbar");
+    egui::Area::new(id)
+        .order(egui::Order::Middle)
+        .fixed_pos(rect.min)
+        .fade_in(false)
+        .constrain(false)
+        .show(ui.ctx(), |ui| {
+            ui.set_min_size(rect.size());
+            ui.painter().rect(
+                rect,
+                8.0,
+                palette.raised,
+                Stroke::new(1.0, palette.border),
+                egui::StrokeKind::Inside,
+            );
+            let spot = |index: f32| {
+                Rect::from_min_size(
+                    pos2(
+                        rect.left() + TOOLBAR_PADDING + TOOLBAR_BUTTON * index,
+                        rect.center().y - TOOLBAR_BUTTON / 2.0,
+                    ),
+                    vec2(TOOLBAR_BUTTON, TOOLBAR_BUTTON),
+                )
+            };
+            let button =
+                |ui: &mut egui::Ui, index: f32, icon: icons::Icon, name: &str, hint: &str| {
+                    IconButton::new(palette, Kind::Ghost, icon, name)
+                        .show_at(ui, id.with(name), spot(index))
+                        .on_hover_text(hint)
+                };
+
+            let shown = bar
+                .fill
+                .map_or(egui::Color32::TRANSPARENT, |[red, green, blue]| {
+                    egui::Color32::from_rgb(red, green, blue)
+                });
+            let swatch = ui
+                .put(
+                    Rect::from_center_size(spot(0.0).center(), vec2(26.0, 26.0)),
+                    ColourSwatch::new(palette, shown, "Colour", false),
+                )
+                .on_hover_text("Colour");
+            if bar.fill.is_none() {
+                ui.painter().line_segment(
+                    [
+                        swatch.rect.left_bottom() + vec2(4.0, -4.0),
+                        swatch.rect.right_top() + vec2(-4.0, 4.0),
+                    ],
+                    Stroke::new(1.5, palette.text_muted),
+                );
+            }
+            egui::Popup::menu(&swatch)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show(|ui| {
+                    if has_outline
+                        && ui
+                            .add(MenuItem::new(palette, icons::X, "No fill", ""))
+                            .clicked()
+                    {
+                        events.art = Some((clip.id, ArtChange::Fill(None)));
+                    }
+                    let start = bar.fill.unwrap_or([255, 255, 255]);
+                    if let Some(colour) = crate::components::colour_choices(
+                        ui,
+                        palette,
+                        start,
+                        &mut state.art_colour_text,
+                    ) {
+                        events.art = Some((clip.id, ArtChange::Fill(Some(colour))));
+                    }
+                });
+            let mut next = 1.0;
+            if let Some(outline) = bar.outline {
+                let thickness = button(ui, next, icons::SQUARE, "Outline", "Outline");
+                egui::Popup::menu(&thickness)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+                    .show(|ui| {
+                        for (width, name) in bareclip_core::art::OUTLINE_STEPS {
+                            let icon = if width == outline {
+                                icons::CHECK
+                            } else {
+                                icons::MINUS
+                            };
+                            if ui.add(MenuItem::new(palette, icon, name, "")).clicked() {
+                                events.art = Some((clip.id, ArtChange::Outline(width)));
+                            }
+                        }
+                    });
+                next += 1.0;
+            }
+            if button(
+                ui,
+                next,
+                icons::ROTATE_CW,
+                "Rotate by 90 degrees",
+                "Rotate by 90\u{b0}",
+            )
+            .clicked()
+            {
+                events.place = Some((clip.id, placement.turned_quarter(clip.size, view.canvas)));
+            }
+            let flip = button(ui, next + 1.0, icons::FLIP_VERTICAL_2, "Flip", "Flip");
+            egui::Popup::menu(&flip)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+                .show(|ui| flip_lines(ui, palette, clip.id, placement, events));
+            let more = button(ui, buttons - 1.0, icons::ELLIPSIS, "More", "More");
+            egui::Popup::menu(&more)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show(|ui| {
+                    if !bar.places_itself {
+                        side_menu(ui, palette, icons::MOVE, "Position", |ui| {
+                            position_lines(ui, palette, clip, placement, view.canvas, events);
+                        });
+                        ui.separator();
+                    }
+                    let arrange = ArrangeView {
+                        id: clip.id,
+                        placement,
+                        size: clip.size,
+                        canvas: view.canvas,
+                        is_title: true,
+                        can_go_forward: view.can_go_forward,
+                        can_go_back: view.can_go_back,
+                    };
+                    arrange_controls(ui, palette, &arrange, events);
+                    if bar.has_more {
+                        ui.separator();
+                        if ui
+                            .add(MenuItem::new(palette, icons::ELLIPSIS, "More options", ""))
+                            .clicked()
+                        {
+                            events.art = Some((clip.id, ArtChange::MoreOptions));
+                        }
+                    }
+                });
+        });
+}
+
+/// A line of a menu that opens more beside it, on being pointed at or pressed. What is picked
+/// there leaves the menus open, as the rest of the menu does. Returns where the part beside it is
+/// on screen, while it is open.
+fn side_menu(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    icon: icons::Icon,
+    name: &str,
+    content: impl FnOnce(&mut egui::Ui),
+) -> Option<Rect> {
+    use egui::containers::menu::{MenuConfig, SubMenu};
+    let line = ui.add(MenuItem::opens_more(palette, icon, name));
+    let config = MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+    SubMenu::new()
+        .config(config)
+        .show(ui, &line, content)
+        .map(|shown| shown.response.rect)
+}
+
+/// Where the Position menu puts something, left to right and then top to bottom.
+pub const LINE_UP: [(Way, u8, &str); 6] = [
+    (Way::Across, 0, "Left"),
+    (Way::Across, 1, "Centre"),
+    (Way::Across, 2, "Right"),
+    (Way::Down, 0, "Top"),
+    (Way::Down, 1, "Middle"),
+    (Way::Down, 2, "Bottom"),
+];
+
+/// The Position menu: three places left to right and three top to bottom, each ticked while it
+/// is lined up there. Picking one keeps where it is the other way.
+fn position_lines(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    clip: &StageClip,
+    placement: Placement,
+    canvas: (u32, u32),
+    events: &mut StageEvents,
+) {
+    for (index, (way, along, name)) in LINE_UP.into_iter().enumerate() {
+        if index == 3 {
+            ui.separator();
+        }
+        let icon = match (way, along) {
+            (Way::Across, 0) => icons::ALIGN_START_VERTICAL,
+            (Way::Across, 1) => icons::ALIGN_CENTER_VERTICAL,
+            (Way::Across, _) => icons::ALIGN_END_VERTICAL,
+            (Way::Down, 0) => icons::ALIGN_START_HORIZONTAL,
+            (Way::Down, 1) => icons::ALIGN_CENTER_HORIZONTAL,
+            (Way::Down, _) => icons::ALIGN_END_HORIZONTAL,
+        };
+        let ticked = TitleSpot::lined_up_at(placement, clip.size, canvas, way) == Some(along);
+        if !ui
+            .add(MenuItem::ticked(palette, icon, name, ticked))
+            .clicked()
+        {
+            continue;
+        }
+        // In a spot it stays there as it grows, so only the spot changes. Moved by hand, it only
+        // moves the one way, unless that lands it in a spot.
+        if let Some(spot) = TitleSpot::of(placement, clip.size, canvas) {
+            events.art = Some((clip.id, ArtChange::Spot(spot.with(way, along))));
+        } else {
+            let moved = TitleSpot::lined_up(placement, clip.size, canvas, way, along);
+            match TitleSpot::of(moved, clip.size, canvas) {
+                Some(spot) => events.art = Some((clip.id, ArtChange::Spot(spot))),
+                None => events.place = Some((clip.id, moved)),
+            }
+        }
+    }
 }
 
 /// The two ways to flip a clip.
@@ -1582,14 +1840,15 @@ fn flip_lines(
 }
 
 /// Everything in the Arrange part of a clip's right-click menu, which is the toolbar's choices
-/// and its More menu together. Returns whether Crop was pressed.
+/// and its More menu together. Returns whether Crop was pressed, and where any side menu it
+/// opened is on screen.
 pub fn arrange_menu(
     ui: &mut egui::Ui,
     palette: &Palette,
     arrange: &ArrangeView,
     can_crop: bool,
     events: &mut StageEvents,
-) -> bool {
+) -> (bool, Option<Rect>) {
     let mut crop = false;
     if !arrange.is_title {
         crop = ui
@@ -1608,17 +1867,18 @@ pub fn arrange_menu(
         flip_lines(ui, palette, arrange.id, arrange.placement, events);
     }
     ui.separator();
-    arrange_controls(ui, palette, arrange, events);
-    crop
+    let beside = arrange_controls(ui, palette, arrange, events);
+    (crop, beside)
 }
 
 /// What doesn't fit on the bar, or isn't needed as often.
+/// Returns where any side menu it opened is on screen.
 fn arrange_controls(
     ui: &mut egui::Ui,
     palette: &Palette,
     arrange: &ArrangeView,
     events: &mut StageEvents,
-) {
+) -> Option<Rect> {
     let placement = arrange.placement;
     ui.horizontal(|ui| {
         ui.add_space(8.0);
@@ -1664,26 +1924,32 @@ fn arrange_controls(
             slider.surrender_focus();
         }
     });
+    let mut beside: Option<Rect> = None;
+    let mut widen = |rect: Option<Rect>| {
+        beside = match (beside, rect) {
+            (Some(a), Some(b)) => Some(a.union(b)),
+            (a, b) => a.or(b),
+        };
+    };
     if !arrange.is_title {
         ui.separator();
-        menu_heading(ui, palette, "Picture in picture");
-        for (corner, name) in CanvasCorner::ALL {
-            if ui
-                .add(MenuItem::new(
-                    palette,
-                    icons::PICTURE_IN_PICTURE_2,
-                    name,
-                    "",
-                ))
-                .clicked()
-            {
-                let placed = placement.in_corner(corner, arrange.size, arrange.canvas);
-                events.place = Some((arrange.id, placed));
-            }
-        }
+        widen(side_menu(
+            ui,
+            palette,
+            icons::PICTURE_IN_PICTURE_2,
+            "Picture in picture",
+            |ui| {
+                for (corner, name) in CanvasCorner::ALL {
+                    let line = MenuItem::new(palette, icons::PICTURE_IN_PICTURE_2, name, "");
+                    if ui.add(line).clicked() {
+                        let placed = placement.in_corner(corner, arrange.size, arrange.canvas);
+                        events.place = Some((arrange.id, placed));
+                    }
+                }
+            },
+        ));
     }
     ui.separator();
-    menu_heading(ui, palette, "Order");
     let orders = [
         (
             OrderMove::ToFront,
@@ -1710,14 +1976,16 @@ fn arrange_controls(
             arrange.can_go_back,
         ),
     ];
-    for (order, icon, name, allowed) in orders {
-        if ui
-            .add_enabled(allowed, MenuItem::new(palette, icon, name, ""))
-            .clicked()
-        {
-            events.order = Some((arrange.id, order));
+    widen(side_menu(ui, palette, icons::LAYERS, "Order", |ui| {
+        for (order, icon, name, allowed) in orders {
+            if ui
+                .add_enabled(allowed, MenuItem::new(palette, icon, name, ""))
+                .clicked()
+            {
+                events.order = Some((arrange.id, order));
+            }
         }
-    }
+    }));
     ui.separator();
     if ui
         .add(MenuItem::new(
@@ -1730,6 +1998,7 @@ fn arrange_controls(
     {
         events.place = Some((arrange.id, Placement::default()));
     }
+    beside
 }
 
 #[cfg(test)]

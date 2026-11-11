@@ -7,7 +7,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    art::Art,
     canvas::Colour,
+    motion::Motion,
     placement::{LARGEST_SCALE, Placement, SMALLEST_SCALE, WHOLE, fit_inside},
     timeline::MediaId,
 };
@@ -15,6 +17,8 @@ use crate::{
 /// How big a title can be, as parts of the canvas's shorter side.
 pub const SMALLEST_SIZE: i32 = WHOLE / 50;
 pub const LARGEST_SIZE: i32 = WHOLE / 2;
+/// How big something from the library can be: a little more than the canvas's longer side.
+pub const LARGEST_ART_SIZE: i32 = WHOLE * 2;
 const DEFAULT_LOGO_SIZE: i32 = WHOLE / 5;
 /// The font a title starts in, which ships with BareClip.
 pub const DEFAULT_FONT: &str = "Hanken Grotesk";
@@ -880,6 +884,13 @@ impl TitleStyle {
     }
 }
 
+/// Left to right, or top to bottom.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Way {
+    Across,
+    Down,
+}
+
 /// One of the nine places the Position control offers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TitleSpot {
@@ -921,6 +932,72 @@ impl TitleSpot {
             Self::BottomMiddle => (1, 2),
             Self::BottomRight => (2, 2),
         }
+    }
+
+    /// The spot this far along each way, where 0 is the start, 1 the middle and 2 the end.
+    pub fn at(across: u8, down: u8) -> Self {
+        match (across.min(2), down.min(2)) {
+            (0, 0) => Self::TopLeft,
+            (1, 0) => Self::TopMiddle,
+            (2, 0) => Self::TopRight,
+            (0, 1) => Self::MiddleLeft,
+            (1, 1) => Self::Middle,
+            (2, 1) => Self::MiddleRight,
+            (0, _) => Self::BottomLeft,
+            (1, _) => Self::BottomMiddle,
+            _ => Self::BottomRight,
+        }
+    }
+
+    /// This spot moved to `along` one way, keeping its place the other way.
+    #[must_use]
+    pub fn with(self, way: Way, along: u8) -> Self {
+        let (across, down) = self.along();
+        match way {
+            Way::Across => Self::at(along, down),
+            Way::Down => Self::at(across, along),
+        }
+    }
+
+    /// Puts a picture at the start, middle or end of one way across the canvas, leaving where it
+    /// is the other way alone, just as a spot would put it.
+    pub fn lined_up(
+        placement: Placement,
+        picture: (u32, u32),
+        canvas: (u32, u32),
+        way: Way,
+        along: u8,
+    ) -> Placement {
+        let there = Self::Middle
+            .with(way, along)
+            .placed(placement, picture, canvas);
+        match way {
+            Way::Across => Placement {
+                center_x: there.center_x,
+                ..placement
+            },
+            Way::Down => Placement {
+                center_y: there.center_y,
+                ..placement
+            },
+        }
+    }
+
+    /// How far along one way a picture is lined up, if it is at its start, middle or end.
+    pub fn lined_up_at(
+        placement: Placement,
+        picture: (u32, u32),
+        canvas: (u32, u32),
+        way: Way,
+    ) -> Option<u8> {
+        (0..3).find(|&along| {
+            let there = Self::lined_up(placement, picture, canvas, way, along);
+            let (a, b) = match way {
+                Way::Across => (placement.center_x, there.center_x),
+                Way::Down => (placement.center_y, there.center_y),
+            };
+            (f64::from(a) - f64::from(b)).abs() / f64::from(WHOLE) <= CLOSE_TO_SPOT
+        })
     }
 
     /// The placement that puts a picture here, leaving everything else about it alone. However
@@ -992,6 +1069,9 @@ pub struct Title {
     pub logo_size: i32,
     /// How many of the five stars are lit, on a Rating.
     pub stars: u8,
+    /// Something from the library drawn in place of words. Its size and position are the title's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub art: Option<Art>,
 }
 
 impl Default for Title {
@@ -1016,6 +1096,7 @@ impl Title {
             logo: None,
             logo_size: DEFAULT_LOGO_SIZE,
             stars: 4,
+            art: None,
         };
         match style {
             TitleStyle::TextBox => title.background = Some(BLACK),
@@ -1132,10 +1213,57 @@ impl Title {
         }
     }
 
+    /// Something from the library, as it starts.
+    pub fn of_art(art: Art) -> Self {
+        Self {
+            text: String::new(),
+            second_text: String::new(),
+            size: art.starting_size(),
+            spot: Some(TitleSpot::Middle),
+            art: Some(art),
+            ..Self::in_style(TitleStyle::Plain)
+        }
+    }
+
+    /// How it moves.
+    pub fn motion(&self) -> Motion {
+        match &self.art {
+            Some(art) => Motion::Art(art.motion()),
+            None => Motion::Title(self.style.motion()),
+        }
+    }
+
+    /// How big it starts, which is where Reset takes it back to.
+    pub fn starting_size(&self) -> i32 {
+        match &self.art {
+            Some(art) => art.starting_size(),
+            None => self.style.starting_size(),
+        }
+    }
+
+    /// The position it starts in.
+    pub fn starting_spot(&self) -> TitleSpot {
+        match self.art {
+            Some(_) => TitleSpot::Middle,
+            None => self.style.spot(),
+        }
+    }
+
+    /// How small and how big it can be, as parts of the canvas's shorter side. Something from the
+    /// library can be far bigger than words, up to more than the canvas.
+    pub fn size_limits(&self) -> (i32, i32) {
+        match self.art {
+            Some(_) => (SMALLEST_SIZE, LARGEST_ART_SIZE),
+            None => (SMALLEST_SIZE, LARGEST_SIZE),
+        }
+    }
+
     /// The same title with anything out of range brought back in, in case a file was edited by
     /// hand.
     pub fn checked(mut self) -> Self {
-        self.size = self.size.clamp(SMALLEST_SIZE, LARGEST_SIZE);
+        let (smallest, largest) = self.size_limits();
+        self.size = self.size.clamp(smallest, largest);
+        self.art = self.art.map(Art::checked);
         self.logo_size = self.logo_size.clamp(SMALLEST_SIZE, LARGEST_SIZE);
         self.stars = self.stars.min(5);
         if self.font.is_empty() {
@@ -1236,6 +1364,48 @@ mod tests {
             let placed = spot.placed(start, picture, CANVAS);
             assert_eq!(TitleSpot::of(placed, picture, CANVAS), Some(spot), "{name}");
         }
+    }
+
+    #[test]
+    fn a_spot_is_found_from_how_far_along_each_way_it_is() {
+        for (spot, name) in TitleSpot::ALL {
+            let (across, down) = spot.along();
+            assert_eq!(TitleSpot::at(across, down), spot, "{name}");
+        }
+        assert_eq!(TitleSpot::TopLeft.with(Way::Across, 2), TitleSpot::TopRight);
+        assert_eq!(TitleSpot::TopLeft.with(Way::Down, 1), TitleSpot::MiddleLeft);
+    }
+
+    #[test]
+    fn lining_up_one_way_leaves_the_other_alone() {
+        let picture = (400, 100);
+        let start = Placement {
+            center_x: WHOLE / 3,
+            center_y: WHOLE / 5,
+            scale: scale_for_pixels(picture, CANVAS, 1.0),
+            ..Placement::default()
+        };
+        let left = TitleSpot::lined_up(start, picture, CANVAS, Way::Across, 0);
+        assert_eq!(left.center_y, start.center_y);
+        let rect = left.rect(picture, CANVAS);
+        let margin = 1080.0 * SPOT_MARGIN as f32;
+        assert!((rect.x - margin).abs() < 0.5, "{}", rect.x);
+        assert_eq!(
+            TitleSpot::lined_up_at(left, picture, CANVAS, Way::Across),
+            Some(0)
+        );
+        assert_eq!(
+            TitleSpot::lined_up_at(left, picture, CANVAS, Way::Down),
+            None
+        );
+        assert_eq!(TitleSpot::of(left, picture, CANVAS), None);
+
+        let bottom = TitleSpot::lined_up(left, picture, CANVAS, Way::Down, 2);
+        assert_eq!(bottom.center_x, left.center_x);
+        assert_eq!(
+            TitleSpot::of(bottom, picture, CANVAS),
+            Some(TitleSpot::BottomLeft)
+        );
     }
 
     #[test]

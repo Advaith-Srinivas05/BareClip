@@ -37,8 +37,10 @@ const EFFECT_CARD_SECONDS: f64 = 5.0;
 /// How long the clip an effect's card shows is taken to be, the same as a sample recording.
 const EFFECT_CARD_LENGTH: f32 = 5.0;
 /// The right-hand rail's tools: its tab, the panel's heading, the tab's name and its symbol.
-const LOOK_TABS: [(LookTab, &str, &str, icons::Icon); 7] = [
+const LOOK_TABS: [(LookTab, &str, &str, icons::Icon); 9] = [
     (LookTab::Text, "Text", "Text", icons::TYPE),
+    (LookTab::Shape, "Shape", "Shape", icons::SHAPES),
+    (LookTab::Animate, "Animate", "Animate", icons::WAND_SPARKLES),
     (LookTab::Filters, "Filters", "Filters", icons::APERTURE),
     (LookTab::Effects, "Effects", "Effects", icons::SPARKLES),
     (
@@ -508,6 +510,31 @@ impl Editor {
         let Some(clip) = self.selected.and_then(|id| tracks.clip(id)) else {
             return Vec::new();
         };
+        if let Some(art) = self.art_of(clip) {
+            use bareclip_core::art::ArtKind;
+            return match art.kind() {
+                ArtKind::Shape => vec![
+                    LookTab::Shape,
+                    LookTab::Animate,
+                    LookTab::Effects,
+                    LookTab::Colours,
+                ],
+                ArtKind::Annotation | ArtKind::Frame => vec![
+                    LookTab::Fade,
+                    LookTab::Filters,
+                    LookTab::Effects,
+                    LookTab::Colours,
+                ],
+                ArtKind::Overlay => vec![LookTab::Fade, LookTab::Effects, LookTab::Colours],
+                ArtKind::Background => vec![
+                    LookTab::Shape,
+                    LookTab::Fade,
+                    LookTab::Filters,
+                    LookTab::Effects,
+                    LookTab::Colours,
+                ],
+            };
+        }
         if clip.is_title() {
             return vec![LookTab::Text, LookTab::Colours, LookTab::Fade];
         }
@@ -719,6 +746,12 @@ impl Editor {
                             .show(ui, |ui| self.colour_controls(ui, palette, clip));
                     }
                     LookTab::Fade => self.fade_controls(ui, palette, clip),
+                    LookTab::Shape => {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| self.shape_controls(ui, palette));
+                    }
+                    LookTab::Animate => self.animate_choices(ui, palette),
                     LookTab::Speed => self.speed_controls(ui, palette),
                     LookTab::Audio => self.audio_controls(ui, palette),
                 }

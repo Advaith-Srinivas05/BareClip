@@ -1557,6 +1557,20 @@ mod tests {
         at_seconds: f64,
     ) -> f64 {
         use bareclip_core::title::Title;
+        let title = Title {
+            size: WHOLE / 7,
+            ..Title::in_style(style)
+        };
+        drawn_title_matches(title, ClipLook::default(), name, at_seconds)
+    }
+
+    /// The same for any title, from words or from the library, with a look on its clip.
+    fn drawn_title_matches(
+        title: bareclip_core::title::Title,
+        look: ClipLook,
+        name: &str,
+        at_seconds: f64,
+    ) -> f64 {
         let path = detailed_clip(&format!("under-moving-{name}"), "testsrc2");
         let infos = vec![probe(&path).expect("the video can be read")];
         let source = TimeRange {
@@ -1564,10 +1578,6 @@ mod tests {
             end: seconds(3.0),
         };
         let canvas = (infos[0].video.width, infos[0].video.height);
-        let title = Title {
-            size: WHOLE / 7,
-            ..Title::in_style(style)
-        };
         let drawing = bareclip_text::draw_title(&title, canvas);
         let size = (drawing.picture.width, drawing.picture.height);
         let picture = Arc::new(drawing.picture);
@@ -1580,6 +1590,7 @@ mod tests {
             ..Placement::default()
         };
         tracks.set_placement(on_top, title.placed(start, size, drawing.scale, canvas));
+        tracks.set_look(on_top, look);
         let still = HashMap::from([(media, picture)]);
         let moving = std::collections::BTreeMap::from([(media, title.clone())]);
         let mut compositor = compositor_of(canvas).expect("the GPU opens");
@@ -1624,7 +1635,7 @@ mod tests {
                         placement: clip.placement,
                         speed: clip.speed,
                         title: (clip.media == media).then(|| title.clone()),
-                        look: Default::default(),
+                        look: clip.look,
                         join_in: None,
                         join_out: None,
                     })
@@ -1667,6 +1678,61 @@ mod tests {
         let shown = compositor.read_display().expect("it reads back");
         let _ = std::fs::remove_file(&output);
         average_difference(&previewed, &shown)
+    }
+
+    #[test]
+    fn a_titles_colours_and_fade_are_in_the_export_too() {
+        if compositor_of((64, 64)).is_none() {
+            return;
+        }
+        use bareclip_core::title::{Title, TitleStyle};
+        let title = Title {
+            size: WHOLE / 7,
+            ..Title::in_style(TitleStyle::TextBox)
+        };
+        let look = ClipLook {
+            fade_in: seconds(1.0).0,
+            exposure: 60,
+            saturation: -80,
+            ..ClipLook::default()
+        };
+        let difference = drawn_title_matches(title, look, "title-look", 0.5);
+        assert!(
+            difference < 6.0,
+            "a faded, recoloured title differs from the preview by {difference:.2} out of 255"
+        );
+    }
+
+    #[test]
+    fn library_items_in_mid_motion_look_the_same_in_the_preview_and_the_export() {
+        if compositor_of((64, 64)).is_none() {
+            return;
+        }
+        use bareclip_core::{
+            art::{Animate, Art, item_named},
+            title::Title,
+        };
+        for (key, animate, at) in [
+            ("flower", Animate::Natural, 0.3),
+            ("outline-star", Animate::Natural, 0.3),
+            ("blob", Animate::Natural, 0.3),
+            ("square", Animate::BounceSlide, 0.3),
+            ("speech-bubble", Animate::Natural, 0.2),
+            ("marker-circle", Animate::None, 0.4),
+            ("snow", Animate::None, 1.2),
+            ("film-strip", Animate::None, 1.0),
+            ("sunset", Animate::None, 1.0),
+        ] {
+            let art = Art {
+                animate,
+                ..Art::of(item_named(key).expect("it is listed"))
+            };
+            let difference = drawn_title_matches(Title::of_art(art), ClipLook::default(), key, at);
+            assert!(
+                difference < 6.0,
+                "{key} differs from the preview by {difference:.2} out of 255"
+            );
+        }
     }
 
     #[test]

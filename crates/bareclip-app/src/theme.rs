@@ -31,6 +31,9 @@ pub struct Palette {
     pub clip_audio_text: Color32,
     pub clip_overlay: Color32,
     pub clip_overlay_text: Color32,
+    /// Things from the content library.
+    pub clip_shape: Color32,
+    pub clip_shape_text: Color32,
     pub danger: Color32,
     pub success: Color32,
 }
@@ -61,6 +64,8 @@ pub const DARK: Palette = Palette {
     clip_audio_text: hex(0xFFFFFF),
     clip_overlay: hex(0xC9A06A),
     clip_overlay_text: hex(0x111111),
+    clip_shape: hex(0x7FA39A),
+    clip_shape_text: hex(0x111111),
     danger: hex(0xE8836F),
     success: hex(0x9CBF7F),
 };
@@ -87,6 +92,8 @@ pub const LIGHT: Palette = Palette {
     clip_audio_text: hex(0xFFFFFF),
     clip_overlay: hex(0xA07F55),
     clip_overlay_text: hex(0x111111),
+    clip_shape: hex(0x5E8A80),
+    clip_shape_text: hex(0x111111),
     danger: hex(0xA93B2A),
     success: hex(0x47702F),
 };
@@ -234,6 +241,8 @@ pub mod tests {
             ("clip_audio_text", palette.clip_audio_text),
             ("clip_overlay", palette.clip_overlay),
             ("clip_overlay_text", palette.clip_overlay_text),
+            ("clip_shape", palette.clip_shape),
+            ("clip_shape_text", palette.clip_shape_text),
             ("danger", palette.danger),
             ("success", palette.success),
         ]
@@ -343,6 +352,7 @@ pub mod tests {
                 ("video clip", p.clip_video_text, p.clip_video),
                 ("audio clip", p.clip_audio_text, p.clip_audio),
                 ("overlay clip", p.clip_overlay_text, p.clip_overlay),
+                ("library clip", p.clip_shape_text, p.clip_shape),
                 ("danger on panel", p.danger, p.surface),
                 ("danger on raised", p.danger, p.raised),
                 ("success on panel", p.success, p.surface),
@@ -365,6 +375,7 @@ pub mod tests {
                 ("video clip", p.clip_video, p.bg_app),
                 ("audio clip", p.clip_audio, p.bg_app),
                 ("overlay clip", p.clip_overlay, p.bg_app),
+                ("library clip", p.clip_shape, p.bg_app),
             ];
             for (label, shape, background) in pairs {
                 let ratio = contrast(shape, background);
@@ -381,6 +392,7 @@ pub mod tests {
                 ("video clip", p.clip_video),
                 ("audio clip", p.clip_audio),
                 ("overlay clip", p.clip_overlay),
+                ("library clip", p.clip_shape),
             ];
             for (label, background) in backgrounds {
                 let ratio =

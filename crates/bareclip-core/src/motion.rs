@@ -6,6 +6,7 @@
 //! picture.
 
 use crate::{
+    art::ArtMotion,
     placement::{CropSides, Placement, WHOLE},
     title::TitleStyle,
 };
@@ -145,6 +146,64 @@ pub struct TitleMotion {
     pub leave_parts: bool,
 }
 
+/// How anything drawn over the picture moves: a title, or something from the library.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Motion {
+    Title(TitleMotion),
+    Art(ArtMotion),
+}
+
+impl Motion {
+    pub fn is_still(&self) -> bool {
+        match self {
+            Self::Title(motion) => motion.is_still(),
+            Self::Art(motion) => motion.is_still(),
+        }
+    }
+
+    /// Whether a new picture has to be drawn while this plays, rather than moving the one there is.
+    pub fn draws_frames(&self) -> bool {
+        match self {
+            Self::Title(motion) => motion.draws_frames(),
+            Self::Art(motion) => motion.draws_frames(),
+        }
+    }
+
+    pub fn stage(&self, seconds: f32, length: f32) -> Stage {
+        match self {
+            Self::Title(motion) => motion.stage(seconds, length),
+            Self::Art(motion) => motion.stage(seconds, length),
+        }
+    }
+
+    pub fn pose(&self, stage: Stage) -> Pose {
+        match self {
+            Self::Title(motion) => motion.pose(stage),
+            Self::Art(motion) => motion.pose(stage),
+        }
+    }
+
+    pub fn draws_frame_at(&self, stage: Stage) -> bool {
+        match self {
+            Self::Title(motion) => motion.draws_frame_at(stage),
+            Self::Art(motion) => motion.draws_frame_at(stage),
+        }
+    }
+
+    pub fn frame_key(&self, stage: Stage) -> u64 {
+        match self {
+            Self::Title(motion) => motion.frame_key(stage),
+            Self::Art(motion) => motion.frame_key(stage),
+        }
+    }
+
+    /// Whether it keeps going while held still to be changed. A countdown reads the time at any
+    /// moment, so holding it only stops it fading.
+    pub fn runs_while_held(&self) -> bool {
+        matches!(self, Self::Title(motion) if motion.running == Running::Countdown)
+    }
+}
+
 /// How the whole picture differs from where it rests, at one moment.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Pose {
@@ -163,6 +222,13 @@ pub struct Pose {
     /// How far it has moved down, as a share of its own height. The part past where it rests is
     /// hidden, as if behind a line.
     pub lift: f32,
+    /// How far it is toward sitting just past the canvas's left edge, at 1, or its right edge, at
+    /// -1, from where it rests at 0.
+    pub offstage: f32,
+    /// How far it has moved, as shares of its own width and height, turned with it.
+    pub shift: [f32; 2],
+    /// The point it grows and shrinks around, as shares of its picture across and down.
+    pub pivot: [f32; 2],
 }
 
 impl Pose {
@@ -175,6 +241,9 @@ impl Pose {
         cut: [0.0; 4],
         through_canvas: 0.0,
         lift: 0.0,
+        offstage: 0.0,
+        shift: [0.0, 0.0],
+        pivot: [0.5, 0.5],
     };
 
     fn and(self, other: Self) -> Self {
@@ -192,6 +261,16 @@ impl Pose {
             ],
             through_canvas: self.through_canvas + other.through_canvas,
             lift: self.lift + other.lift,
+            offstage: self.offstage + other.offstage,
+            shift: [
+                self.shift[0] + other.shift[0],
+                self.shift[1] + other.shift[1],
+            ],
+            pivot: if self.pivot == Self::REST.pivot {
+                other.pivot
+            } else {
+                self.pivot
+            },
         }
     }
 
@@ -230,9 +309,46 @@ impl Pose {
         // Moving by its own height, with the part that has gone past the line cut away, leaves the
         // part still showing where it was.
         let lifted = f64::from(self.lift) * f64::from(rect.height);
-        placed.center_x += (f64::from(self.across) * shorter / width * whole).round() as i32;
-        placed.center_y +=
-            ((f64::from(self.down) * shorter + through + lifted) / height * whole).round() as i32;
+        let (mut across, mut down) = (
+            f64::from(self.across) * shorter,
+            f64::from(self.down) * shorter + through + lifted,
+        );
+        let (sine, cosine) = rest.degrees().to_radians().sin_cos();
+        let turned = |x: f64, y: f64| (x * cosine - y * sine, x * sine + y * cosine);
+        if self.shift != [0.0, 0.0] {
+            let (x, y) = turned(
+                f64::from(self.shift[0]) * f64::from(rect.width),
+                f64::from(self.shift[1]) * f64::from(rect.height),
+            );
+            across += x;
+            down += y;
+        }
+        if self.pivot != Self::REST.pivot && self.grow != 1.0 {
+            // Growing around another point moves the middle away from it, or toward it.
+            let (x, y) = turned(
+                f64::from(self.pivot[0] - 0.5) * f64::from(rect.width),
+                f64::from(self.pivot[1] - 0.5) * f64::from(rect.height),
+            );
+            let grown = f64::from(self.grow) - 1.0;
+            across -= x * grown;
+            down -= y * grown;
+        }
+        if self.offstage != 0.0 {
+            // However it is turned, the whole of it goes past the edge.
+            let half_across =
+                (f64::from(rect.width) * cosine.abs() + f64::from(rect.height) * sine.abs()) / 2.0;
+            let middle = f64::from(rect.x) + f64::from(rect.width) / 2.0;
+            let to_left = middle + half_across;
+            let to_right = width - (middle - half_across);
+            let share = f64::from(self.offstage);
+            across += if share > 0.0 {
+                -share * to_left
+            } else {
+                -share * to_right
+            };
+        }
+        placed.center_x += (across / width * whole).round() as i32;
+        placed.center_y += (down / height * whole).round() as i32;
         placed.scale = (f64::from(placed.scale) * f64::from(self.grow)).round() as i32;
         placed.opacity = if gone {
             0
@@ -283,12 +399,12 @@ const DELETING_SECONDS: f32 = 0.04;
 /// How long the cursor stays on, and then off, once the words are typed.
 const BLINK_SECONDS: f32 = 0.5;
 
-fn ease_out(t: f32) -> f32 {
+pub(crate) fn ease_out(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     1.0 - (1.0 - t).powi(3)
 }
 
-fn ease_in(t: f32) -> f32 {
+pub(crate) fn ease_in(t: f32) -> f32 {
     t.clamp(0.0, 1.0).powi(3)
 }
 

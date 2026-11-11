@@ -11,7 +11,7 @@ use std::{
 use bareclip_core::{
     canvas::{BLACK, Colour},
     effects::{ClipLook, LayerJoin, Transition, join_progress},
-    motion::{Pose, TitleMotion},
+    motion::{Motion, Pose},
     picture::{BlackPicture, StillPicture},
     placement::{Placement, WHOLE},
     speed::Speed,
@@ -132,7 +132,7 @@ fn stretch_at(stretches: &[LayeredStretch], time: Ticks, slack: Ticks) -> Option
 struct ShownTitle {
     rest: StillPicture,
     rest_place: Placement,
-    motion: TitleMotion,
+    motion: Motion,
     /// Filled in the first time its parts have to move.
     moving: Option<bareclip_text::MovingTitle>,
     title: Title,
@@ -153,7 +153,7 @@ impl ShownTitle {
         Self {
             rest: drawing.picture,
             rest_place,
-            motion: title.style.motion(),
+            motion: title.motion(),
             moving: None,
             title: title.clone(),
             logo,
@@ -418,11 +418,20 @@ pub fn export_layered_as(
                                 let picture = shown.picture();
                                 let placement = shown.place;
                                 let size = (picture.width, picture.height);
+                                // Its colours, effects and fades, the same as the preview's.
+                                let mut look = placement.look();
+                                look.grade = clip.look.grade();
+                                look.effects = clip.look.effects.at(
+                                    Ticks(time.0 - clip.start.0),
+                                    Ticks(clip.end().0 - clip.start.0),
+                                    clip.source.start.0,
+                                );
+                                let opacity = placement.opacity as f32 / WHOLE as f32;
                                 return Some(Layer {
                                     picture: picture.into(),
                                     rect: placement.rect(size, canvas),
-                                    opacity: placement.opacity as f32 / WHOLE as f32,
-                                    look: placement.look(),
+                                    opacity: opacity * clip.fade_at(time),
+                                    look,
                                 });
                             }
                             let picture: LayerPicture = if clip.source.is_still() {

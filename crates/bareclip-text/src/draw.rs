@@ -1451,6 +1451,9 @@ pub fn draw_title_with_logo(
     canvas: (u32, u32),
     logo: Option<&StillPicture>,
 ) -> TitleDrawing {
+    if let Some(art) = &title.art {
+        return crate::art::draw_art_title(title, art, canvas);
+    }
     let (font, font_missing) = font_for(title);
     let pixels = letter_pixels(title, canvas);
 

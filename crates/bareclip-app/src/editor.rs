@@ -14,9 +14,8 @@ use std::{
 
 use bareclip_audio::{Bus, MixSpan};
 use bareclip_core::{
-    canvas::{
-        BACKGROUND_SWATCHES, BLACK, Canvas, Colour, ORIGINAL_NAME, colour_from_hex, colour_to_hex,
-    },
+    art::Art,
+    canvas::{BLACK, Canvas, Colour, ORIGINAL_NAME},
     history::History,
     picture::StillPicture,
     picture_effects::EffectKind,
@@ -423,6 +422,8 @@ enum RatePick {
 
 #[path = "captions.rs"]
 mod captions;
+#[path = "library.rs"]
+mod library;
 #[path = "looks.rs"]
 mod looks;
 #[path = "titles.rs"]
@@ -473,6 +474,8 @@ struct Snapshot {
     titles: BTreeMap<MediaId, Title>,
     /// Names given to videos in this project. The files themselves are never renamed.
     names: BTreeMap<MediaId, String>,
+    /// Things from the library with a card in My media, in the order they were added.
+    library: Vec<Art>,
 }
 
 /// A trim in progress: where the clip's edge and the playhead were when the drag started.
@@ -591,6 +594,12 @@ pub struct Editor {
     title_before: Option<Snapshot>,
     title_resize: Option<TitleResize>,
     title_cards: HashMap<TitleStyle, TitleCard>,
+    /// Where the Content library is, and what is typed in its search box.
+    library_view: library::LibraryView,
+    /// Each library item drawn for its card, the first time it is shown.
+    library_thumbnails: HashMap<&'static str, TextureHandle>,
+    /// The library card the pointer is on, if it moves.
+    library_hover: Option<library::LibraryHover>,
     /// The clip whose transition out of it is selected on the timeline.
     selected_join: Option<ClipId>,
     /// A clip's menu opened from the picture, where, and whether it opened this frame.
@@ -724,6 +733,7 @@ impl Editor {
                 canvas: Canvas::default(),
                 titles: BTreeMap::new(),
                 names: BTreeMap::new(),
+                library: Vec::new(),
             },
             history: History::default(),
             preview: Preview::new(use_sound, Arc::new(move || repaint.request_repaint())),
@@ -779,6 +789,9 @@ impl Editor {
             title_before: None,
             title_resize: None,
             title_cards: HashMap::new(),
+            library_view: library::LibraryView::default(),
+            library_thumbnails: HashMap::new(),
+            library_hover: None,
             selected_join: None,
             picture_menu: None,
             transition_search: String::new(),
@@ -857,6 +870,7 @@ impl Editor {
             saved.name = self.project.names.get(&MediaId(saved.id)).cloned();
         }
         self.write_titles_to(&mut file);
+        file.library = self.project.library.clone();
         file
     }
 
@@ -909,6 +923,7 @@ impl Editor {
             canvas: Canvas::default(),
             titles: BTreeMap::new(),
             names: BTreeMap::new(),
+            library: Vec::new(),
         };
         self.history = History::default();
         self.selected = None;
@@ -1080,6 +1095,7 @@ impl Editor {
         }
         self.sync_media_names();
         self.restore_titles(&file.titles);
+        self.project.library = file.library.iter().cloned().map(Art::checked).collect();
         for title in self.project.titles.keys() {
             new_ids.insert(title.0, *title);
             durations.insert(title.0, STILL_LENGTH);
@@ -3559,7 +3575,8 @@ impl Editor {
         egui::Popup::menu(&button)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
-                picked = colour_choices(ui, palette, current, &mut self.background_text);
+                picked =
+                    components::colour_choices(ui, palette, current, &mut self.background_text);
             });
         if let Some(colour) = picked {
             self.change_background(colour);
@@ -3658,6 +3675,7 @@ impl Editor {
             .show(ui, |ui| {
                 for (tab, icon, name) in [
                     (LeftPanel::Media, &icons::FILM, "My media"),
+                    (LeftPanel::Library, &icons::LIBRARY_BIG, "Content library"),
                     (LeftPanel::Text, &icons::TYPE, "Text"),
                     (LeftPanel::Transitions, &icons::BLEND, "Transitions"),
                 ] {
@@ -3695,9 +3713,11 @@ impl Editor {
             .show_collapsible(ui, &mut expanded, |ui| {
                 let on_text = self.left_panel == LeftPanel::Text;
                 let on_transitions = self.left_panel == LeftPanel::Transitions;
+                let on_library = self.left_panel == LeftPanel::Library;
                 ui.horizontal(|ui| {
                     let heading = match self.left_panel {
                         LeftPanel::Media => "My media",
+                        LeftPanel::Library => "Content library",
                         LeftPanel::Text => "Text",
                         LeftPanel::Transitions => "Transitions",
                     };
@@ -3726,6 +3746,10 @@ impl Editor {
                     self.transitions_panel(ui, palette);
                     return;
                 }
+                if on_library {
+                    self.library_panel(ui, palette);
+                    return;
+                }
                 let width = ui.available_width();
                 // Once there are videos, what comes next is on the cards and the timeline.
                 let kind = if self.visible_media().next().is_none() {
@@ -3748,7 +3772,13 @@ impl Editor {
                 ui.add_space(12.0);
 
                 if self.visible_media().next().is_none() {
-                    empty_media_hint(ui, palette);
+                    if self.project.library.is_empty() {
+                        empty_media_hint(ui, palette);
+                    } else {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink(false)
+                            .show(ui, |ui| self.library_media_cards(ui, palette));
+                    }
                     return;
                 }
 
@@ -3790,6 +3820,12 @@ impl Editor {
                                 }
                             });
                             ui.add_space(MEDIA_CARD_SPACING);
+                        }
+                        if !self.project.library.is_empty() {
+                            ui.add_space(4.0);
+                            ui.separator();
+                            ui.add_space(6.0);
+                            self.library_media_cards(ui, palette);
                         }
                     });
                 self.card_thumbnails = thumbnails;
@@ -4195,6 +4231,7 @@ impl Editor {
                     .shows_waveform(self.project.tracks.is_sound_row(track)),
                 is_still: clip.is_still(),
                 is_title: clip.is_title(),
+                art: self.art_of(*clip).map(Art::kind),
                 size: self.video_size(clip.media),
                 speed: clip.speed,
                 fade_in: clip.sound.fade_in_on(clip.duration()),
@@ -4301,6 +4338,11 @@ impl Editor {
         }
         if let Some((style, time, target)) = events.drop_title {
             self.add_title(style, time, Some(target));
+        }
+        if let Some((key, time, target)) = events.drop_art
+            && let Some(item) = bareclip_core::art::item_named(key)
+        {
+            self.add_art(Art::of(item), time, Some(target), None);
         }
         if let Some(selection) = events.select {
             self.selected = selection;
@@ -4450,6 +4492,7 @@ impl Editor {
             });
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             let rect = ui.available_rect_before_wrap();
+            self.take_art_dropped_on_picture(ui, palette, rect);
             let canvas = self.canvas_size();
             let played = self.project.tracks.played();
             let only_sound = played.is_empty() && !self.project.tracks.is_empty();
@@ -4540,6 +4583,47 @@ impl Editor {
         });
     }
 
+    /// Adds something from the Content library that was dragged onto the picture, where it was let
+    /// go. A frame, overlay or background covers the canvas, so only its time comes from this.
+    fn take_art_dropped_on_picture(
+        &mut self,
+        ui: &mut egui::Ui,
+        palette: &Palette,
+        area: egui::Rect,
+    ) {
+        let ctx = ui.ctx().clone();
+        let carrying = egui::DragAndDrop::payload::<MediaDrag>(&ctx).and_then(|drag| drag.art);
+        let Some(key) = carrying else {
+            return;
+        };
+        let zone = ui.interact(area, ui.scope_id().with("stage-art-drop"), Sense::hover());
+        let canvas = self.project.canvas.size();
+        let frame = fitted(vec2(canvas.0 as f32, canvas.1 as f32), area);
+        if zone.contains_pointer() {
+            ui.painter().rect_stroke(
+                frame,
+                0.0,
+                Stroke::new(2.0, palette.accent),
+                egui::StrokeKind::Inside,
+            );
+        }
+        if zone.dnd_release_payload::<MediaDrag>().is_none() {
+            return;
+        }
+        let Some(item) = bareclip_core::art::item_named(key) else {
+            return;
+        };
+        let pointer = ctx.input(|input| input.pointer.latest_pos());
+        let middle = pointer.map(|at| {
+            (
+                f64::from((at.x - frame.left()) / frame.width().max(1.0)),
+                f64::from((at.y - frame.top()) / frame.height().max(1.0)),
+            )
+        });
+        let time = self.position();
+        self.add_art(Art::of(item), time, None, middle);
+    }
+
     /// The handles and toolbar on the picture, and what they ask for.
     /// The selected clip's sound, if its file has any.
     fn selected_sound(&self) -> Option<stage::SelectedSound> {
@@ -4623,6 +4707,15 @@ impl Editor {
                     .can_move_in_order(id, OrderMove::Backward)
             }),
             selected_is_title: self.selected_title().is_some(),
+            art: self.selected_art().map(|(_, art)| stage::ArtBar {
+                fill: art.fill,
+                outline: (art.kind() == bareclip_core::art::ArtKind::Shape).then_some(art.outline),
+                has_more: matches!(
+                    art.kind(),
+                    bareclip_core::art::ArtKind::Shape | bareclip_core::art::ArtKind::Background
+                ),
+                places_itself: art.kind().fills_canvas(),
+            }),
         };
         let events = stage::show(ui, palette, &mut self.stage_state, &view);
         let pointer_down = ui.input(|input| input.pointer.any_down());
@@ -4678,6 +4771,20 @@ impl Editor {
         }
         if let Some(id) = events.detach {
             self.detach_sound(id);
+        }
+        if let Some((id, change)) = events.art
+            && let Some(media) = self.project.tracks.clip(id).map(|clip| clip.media)
+        {
+            match change {
+                stage::ArtChange::Fill(fill) => self.change_art(media, |art| art.fill = fill),
+                stage::ArtChange::Outline(width) => {
+                    self.change_art(media, |art| art.outline = width);
+                }
+                stage::ArtChange::Spot(spot) => {
+                    self.change_title(media, |title| title.spot = Some(spot));
+                }
+                stage::ArtChange::MoreOptions => self.open_clip_panel(id, LookTab::Shape),
+            }
         }
         if !pointer_down
             && let Some(before) = self.stage_before.take()
@@ -5276,61 +5383,6 @@ fn fitted(size: egui::Vec2, within: egui::Rect) -> egui::Rect {
 
 /// A rounded panel. The gap on its right and below it keeps it clear of its neighbours,
 /// and the rail or panel before it keeps it clear on the left.
-/// Swatches, a colour code and a picker. Returns a colour if one was picked. `typed` keeps a code
-/// partway through being typed.
-fn colour_choices(
-    ui: &mut egui::Ui,
-    palette: &Palette,
-    current: Colour,
-    typed: &mut Option<String>,
-) -> Option<Colour> {
-    let mut picked = None;
-    let [red, green, blue] = current;
-    let shown = Color32::from_rgb(red, green, blue);
-    for row in BACKGROUND_SWATCHES.chunks(8) {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            for (colour, name) in row {
-                let [red, green, blue] = *colour;
-                let swatch = ColourSwatch::new(
-                    palette,
-                    Color32::from_rgb(red, green, blue),
-                    name,
-                    *colour == current,
-                );
-                if ui.add(swatch).clicked() {
-                    picked = Some(*colour);
-                }
-            }
-        });
-    }
-    ui.separator();
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Custom").size(13.0).color(palette.text_muted));
-        let mut text = typed.clone().unwrap_or_else(|| colour_to_hex(current));
-        let field = ui.add(
-            egui::TextEdit::singleline(&mut text)
-                .desired_width(80.0)
-                .char_limit(7),
-        );
-        field.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, "Colour code"));
-        if field.changed() {
-            if let Some(colour) = colour_from_hex(&text) {
-                picked = Some(colour);
-            }
-            *typed = Some(text);
-        } else if !field.has_focus() {
-            *typed = None;
-        }
-    });
-    let mut chosen = shown;
-    egui::color_picker::color_picker_color32(ui, &mut chosen, egui::color_picker::Alpha::Opaque);
-    if chosen != shown {
-        picked = Some([chosen.r(), chosen.g(), chosen.b()]);
-    }
-    picked
-}
-
 fn panel_card(fill: Color32, inner: Margin) -> Frame {
     Frame::new()
         .fill(fill)
@@ -5636,6 +5688,7 @@ fn media_card(
                 },
                 sound_only: entry.info.is_sound_only(),
                 title: None,
+                art: None,
             };
             ui.dnd_drag_source(drag_id, payload, |ui| {
                 let width = ui.available_width();
@@ -8298,13 +8351,27 @@ mod tests {
             "Flip left to right",
             "Flip top to bottom",
             "Opacity",
-            "Top left",
-            "Bring to front",
-            "Send to back",
+            "Picture in picture",
+            "Order",
             "Reset size and place",
         ] {
             assert!(is_named(&ctx, &mut editor, line), "{line}");
         }
+        assert!(
+            !is_named(&ctx, &mut editor, "Top left"),
+            "corners wait beside"
+        );
+        open_side_menu(&ctx, &mut editor, "Order", "Send to back");
+        assert!(is_named(&ctx, &mut editor, "Bring to front"));
+        open_side_menu(&ctx, &mut editor, "Picture in picture", "Bottom right");
+        click_menu_item(&ctx, &mut editor, "Bottom right");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(placement_of(&editor, id).scale < WHOLE / 2);
+        assert!(
+            editor.timeline_state.menu_target.is_some(),
+            "a pick beside Arrange is inside the menu"
+        );
+        editor.undo();
 
         click_menu_item(&ctx, &mut editor, "Flip left to right");
         run_frame(&ctx, &mut editor, vec![]);
@@ -17919,6 +17986,7 @@ mod tests {
         };
         let mut file = ProjectFile {
             titles: Vec::new(),
+            library: Vec::new(),
             audio_tracks: Vec::new(),
             row_sound: Vec::new(),
             version: 2,
@@ -18195,6 +18263,17 @@ mod tests {
         }
     }
 
+    /// Opens the part of a menu beside the line `name`, unless `inside` already shows.
+    fn open_side_menu(ctx: &egui::Context, editor: &mut Editor, name: &str, inside: &str) {
+        if is_named(ctx, editor, inside) {
+            return;
+        }
+        click_named(ctx, editor, name);
+        for _ in 0..3 {
+            run_frame(ctx, editor, vec![]);
+        }
+    }
+
     #[test]
     fn picture_in_picture_puts_a_clip_small_in_a_corner_as_one_undo_step() {
         let ctx = context();
@@ -18203,6 +18282,8 @@ mod tests {
         editor.selected = Some(top);
         run_frame(&ctx, &mut editor, vec![]);
         open_more_menu(&ctx, &mut editor);
+        assert!(!is_named(&ctx, &mut editor, "Bottom right"), "one line");
+        open_side_menu(&ctx, &mut editor, "Picture in picture", "Bottom right");
 
         click_named(&ctx, &mut editor, "Bottom right");
 
@@ -18224,6 +18305,7 @@ mod tests {
         editor.selected = Some(below);
         run_frame(&ctx, &mut editor, vec![]);
         open_more_menu(&ctx, &mut editor);
+        open_side_menu(&ctx, &mut editor, "Order", "Bring to front");
 
         click_named(&ctx, &mut editor, "Bring to front");
         run_frame(&ctx, &mut editor, vec![]);
@@ -18243,6 +18325,7 @@ mod tests {
         editor.selected = Some(top);
         run_frame(&ctx, &mut editor, vec![]);
         open_more_menu(&ctx, &mut editor);
+        open_side_menu(&ctx, &mut editor, "Order", "Bring forward");
 
         // The clip on top has nowhere further forward to go, so pressing that does nothing.
         click_named(&ctx, &mut editor, "Bring forward");
@@ -18266,6 +18349,7 @@ mod tests {
         assert_eq!(editor.export_route(), Route::Fast);
 
         open_more_menu(&ctx, &mut editor);
+        open_side_menu(&ctx, &mut editor, "Order", "Bring forward");
         click_named(&ctx, &mut editor, "Bring forward");
         run_frame(&ctx, &mut editor, vec![]);
 
@@ -18459,5 +18543,609 @@ mod tests {
             placement
         );
         assert!(!reopened.has_unsaved_changes());
+    }
+
+    fn library_item(key: &str) -> &'static bareclip_core::art::ArtItem {
+        bareclip_core::art::item_named(key).expect("it is in the library")
+    }
+
+    fn art_of_clip(editor: &Editor, id: ClipId) -> Art {
+        title_of_clip(editor, id)
+            .art
+            .expect("it is from the library")
+    }
+
+    /// What screen readers call a category's or collection's card.
+    fn group_name(name: &str, count: usize) -> String {
+        format!("Open {name}, {count} items")
+    }
+
+    #[test]
+    fn pressing_a_shape_in_the_library_adds_it_at_the_playhead_on_a_new_row() {
+        use bareclip_core::art::{ArtKind, CATALOGUE, items_in};
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        editor.seek(Ticks::from_seconds(1.0));
+        let video = editor.project.tracks.played().clips()[0].id;
+        let video_start = editor.project.tracks.clip(video).map(|clip| clip.start);
+        let rows = editor.project.tracks.tracks().len();
+        run_frame(&ctx, &mut editor, vec![]);
+
+        click_named(&ctx, &mut editor, "Content library");
+        let shapes = CATALOGUE
+            .iter()
+            .filter(|item| item.kind == ArtKind::Shape)
+            .count();
+        click_named(&ctx, &mut editor, &group_name("Shapes", shapes));
+        let basic = items_in(ArtKind::Shape, "Basic").len();
+        click_named(&ctx, &mut editor, &group_name("Basic", basic));
+        assert!(has_named(&ctx, &mut editor, "Add Heart"));
+        click_named(&ctx, &mut editor, "Add Square");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let id = editor.selected.expect("the shape is selected");
+        let clip = editor
+            .project
+            .tracks
+            .clip(id)
+            .expect("it is on the timeline");
+        assert_eq!(art_of_clip(&editor, id).item, "square");
+        assert_eq!(clip.start, Ticks::from_seconds(1.0));
+        assert_eq!(clip.duration(), Ticks::from_seconds(5.0));
+        assert_eq!(editor.project.tracks.tracks().len(), rows + 1);
+        assert_eq!(editor.project.tracks.track_of(id), Some(0));
+        assert_eq!(
+            editor.project.tracks.clip(video).map(|clip| clip.start),
+            video_start,
+            "adding a shape moves nothing else"
+        );
+        assert_eq!(
+            editor.clip_tabs(),
+            vec![
+                LookTab::Shape,
+                LookTab::Animate,
+                LookTab::Effects,
+                LookTab::Colours
+            ]
+        );
+        assert!(
+            editor.project.library.is_empty(),
+            "a shape gets no card in My media"
+        );
+        assert!(editor.right_panel.is_none(), "adding one opens nothing");
+
+        editor.undo();
+        assert!(
+            editor.project.tracks.clip(id).is_none(),
+            "one undo takes it away"
+        );
+    }
+
+    #[test]
+    fn the_chips_step_back_out_of_a_collection() {
+        use bareclip_core::art::{ArtKind, items_in};
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Content library");
+        let frames = bareclip_core::art::CATALOGUE
+            .iter()
+            .filter(|item| item.kind == ArtKind::Frame)
+            .count();
+        click_named(&ctx, &mut editor, &group_name("Frames & borders", frames));
+        let corners = items_in(ArtKind::Frame, "Corners").len();
+        click_named(&ctx, &mut editor, &group_name("Corners", corners));
+        assert!(has_named(&ctx, &mut editor, "Add Round corners"));
+
+        click_named(&ctx, &mut editor, "Corners");
+        assert!(has_named(
+            &ctx,
+            &mut editor,
+            &group_name("Corners", corners)
+        ));
+        click_named(&ctx, &mut editor, "All");
+        assert!(has_named(
+            &ctx,
+            &mut editor,
+            &group_name("Frames & borders", frames)
+        ));
+    }
+
+    #[test]
+    fn searching_the_library_finds_things_in_every_category() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Content library");
+        editor.library_view.search = "arrow".to_owned();
+        let names: Vec<String> = named_nodes(&ctx, &mut editor)
+            .into_iter()
+            .map(|(name, ..)| name)
+            .filter(|name| name.starts_with("Add "))
+            .collect();
+        for wanted in ["Add Arrow", "Add Thin arrow", "Add Loop arrow"] {
+            assert!(
+                names.iter().any(|name| name == wanted),
+                "{wanted} in {names:?}"
+            );
+        }
+        assert!(!names.iter().any(|name| name == "Add Square"));
+    }
+
+    #[test]
+    fn an_annotation_lasts_four_seconds_and_gets_one_card_in_my_media() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        let circle = library_item("marker-circle");
+
+        editor.add_art(Art::of(circle), Ticks::from_seconds(0.5), None, None);
+        let first = editor.selected.expect("it is selected");
+        editor.add_art(Art::of(circle), Ticks::from_seconds(0.5), None, None);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let clip = editor.project.tracks.clip(first).expect("it is there");
+        assert_eq!(clip.start, Ticks::from_seconds(0.5));
+        assert_eq!(clip.duration(), Ticks::from_seconds(4.0));
+        assert_eq!(
+            editor.project.library.len(),
+            1,
+            "adding it twice makes one card"
+        );
+        assert_eq!(editor.project.library[0].item, "marker-circle");
+        assert!(has_named(
+            &ctx,
+            &mut editor,
+            "Marker circle from the library"
+        ));
+        assert_eq!(
+            editor.clip_tabs(),
+            vec![
+                LookTab::Fade,
+                LookTab::Filters,
+                LookTab::Effects,
+                LookTab::Colours
+            ]
+        );
+
+        editor.undo();
+        editor.undo();
+        assert!(
+            editor.project.library.is_empty(),
+            "undo takes the card away too"
+        );
+    }
+
+    #[test]
+    fn a_frame_covers_the_whole_project_from_its_start() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        let length = editor.project.tracks.duration();
+        editor.seek(Ticks::from_seconds(1.0));
+
+        editor.add_art(
+            Art::of(library_item("film-strip")),
+            Ticks::from_seconds(1.0),
+            None,
+            None,
+        );
+        let id = editor.selected.expect("it is selected");
+
+        let clip = editor.project.tracks.clip(id).expect("it is there");
+        assert_eq!(clip.start, Ticks(0));
+        assert_eq!(clip.duration(), length);
+        assert_eq!(
+            editor.project.tracks.duration(),
+            length,
+            "it makes nothing longer"
+        );
+    }
+
+    #[test]
+    fn something_in_an_empty_project_still_gets_a_length() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        editor.add_art(Art::of(library_item("snow")), Ticks(0), None, None);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let id = editor.selected.expect("it is selected");
+        let clip = editor.project.tracks.clip(id).expect("it is there");
+        assert_eq!(clip.duration(), Ticks::from_seconds(5.0));
+    }
+
+    #[test]
+    fn dropping_a_library_item_on_the_timeline_adds_it_where_it_lands() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let events = timeline::TimelineEvents {
+            drop_art: Some(("star", Ticks::from_seconds(2.0), TrackTarget::New(0))),
+            ..Default::default()
+        };
+        editor.apply_timeline_events(events, false);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let id = editor.selected.expect("it is selected");
+        let clip = editor.project.tracks.clip(id).expect("it is there");
+        assert_eq!(clip.start, Ticks::from_seconds(2.0));
+        assert_eq!(art_of_clip(&editor, id).item, "star");
+    }
+
+    #[test]
+    fn dropping_a_shape_on_the_picture_puts_it_there() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        editor.add_art(
+            Art::of(library_item("heart")),
+            Ticks(0),
+            None,
+            Some((0.25, 0.75)),
+        );
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let id = editor.selected.expect("it is selected");
+        let clip = editor.project.tracks.clip(id).expect("it is there");
+        assert_eq!(clip.placement.center_x, WHOLE / 4);
+        assert_eq!(clip.placement.center_y, WHOLE * 3 / 4);
+        assert_eq!(
+            title_of_clip(&editor, id).spot,
+            None,
+            "it stays where it was put"
+        );
+    }
+
+    #[test]
+    fn the_bar_recolours_a_shape_and_each_change_is_one_undo_step() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        editor.add_art(Art::of(library_item("circle")), Ticks(0), None, None);
+        let id = editor.selected.expect("it is selected");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let events = stage::StageEvents {
+            art: Some((id, stage::ArtChange::Fill(Some([10, 20, 30])))),
+            ..Default::default()
+        };
+        editor.apply_stage_events(events, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        let events = stage::StageEvents {
+            art: Some((id, stage::ArtChange::Outline(12))),
+            ..Default::default()
+        };
+        editor.apply_stage_events(events, false);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        let art = art_of_clip(&editor, id);
+        assert_eq!(art.fill, Some([10, 20, 30]));
+        assert_eq!(art.outline, 12);
+        editor.undo();
+        run_frame(&ctx, &mut editor, vec![]);
+        let art = art_of_clip(&editor, id);
+        assert_eq!(art.fill, Some([10, 20, 30]), "only the outline went back");
+        assert_eq!(art.outline, 0);
+
+        let events = stage::StageEvents {
+            art: Some((id, stage::ArtChange::MoreOptions)),
+            ..Default::default()
+        };
+        editor.apply_stage_events(events, false);
+        assert_eq!(editor.right_panel, Some(RightPanel::Tool(LookTab::Shape)));
+    }
+
+    #[test]
+    fn position_lines_a_shape_up_one_way_at_a_time() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        editor.add_art(Art::of(library_item("square")), Ticks(0), None, None);
+        let id = editor.selected.expect("it is selected");
+        for _ in 0..3 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        let open_position = |ctx: &egui::Context, editor: &mut Editor| {
+            // Picking a line leaves the menu open, so another can be picked straight after.
+            if !is_named(ctx, editor, "Position") {
+                open_more_menu(ctx, editor);
+            }
+            assert!(!is_named(ctx, editor, "Top left"), "one line, not nine");
+            if !is_named(ctx, editor, "Left") {
+                click_named(ctx, editor, "Position");
+            }
+            for _ in 0..3 {
+                run_frame(ctx, editor, vec![]);
+            }
+        };
+
+        open_position(&ctx, &mut editor);
+        for line in ["Left", "Centre", "Right", "Top", "Middle", "Bottom"] {
+            assert!(is_named(&ctx, &mut editor, line), "{line}");
+        }
+        click_named(&ctx, &mut editor, "Left");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(
+            title_of_clip(&editor, id).spot,
+            Some(TitleSpot::MiddleLeft),
+            "it keeps its place top to bottom"
+        );
+        editor.undo();
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(title_of_clip(&editor, id).spot, Some(TitleSpot::Middle));
+
+        // Moved by hand, it only moves the one way.
+        let placed = placement_of(&editor, id);
+        let moved = Placement {
+            center_x: WHOLE / 3,
+            center_y: WHOLE / 4,
+            ..placed
+        };
+        editor.apply_stage_events(
+            stage::StageEvents {
+                place: Some((id, moved)),
+                ..Default::default()
+            },
+            false,
+        );
+        for _ in 0..3 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        open_position(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Bottom");
+        run_frame(&ctx, &mut editor, vec![]);
+        let after = placement_of(&editor, id);
+        assert_eq!(after.center_x, WHOLE / 3);
+        assert!(after.center_y > WHOLE / 2, "{after:?}");
+        assert_eq!(title_of_clip(&editor, id).spot, None);
+    }
+
+    #[test]
+    fn choosing_an_animation_shows_it_from_the_start_of_the_clip() {
+        use bareclip_core::art::Animate;
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        editor.add_art(Art::of(library_item("flower")), Ticks(0), None, None);
+        let id = editor.selected.expect("it is selected");
+        editor.open_clip_panel(id, LookTab::Animate);
+        editor.seek(Ticks::from_seconds(2.0));
+        run_frame(&ctx, &mut editor, vec![]);
+
+        click_named(&ctx, &mut editor, "Natural");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert_eq!(art_of_clip(&editor, id).animate, Animate::Natural);
+        assert_eq!(editor.position(), Ticks(0));
+        editor.undo();
+        assert_eq!(art_of_clip(&editor, id).animate, Animate::None);
+    }
+
+    #[test]
+    fn the_clip_menu_offers_the_same_tools_as_the_rail() {
+        use bareclip_core::art::ArtKind;
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        for (key, kind) in [
+            ("square", ArtKind::Shape),
+            ("tick", ArtKind::Annotation),
+            ("corners", ArtKind::Frame),
+            ("rain", ArtKind::Overlay),
+            ("sunset", ArtKind::Background),
+        ] {
+            editor.add_art(Art::of(library_item(key)), Ticks(0), None, None);
+            let menu: Vec<LookTab> = timeline::menu_tools(true, Some(kind))
+                .into_iter()
+                .map(|(_, _, tab)| tab)
+                .collect();
+            let mut rail = editor.clip_tabs();
+            let mut sorted = menu.clone();
+            rail.sort_by_key(|tab| format!("{tab:?}"));
+            sorted.sort_by_key(|tab| format!("{tab:?}"));
+            assert_eq!(sorted, rail, "{key}");
+        }
+    }
+
+    #[test]
+    fn library_items_and_their_cards_save_and_come_back() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        run_frame(&ctx, &mut editor, vec![]);
+        editor.add_art(Art::of(library_item("speech-bubble")), Ticks(0), None, None);
+        let shape = editor.selected.expect("it is selected");
+        let media = editor.project.tracks.clip(shape).expect("there").media;
+        editor.change_art(media, |art| {
+            art.fill = Some([200, 10, 10]);
+            art.animate = bareclip_core::art::Animate::BounceScale;
+        });
+        editor.add_art(Art::of(library_item("dust")), Ticks(0), None, None);
+        run_frame(&ctx, &mut editor, vec![]);
+        let saved = art_of_clip(&editor, shape);
+        let path =
+            std::env::temp_dir().join(format!("bareclip-library-{}.bareclip", std::process::id()));
+        assert!(editor.save_to(&path), "it saves");
+
+        let mut back = Editor::new(&ctx, false);
+        back.open_project(&ctx, &path);
+        run_frame(&ctx, &mut back, vec![]);
+
+        assert!(!back.has_unsaved_changes(), "opening it changes nothing");
+        let arts: Vec<Art> = back
+            .project
+            .tracks
+            .tracks()
+            .iter()
+            .flat_map(|row| row.clips())
+            .filter_map(|clip| back.art_of(*clip).cloned())
+            .collect();
+        assert!(arts.contains(&saved));
+        assert!(arts.iter().any(|art| art.item == "dust"));
+        assert_eq!(back.project.library.len(), 1);
+        assert_eq!(back.project.library[0].item, "dust");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_rating_titles_panel_keeps_its_width_beside_the_picture() {
+        let ctx = context();
+        // The card holding the picture ends where the panel starts, and Export sits at its edge.
+        let edge_of_picture_card = |style: TitleStyle| {
+            let mut editor = with_videos(&ctx, &[test_clip()]);
+            run_frame(&ctx, &mut editor, vec![]);
+            with_a_title(&ctx, &mut editor, style);
+            settle_animations(&ctx, &mut editor);
+            named_rect(&ctx, &mut editor, "Export").right()
+        };
+        let plain = edge_of_picture_card(TitleStyle::Plain);
+        let rating = edge_of_picture_card(TitleStyle::Rating);
+        assert!(
+            (plain - rating).abs() < 1.0,
+            "the Stars slider let the picture's card grow over the panel, from {plain} to {rating}"
+        );
+    }
+
+    #[test]
+    fn the_shape_panel_keeps_its_width_beside_the_picture() {
+        let ctx = context();
+        let edge_with = |tab: LookTab| {
+            let mut editor = with_videos(&ctx, &[test_clip()]);
+            run_frame(&ctx, &mut editor, vec![]);
+            editor.add_art(Art::of(library_item("square")), Ticks(0), None, None);
+            let id = editor.selected.expect("it is selected");
+            editor.open_clip_panel(id, tab);
+            settle_animations(&ctx, &mut editor);
+            named_rect(&ctx, &mut editor, "Export").right()
+        };
+        let animate = edge_with(LookTab::Animate);
+        let shape = edge_with(LookTab::Shape);
+        assert!((animate - shape).abs() < 1.0, "{animate} against {shape}");
+    }
+
+    #[test]
+    fn a_library_clip_says_what_it_is_on_the_timeline() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        run_frame(&ctx, &mut editor, vec![]);
+        editor.add_art(Art::of(library_item("cog")), Ticks(0), None, None);
+        let id = editor.selected.expect("it is selected");
+        let title = title_of_clip(&editor, id);
+        assert_eq!(Editor::title_label(&title), "Cog");
+    }
+
+    /// `$env:BARECLIP_SCREENS = '<folder>'; ./scripts/cargo.ps1 test -p bareclip-app --bin bareclip draw_the_library_screens '--' --ignored`
+    #[test]
+    #[ignore = "needs a real GPU, and draws pictures to look at rather than checking anything"]
+    fn draw_the_library_screens() {
+        use bareclip_core::art::{ArtKind, CATALOGUE, items_in};
+        let folder = std::env::var_os("BARECLIP_SCREENS").map_or_else(
+            || std::env::temp_dir().join("bareclip-screens"),
+            PathBuf::from,
+        );
+        let ctx = context();
+        let mut camera = Camera::new(folder);
+        let big = make_clip("library-screen", "1280x720");
+        let mut editor = with_videos(&ctx, &[&big]);
+        editor.use_gpu(LayerDisplay::new(
+            camera.device.clone(),
+            camera.queue.clone(),
+            camera.renderer.clone(),
+        ));
+        let settle_frames = |ctx: &egui::Context, editor: &mut Editor, count: usize| {
+            for _ in 0..count {
+                run_frame(ctx, editor, vec![]);
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        settle_frames(&ctx, &mut editor, 30);
+        click_named(&ctx, &mut editor, "Content library");
+        settle_frames(&ctx, &mut editor, 12);
+        camera.shoot(&ctx, &mut editor, vec![], "library-01-categories");
+
+        let count = |kind: ArtKind| CATALOGUE.iter().filter(|item| item.kind == kind).count();
+        click_named(
+            &ctx,
+            &mut editor,
+            &group_name("Shapes", count(ArtKind::Shape)),
+        );
+        settle_frames(&ctx, &mut editor, 12);
+        camera.shoot(&ctx, &mut editor, vec![], "library-02-shape-collections");
+
+        let basic = items_in(ArtKind::Shape, "Basic").len();
+        click_named(&ctx, &mut editor, &group_name("Basic", basic));
+        settle_frames(&ctx, &mut editor, 12);
+        camera.shoot(&ctx, &mut editor, vec![], "library-03-basic");
+
+        click_named(&ctx, &mut editor, "Add Star");
+        editor.seek(Ticks::from_seconds(1.0));
+        settle_frames(&ctx, &mut editor, 30);
+        camera.shoot(&ctx, &mut editor, vec![], "library-04-star-selected");
+
+        let id = editor.selected.expect("the star is selected");
+        editor.open_clip_panel(id, LookTab::Shape);
+        settle_frames(&ctx, &mut editor, 40);
+        camera.shoot(&ctx, &mut editor, vec![], "library-05-shape-panel");
+
+        editor.open_clip_panel(id, LookTab::Animate);
+        settle_frames(&ctx, &mut editor, 12);
+        camera.shoot(&ctx, &mut editor, vec![], "library-06-animate-panel");
+
+        click_named(&ctx, &mut editor, "More");
+        settle_frames(&ctx, &mut editor, 12);
+        camera.shoot(&ctx, &mut editor, vec![], "library-07-more-menu");
+        click_named(&ctx, &mut editor, "Position");
+        settle_frames(&ctx, &mut editor, 12);
+        camera.shoot(&ctx, &mut editor, vec![], "library-07-position-menu");
+        click_named(&ctx, &mut editor, "Order");
+        settle_frames(&ctx, &mut editor, 12);
+        camera.shoot(&ctx, &mut editor, vec![], "library-07-order-menu");
+        run_frame(&ctx, &mut editor, key_event(Key::Escape, Modifiers::NONE));
+        settle_frames(&ctx, &mut editor, 4);
+
+        let square = items_in(ArtKind::Shape, "Outline")
+            .into_iter()
+            .find(|item| item.key == "outline-square")
+            .expect("there is a square outline");
+        editor.add_art(Art::of(square), Ticks::from_seconds(1.0), None, None);
+        let outlined = editor.selected.expect("the square is selected");
+        editor.apply_stage_events(
+            stage::StageEvents {
+                art: Some((outlined, stage::ArtChange::Outline(12))),
+                ..Default::default()
+            },
+            false,
+        );
+        settle_frames(&ctx, &mut editor, 30);
+        camera.shoot(&ctx, &mut editor, vec![], "library-07-square-outline");
+
+        editor.add_art(Art::of(library_item("marker-circle")), Ticks(0), None, None);
+        editor.add_art(Art::of(library_item("neon-glow")), Ticks(0), None, None);
+        editor.add_art(Art::of(library_item("snow")), Ticks(0), None, None);
+        editor.selected = None;
+        editor.seek(Ticks::from_seconds(1.5));
+        click_named(&ctx, &mut editor, "My media");
+        settle_frames(&ctx, &mut editor, 40);
+        camera.shoot(
+            &ctx,
+            &mut editor,
+            vec![],
+            "library-08-my-media-and-timeline",
+        );
+
+        click_named(&ctx, &mut editor, "Content library");
+        click_named(&ctx, &mut editor, "All");
+        editor.library_view.search = "frame".to_owned();
+        settle_frames(&ctx, &mut editor, 12);
+        camera.shoot(&ctx, &mut editor, vec![], "library-09-search");
+
+        // A Rating title's Stars slider, which shows its number beside it the same way.
+        with_a_title(&ctx, &mut editor, TitleStyle::Rating);
+        settle_frames(&ctx, &mut editor, 40);
+        camera.shoot(&ctx, &mut editor, vec![], "library-10-rating-stars");
     }
 }

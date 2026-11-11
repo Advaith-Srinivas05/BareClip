@@ -11,6 +11,7 @@ use bareclip_core::{
 use cosmic_text::Color;
 
 use crate::{
+    art::MovingArt,
     draw::{
         Area, Ink, Paint, Plan, draw_title_with_logo, font_for, letter_pixels, plan_title,
         reach_past_words, star_at, word_colours,
@@ -114,6 +115,8 @@ pub struct MovingTitle {
     line_y: Option<f32>,
     /// The frame's outside edge and how thick its lines are, for one that spins open.
     frame_edge: Option<([f32; 4], f32)>,
+    /// Something from the library, which draws itself and has none of the above.
+    art: Option<Box<MovingArt>>,
 }
 
 /// Lays a picture over the frame, at a whole pixel, with only part of it showing if asked.
@@ -450,6 +453,27 @@ fn glyphs_of(
 impl MovingTitle {
     /// Gets a title ready. This takes a moment, so it is only done for titles about to be shown.
     pub fn prepare(title: &Title, canvas: (u32, u32), logo: Option<&StillPicture>) -> Self {
+        if let Some(art) = &title.art {
+            return Self {
+                title: title.clone(),
+                motion: title.style.motion(),
+                canvas,
+                logo: None,
+                rest_size: (1, 1),
+                frame_size: (1, 1),
+                shrink: 1.0,
+                pixels: 1.0,
+                base: Vec::new(),
+                boxes: Vec::new(),
+                white_boxes: Vec::new(),
+                letters: Vec::new(),
+                words: 0,
+                fill: None,
+                line_y: None,
+                frame_edge: None,
+                art: Some(Box::new(MovingArt::prepare(title, art, canvas))),
+            };
+        }
         let mut title = title.clone();
         if title.style.motion().finish == Finish::Karaoke {
             // Each letter is painted in its colour, and the swept copy in the accent's.
@@ -477,6 +501,7 @@ impl MovingTitle {
             fill: None,
             line_y: None,
             frame_edge: None,
+            art: None,
         };
         // These are drawn again for each moment, so they need nothing laid out.
         if matches!(motion.running, Running::Countdown | Running::WordByWord)
@@ -714,11 +739,17 @@ impl MovingTitle {
 
     /// The scale that shows a picture of this size at the title's real size.
     pub fn scale_for(&self, picture: (u32, u32)) -> i32 {
+        if let Some(art) = &self.art {
+            return art.scale_for(picture);
+        }
         scale_for_pixels(picture, self.canvas, self.shrink)
     }
 
     /// The picture for this moment. Its size can differ from the resting one, around the same middle.
     pub fn frame(&self, stage: Stage) -> StillPicture {
+        if let Some(art) = &self.art {
+            return art.frame(stage);
+        }
         if self.motion.running == Running::Countdown {
             return self.drawn_with(&TitleMotion::countdown_words(stage));
         }

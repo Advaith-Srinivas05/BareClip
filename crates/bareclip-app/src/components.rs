@@ -7,6 +7,8 @@ use eframe::egui::{
     Stroke, StrokeKind, Ui, Widget, pos2, vec2,
 };
 
+use bareclip_core::canvas::{BACKGROUND_SWATCHES, Colour, colour_from_hex, colour_to_hex};
+
 use crate::{
     fonts,
     icons::{self, Icon},
@@ -35,6 +37,11 @@ const CARD_ICON_SIZE: f32 = 18.0;
 const CARD_ICON_GAP: f32 = 10.0;
 const PROGRESS_HEIGHT: f32 = 8.0;
 const RAIL_TAB_HEIGHT: f32 = 58.0;
+/// How large a rail tab's symbol is, and the room between it and its name.
+const RAIL_SYMBOL: f32 = 20.0;
+const RAIL_SYMBOL_GAP: f32 = 5.0;
+/// The room kept clear inside a rail tab's edges.
+const RAIL_LABEL_INSET: f32 = 3.0;
 const CHECK_BOX_SIZE: f32 = 20.0;
 const MENU_ITEM_HEIGHT: f32 = 30.0;
 const MENU_WIDTH: f32 = 210.0;
@@ -513,6 +520,8 @@ pub struct MenuItem<'a> {
     opens_more: bool,
     shape: Option<(u32, u32)>,
     detail: &'a str,
+    /// Leaves room for a tick before the symbol, and whether it is ticked.
+    tick: Option<bool>,
 }
 
 impl<'a> MenuItem<'a> {
@@ -525,6 +534,16 @@ impl<'a> MenuItem<'a> {
             opens_more: false,
             shape: None,
             detail: "",
+            tick: None,
+        }
+    }
+
+    /// One choice among several that has a symbol of its own, with a tick before it if it is the
+    /// current one.
+    pub fn ticked(palette: &'a Palette, icon: Icon, label: &'a str, chosen: bool) -> Self {
+        Self {
+            tick: Some(chosen),
+            ..Self::new(palette, icon, label, "")
         }
     }
 
@@ -546,6 +565,7 @@ impl<'a> MenuItem<'a> {
             opens_more: false,
             shape: None,
             detail: "",
+            tick: None,
         }
     }
 
@@ -580,20 +600,37 @@ impl Widget for MenuItem<'_> {
         let enabled = response.enabled();
         let label = self.label;
         let (detail, chosen) = (self.detail, self.icon.is_some());
+        let tick = self.tick;
         response.widget_info(|| {
             let name = if detail.is_empty() {
                 label.to_owned()
             } else {
                 format!("{label} {detail}")
             };
-            egui::WidgetInfo::labeled(egui::Role::MenuItem, enabled, name)
+            match tick {
+                Some(ticked) => {
+                    egui::WidgetInfo::selected(egui::Role::MenuItem, enabled, ticked, name)
+                }
+                None => egui::WidgetInfo::labeled(egui::Role::MenuItem, enabled, name),
+            }
         });
         if ui.is_rect_visible(rect) {
             let palette = self.palette;
             let look = look(palette, Kind::Ghost, state_of(&response));
             paint_box(ui, rect, f32::from(RADIUS), &look, &response, palette);
             let icon_size = 16.0;
-            let left = rect.left() + MENU_ITEM_PADDING;
+            let mut left = rect.left() + MENU_ITEM_PADDING;
+            if let Some(ticked) = self.tick {
+                if ticked {
+                    icons::paint(
+                        ui.painter(),
+                        icons::square_at(pos2(left + icon_size / 2.0, rect.center().y), icon_size),
+                        &icons::CHECK,
+                        look.content,
+                    );
+                }
+                left += icon_size + ICON_GAP;
+            }
             if let Some(icon) = &self.icon {
                 icons::paint(
                     ui.painter(),
@@ -953,6 +990,65 @@ impl Widget for SpotButton<'_> {
     }
 }
 
+/// Swatches, a colour code and a picker. Returns a colour if one was picked. `typed` keeps a code
+/// partway through being typed.
+pub fn colour_choices(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    current: Colour,
+    typed: &mut Option<String>,
+) -> Option<Colour> {
+    let mut picked = None;
+    let [red, green, blue] = current;
+    let shown = Color32::from_rgb(red, green, blue);
+    for row in BACKGROUND_SWATCHES.chunks(8) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for (colour, name) in row {
+                let [red, green, blue] = *colour;
+                let swatch = ColourSwatch::new(
+                    palette,
+                    Color32::from_rgb(red, green, blue),
+                    name,
+                    *colour == current,
+                );
+                if ui.add(swatch).clicked() {
+                    picked = Some(*colour);
+                }
+            }
+        });
+    }
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("Custom")
+                .size(13.0)
+                .color(palette.text_muted),
+        );
+        let mut text = typed.clone().unwrap_or_else(|| colour_to_hex(current));
+        let field = ui.add(
+            egui::TextEdit::singleline(&mut text)
+                .desired_width(80.0)
+                .char_limit(7),
+        );
+        field.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, "Colour code"));
+        if field.changed() {
+            if let Some(colour) = colour_from_hex(&text) {
+                picked = Some(colour);
+            }
+            *typed = Some(text);
+        } else if !field.has_focus() {
+            *typed = None;
+        }
+    });
+    let mut chosen = shown;
+    egui::color_picker::color_picker_color32(ui, &mut chosen, egui::color_picker::Alpha::Opaque);
+    if chosen != shown {
+        picked = Some([chosen.r(), chosen.g(), chosen.b()]);
+    }
+    picked
+}
+
 pub struct ColourSwatch<'a> {
     palette: &'a Palette,
     colour: Color32,
@@ -1117,6 +1213,18 @@ impl Widget for Dropdown<'_> {
 }
 
 /// A tab on a tool rail, with its symbol above its label. `name` is what screen readers are told.
+/// A rail tab's name, centred, going onto a second line rather than past the rail's edges.
+fn rail_label(ui: &Ui, label: &str, width: f32) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple(
+        label.to_owned(),
+        FontId::new(11.0, FontFamily::Proportional),
+        Color32::PLACEHOLDER,
+        width - RAIL_LABEL_INSET * 2.0,
+    );
+    job.halign = Align::Center;
+    ui.painter().layout_job(job)
+}
+
 pub fn rail_tab(
     ui: &mut Ui,
     palette: &Palette,
@@ -1125,7 +1233,10 @@ pub fn rail_tab(
     name: &str,
     selected: bool,
 ) -> Response {
-    let size = vec2(ui.available_width(), RAIL_TAB_HEIGHT);
+    let width = ui.available_width();
+    let words = rail_label(ui, label, width);
+    let content = RAIL_SYMBOL + RAIL_SYMBOL_GAP + words.rect.height();
+    let size = vec2(width, RAIL_TAB_HEIGHT.max(content + RAIL_LABEL_INSET * 4.0));
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, name));
     if !ui.is_rect_visible(rect) {
@@ -1161,17 +1272,17 @@ pub fn rail_tab(
             palette.accent,
         );
     }
+    // The symbol and its name sit together in the middle, however many lines the name takes.
+    let top = rect.center().y - content / 2.0;
     icons::paint(
         ui.painter(),
-        icons::square_at(rect.center() - vec2(0.0, 9.0), 20.0),
+        icons::square_at(pos2(rect.center().x, top + RAIL_SYMBOL / 2.0), RAIL_SYMBOL),
         icon,
         symbol_color,
     );
-    ui.painter().text(
-        rect.center() + vec2(0.0, 14.0),
-        Align2::CENTER_CENTER,
-        label,
-        FontId::new(11.0, FontFamily::Proportional),
+    ui.painter().galley(
+        pos2(rect.center().x, top + RAIL_SYMBOL + RAIL_SYMBOL_GAP),
+        words,
         text_color,
     );
     response
@@ -1352,6 +1463,32 @@ mod tests {
             assert!(contrast(palette.text_muted, palette.bg_app) >= TEXT_MINIMUM);
             assert!(contrast(palette.text, palette.raised) >= TEXT_MINIMUM);
         }
+    }
+
+    #[test]
+    fn a_long_rail_name_goes_onto_a_second_line_inside_the_rail() {
+        // The rail is 78 wide with 8 either side.
+        let width = 62.0;
+        let ctx = context();
+        run_ui(&ctx, egui::RawInput::default(), |ui| {
+            let long = rail_label(ui, "Content library", width);
+            assert_eq!(long.rows.len(), 2);
+            assert!(long.rect.width() <= width - RAIL_LABEL_INSET * 2.0);
+            assert!(long.rect.min.x >= -width / 2.0 && long.rect.max.x <= width / 2.0);
+            assert_eq!(rail_label(ui, "Text", width).rows.len(), 1);
+        });
+    }
+
+    #[test]
+    fn a_long_rail_name_makes_its_tab_taller_and_a_short_one_does_not() {
+        let ctx = context();
+        run_ui(&ctx, egui::RawInput::default(), |ui| {
+            ui.set_width(62.0);
+            let short = rail_tab(ui, &DARK, &icons::TYPE, "Text", "Text", false);
+            let long = rail_tab(ui, &DARK, &icons::LIBRARY_BIG, "Content library", "", false);
+            assert_eq!(short.rect.height(), RAIL_TAB_HEIGHT);
+            assert!(long.rect.height() > RAIL_TAB_HEIGHT);
+        });
     }
 
     #[test]

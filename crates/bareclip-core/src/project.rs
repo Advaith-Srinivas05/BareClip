@@ -10,6 +10,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    art::Art,
     canvas::Canvas,
     effects::{ClipLook, Transition},
     placement::Placement,
@@ -23,7 +24,7 @@ use crate::{
 
 pub const EXTENSION: &str = "bareclip";
 /// Goes up whenever the format changes in a way older versions can't read.
-const CURRENT_VERSION: u32 = 9;
+const CURRENT_VERSION: u32 = 10;
 /// Files older than this had their size worked out from the largest video.
 const FIRST_VERSION_WITH_CANVAS: u32 = 3;
 pub const DEFAULT_NAME: &str = "untitled";
@@ -103,6 +104,9 @@ pub struct ProjectFile {
     /// What each title's clip says and how it looks. Older files have none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub titles: Vec<SavedTitle>,
+    /// Things from the library that have a card in My media, in the order they were added.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub library: Vec<Art>,
     /// Highest track first, each with its clips in order.
     pub tracks: Vec<Vec<SavedClip>>,
     /// The rows of sound below those, from the top down.
@@ -156,6 +160,7 @@ impl ProjectFile {
                 })
                 .collect(),
             titles: Vec::new(),
+            library: Vec::new(),
             tracks: saved_rows(tracks.picture_tracks()),
             audio_tracks: saved_rows(tracks.audio_tracks()),
             row_sound: Vec::new(),
@@ -548,6 +553,35 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn library_cards_and_drawn_items_survive_being_written_and_read_back() {
+        let mut project = file();
+        let art = Art {
+            fill: Some([1, 2, 3]),
+            animate: crate::art::Animate::Natural,
+            ..Art::of(crate::art::item_named("flower").expect("it is listed"))
+        };
+        project.library = vec![Art::of(
+            crate::art::item_named("marker-circle").expect("it is listed"),
+        )];
+        project.titles = vec![SavedTitle {
+            id: MediaId::for_title(3).0,
+            title: Title::of_art(art.clone()),
+        }];
+
+        let back = ProjectFile::from_text(&project.to_text()).expect("it can be read");
+
+        assert_eq!(back, project);
+        assert_eq!(back.titles[0].title.art, Some(art));
+    }
+
+    #[test]
+    fn a_project_without_library_items_writes_nothing_about_them() {
+        let text = file().to_text();
+        assert!(!text.contains("library"));
+        assert!(!text.contains("\"art\""));
     }
 
     #[test]

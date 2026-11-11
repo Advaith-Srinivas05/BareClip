@@ -284,7 +284,8 @@ def build_palette():
         ("border", "Dividers"), ("border_strong", "Control outlines"), ("text", "Text"),
         ("text_muted", "Secondary text"), ("accent", "Accent"), ("accent_hover", "Accent hover"),
         ("selection", "Selection"), ("playhead", "Playhead"), ("stage", "Video stage"), ("clip_video", "Video clips"),
-        ("clip_audio", "Audio clips"), ("clip_overlay", "Overlay clips"), ("danger", "Errors"),
+        ("clip_audio", "Audio clips"), ("clip_overlay", "Overlay clips"), ("clip_shape", "Library clips"),
+        ("danger", "Errors"),
         ("success", "Success"),
     ]
     width, row, head = 1000, 44, 76

@@ -8,7 +8,7 @@ use std::{
 };
 
 use bareclip_core::{
-    motion::{Pose, Running},
+    motion::Pose,
     picture::StillPicture,
     placement::Placement,
     time::Ticks,
@@ -70,13 +70,12 @@ impl TitleFrames {
             let Some(title) = titles.get(&clip.media) else {
                 continue;
             };
-            let motion = title.style.motion();
+            let motion = title.motion();
             if motion.is_still() {
                 continue;
             }
             let is_held = held == Some(clip.id);
-            // A countdown reads the time at any moment, so holding it still only stops it fading.
-            if is_held && motion.running != Running::Countdown {
+            if is_held && !motion.runs_while_held() {
                 continue;
             }
             let (seconds, length) = seconds_in(clip, now);
