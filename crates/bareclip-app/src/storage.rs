@@ -97,6 +97,35 @@ impl From<GpuId> for GpuChoice {
     }
 }
 
+/// A camera's size and frame rate, as picked in the camera's recording bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CameraModeChoice {
+    pub width: u32,
+    pub height: u32,
+    /// Frames per second as a fraction, as the camera gives it.
+    pub rate: (u32, u32),
+}
+
+impl From<CameraModeChoice> for bareclip_capture::CameraMode {
+    fn from(mode: CameraModeChoice) -> Self {
+        Self {
+            width: mode.width,
+            height: mode.height,
+            rate: mode.rate,
+        }
+    }
+}
+
+impl From<bareclip_capture::CameraMode> for CameraModeChoice {
+    fn from(mode: bareclip_capture::CameraMode) -> Self {
+        Self {
+            width: mode.width,
+            height: mode.height,
+            rate: mode.rate,
+        }
+    }
+}
+
 /// The user's choices. Anything missing from the file takes its default, so settings written
 /// by another version still load.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +155,12 @@ pub struct Settings {
     pub screen_microphone: bool,
     pub screen_frame_rate: u32,
     pub screen_pointer: bool,
+    /// The camera last recorded with, by name. `None` is the first one plugged in.
+    pub camera: Option<String>,
+    /// The size and frame rate picked for that camera. `None` lets BareClip pick.
+    pub camera_mode: Option<CameraModeChoice>,
+    /// Whether a camera recording takes the microphone too.
+    pub camera_microphone: bool,
 }
 
 impl Default for Settings {
@@ -145,6 +180,9 @@ impl Default for Settings {
             screen_microphone: false,
             screen_frame_rate: 30,
             screen_pointer: true,
+            camera: None,
+            camera_mode: None,
+            camera_microphone: true,
         }
     }
 }
@@ -470,6 +508,13 @@ mod tests {
             screen_microphone: true,
             screen_frame_rate: 60,
             screen_pointer: false,
+            camera: Some("Desk camera".to_owned()),
+            camera_mode: Some(CameraModeChoice {
+                width: 1280,
+                height: 720,
+                rate: (10_000_000, 333_333),
+            }),
+            camera_microphone: false,
         };
 
         settings.save(&folder).expect("they can be saved");

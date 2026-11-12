@@ -83,6 +83,8 @@ const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(5);
 const AUTO_SAVE_HELD: &str =
     "Auto Save is paused because parts of this project couldn't be opened. Save it to resume.";
 const MIN_CLIP_SECONDS: f64 = 0.05;
+/// How long a deleted recording keeps being tried, while whatever was reading it lets go.
+const TRASH_RETRY_FOR: Duration = Duration::from_secs(3);
 const THUMBNAIL_WIDTH: u32 = 160;
 const THUMBNAIL_HEIGHT: u32 = 90;
 /// The pictures along clips: at most one this often, and at most this many per video, so a
@@ -420,6 +422,8 @@ enum RatePick {
     Redraw,
 }
 
+#[path = "camera_recording.rs"]
+mod camera_recording;
 #[path = "captions.rs"]
 mod captions;
 #[path = "library.rs"]
@@ -446,6 +450,8 @@ struct MediaEntry {
     file_name: String,
     /// When the file was created, on file systems that record it.
     created: Option<SystemTime>,
+    /// Whether BareClip recorded it, so it can be deleted from My media.
+    recorded: bool,
     index: Option<Arc<FrameIndex>>,
     scan: Option<Receiver<ScanMessage>>,
     cancel_scan: Arc<AtomicBool>,
@@ -531,6 +537,10 @@ pub struct Editor {
     /// A colour code partway through being typed.
     background_text: Option<String>,
     selected: Option<ClipId>,
+    /// Other clips selected along with `selected`, with Ctrl, Shift or Ctrl+A. They belong to
+    /// `group_anchor`, so anything that selects a clip some other way leaves them behind.
+    also_selected: Vec<ClipId>,
+    group_anchor: Option<ClipId>,
     /// A moment in the dead space that was clicked on.
     selected_gap: Option<Ticks>,
     timeline_state: TimelineState,
@@ -549,6 +559,12 @@ pub struct Editor {
     /// The lane for adding audio was pressed, so a file picker opens once this frame is drawn.
     add_audio_requested: bool,
     confirm_remove: Vec<MediaId>,
+    /// A recording waiting for a yes before it is deleted.
+    confirm_delete_recording: Option<MediaId>,
+    /// How a file is moved to the Recycle Bin, which tests replace so nothing reaches the real one.
+    trash_file: TrashFile,
+    /// Recordings being moved to the Recycle Bin, each saying how it went.
+    trashing: Vec<Receiver<Result<(), String>>>,
     project_name: String,
     /// The file this project saves to, once it has one.
     project_path: Option<PathBuf>,
@@ -598,6 +614,11 @@ pub struct Editor {
     open_screen: screen_recording::OpenScreen,
     open_pc_sound: screen_recording::OpenPcSound,
     list_sources: screen_recording::ListSources,
+    /// The camera recording bar, while it is open, and how cameras are found and opened, which
+    /// tests replace with a made-up camera.
+    camera_bar: Option<camera_recording::CameraBar>,
+    open_camera: camera_recording::OpenCamera,
+    list_cameras: camera_recording::ListCameras,
     /// How a folder to save recordings in is picked, which tests replace too.
     pick_folder: recording::PickFolder,
     /// Files from "Edit with BareClip", waiting for any dialog that decides what the project is.
@@ -653,7 +674,8 @@ pub struct Editor {
     font_faces: HashMap<String, Option<TextureHandle>>,
     /// Fonts already reported as missing, so a redraw doesn't keep saying so.
     fonts_reported: Vec<String>,
-    clipboard: Option<CopiedClip>,
+    /// Clips copied to be pasted, in order of time.
+    clipboard: Vec<CopiedClip>,
     duration_edit: Option<DurationEdit>,
     media_sort: MediaSort,
     media_sort_descending: bool,
@@ -708,11 +730,45 @@ struct CardState {
     order: Option<usize>,
 }
 
+/// Moves a file to the Recycle Bin. Tests swap it for one that never reaches the real one.
+type TrashFile = fn(&Path) -> Result<(), String>;
+
+/// Moves a file to the Recycle Bin, quietly, so it can be brought back from there.
+fn move_to_recycle_bin(path: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::{
+        FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, SHFILEOPSTRUCTW,
+        SHFileOperationW,
+    };
+    let absolute = std::path::absolute(path).map_err(|error| error.to_string())?;
+    if !absolute.exists() {
+        return Err("The file isn't there any more.".to_owned());
+    }
+    // The list of files ends in two zeros.
+    let from: Vec<u16> = absolute.as_os_str().encode_wide().chain([0, 0]).collect();
+    let mut operation = SHFILEOPSTRUCTW {
+        wFunc: FO_DELETE,
+        pFrom: from.as_ptr(),
+        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI) as u16,
+        ..Default::default()
+    };
+    // SAFETY: the structure and the list it points to live until the call returns.
+    let result = unsafe { SHFileOperationW(&mut operation) };
+    if result != 0 || operation.fAnyOperationsAborted != 0 {
+        return Err(format!("Windows gave error {result}."));
+    }
+    if absolute.exists() {
+        return Err("It is still in use.".to_owned());
+    }
+    Ok(())
+}
+
 /// What was pressed on the media cards this frame.
 #[derive(Default)]
 struct CardActions {
     add: Option<MediaId>,
     remove: Option<MediaId>,
+    delete_recording: Option<MediaId>,
     toggle: Option<MediaId>,
     rename: Option<(MediaId, String)>,
 }
@@ -765,6 +821,8 @@ impl Editor {
             stage_before: None,
             background_text: None,
             selected: None,
+            also_selected: Vec::new(),
+            group_anchor: None,
             selected_gap: None,
             timeline_state: TimelineState::default(),
             trim_origin: None,
@@ -777,6 +835,9 @@ impl Editor {
             sound_only: false,
             add_audio_requested: false,
             confirm_remove: Vec::new(),
+            confirm_delete_recording: None,
+            trash_file: move_to_recycle_bin,
+            trashing: Vec::new(),
             project_name: project::DEFAULT_NAME.to_owned(),
             project_path: None,
             baseline: ProjectFile::default(),
@@ -808,6 +869,9 @@ impl Editor {
             open_screen: screen_recording::open_real_screen,
             open_pc_sound: screen_recording::open_real_pc_sound,
             list_sources: screen_recording::list_real_sources,
+            camera_bar: None,
+            open_camera: camera_recording::open_real_camera,
+            list_cameras: camera_recording::list_real_cameras,
             pick_folder: recording::pick_real_folder,
             waiting_edits: Vec::new(),
             selected_media: Vec::new(),
@@ -842,7 +906,7 @@ impl Editor {
             font_search: String::new(),
             font_faces: HashMap::new(),
             fonts_reported: Vec::new(),
-            clipboard: None,
+            clipboard: Vec::new(),
             duration_edit: None,
             media_sort: MediaSort::Name,
             media_sort_descending: false,
@@ -897,6 +961,9 @@ impl Editor {
         file.canvas = self.project.canvas;
         for saved in &mut file.media {
             saved.name = self.project.names.get(&MediaId(saved.id)).cloned();
+            saved.recorded = self
+                .entry(MediaId(saved.id))
+                .is_some_and(|entry| entry.recorded);
         }
         self.write_titles_to(&mut file);
         file.library = self.project.library.clone();
@@ -1106,7 +1173,8 @@ impl Editor {
                 continue;
             }
             match self.load(ctx, &media.path) {
-                Ok(entry) => {
+                Ok(mut entry) => {
+                    entry.recorded = media.recorded;
                     new_ids.insert(media.id, entry.id);
                     durations.insert(media.id, entry.info.duration);
                     if let Some(name) = &media.name {
@@ -1342,6 +1410,13 @@ impl Editor {
         {
             self.stop_screen_recording(ctx);
         }
+        if self
+            .camera_bar
+            .as_ref()
+            .is_some_and(camera_recording::CameraBar::is_recording)
+        {
+            self.stop_camera_recording(ctx);
+        }
         self.flush_auto_save();
         if self.has_unsaved_changes() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1480,6 +1555,7 @@ impl Editor {
         let deciding = self.leave_for.is_some()
             || self.record_bar.is_some()
             || self.screen_bar.is_some()
+            || self.camera_bar.is_some()
             || self.missing_videos.is_some()
             || !self.recovery_offers.is_empty()
             || !matches!(self.export_state, ExportState::Closed);
@@ -1585,6 +1661,7 @@ impl Editor {
             file_name: name.clone(),
             name,
             created,
+            recorded: false,
             index: None,
             scan,
             cancel_scan,
@@ -1783,12 +1860,8 @@ impl Editor {
         // Dropping a video stops whatever is still reading it in the background.
         self.media.retain(|entry| !ids.contains(&entry.id));
         self.selected_media.retain(|id| !ids.contains(id));
-        if self
-            .clipboard
-            .as_ref()
-            .is_some_and(|copied| copied.is_from_any(ids))
-        {
-            self.clipboard = None;
+        if self.clipboard.iter().any(|copied| copied.is_from_any(ids)) {
+            self.clipboard.clear();
         }
         let tracks = &self.project.tracks;
         self.layer_pictures
@@ -1799,6 +1872,7 @@ impl Editor {
 
     /// Tidies up after clips changed, so nothing points at a clip that has gone.
     fn after_timeline_change(&mut self) {
+        self.tidy_selection();
         self.settle_canvas();
         if let Some(selected) = self.selected
             && self.project.tracks.clip(selected).is_none()
@@ -1855,9 +1929,165 @@ impl Editor {
         }
     }
 
-    /// Deletes the selected clip, leaving dead space, or closes the selected dead space.
+    /// Every selected clip: the main one first, then the rest.
+    fn selected_clips(&self) -> Vec<ClipId> {
+        self.selected
+            .into_iter()
+            .chain(self.also_selected.iter().copied())
+            .collect()
+    }
+
+    /// Whether more than one clip is selected.
+    fn several_selected(&self) -> bool {
+        self.selected.is_some() && !self.also_selected.is_empty()
+    }
+
+    /// The clips an action on `id` covers: every selected clip if it is one of them, otherwise
+    /// just it.
+    fn group_with(&self, id: ClipId) -> Vec<ClipId> {
+        let selected = self.selected_clips();
+        if selected.contains(&id) {
+            selected
+        } else {
+            vec![id]
+        }
+    }
+
+    fn select_only(&mut self, id: Option<ClipId>) {
+        self.selected = id;
+        self.also_selected.clear();
+        self.group_anchor = id;
+    }
+
+    /// Selects several clips at once, the first as the main one.
+    fn select_group(&mut self, ids: &[ClipId]) {
+        self.selected = ids.first().copied();
+        self.also_selected = ids.iter().skip(1).copied().collect();
+        self.group_anchor = self.selected;
+    }
+
+    /// Changes what is selected after a click on the timeline: Ctrl adds or takes away one clip,
+    /// Shift takes everything from the clip clicked last, and a drag or right-click keeps the
+    /// selection if the clip is part of it.
+    fn select_on_timeline(&mut self, clicked: Option<ClipId>, how: timeline::SelectHow) {
+        use timeline::SelectHow;
+        self.tidy_selection();
+        let Some(id) = clicked else {
+            self.select_only(None);
+            return;
+        };
+        let already = self.selected_clips().contains(&id);
+        match how {
+            SelectHow::Only => self.select_only(Some(id)),
+            SelectHow::Keep if already => {}
+            SelectHow::Keep => self.select_only(Some(id)),
+            SelectHow::Toggle => {
+                let mut group = self.selected_clips();
+                if already {
+                    group.retain(|other| *other != id);
+                } else {
+                    group.push(id);
+                }
+                self.select_group(&group);
+            }
+            SelectHow::Range => match self.selected {
+                Some(anchor) => {
+                    let mut group = vec![anchor];
+                    group.extend(
+                        self.clips_between(anchor, id)
+                            .into_iter()
+                            .filter(|other| *other != anchor),
+                    );
+                    self.select_group(&group);
+                }
+                None => self.select_only(Some(id)),
+            },
+        }
+    }
+
+    /// Every clip on the rows from one clip's to the other's that starts between their starts,
+    /// both included, in order of row and time.
+    fn clips_between(&self, from: ClipId, to: ClipId) -> Vec<ClipId> {
+        let tracks = &self.project.tracks;
+        let (Some(first), Some(last), Some(first_row), Some(last_row)) = (
+            tracks.clip(from),
+            tracks.clip(to),
+            tracks.track_of(from),
+            tracks.track_of(to),
+        ) else {
+            return vec![to];
+        };
+        let (earliest, latest) = (first.start.min(last.start), first.start.max(last.start));
+        let rows = first_row.min(last_row)..=first_row.max(last_row);
+        tracks.tracks()[rows]
+            .iter()
+            .flat_map(|track| track.clips())
+            .filter(|clip| clip.start >= earliest && clip.start <= latest)
+            .map(|clip| clip.id)
+            .collect()
+    }
+
+    /// Ctrl+A: every clip on the selected clip's row. Nothing happens with nothing selected.
+    fn select_row(&mut self) {
+        let Some(id) = self.selected else {
+            return;
+        };
+        let Some(row) = self.project.tracks.track_of(id) else {
+            return;
+        };
+        let mut group = vec![id];
+        group.extend(
+            self.project.tracks.tracks()[row]
+                .clips()
+                .iter()
+                .map(|clip| clip.id)
+                .filter(|other| *other != id),
+        );
+        self.select_group(&group);
+        self.selected_gap = None;
+        self.selected_join = None;
+    }
+
+    /// Lets go of clips that have gone, and of the others if the main clip was changed some other
+    /// way, such as by adding a clip.
+    fn tidy_selection(&mut self) {
+        if self.selected != self.group_anchor {
+            self.also_selected.clear();
+            self.group_anchor = self.selected;
+        }
+        let tracks = &self.project.tracks;
+        let main = self.selected;
+        self.also_selected
+            .retain(|id| Some(*id) != main && tracks.clip(*id).is_some());
+        if self.selected.is_some_and(|id| tracks.clip(id).is_none()) {
+            self.selected = None;
+        }
+        if self.selected.is_none() && !self.also_selected.is_empty() {
+            let first = self.also_selected.remove(0);
+            self.selected = Some(first);
+        }
+        self.group_anchor = self.selected;
+    }
+
+    /// Duplicates one clip straight after itself, or several together straight after the last.
+    fn duplicate_clips(&mut self, ids: &[ClipId]) {
+        match ids {
+            [one] => self.duplicate_clip(*one),
+            _ => self.duplicate_group(ids),
+        }
+    }
+
+    /// Deletes the selected clips, leaving dead space, or closes the selected dead space.
     fn delete_selected(&mut self) {
-        if let Some(selected) = self.selected {
+        self.tidy_selection();
+        if self.several_selected() {
+            self.record();
+            for id in self.selected_clips() {
+                self.project.tracks.remove(id);
+            }
+            self.select_only(None);
+            self.after_timeline_change();
+        } else if let Some(selected) = self.selected {
             self.record();
             self.project.tracks.remove(selected);
             self.after_timeline_change();
@@ -2841,6 +3071,7 @@ impl Editor {
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let blocked = !matches!(self.export_state, ExportState::Closed)
             || !self.confirm_remove.is_empty()
+            || self.confirm_delete_recording.is_some()
             || self.leave_for.is_some()
             || self.missing_videos.is_some()
             || !self.recovery_offers.is_empty()
@@ -2848,6 +3079,7 @@ impl Editor {
             || self.duration_edit.is_some()
             || self.record_bar.as_ref().is_some_and(recording::RecordBar::is_recording)
             || self.screen_bar.as_ref().is_some_and(screen_recording::ScreenBar::is_recording)
+            || self.camera_bar.as_ref().is_some_and(camera_recording::CameraBar::is_recording)
             || !self.cut_short.is_empty()
             // Letters typed into a name are not commands.
             || ctx.egui_wants_keyboard_input();
@@ -2874,15 +3106,15 @@ impl Editor {
         if consume(Modifiers::COMMAND, Key::E) && !self.project.tracks.is_empty() {
             self.open_export();
         }
-        if consume(Modifiers::COMMAND, Key::D)
-            && let Some(selected) = self.selected
-        {
-            self.duplicate_clip(selected);
+        self.tidy_selection();
+        if consume(Modifiers::COMMAND, Key::A) {
+            self.select_row();
         }
-        if consume(Modifiers::COMMAND, Key::C)
-            && let Some(selected) = self.selected
-        {
-            self.copy_clip(selected);
+        if consume(Modifiers::COMMAND, Key::D) && self.selected.is_some() {
+            self.duplicate_clips(&self.selected_clips());
+        }
+        if consume(Modifiers::COMMAND, Key::C) && self.selected.is_some() {
+            self.copy_clips(&self.selected_clips());
         }
         if consume(Modifiers::COMMAND, Key::V) {
             self.paste_clip();
@@ -3049,6 +3281,8 @@ impl Editor {
         self.hold_playback_while_scrubbing();
         self.settle_title_edit(&ctx);
         self.remove_dialog(&ctx, palette);
+        self.delete_recording_dialog(&ctx, palette);
+        self.check_trashing();
         self.edit_duration_dialog(&ctx, palette);
         self.export_dialog(&ctx, palette);
         self.settings_dialog(&ctx, palette);
@@ -3056,6 +3290,7 @@ impl Editor {
         self.recovery_dialog(&ctx, palette);
         self.record_bar_dialog(&ctx, palette);
         self.screen_bar_dialog(&ctx, palette);
+        self.camera_bar_dialog(&ctx, palette);
         self.cut_short_dialog(&ctx, palette);
         self.unsaved_changes_dialog(&ctx, palette);
         drop_overlay(&ctx, palette);
@@ -3921,6 +4156,9 @@ impl Editor {
                 if let Some(id) = actions.remove {
                     self.request_remove(id);
                 }
+                if let Some(id) = actions.delete_recording {
+                    self.confirm_delete_recording = Some(id);
+                }
                 self.media_rename = rename;
                 if let Some((id, typed)) = actions.rename {
                     self.rename_media(id, &typed);
@@ -4343,8 +4581,9 @@ impl Editor {
             faces: &faces,
             position: self.position(),
             selected: self.selected,
+            also_selected: &self.also_selected,
             selected_gap: self.selected_gap,
-            can_paste: self.clipboard.is_some(),
+            can_paste: !self.clipboard.is_empty(),
             joins: &joins,
             selected_join: self.selected_join,
         };
@@ -4431,7 +4670,7 @@ impl Editor {
             self.add_art(Art::of(item), time, Some(target), None);
         }
         if let Some(selection) = events.select {
-            self.selected = selection;
+            self.select_on_timeline(selection, events.select_how);
             self.selected_gap = events.select_gap;
             self.selected_join = None;
         }
@@ -4480,6 +4719,15 @@ impl Editor {
                 self.after_timeline_change();
             }
         }
+        if let Some((by, rows)) = events.move_group {
+            let before = self.project.clone();
+            let group = self.selected_clips();
+            self.project.tracks.move_clips(&group, by, rows);
+            if self.project != before {
+                self.history.record(before);
+                self.after_timeline_change();
+            }
+        }
         if let Some(gap) = events.remove_gap {
             self.remove_gap(gap);
         }
@@ -4488,12 +4736,14 @@ impl Editor {
         }
         match events.menu {
             Some(MenuAction::Split) => self.split_at_playhead(),
-            Some(MenuAction::Duplicate(id)) => self.duplicate_clip(id),
-            Some(MenuAction::Copy(id)) => self.copy_clip(id),
+            Some(MenuAction::Duplicate(id)) => self.duplicate_clips(&self.group_with(id)),
+            Some(MenuAction::Copy(id)) => self.copy_clips(&self.group_with(id)),
             Some(MenuAction::Paste) => self.paste_clip(),
             Some(MenuAction::EditDuration(id)) => self.open_edit_duration(id),
             Some(MenuAction::Delete(id)) => {
-                self.selected = Some(id);
+                if !self.selected_clips().contains(&id) || !self.several_selected() {
+                    self.select_only(Some(id));
+                }
                 self.delete_selected();
             }
             Some(MenuAction::Detach(id)) => self.detach_sound(id),
@@ -4781,7 +5031,8 @@ impl Editor {
             area,
             canvas,
             clips: &clips,
-            selected: self.selected,
+            // With several selected, the picture's controls step aside, as they change one clip.
+            selected: self.selected.filter(|_| !self.several_selected()),
             row_above_is_free: self.notice.is_none(),
             can_go_forward: self.selected.is_some_and(|id| {
                 self.project
@@ -4812,7 +5063,7 @@ impl Editor {
     /// A change stays one undo step for as long as a pointer is held down, however it began.
     fn apply_stage_events(&mut self, events: stage::StageEvents, pointer_down: bool) {
         if let Some(selection) = events.select {
-            self.selected = selection;
+            self.select_only(selection);
             self.selected_gap = None;
         }
         if let Some((id, order)) = events.order {
@@ -4934,6 +5185,108 @@ impl Editor {
             self.remove_many(&ids);
         } else if cancelled {
             self.confirm_remove.clear();
+        }
+    }
+
+    /// Asks before deleting a recording: it leaves the project for good, and its file goes to the
+    /// Recycle Bin.
+    fn delete_recording_dialog(&mut self, ctx: &egui::Context, palette: &Palette) {
+        let Some(id) = self.confirm_delete_recording else {
+            return;
+        };
+        let Some(entry) = self.entry(id) else {
+            self.confirm_delete_recording = None;
+            return;
+        };
+        let name = entry.name.clone();
+        let clips = self.project.tracks.clips_using(id);
+        let mut confirmed = false;
+        let mut cancelled = false;
+        egui::Modal::new(egui::Id::unique("delete_recording_dialog"))
+            .frame(dialog_frame(ctx))
+            .show(ctx, |ui| {
+                ui.set_width(400.0);
+                components::dialog_title(
+                    ui,
+                    &icons::CIRCLE_ALERT,
+                    palette.danger,
+                    "Delete this recording?",
+                );
+                ui.add_space(12.0);
+                ui.label(text::delete_recording_warning(&name, clips));
+                ui.add_space(4.0);
+                ui.colored_label(
+                    palette.text_muted,
+                    "It can be brought back from the Recycle Bin, but not with Undo.",
+                );
+                ui.add_space(18.0);
+                components::dialog_buttons(ui, |ui| {
+                    confirmed = ui
+                        .add(
+                            ActionButton::new(palette, Kind::Danger, "Move to Recycle Bin")
+                                .icon(icons::TRASH_2)
+                                .width(DIALOG_BUTTON_WIDTH * 1.8),
+                        )
+                        .clicked();
+                    cancelled = ui.add(dialog_button(palette, "Cancel")).clicked();
+                });
+            });
+        if cancelled || ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape)) {
+            self.confirm_delete_recording = None;
+        } else if confirmed {
+            self.confirm_delete_recording = None;
+            self.delete_recording(id);
+        }
+    }
+
+    /// Takes a recording out of the project for good and moves its file to the Recycle Bin. The
+    /// file is let go of first, and anything still reading it in the background may take a
+    /// moment to stop, so the move is tried again for a little while.
+    fn delete_recording(&mut self, id: MediaId) {
+        let Some(path) = self.entry(id).map(|entry| entry.info.path.clone()) else {
+            return;
+        };
+        self.remove_many(&[id]);
+        let trash = self.trash_file;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let started = Instant::now();
+            let result = loop {
+                match trash(&path) {
+                    Ok(()) => break Ok(()),
+                    Err(_) if started.elapsed() < TRASH_RETRY_FOR => {
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(problem) => {
+                        let name = path
+                            .file_name()
+                            .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+                        break Err(format!(
+                            "{name} was removed from the project but could not be moved to the Recycle Bin. {problem}"
+                        ));
+                    }
+                }
+            };
+            let _ = sender.send(result);
+        });
+        self.trashing.push(receiver);
+    }
+
+    /// Says if a recording couldn't be moved to the Recycle Bin.
+    fn check_trashing(&mut self) {
+        let mut problems = Vec::new();
+        self.trashing.retain(|receiver| match receiver.try_recv() {
+            Ok(result) => {
+                if let Err(problem) = result {
+                    problems.push(problem);
+                }
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+        });
+        if !problems.is_empty() {
+            self.notice = Some(problems.join(" "));
         }
     }
 
@@ -5904,6 +6257,18 @@ fn media_card(
             .clicked()
         {
             actions.remove = Some(entry.id);
+        }
+        if entry.recorded
+            && ui
+                .add(MenuItem::new(
+                    palette,
+                    icons::TRASH_2,
+                    "Delete recording",
+                    "",
+                ))
+                .clicked()
+        {
+            actions.delete_recording = Some(entry.id);
         }
     });
     let mut over_a_button = added.hovered() || more.hovered();
@@ -7005,6 +7370,7 @@ mod tests {
             project: ProjectFile {
                 media: vec![project::SavedMedia {
                     name: None,
+                    recorded: false,
                     id: 1,
                     path: PathBuf::from(r"D:\Recordings\2026\ranked-match-final.mkv"),
                 }],
@@ -18158,11 +18524,13 @@ mod tests {
             media: vec![
                 project::SavedMedia {
                     name: None,
+                    recorded: false,
                     id: 1,
                     path: small_clip().to_path_buf(),
                 },
                 project::SavedMedia {
                     name: None,
+                    recorded: false,
                     id: 2,
                     path: test_clip().to_path_buf(),
                 },
@@ -19728,6 +20096,45 @@ mod tests {
         camera.shoot(&ctx, &mut editor, vec![], "record-10-screen-folded");
         click_named(&ctx, &mut editor, "Stop");
         run_for(&ctx, &mut editor, 0.3);
+        editor.open_camera = made_up_camera;
+        editor.list_cameras = made_up_cameras;
+        editor.settings.play_while_recording = false;
+        open_camera_bar_by_hand(&ctx, &mut editor);
+        run_for(&ctx, &mut editor, 0.4);
+        camera.shoot(&ctx, &mut editor, vec![], "record-11-camera-bar");
+        editor.settings.countdown = true;
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.3);
+        camera.shoot(&ctx, &mut editor, vec![], "record-12-camera-countdown");
+        if let Some(bar) = &mut editor.camera_bar {
+            bar.stage = camera_recording::CameraStage::Counting(0.0);
+        }
+        run_for(&ctx, &mut editor, 0.8);
+        camera.shoot(&ctx, &mut editor, vec![], "record-13-camera-recording");
+        click_named(&ctx, &mut editor, "Stop");
+        run_for(&ctx, &mut editor, 0.3);
+        editor.list_cameras = no_cameras;
+        open_camera_bar_by_hand(&ctx, &mut editor);
+        run_for(&ctx, &mut editor, 0.2);
+        camera.shoot(&ctx, &mut editor, vec![], "record-14-no-camera");
+        editor.camera_bar = None;
+        editor.list_cameras = made_up_cameras;
+        editor.settings.screen_microphone = true;
+        open_screen_and_camera_bar_by_hand(&ctx, &mut editor);
+        run_for(&ctx, &mut editor, 0.5);
+        camera.shoot(&ctx, &mut editor, vec![], "record-15-screen-and-camera-bar");
+        editor.settings.countdown = false;
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.4);
+        click_named(&ctx, &mut editor, "Show the camera");
+        run_for(&ctx, &mut editor, 0.4);
+        camera.shoot(&ctx, &mut editor, vec![], "record-16-overlay-with-camera");
+        click_named(&ctx, &mut editor, "Stop");
+        run_for(&ctx, &mut editor, 0.5);
+        for _ in 0..12 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "record-17-three-clips");
         // Pictures still arriving from the video leave texture changes nobody will draw.
         KEPT_TEXTURES.with_borrow_mut(|kept| {
             for delta in kept.iter_mut().flatten() {
@@ -20068,7 +20475,7 @@ mod tests {
         ] {
             let grip = named_rect(&ctx, &mut editor, "Move the recording bar");
             let end = named_rect(&ctx, &mut editor, fold);
-            let wanted = screen_recording::overlay_size(folded);
+            let wanted = screen_recording::overlay_size(folded, None);
             let width = end.right() - grip.left() + padding;
             assert!((width - wanted.x).abs() < 0.5, "{width} against {wanted:?}");
             assert!(grip.height() + padding <= wanted.y + 0.5);
@@ -20161,5 +20568,1119 @@ mod tests {
         run_frame(&ctx, &mut editor, vec![]);
         assert!(editor.screen_bar.is_none());
         assert!(recorded_files(&folder).is_empty());
+    }
+
+    /// Stops a made-up camera's pictures when it is closed.
+    struct StopCamera(Arc<AtomicBool>);
+
+    impl Drop for StopCamera {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    /// Stands in for a camera: red on its left half and blue on its right, 30 times a second,
+    /// in either of two modes. "Failing camera" stops after a moment, like one unplugged.
+    fn made_up_camera(
+        camera: &bareclip_capture::Camera,
+        wanted: Option<bareclip_capture::CameraMode>,
+    ) -> camera_recording::CameraSource {
+        use bareclip_capture::{CameraMode, CameraState, CameraView, Picture};
+        let modes = vec![
+            CameraMode {
+                width: 640,
+                height: 360,
+                rate: (30, 1),
+            },
+            CameraMode {
+                width: 320,
+                height: 180,
+                rate: (15, 1),
+            },
+        ];
+        let mode = wanted
+            .and_then(|wanted| modes.iter().copied().find(|mode| mode.same_as(wanted)))
+            .unwrap_or(modes[0]);
+        let fails = camera.name == "Failing camera";
+        let view = CameraView::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (stopping, shown) = (stop.clone(), view.clone());
+        thread::spawn(move || {
+            let (width, height) = (mode.width as usize, mode.height as usize);
+            let mut row = [0_u8, 0, 200, 255].repeat(width / 2);
+            row.extend([200_u8, 0, 0, 255].repeat(width - width / 2));
+            let bgra = row.repeat(height);
+            shown.set_state(CameraState::Running { modes, mode });
+            let started = Instant::now();
+            while !stopping.load(Ordering::Acquire) {
+                if fails && started.elapsed() > Duration::from_millis(600) {
+                    shown.set_state(CameraState::Failed(
+                        "The camera stopped. It may have been unplugged.".to_owned(),
+                    ));
+                    return;
+                }
+                shown.show(Picture {
+                    width: mode.width,
+                    height: mode.height,
+                    bgra: bgra.clone(),
+                    shown_at: 0,
+                });
+                thread::sleep(Duration::from_millis(33));
+            }
+        });
+        camera_recording::CameraSource {
+            view,
+            _keep: Box::new(StopCamera(stop)),
+        }
+    }
+
+    fn made_up_cameras() -> Vec<bareclip_capture::Camera> {
+        ["Desk camera", "Phone camera"]
+            .iter()
+            .map(|name| bareclip_capture::Camera {
+                name: (*name).to_owned(),
+                link: format!("made-up {name}"),
+            })
+            .collect()
+    }
+
+    fn no_cameras() -> Vec<bareclip_capture::Camera> {
+        Vec::new()
+    }
+
+    fn failing_cameras() -> Vec<bareclip_capture::Camera> {
+        vec![bareclip_capture::Camera {
+            name: "Failing camera".to_owned(),
+            link: "made-up failing".to_owned(),
+        }]
+    }
+
+    /// An editor ready to record a made-up camera with a made-up microphone.
+    fn ready_to_record_the_camera(ctx: &egui::Context, name: &str) -> (Editor, PathBuf) {
+        let (mut editor, folder) = ready_to_record(ctx, name);
+        editor.open_camera = made_up_camera;
+        editor.list_cameras = made_up_cameras;
+        editor.settings.camera_microphone = true;
+        (editor, folder)
+    }
+
+    fn open_camera_bar_by_hand(ctx: &egui::Context, editor: &mut Editor) {
+        if !is_named(ctx, editor, "Camera") {
+            click_named(ctx, editor, "Record");
+            run_frame(ctx, editor, vec![]);
+        }
+        click_named(ctx, editor, "Camera");
+        // The camera starts on a thread of its own.
+        run_for(ctx, editor, 0.2);
+    }
+
+    fn is_disabled(ctx: &egui::Context, editor: &mut Editor, name: &str) -> bool {
+        named_nodes(ctx, editor)
+            .into_iter()
+            .find(|(label, ..)| label == name)
+            .map(|(.., disabled)| disabled)
+            .unwrap_or_else(|| panic!("{name} is there"))
+    }
+
+    /// Whether a frame draws this text anywhere.
+    fn shows_text(ctx: &egui::Context, editor: &mut Editor, wanted: &str) -> bool {
+        let output = run_frame(ctx, editor, vec![]);
+        let everything =
+            egui::Rect::from_min_size(pos2(-10_000.0, -10_000.0), vec2(20_000.0, 20_000.0));
+        text_in(&output, everything)
+            .iter()
+            .any(|text| text == wanted)
+    }
+
+    fn sound_track_names(path: &Path) -> Vec<Option<String>> {
+        bareclip_media::probe(path)
+            .expect("it can be read")
+            .audio
+            .iter()
+            .map(|track| track.title.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_camera_recording_lands_as_a_video_with_the_microphone_at_the_playhead() {
+        let ctx = context();
+        let (mut editor, folder) = ready_to_record_the_camera(&ctx, "camera-lands");
+        let tracks_before = editor.project.tracks.clone();
+        editor.seek(Ticks::from_seconds(1.0));
+        run_frame(&ctx, &mut editor, vec![]);
+        open_camera_bar_by_hand(&ctx, &mut editor);
+        assert!(editor.camera_bar.is_some());
+        assert!(is_named(&ctx, &mut editor, "Camera: Desk camera"));
+        assert!(is_named(&ctx, &mut editor, "Size: 640 x 360, 30 fps"));
+        assert!(is_named(&ctx, &mut editor, "Microphone: Desk microphone"));
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 1.5);
+        assert!(is_named(&ctx, &mut editor, "Pause recording"));
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert!(editor.camera_bar.is_none());
+        let files = recorded_files(&folder);
+        assert_eq!(files.len(), 1);
+        let name = files[0].file_name().expect("named").to_string_lossy();
+        assert!(
+            name.starts_with("Camera ") && name.ends_with(".mp4"),
+            "{name}"
+        );
+        let info = bareclip_media::probe(&files[0]).expect("it can be read");
+        assert_eq!((info.video.width, info.video.height), (640, 360));
+        assert_eq!(
+            sound_track_names(&files[0]),
+            [Some("Microphone".to_owned())]
+        );
+
+        let id = editor.selected.expect("the recording is selected");
+        let clip = editor.project.tracks.clip(id).expect("on the timeline");
+        assert_eq!(clip.start, Ticks::from_seconds(1.0));
+        assert_eq!(
+            editor.project.tracks.track_of(id),
+            Some(0),
+            "a new row on top"
+        );
+        let seconds = clip.duration().as_seconds();
+        assert!(seconds > 1.0 && seconds < 2.3, "{seconds}");
+        editor.undo();
+        assert_eq!(
+            editor.project.tracks, tracks_before,
+            "one step, and nothing moved"
+        );
+    }
+
+    #[test]
+    fn the_camera_its_size_and_the_microphone_are_chosen_before_recording_and_remembered() {
+        let ctx = context();
+        let (mut editor, folder) = ready_to_record_the_camera(&ctx, "camera-choose");
+        open_camera_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Camera: Desk camera");
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Phone camera");
+        run_for(&ctx, &mut editor, 0.2);
+        assert_eq!(editor.settings.camera.as_deref(), Some("Phone camera"));
+        click_named(&ctx, &mut editor, "Size: 640 x 360, 30 fps");
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "320 x 180, 15 fps");
+        run_for(&ctx, &mut editor, 0.2);
+        assert_eq!(
+            editor.settings.camera_mode,
+            Some(storage::CameraModeChoice {
+                width: 320,
+                height: 180,
+                rate: (15, 1),
+            })
+        );
+        click_named(&ctx, &mut editor, "Microphone: Desk microphone");
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Headset microphone");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(
+            editor.settings.microphone.as_deref(),
+            Some("Headset microphone")
+        );
+
+        // Opened again, it starts on all three.
+        click_named(&ctx, &mut editor, "Cancel");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.camera_bar.is_none());
+        open_camera_bar_by_hand(&ctx, &mut editor);
+        assert!(is_named(&ctx, &mut editor, "Camera: Phone camera"));
+        assert!(is_named(&ctx, &mut editor, "Size: 320 x 180, 15 fps"));
+        assert!(is_named(
+            &ctx,
+            &mut editor,
+            "Microphone: Headset microphone"
+        ));
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.6);
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+        let file = recorded_files(&folder).pop().expect("a file");
+        let info = bareclip_media::probe(&file).expect("it can be read");
+        assert_eq!((info.video.width, info.video.height), (320, 180));
+
+        // Another camera starts on its own usual size.
+        open_camera_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Camera: Phone camera");
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Desk camera");
+        run_for(&ctx, &mut editor, 0.2);
+        assert_eq!(editor.settings.camera_mode, None);
+        assert!(is_named(&ctx, &mut editor, "Size: 640 x 360, 30 fps"));
+    }
+
+    #[test]
+    fn with_the_microphone_off_a_camera_records_only_the_picture() {
+        let ctx = context();
+        let (mut editor, folder) = ready_to_record_the_camera(&ctx, "camera-silent");
+        open_camera_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Record the microphone");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(!editor.settings.camera_microphone);
+        assert!(!is_named(&ctx, &mut editor, "Microphone: Desk microphone"));
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.6);
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+        let file = recorded_files(&folder).pop().expect("a file");
+        assert!(sound_track_names(&file).is_empty());
+        assert!(editor.selected.is_some(), "it still lands");
+    }
+
+    #[test]
+    fn a_camera_recording_with_the_video_playing_lands_where_the_video_was_when_it_began() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record_the_camera(&ctx, "camera-along");
+        editor.settings.play_while_recording = true;
+        editor.seek(Ticks::from_seconds(0.5));
+        run_frame(&ctx, &mut editor, vec![]);
+        open_camera_bar_by_hand(&ctx, &mut editor);
+        assert!(shows_text(
+            &ctx,
+            &mut editor,
+            "Wear headphones, or the microphone will hear the video too."
+        ));
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 1.2);
+
+        assert!(editor.preview.is_playing());
+        assert!(
+            !is_named(&ctx, &mut editor, "Pause recording"),
+            "pausing would lose step"
+        );
+        let (lands, recorded) = match editor.camera_bar.as_ref().map(|bar| &bar.stage) {
+            Some(camera_recording::CameraStage::Recording(live)) => {
+                (live.lands_at(), live.seconds())
+            }
+            _ => panic!("it is recording"),
+        };
+        assert!(
+            lands >= Ticks::from_seconds(0.5) && lands < Ticks::from_seconds(1.0),
+            "{lands:?}"
+        );
+        let moved = (editor.position().0 - lands.0) as f64 / Ticks::from_seconds(1.0).0 as f64;
+        assert!(
+            (moved - recorded).abs() < 0.15,
+            "{moved} against {recorded}"
+        );
+
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(!editor.preview.is_playing(), "stopping stops the video too");
+        let id = editor.selected.expect("the recording is selected");
+        assert_eq!(editor.project.tracks.clip(id).expect("placed").start, lands);
+    }
+
+    #[test]
+    fn the_countdown_comes_before_a_camera_recording() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record_the_camera(&ctx, "camera-countdown");
+        editor.settings.countdown = true;
+        open_camera_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Start recording");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(matches!(
+            editor.camera_bar.as_ref().map(|bar| &bar.stage),
+            Some(camera_recording::CameraStage::Counting(_))
+        ));
+        assert!(!is_named(&ctx, &mut editor, "Stop"));
+        if let Some(bar) = &mut editor.camera_bar {
+            bar.stage = camera_recording::CameraStage::Counting(0.0);
+        }
+        run_frame(&ctx, &mut editor, vec![]);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(is_named(&ctx, &mut editor, "Stop"));
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.camera_bar.is_none());
+    }
+
+    #[test]
+    fn without_a_camera_the_bar_says_so_and_can_look_again() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record_the_camera(&ctx, "camera-none");
+        editor.list_cameras = no_cameras;
+        open_camera_bar_by_hand(&ctx, &mut editor);
+        assert!(is_disabled(&ctx, &mut editor, "Start recording"));
+        assert!(!is_named(&ctx, &mut editor, "Camera: Desk camera"));
+
+        // Plugged in, and found again.
+        editor.list_cameras = made_up_cameras;
+        click_named(&ctx, &mut editor, "Look again");
+        run_for(&ctx, &mut editor, 0.2);
+        assert!(is_named(&ctx, &mut editor, "Camera: Desk camera"));
+        assert!(!is_disabled(&ctx, &mut editor, "Start recording"));
+    }
+
+    #[test]
+    fn a_camera_lost_while_recording_is_shown_and_what_was_recorded_still_lands() {
+        let ctx = context();
+        let (mut editor, folder) = ready_to_record_the_camera(&ctx, "camera-lost");
+        editor.list_cameras = failing_cameras;
+        open_camera_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 1.0);
+        assert!(shows_text(&ctx, &mut editor, "Camera lost"));
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(recorded_files(&folder).len(), 1);
+        assert!(editor.selected.is_some());
+    }
+
+    #[test]
+    fn escape_closes_the_camera_bar_only_before_recording() {
+        let ctx = context();
+        let (mut editor, folder) = ready_to_record_the_camera(&ctx, "camera-escape");
+        open_camera_bar_by_hand(&ctx, &mut editor);
+        run_frame(&ctx, &mut editor, key_event(Key::Escape, Modifiers::NONE));
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.camera_bar.is_none());
+        assert!(recorded_files(&folder).is_empty());
+
+        open_camera_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.3);
+        run_frame(&ctx, &mut editor, key_event(Key::Escape, Modifiers::NONE));
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.camera_bar.is_some(), "a recording isn't thrown away");
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+    }
+
+    #[test]
+    fn closing_the_window_while_recording_the_camera_keeps_the_recording() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record_the_camera(&ctx, "camera-closing");
+        open_camera_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.6);
+        editor.handle_close_request(&ctx);
+        assert!(editor.camera_bar.is_none());
+        let id = editor.selected.expect("the recording is selected");
+        assert!(editor.project.tracks.clip(id).is_some());
+        assert!(
+            editor.leave_for.is_some(),
+            "it asks about saving the project"
+        );
+    }
+
+    #[test]
+    fn opening_one_recording_bar_closes_the_others() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record_the_camera(&ctx, "camera-switch");
+        editor.open_screen = made_up_screen;
+        editor.open_pc_sound = made_up_pc_sound;
+        editor.list_sources = made_up_sources;
+        open_camera_bar_by_hand(&ctx, &mut editor);
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        assert!(editor.camera_bar.is_none() && editor.screen_bar.is_some());
+        open_camera_bar_by_hand(&ctx, &mut editor);
+        assert!(editor.screen_bar.is_none() && editor.camera_bar.is_some());
+        open_record_bar_by_hand(&ctx, &mut editor);
+        assert!(editor.camera_bar.is_none() && editor.record_bar.is_some());
+        open_screen_and_camera_bar_by_hand(&ctx, &mut editor);
+        assert!(editor.record_bar.is_none());
+        assert!(
+            editor
+                .screen_bar
+                .as_ref()
+                .is_some_and(|bar| bar.camera.is_some())
+        );
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        assert!(
+            editor
+                .screen_bar
+                .as_ref()
+                .is_some_and(|bar| bar.camera.is_none()),
+            "the plain screen bar has no camera"
+        );
+    }
+
+    /// An editor ready to record a made-up screen and camera, with made-up PC sound and
+    /// microphone.
+    fn ready_to_record_the_screen_and_camera(ctx: &egui::Context, name: &str) -> (Editor, PathBuf) {
+        let (mut editor, folder) = ready_to_record_the_screen(ctx, name);
+        editor.open_camera = made_up_camera;
+        editor.list_cameras = made_up_cameras;
+        editor.settings.screen_microphone = true;
+        (editor, folder)
+    }
+
+    fn open_screen_and_camera_bar_by_hand(ctx: &egui::Context, editor: &mut Editor) {
+        if !is_named(ctx, editor, "Screen and camera") {
+            click_named(ctx, editor, "Record");
+            run_frame(ctx, editor, vec![]);
+        }
+        click_named(ctx, editor, "Screen and camera");
+        // The camera starts on a thread of its own.
+        run_for(ctx, editor, 0.2);
+    }
+
+    /// The clip on the timeline playing a file whose name starts with `kind`, and its row.
+    fn clip_of_kind(editor: &Editor, kind: &str) -> Option<(bareclip_core::timeline::Clip, usize)> {
+        let tracks = editor.project.tracks.tracks();
+        tracks.iter().enumerate().find_map(|(row, track)| {
+            track.clips().iter().find_map(|clip| {
+                let path = &editor.entry(clip.media)?.info.path;
+                let name = path.file_name()?.to_string_lossy();
+                name.starts_with(kind).then_some((*clip, row))
+            })
+        })
+    }
+
+    fn file_of_kind(folder: &Path, kind: &str) -> Option<PathBuf> {
+        recorded_files(folder).into_iter().find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(kind))
+        })
+    }
+
+    fn seconds_of(path: &Path) -> f64 {
+        bareclip_media::probe(path)
+            .expect("it can be read")
+            .duration
+            .as_seconds()
+    }
+
+    #[test]
+    fn a_screen_and_camera_recording_lands_as_three_clips_in_step_as_one_undo_step() {
+        let ctx = context();
+        let (mut editor, folder) =
+            ready_to_record_the_screen_and_camera(&ctx, "screen-camera-lands");
+        let tracks_before = editor.project.tracks.clone();
+        editor.seek(Ticks::from_seconds(1.0));
+        run_frame(&ctx, &mut editor, vec![]);
+        open_screen_and_camera_bar_by_hand(&ctx, &mut editor);
+        assert!(is_named(
+            &ctx,
+            &mut editor,
+            "Record: Screen 1 (main), 640 x 360"
+        ));
+        assert!(is_named(&ctx, &mut editor, "Camera: Desk camera"));
+        assert!(is_named(&ctx, &mut editor, "Size: 640 x 360, 30 fps"));
+        assert!(is_named(&ctx, &mut editor, "Microphone: Desk microphone"));
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 1.5);
+        assert!(is_named(&ctx, &mut editor, "Turn the microphone off"));
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.screen_bar.is_none());
+
+        // Three files, named for the same moment.
+        let screen = file_of_kind(&folder, "Screen ").expect("the screen's file");
+        let camera = file_of_kind(&folder, "Camera ").expect("the camera's file");
+        let microphone = file_of_kind(&folder, "Microphone ").expect("the microphone's file");
+        assert_eq!(recorded_files(&folder).len(), 3);
+        let when = |path: &Path| {
+            let name = path
+                .file_stem()
+                .expect("named")
+                .to_string_lossy()
+                .into_owned();
+            name.split_once(' ').map(|(_, when)| when.to_owned())
+        };
+        assert_eq!(when(&screen), when(&camera));
+        assert_eq!(when(&screen), when(&microphone));
+        assert_eq!(sound_track_names(&screen), [Some("PC sound".to_owned())]);
+        assert!(
+            sound_track_names(&camera).is_empty(),
+            "the camera is silent"
+        );
+        let heard = bareclip_media::probe(&microphone).expect("it can be read");
+        assert!(heard.is_sound_only() && heard.audio.len() == 1);
+        let info = bareclip_media::probe(&camera).expect("it can be read");
+        assert_eq!((info.video.width, info.video.height), (640, 360));
+        // They began and ended together.
+        let lengths = [
+            seconds_of(&screen),
+            seconds_of(&camera),
+            seconds_of(&microphone),
+        ];
+        for length in lengths {
+            assert!((length - lengths[0]).abs() < 0.15, "{lengths:?}");
+        }
+
+        let (camera_clip, camera_row) = clip_of_kind(&editor, "Camera ").expect("the camera");
+        let (screen_clip, screen_row) = clip_of_kind(&editor, "Screen ").expect("the screen");
+        let (microphone_clip, microphone_row) =
+            clip_of_kind(&editor, "Microphone ").expect("the microphone");
+        assert_eq!(
+            (camera_row, screen_row),
+            (0, 1),
+            "the camera over the screen"
+        );
+        assert!(editor.project.tracks.is_sound_row(microphone_row));
+        for clip in [&camera_clip, &screen_clip, &microphone_clip] {
+            assert_eq!(clip.start, Ticks::from_seconds(1.0));
+        }
+        let canvas = editor.project.canvas.size();
+        assert_eq!(
+            camera_clip.placement,
+            bareclip_core::placement::Placement::default().in_corner(
+                bareclip_core::placement::CanvasCorner::BottomRight,
+                (640, 360),
+                canvas
+            ),
+            "Picture in picture's size, bottom right"
+        );
+        assert_eq!(
+            screen_clip.placement,
+            bareclip_core::placement::Placement::default()
+        );
+        editor.undo();
+        assert_eq!(
+            editor.project.tracks, tracks_before,
+            "one step, and nothing moved"
+        );
+    }
+
+    #[test]
+    fn a_microphone_never_turned_on_leaves_no_file_or_clip() {
+        let ctx = context();
+        let (mut editor, folder) =
+            ready_to_record_the_screen_and_camera(&ctx, "screen-camera-silent");
+        editor.settings.screen_microphone = false;
+        open_screen_and_camera_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.8);
+        assert!(is_named(&ctx, &mut editor, "Turn the microphone on"));
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(recorded_files(&folder).len(), 2);
+        assert!(file_of_kind(&folder, "Microphone ").is_none());
+        assert!(clip_of_kind(&editor, "Microphone ").is_none());
+        assert!(clip_of_kind(&editor, "Camera ").is_some());
+    }
+
+    #[test]
+    fn a_microphone_turned_on_midway_is_kept_and_silent_until_then() {
+        let ctx = context();
+        let (mut editor, folder) =
+            ready_to_record_the_screen_and_camera(&ctx, "screen-camera-midway");
+        editor.settings.screen_microphone = false;
+        open_screen_and_camera_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.6);
+        click_named(&ctx, &mut editor, "Turn the microphone on");
+        run_for(&ctx, &mut editor, 0.6);
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+        let microphone = file_of_kind(&folder, "Microphone ").expect("kept");
+        let screen = file_of_kind(&folder, "Screen ").expect("the screen");
+        assert!((seconds_of(&microphone) - seconds_of(&screen)).abs() < 0.15);
+        assert!(clip_of_kind(&editor, "Microphone ").is_some());
+    }
+
+    #[test]
+    fn pausing_pauses_the_screen_the_camera_and_the_microphone_together() {
+        let ctx = context();
+        let (mut editor, folder) =
+            ready_to_record_the_screen_and_camera(&ctx, "screen-camera-paused");
+        open_screen_and_camera_bar_by_hand(&ctx, &mut editor);
+        // Timed as it really runs, since a busy machine stretches every wait.
+        click_named(&ctx, &mut editor, "Start recording");
+        let started = Instant::now();
+        run_for(&ctx, &mut editor, 0.7);
+        click_named(&ctx, &mut editor, "Pause recording");
+        let paused = Instant::now();
+        run_for(&ctx, &mut editor, 1.0);
+        click_named(&ctx, &mut editor, "Resume recording");
+        let resumed = Instant::now();
+        run_for(&ctx, &mut editor, 0.7);
+        let stopping = Instant::now();
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+        let recorded = (paused - started + (stopping - resumed)).as_secs_f64();
+        let lengths = ["Screen ", "Camera ", "Microphone "]
+            .map(|kind| seconds_of(&file_of_kind(&folder, kind).expect("a file")));
+        for length in lengths {
+            assert!(
+                (length - recorded).abs() < 0.3,
+                "{lengths:?} against {recorded}"
+            );
+        }
+        let [screen, camera, microphone] = lengths;
+        assert!((screen - camera).abs() < 0.15, "{lengths:?}");
+        assert!((screen - microphone).abs() < 0.25, "{lengths:?}");
+    }
+
+    #[test]
+    fn the_overlay_shows_the_camera_on_request_and_folding_closes_it() {
+        let ctx = context();
+        let (mut editor, _folder) =
+            ready_to_record_the_screen_and_camera(&ctx, "screen-camera-overlay");
+        open_screen_and_camera_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.4);
+        assert!(
+            is_named(&ctx, &mut editor, "Show the camera"),
+            "it starts hidden"
+        );
+        assert!(!is_named(&ctx, &mut editor, "The camera's picture"));
+        click_named(&ctx, &mut editor, "Show the camera");
+        run_for(&ctx, &mut editor, 0.2);
+        assert!(is_named(&ctx, &mut editor, "Hide the camera"));
+        assert!(is_named(&ctx, &mut editor, "The camera's picture"));
+
+        // Folding takes the picture and its switch away, and unfolding doesn't bring it back.
+        click_named(&ctx, &mut editor, "Show only Pause and Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Show all controls");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(is_named(&ctx, &mut editor, "Show the camera"));
+        assert!(!is_named(&ctx, &mut editor, "The camera's picture"));
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+    }
+
+    #[test]
+    fn a_screen_on_its_own_has_no_camera_switch() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record_the_screen(&ctx, "screen-no-camera");
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.3);
+        assert!(!is_named(&ctx, &mut editor, "Show the camera"));
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+    }
+
+    #[test]
+    fn without_a_camera_screen_and_camera_cant_start() {
+        let ctx = context();
+        let (mut editor, _folder) =
+            ready_to_record_the_screen_and_camera(&ctx, "screen-camera-none");
+        editor.list_cameras = no_cameras;
+        open_screen_and_camera_bar_by_hand(&ctx, &mut editor);
+        assert!(is_disabled(&ctx, &mut editor, "Start recording"));
+        editor.list_cameras = made_up_cameras;
+        click_named(&ctx, &mut editor, "Look again");
+        run_for(&ctx, &mut editor, 0.2);
+        assert!(!is_disabled(&ctx, &mut editor, "Start recording"));
+    }
+
+    #[test]
+    fn the_screen_bars_microphone_can_be_chosen_and_is_remembered() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record_the_screen(&ctx, "screen-choose-mic");
+        editor.settings.screen_microphone = true;
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Microphone: Desk microphone");
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Headset microphone");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(
+            editor.settings.microphone.as_deref(),
+            Some("Headset microphone")
+        );
+        assert!(is_named(
+            &ctx,
+            &mut editor,
+            "Microphone: Headset microphone"
+        ));
+    }
+
+    /// Four two-second clips: three on the top row at 0, 3 and 6 seconds, and one on the row
+    /// below at 4 seconds.
+    fn clips_to_select(ctx: &egui::Context) -> (Editor, Vec<ClipId>) {
+        let mut editor = in_panel_only(ctx, &[test_clip()]);
+        let media = editor.media[0].id;
+        let piece = TimeRange {
+            start: Ticks(0),
+            end: Ticks::from_seconds(2.0),
+        };
+        let at = Ticks::from_seconds;
+        let tracks = &mut editor.project.tracks;
+        let ids = vec![
+            tracks.place(media, piece, at(0.0), TrackTarget::New(0)),
+            tracks.place(media, piece, at(3.0), TrackTarget::Existing(0)),
+            tracks.place(media, piece, at(6.0), TrackTarget::Existing(0)),
+            tracks.place(media, piece, at(4.0), TrackTarget::New(1)),
+        ];
+        editor.settle_canvas();
+        editor.after_clip_added();
+        editor.select_only(None);
+        for _ in 0..3 {
+            run_frame(ctx, &mut editor, vec![]);
+        }
+        (editor, ids)
+    }
+
+    /// The middle of a clip on the timeline.
+    fn clip_point(editor: &Editor, id: ClipId) -> egui::Pos2 {
+        let tracks = &editor.project.tracks;
+        let clip = tracks.clip(id).expect("on the timeline");
+        let row = tracks.track_of(id).expect("on a row");
+        let middle = Ticks(clip.start.0 + clip.duration().0 / 2);
+        pos2(
+            editor.timeline_state.scale.x_of(middle),
+            editor.timeline_state.layout.track(row).center().y,
+        )
+    }
+
+    fn click_holding(ctx: &egui::Context, editor: &mut Editor, at: egui::Pos2, held: Modifiers) {
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: held,
+        };
+        let holding = egui::Event::ModifiersChanged(held);
+        run_frame(ctx, editor, vec![egui::Event::PointerMoved(at)]);
+        run_frame(ctx, editor, vec![holding.clone(), button(true)]);
+        run_frame(ctx, editor, vec![holding, button(false)]);
+        run_frame(
+            ctx,
+            editor,
+            vec![egui::Event::ModifiersChanged(Modifiers::NONE)],
+        );
+    }
+
+    fn click_clip(ctx: &egui::Context, editor: &mut Editor, id: ClipId, held: Modifiers) {
+        let at = clip_point(editor, id);
+        click_holding(ctx, editor, at, held);
+    }
+
+    fn selection_of(editor: &Editor) -> Vec<ClipId> {
+        let mut ids = editor.selected_clips();
+        ids.sort();
+        ids
+    }
+
+    fn sorted(mut ids: Vec<ClipId>) -> Vec<ClipId> {
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn ctrl_click_adds_and_takes_away_clips_and_a_plain_click_selects_one_again() {
+        let ctx = context();
+        let (mut editor, ids) = clips_to_select(&ctx);
+        click_clip(&ctx, &mut editor, ids[0], Modifiers::NONE);
+        assert_eq!(selection_of(&editor), [ids[0]]);
+        click_clip(&ctx, &mut editor, ids[2], Modifiers::CTRL);
+        click_clip(&ctx, &mut editor, ids[3], Modifiers::CTRL);
+        assert_eq!(selection_of(&editor), sorted(vec![ids[0], ids[2], ids[3]]));
+        click_clip(&ctx, &mut editor, ids[2], Modifiers::CTRL);
+        assert_eq!(selection_of(&editor), sorted(vec![ids[0], ids[3]]));
+        click_clip(&ctx, &mut editor, ids[1], Modifiers::NONE);
+        assert_eq!(selection_of(&editor), [ids[1]]);
+    }
+
+    #[test]
+    fn shift_click_selects_everything_that_starts_between_across_the_rows() {
+        let ctx = context();
+        let (mut editor, ids) = clips_to_select(&ctx);
+        click_clip(&ctx, &mut editor, ids[0], Modifiers::NONE);
+        click_clip(&ctx, &mut editor, ids[3], Modifiers::SHIFT);
+        // From 0 s on the top row to 4 s on the row below: not the clip at 6 s.
+        assert_eq!(selection_of(&editor), sorted(vec![ids[0], ids[1], ids[3]]));
+        assert_eq!(
+            editor.selected,
+            Some(ids[0]),
+            "the first clicked stays the main one"
+        );
+    }
+
+    #[test]
+    fn ctrl_a_selects_the_selected_clips_row_and_nothing_without_a_selection() {
+        let ctx = context();
+        let (mut editor, ids) = clips_to_select(&ctx);
+        run_frame(&ctx, &mut editor, key_event(Key::A, Modifiers::COMMAND));
+        assert!(editor.selected_clips().is_empty());
+
+        click_clip(&ctx, &mut editor, ids[1], Modifiers::NONE);
+        run_frame(&ctx, &mut editor, key_event(Key::A, Modifiers::COMMAND));
+        assert_eq!(selection_of(&editor), sorted(vec![ids[0], ids[1], ids[2]]));
+    }
+
+    #[test]
+    fn deleting_several_clips_is_one_step_to_undo() {
+        let ctx = context();
+        let (mut editor, ids) = clips_to_select(&ctx);
+        let before = editor.project.tracks.clone();
+        click_clip(&ctx, &mut editor, ids[0], Modifiers::NONE);
+        click_clip(&ctx, &mut editor, ids[2], Modifiers::CTRL);
+        run_frame(&ctx, &mut editor, press(Key::Delete));
+        let tracks = &editor.project.tracks;
+        assert!(tracks.clip(ids[0]).is_none() && tracks.clip(ids[2]).is_none());
+        assert!(tracks.clip(ids[1]).is_some() && tracks.clip(ids[3]).is_some());
+        assert!(editor.selected_clips().is_empty());
+        editor.undo();
+        assert_eq!(editor.project.tracks, before);
+    }
+
+    #[test]
+    fn copy_and_paste_keep_the_gaps_and_rows_and_select_what_was_pasted() {
+        let ctx = context();
+        let (mut editor, ids) = clips_to_select(&ctx);
+        click_clip(&ctx, &mut editor, ids[0], Modifiers::NONE);
+        click_clip(&ctx, &mut editor, ids[3], Modifiers::CTRL);
+        run_frame(&ctx, &mut editor, key_event(Key::C, Modifiers::COMMAND));
+        editor.seek(Ticks::from_seconds(10.0));
+        let before = editor.project.tracks.clone();
+        run_frame(&ctx, &mut editor, key_event(Key::V, Modifiers::COMMAND));
+
+        let pasted = editor.selected_clips();
+        assert_eq!(pasted.len(), 2);
+        let tracks = &editor.project.tracks;
+        let mut placed: Vec<(Ticks, usize)> = pasted
+            .iter()
+            .map(|id| {
+                (
+                    tracks.clip(*id).expect("placed").start,
+                    tracks.track_of(*id).expect("on a row"),
+                )
+            })
+            .collect();
+        placed.sort();
+        // The project ends at 8 s, so that is where the playhead waits.
+        let at = editor.position();
+        assert_eq!(at, Ticks::from_seconds(8.0));
+        assert_eq!(
+            placed,
+            [(at, 0), (Ticks(at.0 + Ticks::from_seconds(4.0).0), 1)]
+        );
+        editor.undo();
+        assert_eq!(editor.project.tracks, before, "one step to undo");
+    }
+
+    #[test]
+    fn duplicating_several_puts_the_copies_after_the_last_keeping_their_gaps() {
+        let ctx = context();
+        let (mut editor, ids) = clips_to_select(&ctx);
+        click_clip(&ctx, &mut editor, ids[1], Modifiers::NONE);
+        click_clip(&ctx, &mut editor, ids[2], Modifiers::CTRL);
+        run_frame(&ctx, &mut editor, key_event(Key::D, Modifiers::COMMAND));
+        let copies = editor.selected_clips();
+        assert_eq!(copies.len(), 2);
+        assert!(!copies.contains(&ids[1]) && !copies.contains(&ids[2]));
+        let tracks = &editor.project.tracks;
+        let mut starts: Vec<Ticks> = copies
+            .iter()
+            .map(|id| tracks.clip(*id).expect("placed").start)
+            .collect();
+        starts.sort();
+        // The last ends at 8 s, and the two were 3 s apart.
+        assert_eq!(
+            starts,
+            [Ticks::from_seconds(8.0), Ticks::from_seconds(11.0)]
+        );
+    }
+
+    #[test]
+    fn dragging_one_of_several_moves_them_all_by_the_same_amount() {
+        let ctx = context();
+        let (mut editor, ids) = clips_to_select(&ctx);
+        click_clip(&ctx, &mut editor, ids[0], Modifiers::NONE);
+        click_clip(&ctx, &mut editor, ids[3], Modifiers::CTRL);
+        let before = editor.project.tracks.clone();
+        let from = clip_point(&editor, ids[0]);
+        let to = from + vec2(time_x(&editor, 1.0) - time_x(&editor, 0.0), 0.0);
+        begin_drag(&ctx, &mut editor, from, to);
+        end_drag(&ctx, &mut editor, to);
+
+        let start = |id| editor.project.tracks.clip(id).map(|clip| clip.start);
+        assert_eq!(start(ids[0]), Some(Ticks::from_seconds(1.0)));
+        assert_eq!(
+            start(ids[3]),
+            Some(Ticks::from_seconds(5.0)),
+            "moved along with it"
+        );
+        assert_eq!(
+            start(ids[1]),
+            Some(Ticks::from_seconds(3.0)),
+            "not selected, so it stays"
+        );
+        assert_eq!(
+            selection_of(&editor),
+            sorted(vec![ids[0], ids[3]]),
+            "still both"
+        );
+        editor.undo();
+        assert_eq!(editor.project.tracks, before, "one step to undo");
+    }
+
+    #[test]
+    fn right_clicking_one_of_several_keeps_them_all() {
+        let ctx = context();
+        let (mut editor, ids) = clips_to_select(&ctx);
+        click_clip(&ctx, &mut editor, ids[0], Modifiers::NONE);
+        click_clip(&ctx, &mut editor, ids[2], Modifiers::CTRL);
+        let at = clip_point(&editor, ids[2]);
+        secondary_click(&ctx, &mut editor, at);
+        assert_eq!(selection_of(&editor), sorted(vec![ids[0], ids[2]]));
+        // A right-click on a clip outside them selects only it.
+        run_frame(&ctx, &mut editor, press(Key::Escape));
+        let at = clip_point(&editor, ids[1]);
+        secondary_click(&ctx, &mut editor, at);
+        assert_eq!(selection_of(&editor), [ids[1]]);
+    }
+
+    #[test]
+    fn a_clips_own_tools_step_aside_while_several_are_selected() {
+        let ctx = context();
+        let (mut editor, ids) = clips_to_select(&ctx);
+        click_clip(&ctx, &mut editor, ids[0], Modifiers::NONE);
+        assert!(!editor.clip_tabs().is_empty());
+        click_clip(&ctx, &mut editor, ids[1], Modifiers::CTRL);
+        assert!(editor.clip_tabs().is_empty());
+    }
+
+    #[test]
+    fn selecting_a_clip_another_way_lets_go_of_the_others() {
+        let ctx = context();
+        let (mut editor, ids) = clips_to_select(&ctx);
+        click_clip(&ctx, &mut editor, ids[0], Modifiers::NONE);
+        click_clip(&ctx, &mut editor, ids[1], Modifiers::CTRL);
+        let media = editor.media[0].id;
+        editor.add_to_timeline(media);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.selected_clips().len(), 1, "only the new clip");
+        assert!(!editor.selected_clips().contains(&ids[0]));
+    }
+
+    /// Stands in for the Recycle Bin: a folder of the test's own.
+    fn test_bin() -> PathBuf {
+        std::env::temp_dir()
+            .join("bareclip-test-bin")
+            .join(std::process::id().to_string())
+    }
+
+    fn moves_to_test_bin(path: &Path) -> Result<(), String> {
+        let bin = test_bin();
+        std::fs::create_dir_all(&bin).map_err(|error| error.to_string())?;
+        let name = path.file_name().ok_or("no name")?;
+        std::fs::rename(path, bin.join(name)).map_err(|error| error.to_string())
+    }
+
+    /// A project holding only a recording just made, which its card can delete.
+    fn only_a_recording(ctx: &egui::Context, name: &str) -> (Editor, PathBuf) {
+        let (mut editor, folder) = ready_to_record(ctx, name);
+        editor.trash_file = moves_to_test_bin;
+        open_record_bar_by_hand(ctx, &mut editor);
+        click_named(ctx, &mut editor, "Start recording");
+        run_for(ctx, &mut editor, 0.6);
+        click_named(ctx, &mut editor, "Stop");
+        run_frame(ctx, &mut editor, vec![]);
+        let video = editor.media[0].id;
+        editor.remove_media(video);
+        run_frame(ctx, &mut editor, vec![]);
+        let file = recorded_files(&folder).pop().expect("a recording");
+        (editor, file)
+    }
+
+    #[test]
+    fn a_recording_can_be_deleted_from_my_media_after_a_yes() {
+        let ctx = context();
+        let (mut editor, file) = only_a_recording(&ctx, "delete-recording");
+        assert!(editor.media[0].recorded);
+        click_named(&ctx, &mut editor, "My media");
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Video options");
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Delete recording");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(
+            is_named(&ctx, &mut editor, "Move to Recycle Bin"),
+            "it asks first"
+        );
+        assert!(file.exists(), "nothing happens before the yes");
+        click_named(&ctx, &mut editor, "Move to Recycle Bin");
+        run_for(&ctx, &mut editor, 0.5);
+
+        assert!(!file.exists());
+        let name = file.file_name().expect("named");
+        assert!(test_bin().join(name).exists(), "moved to the bin");
+        assert!(editor.media.is_empty(), "gone from My media");
+        assert!(
+            editor.project.tracks.is_empty(),
+            "and its clip from the timeline"
+        );
+        assert!(editor.notice.is_none(), "{:?}", editor.notice);
+        editor.undo();
+        assert!(
+            editor.project.tracks.is_empty(),
+            "undo doesn't bring it back"
+        );
+    }
+
+    #[test]
+    fn cancelling_keeps_the_recording() {
+        let ctx = context();
+        let (mut editor, file) = only_a_recording(&ctx, "keep-recording");
+        editor.confirm_delete_recording = Some(editor.media[0].id);
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Cancel");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.confirm_delete_recording.is_none());
+        assert!(file.exists());
+        assert_eq!(editor.media.len(), 1);
+    }
+
+    #[test]
+    fn only_recordings_can_be_deleted_from_my_media() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        click_named(&ctx, &mut editor, "Video options");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(is_named(&ctx, &mut editor, "Remove from this project"));
+        assert!(!is_named(&ctx, &mut editor, "Delete recording"));
+    }
+
+    #[test]
+    fn a_recording_is_still_known_as_one_once_saved() {
+        let ctx = context();
+        let (editor, _file) = only_a_recording(&ctx, "recorded-saved");
+        let file = editor.current_file();
+        assert!(file.media.iter().all(|saved| saved.recorded));
+        let written = serde_json::to_string(&file).expect("it can be written");
+        let read: ProjectFile = serde_json::from_str(&written).expect("and read back");
+        assert!(read.media[0].recorded);
+    }
+
+    #[test]
+    fn a_file_that_isnt_there_cant_go_to_the_recycle_bin() {
+        let missing = std::env::temp_dir().join("bareclip-no-such-recording.mp4");
+        assert!(move_to_recycle_bin(&missing).is_err());
+    }
+
+    #[test]
+    #[ignore = "draws pictures to look at rather than checking anything"]
+    fn draw_the_selection_screens() {
+        let folder = std::env::var_os("BARECLIP_SCREENS").map_or_else(
+            || std::env::temp_dir().join("bareclip-screens"),
+            PathBuf::from,
+        );
+        let ctx = context();
+        let mut camera = Camera::new(folder);
+        let (mut editor, ids) = clips_to_select(&ctx);
+        click_clip(&ctx, &mut editor, ids[0], Modifiers::NONE);
+        click_clip(&ctx, &mut editor, ids[3], Modifiers::SHIFT);
+        for _ in 0..12 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "select-01-several");
+        let from = clip_point(&editor, ids[0]);
+        let to = from + vec2(time_x(&editor, 1.5) - time_x(&editor, 0.0), 0.0);
+        begin_drag(&ctx, &mut editor, from, to);
+        camera.shoot(&ctx, &mut editor, moved(to), "select-02-dragging");
+        end_drag(&ctx, &mut editor, to);
+        let (mut editor, _file) = only_a_recording(&ctx, "select-screens");
+        editor.confirm_delete_recording = editor.media.first().map(|entry| entry.id);
+        for _ in 0..12 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "select-03-delete-recording");
+        editor.confirm_delete_recording = None;
+        KEPT_TEXTURES.with_borrow_mut(|kept| {
+            for delta in kept.iter_mut().flatten() {
+                delta.clear();
+            }
+            *kept = None;
+        });
     }
 }

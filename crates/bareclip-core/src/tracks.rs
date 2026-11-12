@@ -636,6 +636,51 @@ impl Tracks {
         self.refresh();
     }
 
+    /// Whether every one of these clips has a row of its own kind `rows` further down (up, if
+    /// negative), so a group can move across rows together.
+    pub fn group_fits_rows(&self, ids: &[ClipId], rows: isize) -> bool {
+        ids.iter().all(|id| {
+            let Some(row) = self.track_of(*id) else {
+                return false;
+            };
+            let to = row as isize + rows;
+            to >= 0
+                && (to as usize) < self.tracks.len()
+                && self.kind_of_row(to as usize) == self.kind_of_row(row)
+        })
+    }
+
+    /// Moves several clips by the same time and the same number of rows, so they keep their gaps
+    /// and rows. Nothing goes before the start: the whole group stops there. If any clip has no
+    /// row of its own kind to go to, they all stay on their rows and only move in time. Each then
+    /// lands as a moved clip does, and clips that aren't moving make room as usual.
+    pub fn move_clips(&mut self, ids: &[ClipId], by: Ticks, rows: isize) {
+        let mut moving: Vec<(Clip, usize)> = ids
+            .iter()
+            .filter_map(|id| Some((self.clip(*id)?, self.track_of(*id)?)))
+            .collect();
+        let Some(earliest) = moving.iter().map(|(clip, _)| clip.start.0).min() else {
+            return;
+        };
+        let by = by.0.max(-earliest);
+        let rows = if self.group_fits_rows(ids, rows) {
+            rows
+        } else {
+            0
+        };
+        // Everything comes out first, so the group never bumps into itself.
+        for (clip, row) in &moving {
+            self.tracks[*row].remove(clip.id);
+        }
+        moving.sort_by_key(|(clip, _)| clip.start);
+        for (clip, row) in moving {
+            let to = (row as isize + rows) as usize;
+            let wanted = Ticks(clip.start.0 + by);
+            self.tracks[to].land(clip, wanted);
+        }
+        self.refresh();
+    }
+
     /// The picture rows, by position, with a clip overlapping this one in time.
     fn overlapping_tracks(&self, clip: Clip) -> Vec<usize> {
         self.picture_tracks()
@@ -2663,6 +2708,70 @@ mod tests {
         assert_eq!(tracks.track_of(low), Some(0));
         assert_eq!(after.start, Ticks(60));
         assert_eq!(after.source, before.source);
+    }
+
+    #[test]
+    fn a_group_moves_together_keeping_its_gaps_and_rows() {
+        let mut tracks = Tracks::default();
+        let lower = tracks.place(VIDEO, range(0, 10), Ticks(0), TrackTarget::New(0));
+        let later = tracks.place(VIDEO, range(0, 10), Ticks(30), TrackTarget::Existing(0));
+        let upper = tracks.place(OTHER, range(0, 10), Ticks(5), TrackTarget::New(0));
+        let stays = tracks.place(VIDEO, range(0, 10), Ticks(100), TrackTarget::Existing(1));
+
+        tracks.move_clips(&[lower, later, upper], Ticks(40), 0);
+
+        let start = |id| tracks.clip(id).map(|clip: Clip| clip.start);
+        assert_eq!(start(lower), Some(Ticks(40)));
+        assert_eq!(start(later), Some(Ticks(70)));
+        assert_eq!(start(upper), Some(Ticks(45)));
+        assert_eq!(tracks.track_of(upper), Some(0));
+        assert_eq!(tracks.track_of(lower), Some(1));
+        assert_eq!(
+            start(stays),
+            Some(Ticks(100)),
+            "far enough away to stay put"
+        );
+    }
+
+    #[test]
+    fn a_group_stops_at_the_start_together() {
+        let mut tracks = Tracks::default();
+        let first = tracks.place(VIDEO, range(0, 10), Ticks(20), TrackTarget::New(0));
+        let second = tracks.place(VIDEO, range(0, 10), Ticks(50), TrackTarget::Existing(0));
+
+        tracks.move_clips(&[first, second], Ticks(-100), 0);
+
+        assert_eq!(tracks.clip(first).map(|clip| clip.start), Some(Ticks(0)));
+        assert_eq!(
+            tracks.clip(second).map(|clip| clip.start),
+            Some(Ticks(30)),
+            "the gap between them is kept"
+        );
+    }
+
+    #[test]
+    fn a_group_moves_across_rows_only_if_every_clip_has_a_row_of_its_kind() {
+        let mut tracks = Tracks::default();
+        let bottom = tracks.place(VIDEO, range(0, 10), Ticks(0), TrackTarget::New(0));
+        let middle = tracks.place(OTHER, range(0, 10), Ticks(0), TrackTarget::New(0));
+        let top = tracks.place(VIDEO, range(0, 10), Ticks(50), TrackTarget::New(0));
+        let song = tracks.place_sound(SONG, range(0, 10), Ticks(0), TrackTarget::New(3));
+        // Rows from the top: top, middle, bottom, then the song's.
+        assert_eq!(tracks.track_of(top), Some(0));
+
+        assert!(tracks.group_fits_rows(&[top, middle], 1));
+        tracks.move_clips(&[top, middle], Ticks(0), 1);
+        // The top row is left empty and goes, so the middle clip now shares the bottom's row.
+        assert_eq!(tracks.track_of(middle), tracks.track_of(bottom));
+        assert_eq!(tracks.track_of(top), Some(0));
+        assert_eq!(tracks.picture_rows(), 2);
+
+        // The bottom picture row can't go onto the song's row, so neither moves down.
+        assert!(!tracks.group_fits_rows(&[bottom, song], 1));
+        let before = (tracks.track_of(bottom), tracks.track_of(song));
+        tracks.move_clips(&[bottom, song], Ticks(100), 1);
+        assert_eq!((tracks.track_of(bottom), tracks.track_of(song)), before);
+        assert_eq!(tracks.clip(song).map(|clip| clip.start), Some(Ticks(100)));
     }
 
     #[test]

@@ -17,8 +17,8 @@ pub use shadcn_egui_icons_lucide::{
     PANEL_BOTTOM_CLOSE, PANEL_BOTTOM_OPEN, PANEL_LEFT_CLOSE, PAUSE, PENCIL, PICTURE_IN_PICTURE_2,
     PLAY, PLUS, RATIO, REDO, REDO_2, ROTATE_CCW, ROTATE_CW, SAVE, SCALING, SCISSORS, SETTINGS,
     SHAPES, SKIP_BACK, SKIP_FORWARD, SLIDERS_HORIZONTAL, SPARKLES, SQUARE, SUN, SWATCH_BOOK,
-    TARGET, TRASH_2, TYPE, UNDO, UNDO_2, UNLINK, UPLOAD, VOLUME_2, VOLUME_X, WAND_SPARKLES, X, ZAP,
-    ZOOM_IN, ZOOM_OUT,
+    TARGET, TRASH_2, TYPE, UNDO, UNDO_2, UNLINK, UPLOAD, VOLUME_2, VOLUME_X, WAND_SPARKLES, WEBCAM,
+    WEBCAM_OFF, X, ZAP, ZOOM_IN, ZOOM_OUT,
 };
 
 /// Lucide draws its outlines 2 units wide on a 24 unit square.
@@ -145,7 +145,9 @@ pub fn square_at(center: Pos2, side: f32) -> Rect {
 mod tests {
     use super::*;
 
-    const USED: [Icon; 91] = [
+    const USED: [Icon; 93] = [
+        WEBCAM,
+        WEBCAM_OFF,
         CIRCLE_DOT,
         MIC,
         MIC_OFF,

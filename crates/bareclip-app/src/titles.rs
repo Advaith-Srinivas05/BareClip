@@ -54,6 +54,8 @@ pub(super) struct CopiedClip {
     title: Option<Title>,
     row: usize,
     sound_only: bool,
+    /// How long after the first clip copied with it this one starts.
+    offset: Ticks,
 }
 
 impl CopiedClip {
@@ -482,6 +484,7 @@ impl Editor {
             file_name: String::new(),
             name: Self::title_label(title),
             created: None,
+            recorded: false,
             index: None,
             scan: None,
             cancel_scan: Arc::new(AtomicBool::new(false)),
@@ -769,45 +772,97 @@ impl Editor {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn copy_clip(&mut self, id: ClipId) {
-        let tracks = &self.project.tracks;
-        let (Some(clip), Some(row)) = (tracks.clip(id), tracks.track_of(id)) else {
-            return;
-        };
-        self.clipboard = Some(CopiedClip {
-            clip,
-            title: self.title_of(clip).cloned(),
-            row,
-            sound_only: tracks.is_sound_row(row),
-        });
+        self.copy_clips(&[id]);
     }
 
-    /// Adds a copy of the copied clip at the playhead, on the row it came from if it can.
-    pub(super) fn paste_clip(&mut self) {
-        let Some(copied) = self.clipboard.clone() else {
-            return;
-        };
-        self.record();
-        let media = match copied.title {
-            Some(title) => {
-                let own = self.new_title_id();
-                self.project.titles.insert(own, title);
-                own
-            }
-            None => copied.clip.media,
-        };
-        let time = self.position();
-        let pasted = self.project.tracks.place_copy(
-            copied.clip,
-            media,
-            time,
-            TrackTarget::Existing(copied.row),
-            copied.sound_only,
-        );
+    /// Copies of clips that stand on their own, in order of time, each knowing how long after the
+    /// first it starts.
+    fn copies_of(&self, ids: &[ClipId]) -> Vec<CopiedClip> {
+        let tracks = &self.project.tracks;
+        let mut copies: Vec<CopiedClip> = ids
+            .iter()
+            .filter_map(|id| {
+                let (clip, row) = (tracks.clip(*id)?, tracks.track_of(*id)?);
+                Some(CopiedClip {
+                    clip,
+                    title: self.title_of(clip).cloned(),
+                    row,
+                    sound_only: tracks.is_sound_row(row),
+                    offset: clip.start,
+                })
+            })
+            .collect();
+        copies.sort_by_key(|copy| (copy.clip.start, copy.row));
+        let first = copies.first().map_or(Ticks(0), |copy| copy.clip.start);
+        for copy in &mut copies {
+            copy.offset = Ticks(copy.clip.start.0 - first.0);
+        }
+        copies
+    }
+
+    pub(super) fn copy_clips(&mut self, ids: &[ClipId]) {
+        let copies = self.copies_of(ids);
+        if !copies.is_empty() {
+            self.clipboard = copies;
+        }
+    }
+
+    /// Adds copies starting at `at`, keeping their gaps, each on the row it came from if it can,
+    /// and selects them. Not a step of its own to undo.
+    fn place_copies(&mut self, copies: Vec<CopiedClip>, at: Ticks) {
+        let mut placed = Vec::new();
+        for copied in copies {
+            let media = match copied.title {
+                Some(title) => {
+                    let own = self.new_title_id();
+                    self.project.titles.insert(own, title);
+                    own
+                }
+                None => copied.clip.media,
+            };
+            placed.push(self.project.tracks.place_copy(
+                copied.clip,
+                media,
+                Ticks(at.0 + copied.offset.0),
+                TrackTarget::Existing(copied.row),
+                copied.sound_only,
+            ));
+        }
         self.sync_titles();
-        self.selected = Some(pasted);
+        self.select_group(&placed);
         self.settle_canvas();
         self.after_clip_added();
+    }
+
+    /// Adds copies of the copied clips at the playhead, keeping their gaps, on the rows they came
+    /// from if they can.
+    pub(super) fn paste_clip(&mut self) {
+        if self.clipboard.is_empty() {
+            return;
+        }
+        self.record();
+        let copies = self.clipboard.clone();
+        let time = self.position();
+        self.place_copies(copies, time);
+    }
+
+    /// Puts copies of several clips straight after the last of them ends, keeping their gaps and
+    /// rows, and selects the copies.
+    pub(super) fn duplicate_group(&mut self, ids: &[ClipId]) {
+        let tracks = &self.project.tracks;
+        let Some(end) = ids
+            .iter()
+            .filter_map(|id| tracks.clip(*id))
+            .map(|clip| clip.end())
+            .max()
+        else {
+            return;
+        };
+        let copies = self.copies_of(ids);
+        self.record();
+        self.place_copies(copies, end);
     }
 
     pub(super) fn open_edit_duration(&mut self, id: ClipId) {

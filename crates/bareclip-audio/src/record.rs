@@ -23,6 +23,8 @@ const WRITE_EVERY: Duration = Duration::from_millis(20);
 #[derive(Debug, Default)]
 struct Control {
     paused: AtomicBool,
+    /// Silence is written in place of what is heard, so the file keeps its length.
+    muted: AtomicBool,
     stop: AtomicBool,
     /// Frames written to the file, at `SOUND_RATE`.
     written: AtomicU64,
@@ -47,11 +49,35 @@ impl SoundRecording {
     /// can't be made.
     pub fn start(
         path: &Path,
-        mut queue: Consumer<f32>,
+        queue: Consumer<f32>,
         rate: u32,
         label: SoundLabel,
     ) -> Result<Self, MediaError> {
-        let control = Arc::new(Control::default());
+        Self::start_with(path, queue, rate, label, false)
+    }
+
+    /// Makes the file like `start`, but keeps nothing until `set_paused(false)`, so it can begin
+    /// at the same moment as other recordings that take longer to get ready.
+    pub fn start_paused(
+        path: &Path,
+        queue: Consumer<f32>,
+        rate: u32,
+        label: SoundLabel,
+    ) -> Result<Self, MediaError> {
+        Self::start_with(path, queue, rate, label, true)
+    }
+
+    fn start_with(
+        path: &Path,
+        mut queue: Consumer<f32>,
+        rate: u32,
+        label: SoundLabel,
+        paused: bool,
+    ) -> Result<Self, MediaError> {
+        let control = Arc::new(Control {
+            paused: AtomicBool::new(paused),
+            ..Control::default()
+        });
         let (ready, started) = mpsc::channel();
         let path = path.to_owned();
         let shared = control.clone();
@@ -82,6 +108,9 @@ impl SoundRecording {
                 }
                 // A paused stretch is thrown away, so the file has no gap.
                 if !shared.paused.load(Ordering::Acquire) && !heard.is_empty() {
+                    if shared.muted.load(Ordering::Acquire) {
+                        heard.fill(0.0);
+                    }
                     let samples = match &mut change {
                         Some(change) => change.run(&heard)?,
                         None => heard.clone(),
@@ -125,6 +154,16 @@ impl SoundRecording {
 
     pub fn is_paused(&self) -> bool {
         self.control.paused.load(Ordering::Acquire)
+    }
+
+    /// Silences what is heard from now on, or lets it be heard again. Silence is still written,
+    /// so the file stays in step with anything recorded beside it.
+    pub fn set_muted(&self, muted: bool) {
+        self.control.muted.store(muted, Ordering::Release);
+    }
+
+    pub fn is_muted(&self) -> bool {
+        self.control.muted.load(Ordering::Acquire)
     }
 
     /// How long the recording is so far, pauses left out.
@@ -253,10 +292,78 @@ mod tests {
         feed(&mut producer, 48_000, 1.0, capacity);
         recording.set_paused(false);
         feed(&mut producer, 48_000, 1.0, capacity);
-        assert!((recording.seconds() - 2.0).abs() < 0.03);
+        // Sound taken from the queue may still be being written on a busy machine.
+        let waiting = Instant::now();
+        while recording.seconds() < 1.97 && waiting.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let seconds = recording.seconds();
+        assert!((seconds - 2.0).abs() < 0.03, "{seconds}");
         recording.stop().expect("it finishes");
         let length = length_of(&path);
         assert!((length - 2.0).abs() < 0.05, "{length}");
+    }
+
+    /// The loudest sample in a file's sound between two times, in seconds.
+    fn loudest_between(path: &Path, from: f64, to: f64) -> f32 {
+        use bareclip_media::{AudioPreview, AudioStep};
+        let mut sound = AudioPreview::open(path, 48_000).expect("it opens");
+        let mut peak = 0.0_f32;
+        loop {
+            match sound.next_step().expect("it decodes") {
+                AudioStep::Chunk(chunk) => {
+                    for (index, pair) in chunk.samples.as_chunks::<2>().0.iter().enumerate() {
+                        let at = (chunk.start_frame + index as i64) as f64 / 48_000.0;
+                        if at >= from && at < to {
+                            peak = peak.max(pair[0].abs()).max(pair[1].abs());
+                        }
+                    }
+                }
+                AudioStep::Pending => {}
+                AudioStep::End => return peak,
+            }
+        }
+    }
+
+    #[test]
+    fn started_paused_it_keeps_nothing_until_it_goes_on() {
+        let path = folder("started-paused").join("paused.m4a");
+        let capacity = 48_000 * CHANNELS;
+        let (mut producer, consumer) = RingBuffer::new(capacity);
+        let recording =
+            SoundRecording::start_paused(&path, consumer, 48_000, label()).expect("it starts");
+        assert!(recording.is_paused());
+        feed(&mut producer, 48_000, 1.0, capacity);
+        assert_eq!(recording.seconds(), 0.0);
+        recording.set_paused(false);
+        feed(&mut producer, 48_000, 1.0, capacity);
+        recording.stop().expect("it finishes");
+        let length = length_of(&path);
+        assert!((length - 1.0).abs() < 0.05, "{length}");
+    }
+
+    #[test]
+    fn a_muted_stretch_is_silence_of_the_same_length() {
+        let path = folder("muted").join("muted.m4a");
+        let capacity = 48_000 * CHANNELS;
+        let (mut producer, consumer) = RingBuffer::new(capacity);
+        let recording = SoundRecording::start(&path, consumer, 48_000, label()).expect("it starts");
+        recording.set_muted(true);
+        assert!(recording.is_muted());
+        feed(&mut producer, 48_000, 1.0, capacity);
+        recording.set_muted(false);
+        feed(&mut producer, 48_000, 1.0, capacity);
+        recording.stop().expect("it finishes");
+        let length = length_of(&path);
+        assert!((length - 2.0).abs() < 0.05, "{length}");
+        assert!(
+            loudest_between(&path, 0.1, 0.9) < 0.001,
+            "the muted second is silent"
+        );
+        assert!(
+            loudest_between(&path, 1.1, 1.9) > 0.2,
+            "heard once on again"
+        );
     }
 
     #[test]

@@ -36,6 +36,13 @@ pub struct SavedMedia {
     /// A name given to it in this project, if it isn't going by its file's name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Whether BareClip recorded it, which lets it be deleted from inside the project.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub recorded: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// A title as it is written down, under the id its clip refers to.
@@ -157,6 +164,7 @@ impl ProjectFile {
                     id: id.0,
                     path,
                     name: None,
+                    recorded: false,
                 })
                 .collect(),
             titles: Vec::new(),

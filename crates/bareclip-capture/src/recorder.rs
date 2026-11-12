@@ -126,7 +126,30 @@ impl ScreenRecording {
         sounds: Vec<SoundFeed>,
         settings: ScreenSettings,
     ) -> Result<Self, MediaError> {
+        Self::start_with(path, pictures, sounds, settings, false)
+    }
+
+    /// Opens the file and encoder like `start`, but records nothing until `set_paused(false)`.
+    /// Opening an encoder can take a second, so this lets a recording begin at an exact moment,
+    /// such as when a video starts to move.
+    pub fn start_paused(
+        path: &Path,
+        pictures: Box<dyn PictureSource>,
+        sounds: Vec<SoundFeed>,
+        settings: ScreenSettings,
+    ) -> Result<Self, MediaError> {
+        Self::start_with(path, pictures, sounds, settings, true)
+    }
+
+    fn start_with(
+        path: &Path,
+        pictures: Box<dyn PictureSource>,
+        sounds: Vec<SoundFeed>,
+        settings: ScreenSettings,
+        paused: bool,
+    ) -> Result<Self, MediaError> {
         let control = Arc::new(Control {
+            paused: AtomicBool::new(paused),
             muted: sounds
                 .iter()
                 .map(|feed| AtomicBool::new(feed.muted))
@@ -580,6 +603,45 @@ mod tests {
         assert!((report.seconds - 1.4).abs() < 0.2, "{report:?}");
         let info = bareclip_media::probe(&path).expect("it can be read");
         assert!((info.duration.as_seconds() - 1.4).abs() < 0.3);
+    }
+
+    #[test]
+    fn a_recording_started_paused_holds_nothing_until_it_goes_on() {
+        let path = folder("started-paused").join("camera.mp4");
+        let latest = Arc::new(Mutex::new(None));
+        show(&latest, (160, 90), [0, 0, 255]);
+        let (mut talking, queue) = RingBuffer::new(48_000 * 8);
+        let recording = ScreenRecording::start_paused(
+            &path,
+            Box::new(MadeUp {
+                latest,
+                size: (160, 90),
+            }),
+            vec![SoundFeed {
+                queue,
+                rate: 48_000,
+                name: "Microphone".to_owned(),
+                muted: false,
+            }],
+            ScreenSettings::default(),
+        )
+        .expect("it starts");
+        // Sound heard while waiting is left out, like a pause.
+        for _ in 0..48_000 {
+            let _ = talking.push(0.5);
+            let _ = talking.push(0.5);
+        }
+        thread::sleep(Duration::from_millis(600));
+        assert!(recording.is_paused());
+        assert_eq!(recording.seconds(), 0.0, "nothing yet");
+        recording.set_paused(false);
+        thread::sleep(Duration::from_millis(700));
+        let report = recording.stop().expect("it finishes");
+        assert!((report.seconds - 0.7).abs() < 0.15, "{report:?}");
+        assert!(
+            loudest_between(&path, 0.0, 10.0) < 0.01,
+            "the sound from before it went on is gone"
+        );
     }
 
     /// The loudest sample of a file's first sound track between two times, in seconds.

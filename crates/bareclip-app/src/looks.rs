@@ -506,6 +506,10 @@ impl Editor {
 
     /// The tools the selected clip has on the right-hand rail. A title has its own panel instead.
     pub(super) fn clip_tabs(&self) -> Vec<LookTab> {
+        // A clip's tools change one clip, so they wait while several are selected.
+        if !self.also_selected.is_empty() {
+            return Vec::new();
+        }
         let tracks = &self.project.tracks;
         let Some(clip) = self.selected.and_then(|id| tracks.clip(id)) else {
             return Vec::new();

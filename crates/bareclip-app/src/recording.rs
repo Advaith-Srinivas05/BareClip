@@ -206,6 +206,24 @@ pub(super) fn meter_fill(level: f32) -> f32 {
     ((db - METER_FLOOR_DB) / -METER_FLOOR_DB).clamp(0.0, 1.0)
 }
 
+/// The microphone to show as chosen: the one picked before if it's still there, otherwise the
+/// first, which is Windows' default.
+pub(super) fn shown_microphone(chosen: Option<&String>, microphones: &[Microphone]) -> String {
+    chosen
+        .filter(|name| {
+            microphones
+                .iter()
+                .any(|microphone| &microphone.name == *name)
+        })
+        .cloned()
+        .or_else(|| {
+            microphones
+                .first()
+                .map(|microphone| microphone.name.clone())
+        })
+        .unwrap_or_else(|| "No microphone".to_owned())
+}
+
 /// A recording's file name, such as `Microphone 2026-11-11 14-05-32.m4a`.
 pub(super) fn recording_name(
     kind: &str,
@@ -303,7 +321,11 @@ impl Editor {
             || self
                 .screen_bar
                 .as_ref()
-                .is_some_and(super::screen_recording::ScreenBar::is_recording);
+                .is_some_and(super::screen_recording::ScreenBar::is_recording)
+            || self
+                .camera_bar
+                .as_ref()
+                .is_some_and(super::camera_recording::CameraBar::is_recording);
         let screen = components::choice_card(
             ui,
             palette,
@@ -314,7 +336,36 @@ impl Editor {
         );
         if screen.clicked() && !busy {
             self.record_bar = None;
-            self.open_screen_bar();
+            self.camera_bar = None;
+            self.open_screen_bar(false);
+        }
+        ui.add_space(6.0);
+        let both = components::choice_card(
+            ui,
+            palette,
+            &icons::PICTURE_IN_PICTURE_2,
+            "Screen and camera",
+            "Record a screen with your webcam in a corner, landing as separate clips",
+            false,
+        );
+        if both.clicked() && !busy {
+            self.record_bar = None;
+            self.camera_bar = None;
+            self.open_screen_bar(true);
+        }
+        ui.add_space(6.0);
+        let camera = components::choice_card(
+            ui,
+            palette,
+            &icons::WEBCAM,
+            "Camera",
+            "Record yourself with a webcam and your microphone, as a video at the playhead",
+            false,
+        );
+        if camera.clicked() && !busy {
+            self.record_bar = None;
+            self.screen_bar = None;
+            self.open_camera_bar();
         }
         ui.add_space(6.0);
         let card = components::choice_card(
@@ -327,6 +378,7 @@ impl Editor {
         );
         if card.clicked() && !busy {
             self.screen_bar = None;
+            self.camera_bar = None;
             self.open_record_bar();
         }
     }
@@ -348,24 +400,11 @@ impl Editor {
     }
 
     fn microphone_name(&self) -> String {
-        let chosen = self.settings.microphone.as_ref();
         let microphones = self
             .record_bar
             .as_ref()
             .map_or(&[][..], |bar| &bar.microphones[..]);
-        chosen
-            .filter(|name| {
-                microphones
-                    .iter()
-                    .any(|microphone| &microphone.name == *name)
-            })
-            .cloned()
-            .or_else(|| {
-                microphones
-                    .first()
-                    .map(|microphone| microphone.name.clone())
-            })
-            .unwrap_or_else(|| "No microphone".to_owned())
+        shown_microphone(self.settings.microphone.as_ref(), microphones)
     }
 
     fn choose_microphone(&mut self, name: String) {
@@ -466,7 +505,7 @@ impl Editor {
     /// Puts a recorded file in My media and on a new row at `at`, moving nothing, as one step to
     /// undo: a sound row for sound, and a picture row above everything for a video.
     pub(super) fn add_recording(&mut self, ctx: &egui::Context, path: &Path, at: Ticks) {
-        let entry = match self.load(ctx, path) {
+        let mut entry = match self.load(ctx, path) {
             Ok(entry) => entry,
             Err(error) => {
                 let name = path
@@ -476,6 +515,8 @@ impl Editor {
                 return;
             }
         };
+        // Made by BareClip, so it can be deleted from My media.
+        entry.recorded = true;
         let id = entry.id;
         self.media.push(entry);
         let Some(range) = self.full_range(id) else {
@@ -499,7 +540,7 @@ impl Editor {
     }
 
     /// Whether the video can play from where the playhead is.
-    fn can_play_along(&self) -> bool {
+    pub(super) fn can_play_along(&self) -> bool {
         let position = self.position();
         !self.project.tracks.is_empty() && position < self.project.tracks.duration()
     }

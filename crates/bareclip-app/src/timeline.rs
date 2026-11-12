@@ -243,6 +243,8 @@ pub struct TimelineView<'a> {
     pub faces: &'a HashMap<MediaId, ClipFace<'a>>,
     pub position: Ticks,
     pub selected: Option<ClipId>,
+    /// Other clips selected along with `selected`, with Ctrl, Shift or Ctrl+A.
+    pub also_selected: &'a [ClipId],
     pub selected_gap: Option<Ticks>,
     /// Whether a clip has been copied and can be pasted.
     pub can_paste: bool,
@@ -278,6 +280,58 @@ fn released<Payload: std::any::Any + Send + Sync>(
     egui::DragAndDrop::has_payload_of_type::<Payload>(&response.ctx)
         .then(|| response.dnd_release_payload::<Payload>())
         .flatten()
+}
+
+/// Where a clip being dragged would land: its start, its end and its row.
+type Landing = (ClipId, Ticks, Ticks, TrackTarget);
+
+/// Every clip selected with this one, itself included, if it is part of the selection.
+fn group_of(view: &TimelineView, id: ClipId) -> Vec<ClipId> {
+    let mut group: Vec<ClipId> = view.selected.into_iter().collect();
+    group.extend(view.also_selected.iter().copied());
+    if group.contains(&id) { group } else { vec![id] }
+}
+
+/// How far a group moves when one of it lands at `landing` on `target`: the time, the rows, and
+/// where each of the others would land. The group stops at the start together, and only moves
+/// across rows if every clip has a row of its own kind to go to, as `Tracks::move_clips` does.
+fn group_move(
+    view: &TimelineView,
+    clips: &[ClipView],
+    group: &[ClipId],
+    dragged: &ClipView,
+    landing: Ticks,
+    target: TrackTarget,
+) -> (Ticks, isize, Vec<Landing>) {
+    let members: Vec<&ClipView> = clips
+        .iter()
+        .filter(|clip| group.contains(&clip.id))
+        .collect();
+    let earliest = members.iter().map(|clip| clip.start.0).min().unwrap_or(0);
+    let by = (landing.0 - dragged.start.0).max(-earliest);
+    let rows = match target {
+        TrackTarget::Existing(row) => row as isize - dragged.track as isize,
+        TrackTarget::New(_) => 0,
+    };
+    let rows = if view.tracks.group_fits_rows(group, rows) {
+        rows
+    } else {
+        0
+    };
+    let landings = members
+        .iter()
+        .filter(|clip| clip.id != dragged.id)
+        .map(|clip| {
+            let row = (clip.track as isize + rows) as usize;
+            (
+                clip.id,
+                Ticks(clip.start.0 + by),
+                Ticks(clip.end.0 + by),
+                TrackTarget::Existing(row),
+            )
+        })
+        .collect();
+    (Ticks(by), rows, landings)
 }
 
 /// The join a dragged transition would land on, if one is close enough.
@@ -917,6 +971,20 @@ impl TimelineState {
     }
 }
 
+/// How a click on a clip changes what is selected.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SelectHow {
+    /// Only that clip, or nothing for empty space.
+    #[default]
+    Only,
+    /// Ctrl+click: adds it, or takes it away if it was selected.
+    Toggle,
+    /// Shift+click: everything from the clip clicked last to this one.
+    Range,
+    /// A drag or right-click on a clip: keeps the selection if the clip is part of it.
+    Keep,
+}
+
 /// Changes the user made on the timeline this frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TimelineEvents {
@@ -938,6 +1006,8 @@ pub struct TimelineEvents {
     pub delete_join: Option<ClipId>,
     pub seek: Option<Ticks>,
     pub select: Option<Option<ClipId>>,
+    /// Comes with `select`: how it changes what else is selected.
+    pub select_how: SelectHow,
     /// Comes with `select`: the dead space that was clicked on, if any.
     pub select_gap: Option<Ticks>,
     pub remove_gap: Option<Ticks>,
@@ -948,6 +1018,8 @@ pub struct TimelineEvents {
     pub trim_snap: Option<Ticks>,
     pub trim_finished: bool,
     pub move_clip: Option<(ClipId, Ticks, TrackTarget)>,
+    /// Several selected clips were dragged together: how far in time and how many rows.
+    pub move_group: Option<(Ticks, isize)>,
     pub drop_media: Option<(MediaId, Ticks, TrackTarget)>,
     pub menu: Option<MenuAction>,
     /// What the clip's menu changed, which is what the clip's own controls can change.
@@ -2318,12 +2390,17 @@ pub fn timeline(
                 events.select = Some(Some(id));
                 events.trim_started = Some((id, edge, time));
             }
-            TimelineDrag::Move { id, .. } => events.select = Some(Some(id)),
+            TimelineDrag::Move { id, .. } => {
+                events.select = Some(Some(id));
+                events.select_how = SelectHow::Keep;
+            }
             _ => {}
         }
     }
     let tolerance = scale.time_of_pixels(SNAP_PIXELS);
     let mut move_landing = None;
+    // The other selected clips being dragged along, with where each would land.
+    let mut group_landing: Vec<Landing> = Vec::new();
     if let Some(pointer) = response.interact_pointer_pos() {
         let time = scale.time_at(pointer.x);
         match state.drag {
@@ -2359,7 +2436,15 @@ pub fn timeline(
                     state.snap_line = snap_target(landing, length, &targets);
                     state.track_scroll =
                         scroll_toward_edge(ui, state.track_scroll, furthest, area, pointer.y);
-                    if response.drag_stopped() {
+                    let group = group_of(view, id);
+                    if group.len() > 1 {
+                        let (by, rows, landings) =
+                            group_move(view, clips, &group, clip, landing, target);
+                        group_landing = landings;
+                        if response.drag_stopped() {
+                            events.move_group = Some((by, rows));
+                        }
+                    } else if response.drag_stopped() {
                         events.move_clip = Some((id, snapped, target));
                     }
                 }
@@ -2383,6 +2468,16 @@ pub fn timeline(
                 .then(|| clip_at(clips, &layout, &scale, pointer))
                 .flatten();
             events.select = Some(clicked_clip.map(|(clip, _)| clip.id));
+            let modifiers = ui.input(|input| input.modifiers);
+            if clicked_clip.is_some() {
+                events.select_how = if modifiers.command || modifiers.ctrl {
+                    SelectHow::Toggle
+                } else if modifiers.shift {
+                    SelectHow::Range
+                } else {
+                    SelectHow::Only
+                };
+            }
             if in_area && view.tracks.gap_at(time).is_some() {
                 events.select_gap = Some(time);
             }
@@ -2415,6 +2510,7 @@ pub fn timeline(
             .flatten();
         state.menu_target = if let Some((clip, _)) = clip {
             events.select = Some(Some(clip.id));
+            events.select_how = SelectHow::Keep;
             Some(MenuTarget::Clip(clip.id))
         } else if view.tracks.gap_at(time).is_some() {
             events.select = Some(None);
@@ -2529,7 +2625,8 @@ pub fn timeline(
         if shape.right() < area.left() || shape.left() > area.right() {
             continue;
         }
-        let moving = move_landing.is_some_and(|(id, ..)| id == clip.id);
+        let moving = move_landing.is_some_and(|(id, ..)| id == clip.id)
+            || group_landing.iter().any(|(id, ..)| *id == clip.id);
         let mut clip_painter = area_painter.clone();
         if moving {
             clip_painter.multiply_opacity(0.45);
@@ -2541,7 +2638,7 @@ pub fn timeline(
             clip,
             (view.faces.get(&clip.media), &scale),
             clip_look(
-                view.selected == Some(clip.id),
+                view.selected == Some(clip.id) || view.also_selected.contains(&clip.id),
                 state.hovered_clip == Some(clip.id),
             ),
         );
@@ -2556,6 +2653,16 @@ pub fn timeline(
             &scale,
             target,
             (start, end),
+        );
+    }
+    for (_, start, end, target) in &group_landing {
+        draw_drop(
+            &area_painter,
+            palette,
+            &layout,
+            &scale,
+            *target,
+            (*start, *end),
         );
     }
     if clips.is_empty() {

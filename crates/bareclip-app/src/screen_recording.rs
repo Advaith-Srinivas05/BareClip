@@ -2,19 +2,31 @@
 //! own. The bar floats over the picture like the microphone's, with a small live picture of what
 //! will be recorded. While recording, BareClip's windows keep themselves out of the picture, a
 //! small overlay stays on top of everything with Pause, Stop and the microphone, and keys pause
-//! and stop from any program. The overlay can be dragged by its grip and folded down to Pause and
-//! Stop.
+//! and stop from any program. The overlay starts near the screen's top right corner, can be
+//! dragged by its grip and folded down to Pause and Stop.
+//!
+//! With a camera too, three files are recorded side by side: the screen with the PC's sound, the
+//! camera with no sound, and the microphone on its own. All three are opened paused and set going
+//! at the same moment, so they line up, and they land as three clips: the camera in a corner over
+//! the screen, and the microphone on a sound row. The overlay can then show the camera too.
 
 use std::sync::mpsc;
 
+use bareclip_audio::{Microphone, SoundRecording};
 use bareclip_capture::{
     Offered, PictureSource, ScreenRecording, ScreenSettings, SoundFeed, Source,
 };
-use bareclip_media::Quality;
+use bareclip_core::placement::{CanvasCorner, Placement};
+use bareclip_core::tracks::TrackTarget;
+use bareclip_media::{Quality, SoundLabel};
 
+use super::camera_recording::{
+    CameraPick, camera_choices, camera_settings, camera_state_text, draw_live_picture,
+    microphone_choice,
+};
 use super::recording::{
     MicSource, TIME_WIDTH, local_time, meter, meter_fill, pause_button, recording_name,
-    save_in_row, stop_button, time_label, unused_path,
+    save_in_row, shown_microphone, stop_button, time_label, unused_path,
 };
 use super::*;
 use crate::{
@@ -29,8 +41,11 @@ const PREVIEW_EVERY: f64 = 0.2;
 const PREVIEW_WIDTH: u32 = 320;
 const COUNTDOWN_SECONDS: f64 = 3.0;
 const BAR_LIFT: f32 = 16.0;
-/// How far in from the screen's corner the overlay sits.
+/// How far in from the screen's edge the overlay sits.
 const OVERLAY_MARGIN: f32 = 24.0;
+/// How far down from the screen's top the overlay starts, below where full-screen windows keep
+/// their minimise, maximise and close buttons.
+const OVERLAY_TOP: f32 = 72.0;
 /// The room around the overlay's controls.
 pub(super) const OVERLAY_PADDING: i8 = 8;
 /// The room between the recording controls.
@@ -38,6 +53,10 @@ const CONTROL_SPACING: f32 = 4.0;
 const CONTROL_SIZE: f32 = 32.0;
 const GRIP_WIDTH: f32 = 16.0;
 const FOLD_WIDTH: f32 = 24.0;
+/// The room above the camera's picture in the overlay.
+const CAMERA_GAP: f32 = 6.0;
+/// Which corner the camera lands in over the screen.
+const CAMERA_CORNER: CanvasCorner = CanvasCorner::BottomRight;
 
 /// Starts capturing a screen or window, with or without the pointer.
 pub(super) type OpenScreen = fn(Source, bool) -> Result<Box<dyn PictureSource>, String>;
@@ -76,6 +95,22 @@ pub(super) enum ScreenStage {
     Recording(Box<LiveScreen>),
 }
 
+/// The camera's file, recorded beside the screen's.
+struct LiveCameraFile {
+    recording: ScreenRecording,
+    path: PathBuf,
+    marker: Option<RecordingMarker>,
+}
+
+/// The microphone's file, recorded beside the screen's when there is a camera too.
+struct LiveMicrophoneFile {
+    recording: SoundRecording,
+    path: PathBuf,
+    marker: Option<RecordingMarker>,
+    /// Whether it was ever on. A file that was silent the whole time is thrown away.
+    heard: bool,
+}
+
 pub(super) struct LiveScreen {
     recording: ScreenRecording,
     path: PathBuf,
@@ -84,19 +119,46 @@ pub(super) struct LiveScreen {
     keys: RecordingKeys,
     pressed: mpsc::Receiver<RecordingKey>,
     /// The microphone's track in the file. There is one whenever a microphone could be opened,
-    /// even if it starts silenced, so it can be turned on midway.
+    /// even if it starts silenced, so it can be turned on midway. With a camera, the microphone
+    /// has a file of its own instead.
     microphone_track: Option<usize>,
+    camera: Option<LiveCameraFile>,
+    microphone_file: Option<LiveMicrophoneFile>,
     /// The overlay is folded down to Pause and Stop. Every recording starts unfolded.
     folded: bool,
+    /// The overlay shows the camera's picture. Every recording starts without it.
+    camera_shown: bool,
     /// Where the overlay first appears. It stays put from then on, until dragged.
     overlay_at: egui::Pos2,
 }
 
 impl LiveScreen {
-    /// Whether the microphone is silenced, or `None` without a microphone track.
+    /// Whether the microphone is silenced, or `None` without a microphone.
     fn microphone_muted(&self) -> Option<bool> {
+        if let Some(file) = &self.microphone_file {
+            return Some(file.recording.is_muted());
+        }
         self.microphone_track
             .map(|track| self.recording.is_muted(track))
+    }
+
+    fn set_paused(&self, paused: bool) {
+        self.recording.set_paused(paused);
+        if let Some(camera) = &self.camera {
+            camera.recording.set_paused(paused);
+        }
+        if let Some(file) = &self.microphone_file {
+            file.recording.set_paused(paused);
+        }
+    }
+
+    fn set_microphone_muted(&mut self, muted: bool) {
+        if let Some(file) = &mut self.microphone_file {
+            file.recording.set_muted(muted);
+            file.heard |= !muted;
+        } else if let Some(track) = self.microphone_track {
+            self.recording.set_muted(track, muted);
+        }
     }
 }
 
@@ -107,28 +169,43 @@ struct Shown {
     paused: bool,
     microphone_muted: Option<bool>,
     folded: bool,
+    /// Whether the camera's picture shows, or `None` without a camera.
+    camera_shown: Option<bool>,
 }
 
-/// The overlay's size: the grip, the controls and the fold button, with room around them.
-pub(super) fn overlay_size(folded: bool) -> egui::Vec2 {
-    let controls = if folded {
-        [GRIP_WIDTH, CONTROL_SIZE, CONTROL_SIZE, FOLD_WIDTH].as_slice()
-    } else {
-        [
-            GRIP_WIDTH,
-            CONTROL_SIZE,
-            CONTROL_SIZE,
-            TIME_WIDTH,
-            CONTROL_SIZE,
-            FOLD_WIDTH,
-        ]
-        .as_slice()
-    };
+/// The overlay's size: the grip, the controls and the fold button, with room around them, and
+/// the camera's picture below them when it shows. `camera` is `None` without a camera, and
+/// otherwise whether its picture shows.
+pub(super) fn overlay_size(folded: bool, camera: Option<bool>) -> egui::Vec2 {
+    let mut controls = vec![GRIP_WIDTH, CONTROL_SIZE, CONTROL_SIZE];
+    if !folded {
+        controls.extend([TIME_WIDTH, CONTROL_SIZE]);
+        if camera.is_some() {
+            controls.push(CONTROL_SIZE);
+        }
+    }
+    controls.push(FOLD_WIDTH);
     let gaps = CONTROL_SPACING * (controls.len() - 1) as f32;
     let padding = 2.0 * f32::from(OVERLAY_PADDING);
-    vec2(
-        controls.iter().sum::<f32>() + gaps + padding,
-        CONTROL_SIZE + padding,
+    let inner = controls.iter().sum::<f32>() + gaps;
+    let picture = if !folded && camera == Some(true) {
+        CAMERA_GAP + camera_picture_height(inner)
+    } else {
+        0.0
+    };
+    vec2(inner + padding, CONTROL_SIZE + picture + padding)
+}
+
+/// The camera's picture in the overlay: as wide as the controls, in the usual 16:9.
+fn camera_picture_height(width: f32) -> f32 {
+    (width * 9.0 / 16.0).round()
+}
+
+/// Where the overlay starts: near the top right corner of a screen this size.
+pub(super) fn overlay_start(screen: egui::Vec2, overlay: egui::Vec2) -> egui::Pos2 {
+    pos2(
+        (screen.x - overlay.x - OVERLAY_MARGIN).max(0.0),
+        OVERLAY_TOP,
     )
 }
 
@@ -141,9 +218,12 @@ pub(super) struct ScreenBar {
     preview_count: u64,
     preview_at: f64,
     pc_sound: Option<Result<MicSource, String>>,
+    microphones: Vec<Microphone>,
     microphone: Option<Result<MicSource, String>>,
     pc_level: f32,
     microphone_level: f32,
+    /// The camera recorded beside the screen, for Screen and camera.
+    pub(super) camera: Option<CameraPick>,
     /// A folder picked with Browse for this recording only.
     pub(super) folder: Option<PathBuf>,
     pub(super) stage: ScreenStage,
@@ -161,6 +241,11 @@ impl ScreenBar {
                 || "Nothing to record".to_owned(),
                 |offered| offered.name.clone(),
             )
+    }
+
+    /// Whether everything to be recorded is ready.
+    fn ready(&self) -> bool {
+        self.capture.is_ok() && self.camera.as_ref().is_none_or(CameraPick::is_ready)
     }
 }
 
@@ -187,8 +272,52 @@ pub(super) fn shrunk(picture: &bareclip_capture::Picture, width: u32) -> egui::C
     egui::ColorImage::from_rgba_unmultiplied([out_width, out_height], &rgba)
 }
 
+/// Whether a recording finished. If so, its marker goes, and otherwise what went wrong is noted,
+/// and the marker stays so it's offered on the next start.
+fn finished<T>(
+    stopped: Result<T, bareclip_media::MediaError>,
+    path: &Path,
+    marker: Option<RecordingMarker>,
+    problems: &mut Vec<String>,
+) -> bool {
+    match stopped {
+        Ok(_) => {
+            if let Some(marker) = marker {
+                marker.finish();
+            }
+            true
+        }
+        Err(error) => {
+            problems.push(format!(
+                "{} could not be finished, but what was recorded is in it. {error}",
+                path.display()
+            ));
+            false
+        }
+    }
+}
+
+/// Where the camera's box sits over a picture of the screen, the way it will land: Picture in
+/// picture's size, in its corner. Shares of the picture, so it fits a preview of any size.
+pub(super) fn camera_box_share(camera: (u32, u32), screen: (u32, u32)) -> egui::Rect {
+    let placed = Placement::default().in_corner(CAMERA_CORNER, camera, screen);
+    let rect = placed.rect(camera, screen);
+    let (width, height) = (f64::from(screen.0.max(1)), f64::from(screen.1.max(1)));
+    egui::Rect::from_min_size(
+        pos2(
+            (f64::from(rect.x) / width) as f32,
+            (f64::from(rect.y) / height) as f32,
+        ),
+        vec2(
+            (f64::from(rect.width) / width) as f32,
+            (f64::from(rect.height) / height) as f32,
+        ),
+    )
+}
+
 impl Editor {
-    pub(super) fn open_screen_bar(&mut self) {
+    /// Opens the screen recording bar, with the camera's choices too for Screen and camera.
+    pub(super) fn open_screen_bar(&mut self, with_camera: bool) {
         let offered = (self.list_sources)();
         let chosen = offered
             .iter()
@@ -203,10 +332,12 @@ impl Editor {
             .settings
             .screen_pc_sound
             .then(|| (self.open_pc_sound)());
+        let microphones = (self.list_microphones)();
         let microphone = self
             .settings
             .screen_microphone
-            .then(|| (self.open_microphone)(self.settings.microphone.as_deref()));
+            .then(|| (self.open_microphone)(self.wanted_microphone(&microphones)));
+        let camera = with_camera.then(|| CameraPick::new((self.list_cameras)()));
         self.screen_bar = Some(ScreenBar {
             offered,
             chosen,
@@ -215,12 +346,17 @@ impl Editor {
             preview_count: 0,
             preview_at: 0.0,
             pc_sound,
+            microphones,
             microphone,
             pc_level: 0.0,
             microphone_level: 0.0,
+            camera,
             folder: None,
             stage: ScreenStage::Waiting,
         });
+        if with_camera {
+            self.open_chosen_camera();
+        }
     }
 
     fn choose_source(&mut self, source: Source) {
@@ -235,6 +371,19 @@ impl Editor {
         }
     }
 
+    fn choose_screen_microphone(&mut self, name: String) {
+        self.settings.microphone = Some(name.clone());
+        self.save_settings();
+        let opened = (self.open_microphone)(Some(&name));
+        if let Some(bar) = &mut self.screen_bar
+            && bar.microphone.is_some()
+        {
+            // The old one stops being listened to as it's replaced.
+            bar.microphone = Some(opened);
+            bar.microphone_level = 0.0;
+        }
+    }
+
     fn start_screen_recording(&mut self, ctx: &egui::Context) {
         let default_folder = self.recordings_folder();
         let lands_at = self.position();
@@ -244,11 +393,6 @@ impl Editor {
         let monitor = ctx
             .input(|input| input.viewport().monitor_size)
             .unwrap_or(vec2(1920.0, 1080.0));
-        let overlay = overlay_size(false);
-        let overlay_at = pos2(
-            monitor.x - overlay.x - OVERLAY_MARGIN,
-            monitor.y - overlay.y - OVERLAY_MARGIN * 3.0,
-        );
         let settings = ScreenSettings {
             frame_rate: self.settings.screen_frame_rate,
             size: None,
@@ -257,6 +401,18 @@ impl Editor {
         let Some(bar) = &mut self.screen_bar else {
             return;
         };
+        let with_camera = bar.camera.is_some();
+        let overlay_at = overlay_start(monitor, overlay_size(false, with_camera.then_some(false)));
+        let camera = match &mut bar.camera {
+            Some(pick) => match pick.take_running() {
+                Some(running) => Some(running),
+                None => {
+                    bar.stage = ScreenStage::Waiting;
+                    return;
+                }
+            },
+            None => None,
+        };
         let capture = std::mem::replace(&mut bar.capture, Err("Recording".to_owned()));
         let Ok(capture) = capture else {
             bar.capture = capture;
@@ -264,28 +420,37 @@ impl Editor {
             return;
         };
         let folder = bar.folder.clone().unwrap_or(default_folder);
-        // The microphone gets a track even when switched off, silenced, so it can be turned on
-        // midway. A track can't be added once the file has begun.
+        // The microphone is always listened to, silenced when switched off, so it can be turned
+        // on midway. A track can't be added once the file has begun.
         if bar.microphone.is_none() {
             bar.microphone = Some(open_microphone(microphone_name.as_deref()));
         }
         let mut sounds = Vec::new();
         let mut microphone_track = None;
-        for (source, name, muted) in [
-            (&mut bar.pc_sound, "PC sound", false),
-            (&mut bar.microphone, "Microphone", !microphone_on),
-        ] {
-            if let Some(Ok(source)) = source
-                && let Some(queue) = source.queue.take()
-            {
-                if name == "Microphone" {
-                    microphone_track = Some(sounds.len());
-                }
+        if let Some(Ok(source)) = &mut bar.pc_sound
+            && let Some(queue) = source.queue.take()
+        {
+            sounds.push(SoundFeed {
+                queue,
+                rate: source.rate,
+                name: "PC sound".to_owned(),
+                muted: false,
+            });
+        }
+        // With a camera the microphone gets a file of its own, otherwise a track in the screen's.
+        let mut microphone_queue = None;
+        if let Some(Ok(source)) = &mut bar.microphone
+            && let Some(queue) = source.queue.take()
+        {
+            if with_camera {
+                microphone_queue = Some((queue, source.rate));
+            } else {
+                microphone_track = Some(sounds.len());
                 sounds.push(SoundFeed {
                     queue,
                     rate: source.rate,
-                    name: name.to_owned(),
-                    muted,
+                    name: "Microphone".to_owned(),
+                    muted: !microphone_on,
                 });
             }
         }
@@ -297,46 +462,122 @@ impl Editor {
             self.screen_bar = None;
             return;
         }
-        let path = unused_path(&folder, &recording_name("Screen", local_time(), "mp4"));
+        let when = local_time();
+        let path = unused_path(&folder, &recording_name("Screen", when, "mp4"));
         // The keys are taken first, so the file starts only once they are ready.
         let (sender, pressed) = mpsc::channel();
         let wake = ctx.clone();
         let keys = RecordingKeys::listen(sender, move || wake.request_repaint());
-        match ScreenRecording::start(&path, capture, sounds, settings) {
-            Ok(recording) => {
-                let marker = self
-                    .app_folder
-                    .as_ref()
-                    .and_then(|app| RecordingMarker::start(app, &path).ok());
-                hotkeys::hide_from_captures(true);
-                if !keys.taken {
-                    self.notice = Some(format!(
-                        "Another program uses {} or {}, so pause and stop with the recording bar.",
-                        STOP_KEY.1, PAUSE_KEY.1
-                    ));
-                }
-                if let Some(bar) = &mut self.screen_bar {
-                    bar.stage = ScreenStage::Recording(Box::new(LiveScreen {
-                        recording,
-                        path,
-                        marker,
-                        lands_at,
-                        keys,
-                        pressed,
-                        microphone_track,
-                        folded: false,
-                        overlay_at,
-                    }));
-                }
-            }
+        let marker_for = |editor: &Self, path: &Path| {
+            editor
+                .app_folder
+                .as_ref()
+                .and_then(|app| RecordingMarker::start(app, path).ok())
+        };
+        // With a camera, everything opens paused and goes on together, so the files line up
+        // however long each encoder takes to open.
+        let start = if with_camera {
+            ScreenRecording::start_paused
+        } else {
+            ScreenRecording::start
+        };
+        let recording = match start(&path, capture, sounds, settings) {
+            Ok(recording) => recording,
             Err(error) => {
                 self.notice = Some(format!("The recording could not start. {error}"));
                 self.screen_bar = None;
+                return;
             }
+        };
+        let marker = marker_for(self, &path);
+        let mut camera_file = None;
+        if let Some((source, mode)) = camera {
+            let camera_path = unused_path(&folder, &recording_name("Camera", when, "mp4"));
+            match ScreenRecording::start_paused(
+                &camera_path,
+                Box::new(source),
+                Vec::new(),
+                camera_settings(mode),
+            ) {
+                Ok(camera_recording) => {
+                    camera_file = Some(LiveCameraFile {
+                        recording: camera_recording,
+                        marker: marker_for(self, &camera_path),
+                        path: camera_path,
+                    });
+                }
+                Err(error) => {
+                    self.notice = Some(format!("The recording could not start. {error}"));
+                    let _ = recording.stop();
+                    if let Some(marker) = marker {
+                        marker.finish();
+                    }
+                    let _ = std::fs::remove_file(&path);
+                    self.screen_bar = None;
+                    return;
+                }
+            }
+        }
+        let mut microphone_file = None;
+        if let Some((queue, rate)) = microphone_queue {
+            let microphone_path = unused_path(&folder, &recording_name("Microphone", when, "m4a"));
+            let label = SoundLabel {
+                title: Some("Microphone".to_owned()),
+                language: None,
+            };
+            match SoundRecording::start_paused(&microphone_path, queue, rate, label) {
+                Ok(sound) => {
+                    sound.set_muted(!microphone_on);
+                    microphone_file = Some(LiveMicrophoneFile {
+                        recording: sound,
+                        marker: marker_for(self, &microphone_path),
+                        path: microphone_path,
+                        heard: microphone_on,
+                    });
+                }
+                Err(error) => {
+                    self.notice = Some(format!(
+                        "The microphone could not be recorded, so the screen and camera are recorded without it. {error}"
+                    ));
+                }
+            }
+        }
+        // Everything goes on at the same moment.
+        if with_camera {
+            recording.set_paused(false);
+            if let Some(camera) = &camera_file {
+                camera.recording.set_paused(false);
+            }
+            if let Some(file) = &microphone_file {
+                file.recording.set_paused(false);
+            }
+        }
+        hotkeys::hide_from_captures(true);
+        if !keys.taken {
+            self.notice = Some(format!(
+                "Another program uses {} or {}, so pause and stop with the recording bar.",
+                STOP_KEY.1, PAUSE_KEY.1
+            ));
+        }
+        if let Some(bar) = &mut self.screen_bar {
+            bar.stage = ScreenStage::Recording(Box::new(LiveScreen {
+                recording,
+                path,
+                marker,
+                lands_at,
+                keys,
+                pressed,
+                microphone_track,
+                camera: camera_file,
+                microphone_file,
+                folded: false,
+                camera_shown: false,
+                overlay_at,
+            }));
         }
     }
 
-    /// Finishes the file and adds it to the project.
+    /// Finishes the files and adds them to the project.
     pub(super) fn stop_screen_recording(&mut self, ctx: &egui::Context) {
         let Some(bar) = self.screen_bar.take() else {
             return;
@@ -344,54 +585,144 @@ impl Editor {
         let ScreenStage::Recording(live) = bar.stage else {
             return;
         };
+        // Everything stops taking pictures and sound at the same moment. Finishing a file can take
+        // a while, and the others would go on recording meanwhile.
+        live.set_paused(true);
         let LiveScreen {
             recording,
             path,
             marker,
             lands_at,
             keys,
+            camera,
+            microphone_file,
             ..
         } = *live;
         drop(keys);
         hotkeys::hide_from_captures(false);
-        match recording.stop() {
-            Ok(_) => {
-                if let Some(marker) = marker {
+        let mut problems = Vec::new();
+        let screen_done = finished(recording.stop(), &path, marker, &mut problems);
+        let camera_path = camera.and_then(|camera| {
+            let stopped = camera.recording.stop();
+            finished(stopped, &camera.path, camera.marker, &mut problems).then_some(camera.path)
+        });
+        let microphone_path = microphone_file.and_then(|file| {
+            let stopped = file.recording.stop();
+            if !file.heard {
+                // Silent all along, so there's nothing to add.
+                if let Some(marker) = file.marker {
                     marker.finish();
                 }
-                self.add_recording(ctx, &path, lands_at);
+                let _ = std::fs::remove_file(&file.path);
+                return None;
             }
-            Err(error) => {
-                self.notice = Some(format!(
-                    "The recording could not be finished. What was recorded is in {}. {error}",
-                    path.display()
-                ));
-            }
+            finished(stopped, &file.path, file.marker, &mut problems).then_some(file.path)
+        });
+        if !problems.is_empty() {
+            self.notice = Some(problems.join(" "));
+        }
+        if !screen_done {
+            return;
+        }
+        match camera_path {
+            Some(camera_path) => self.add_screen_and_camera(
+                ctx,
+                &path,
+                &camera_path,
+                microphone_path.as_deref(),
+                lands_at,
+            ),
+            None => self.add_recording(ctx, &path, lands_at),
         }
     }
 
-    fn set_screen_paused(&mut self, paused: bool) {
+    /// Puts a screen, camera and microphone recorded together in My media and on new rows at
+    /// `at`, moving nothing, as one step to undo: the screen at full size, the camera over it in
+    /// its corner at Picture in picture's size, and the microphone on a sound row.
+    fn add_screen_and_camera(
+        &mut self,
+        ctx: &egui::Context,
+        screen: &Path,
+        camera: &Path,
+        microphone: Option<&Path>,
+        at: Ticks,
+    ) {
+        let mut loaded = Vec::new();
+        for path in [Some(screen), Some(camera), microphone]
+            .into_iter()
+            .flatten()
+        {
+            match self.load(ctx, path) {
+                Ok(mut entry) => {
+                    entry.recorded = true;
+                    let id = entry.id;
+                    self.media.push(entry);
+                    loaded.push(self.full_range(id).map(|range| (id, range)));
+                }
+                Err(error) => {
+                    let name = path
+                        .file_name()
+                        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+                    self.notice = Some(format!("{name} could not be opened. {error}"));
+                    loaded.push(None);
+                }
+            }
+        }
+        let recorded = |found: Option<&Option<(MediaId, TimeRange)>>| {
+            found
+                .copied()
+                .flatten()
+                .filter(|(_, range)| range.duration().0 > 0)
+        };
+        let (screen, camera, microphone) = (
+            recorded(loaded.first()),
+            recorded(loaded.get(1)),
+            recorded(loaded.get(2)),
+        );
+        let Some((screen_id, screen_range)) = screen else {
+            self.notice
+                .get_or_insert_with(|| "Nothing was recorded.".to_owned());
+            return;
+        };
+        self.record();
+        let screen_clip =
+            self.project
+                .tracks
+                .place(screen_id, screen_range, at, TrackTarget::New(0));
+        // The screen sets an empty project's size, being the main picture.
+        self.settle_canvas();
+        if let Some((camera_id, camera_range)) = camera {
+            let clip = self
+                .project
+                .tracks
+                .place(camera_id, camera_range, at, TrackTarget::New(0));
+            let canvas = self.project.canvas.size();
+            if let Some(size) = self.video_size(camera_id) {
+                let placed = Placement::default().in_corner(CAMERA_CORNER, size, canvas);
+                self.project.tracks.set_placement(clip, placed);
+            }
+        }
+        if let Some((microphone_id, microphone_range)) = microphone {
+            let tracks = &mut self.project.tracks;
+            let row = TrackTarget::New(tracks.picture_rows());
+            tracks.place_sound(microphone_id, microphone_range, at, row);
+        }
+        self.selected = Some(screen_clip);
+        self.settle_canvas();
+        self.after_clip_added();
+    }
+
+    fn with_live_screen(&mut self, change: impl FnOnce(&mut LiveScreen)) {
         if let Some(ScreenBar {
             stage: ScreenStage::Recording(live),
             ..
-        }) = &self.screen_bar
+        }) = &mut self.screen_bar
         {
-            live.recording.set_paused(paused);
+            change(live);
         }
     }
 
-    fn set_screen_microphone_muted(&mut self, muted: bool) {
-        if let Some(ScreenBar {
-            stage: ScreenStage::Recording(live),
-            ..
-        }) = &self.screen_bar
-            && let Some(track) = live.microphone_track
-        {
-            live.recording.set_muted(track, muted);
-        }
-    }
-
-    /// Keeps the small picture and the meters up to date.
+    /// Keeps the small pictures and the meters up to date.
     fn refresh_screen_bar(&mut self, ctx: &egui::Context, now: f64) {
         let Some(bar) = &mut self.screen_bar else {
             return;
@@ -403,6 +734,10 @@ impl Editor {
             if let Some(Ok(source)) = source {
                 *level = (*level * 0.85).max(meter_fill(source.level.take()));
             }
+        }
+        // The camera's picture keeps coming while recording, for the overlay.
+        if let Some(pick) = &mut bar.camera {
+            pick.refresh(ctx, now);
         }
         if now - bar.preview_at < PREVIEW_EVERY {
             return;
@@ -459,7 +794,9 @@ impl Editor {
                 self.stop_screen_recording(ctx);
                 return;
             }
-            Some((RecordingKey::Pause, paused)) => self.set_screen_paused(!paused),
+            Some((RecordingKey::Pause, paused)) => {
+                self.with_live_screen(|live| live.set_paused(!paused));
+            }
             None => {}
         }
         let Some(bar) = &self.screen_bar else {
@@ -474,11 +811,14 @@ impl Editor {
             Source(Source),
             PcSound(bool),
             Microphone(bool),
+            ChooseMicrophone(String),
+            Camera(super::camera_recording::CameraAsk),
             FrameRate(u32),
             Pointer(bool),
             Countdown(bool),
             MicrophoneMuted(bool),
             Folded(bool),
+            CameraShown(bool),
             Browse,
         }
         let mut asked = Asked::Nothing;
@@ -489,6 +829,7 @@ impl Editor {
                     paused: live.recording.is_paused(),
                     microphone_muted: live.microphone_muted(),
                     folded: live.folded,
+                    camera_shown: live.camera.as_ref().map(|_| live.camera_shown),
                 },
                 live.overlay_at,
             )),
@@ -500,10 +841,27 @@ impl Editor {
         };
         let stage = self.stage_rect;
         let settings = self.settings.clone();
+        let shown_mic = shown_microphone(settings.microphone.as_ref(), &bar.microphones);
         let folder = bar
             .folder
             .clone()
             .unwrap_or_else(|| self.recordings_folder());
+        let camera_picture = bar.camera.as_ref().and_then(|pick| pick.preview.clone());
+        let camera_box = bar.camera.as_ref().and_then(|pick| match pick.state() {
+            bareclip_capture::CameraState::Running { mode, .. } => {
+                let screen = bar
+                    .chosen
+                    .and_then(|source| bar.offered.iter().find(|offered| offered.source == source))
+                    .map_or((1920, 1080), |offered| offered.size);
+                Some(camera_box_share((mode.width, mode.height), screen))
+            }
+            _ => None,
+        });
+        let title = if bar.camera.is_some() {
+            "Record screen and camera"
+        } else {
+            "Record screen"
+        };
         egui::Area::new(egui::Id::unique("screen_bar"))
             .order(egui::Order::Foreground)
             .pivot(egui::Align2::CENTER_BOTTOM)
@@ -520,12 +878,17 @@ impl Editor {
                                     asked = choice;
                                 }
                             });
+                            if shown.camera_shown == Some(true)
+                                && let Some(picture) = &camera_picture
+                            {
+                                camera_window(ui, palette, picture);
+                            }
                         });
                     return;
                 }
                 dialog_frame(ctx).show(ui, |ui| {
                     ui.set_width(SCREEN_BAR_WIDTH);
-                    components::dialog_title(ui, &icons::MONITOR, palette.accent, "Record screen");
+                    components::dialog_title(ui, &icons::MONITOR, palette.accent, title);
                     ui.add_space(12.0);
                     if let Some(left) = counting {
                         ui.vertical_centered(|ui| {
@@ -544,7 +907,7 @@ impl Editor {
                         });
                         return;
                     }
-                    // What will be recorded, as it looks now.
+                    // What will be recorded, as it looks now, with the camera where it will land.
                     let width = ui.available_width();
                     let (spot, _) =
                         ui.allocate_exact_size(vec2(width, PREVIEW_HEIGHT), Sense::hover());
@@ -560,6 +923,14 @@ impl Editor {
                                 egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
                                 Color32::WHITE,
                             );
+                            if let (Some(share), Some(picture)) = (camera_box, &camera_picture) {
+                                let inside = egui::Rect::from_min_size(
+                                    shown.min + share.min.to_vec2() * shown.size(),
+                                    share.size() * shown.size(),
+                                );
+                                ui.painter().rect_filled(inside, 0.0, palette.stage);
+                                draw_live_picture(ui.painter(), inside, picture);
+                            }
                         }
                         (Err(problem), _) => {
                             ui.painter().text(
@@ -571,6 +942,10 @@ impl Editor {
                             );
                         }
                         _ => {}
+                    }
+                    if let Some(pick) = &bar.camera {
+                        // Until the camera runs, the reason it doesn't goes over the picture.
+                        camera_state_text(ui, palette, spot, &pick.state());
                     }
                     ui.add_space(10.0);
                     let shown = bar.chosen_name();
@@ -592,6 +967,12 @@ impl Editor {
                                 }
                             });
                     });
+                    if let Some(pick) = &bar.camera {
+                        ui.add_space(6.0);
+                        if let Some(choice) = camera_choices(ui, palette, pick, width) {
+                            asked = Asked::Camera(choice);
+                        }
+                    }
                     ui.add_space(8.0);
                     let sound_row = |ui: &mut egui::Ui,
                                      name: &str,
@@ -626,6 +1007,15 @@ impl Editor {
                         bar.microphone_level,
                     ) {
                         asked = Asked::Microphone(!settings.screen_microphone);
+                    }
+                    if settings.screen_microphone {
+                        ui.add_space(4.0);
+                        if let Some(name) =
+                            microphone_choice(ui, palette, &bar.microphones, &shown_mic, width)
+                        {
+                            asked = Asked::ChooseMicrophone(name);
+                        }
+                        ui.add_space(4.0);
                     }
                     if ui
                         .add(SwitchRow::new(
@@ -680,7 +1070,7 @@ impl Editor {
                         let record = ActionButton::new(palette, Kind::Primary, "Start recording")
                             .icon(icons::CIRCLE_DOT)
                             .width(DIALOG_BUTTON_WIDTH * 1.5);
-                        if ui.add_enabled(bar.capture.is_ok(), record).clicked() {
+                        if ui.add_enabled(bar.ready(), record).clicked() {
                             asked = Asked::Record;
                         }
                         if ui.add(dialog_button(palette, "Cancel")).clicked() {
@@ -690,7 +1080,7 @@ impl Editor {
                 });
             });
         if let Some((shown, at)) = recording
-            && let Some(choice) = recording_overlay(ctx, palette, shown, at)
+            && let Some(choice) = recording_overlay(ctx, palette, shown, at, camera_picture.clone())
         {
             asked = choice;
         }
@@ -722,7 +1112,7 @@ impl Editor {
             }
             Asked::Cancel => self.screen_bar = None,
             Asked::Stop => self.stop_screen_recording(ctx),
-            Asked::Pause(paused) => self.set_screen_paused(paused),
+            Asked::Pause(paused) => self.with_live_screen(|live| live.set_paused(paused)),
             Asked::Source(source) => self.choose_source(source),
             Asked::PcSound(on) => {
                 self.settings.screen_pc_sound = on;
@@ -734,13 +1124,20 @@ impl Editor {
             }
             Asked::Microphone(on) => {
                 self.settings.screen_microphone = on;
+                let microphones = self
+                    .screen_bar
+                    .as_ref()
+                    .map(|bar| bar.microphones.clone())
+                    .unwrap_or_default();
                 let opened =
-                    on.then(|| (self.open_microphone)(self.settings.microphone.as_deref()));
+                    on.then(|| (self.open_microphone)(self.wanted_microphone(&microphones)));
                 if let Some(bar) = &mut self.screen_bar {
                     bar.microphone = opened;
                 }
                 save(self);
             }
+            Asked::ChooseMicrophone(name) => self.choose_screen_microphone(name),
+            Asked::Camera(choice) => self.camera_asked(choice),
             Asked::FrameRate(rate) => {
                 self.settings.screen_frame_rate = rate;
                 save(self);
@@ -756,16 +1153,17 @@ impl Editor {
                 self.settings.countdown = on;
                 save(self);
             }
-            Asked::MicrophoneMuted(muted) => self.set_screen_microphone_muted(muted),
-            Asked::Folded(folded) => {
-                if let Some(ScreenBar {
-                    stage: ScreenStage::Recording(live),
-                    ..
-                }) = &mut self.screen_bar
-                {
-                    live.folded = folded;
-                }
+            Asked::MicrophoneMuted(muted) => {
+                self.with_live_screen(|live| live.set_microphone_muted(muted));
             }
+            Asked::Folded(folded) => self.with_live_screen(|live| {
+                live.folded = folded;
+                // Folding closes the camera's picture too, and unfolding doesn't bring it back.
+                if folded {
+                    live.camera_shown = false;
+                }
+            }),
+            Asked::CameraShown(on) => self.with_live_screen(|live| live.camera_shown = on),
             Asked::Browse => {
                 let pick = self.pick_folder;
                 if let Some(bar) = &mut self.screen_bar
@@ -776,7 +1174,8 @@ impl Editor {
             }
         }
 
-        /// Pause, Stop, the time and the microphone, in the bar and on the overlay alike.
+        /// Pause, Stop, the time, the microphone and the camera's picture, in the bar and on the
+        /// overlay alike.
         fn recording_controls(ui: &mut egui::Ui, palette: &Palette, shown: Shown) -> Option<Asked> {
             let mut asked = None;
             if pause_button(ui, palette, shown.paused) {
@@ -805,7 +1204,31 @@ impl Editor {
                         .on_disabled_hover_text("No microphone was found when recording began");
                 }
             }
+            if let Some(on) = shown.camera_shown {
+                let (icon, name) = if on {
+                    (icons::WEBCAM, "Hide the camera")
+                } else {
+                    (icons::WEBCAM_OFF, "Show the camera")
+                };
+                let button = IconButton::new(palette, Kind::Ghost, icon, name);
+                if ui.add(button).on_hover_text(name).clicked() {
+                    asked = Some(Asked::CameraShown(!on));
+                }
+            }
             asked
+        }
+
+        /// The camera's live picture, under the controls.
+        fn camera_window(ui: &mut egui::Ui, palette: &Palette, picture: &TextureHandle) {
+            ui.add_space(CAMERA_GAP);
+            let width = ui.min_rect().width().max(ui.available_width());
+            let (spot, response) =
+                ui.allocate_exact_size(vec2(width, camera_picture_height(width)), Sense::hover());
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::Role::Image, true, "The camera's picture")
+            });
+            ui.painter().rect_filled(spot, 4.0, palette.stage);
+            draw_live_picture(ui.painter(), spot, picture);
         }
 
         /// The handle the overlay is dragged by. Windows moves the window itself, so it follows
@@ -833,8 +1256,8 @@ impl Editor {
             response.on_hover_cursor(egui::CursorIcon::Grab);
         }
 
-        /// A small window on top of everything, starting near the screen's bottom right corner,
-        /// so the recording can be paused and stopped from inside a game. It keeps itself out of
+        /// A small window on top of everything, starting near the screen's top right corner, so
+        /// the recording can be paused and stopped from inside a game. It keeps itself out of
         /// the recording like BareClip's other windows. The whole window is painted, so no part
         /// of it is left black.
         fn recording_overlay(
@@ -842,10 +1265,11 @@ impl Editor {
             palette: &Palette,
             shown: Shown,
             at: egui::Pos2,
+            camera_picture: Option<TextureHandle>,
         ) -> Option<Asked> {
             let builder = egui::ViewportBuilder::default()
                 .with_title("BareClip recording")
-                .with_inner_size(overlay_size(shown.folded))
+                .with_inner_size(overlay_size(shown.folded, shown.camera_shown))
                 .with_position(at)
                 .with_decorations(false)
                 .with_resizable(false)
@@ -865,33 +1289,41 @@ impl Editor {
                     Frame::new()
                         .inner_margin(Margin::same(OVERLAY_PADDING))
                         .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = CONTROL_SPACING;
-                                grip(ui, palette);
-                                let mut asked = None;
-                                if shown.folded {
-                                    if pause_button(ui, palette, shown.paused) {
-                                        asked = Some(Asked::Pause(!shown.paused));
+                            let asked = ui
+                                .horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = CONTROL_SPACING;
+                                    grip(ui, palette);
+                                    let mut asked = None;
+                                    if shown.folded {
+                                        if pause_button(ui, palette, shown.paused) {
+                                            asked = Some(Asked::Pause(!shown.paused));
+                                        }
+                                        if stop_button(ui, palette) {
+                                            asked = Some(Asked::Stop);
+                                        }
+                                    } else {
+                                        asked = recording_controls(ui, palette, shown);
                                     }
-                                    if stop_button(ui, palette) {
-                                        asked = Some(Asked::Stop);
+                                    let (icon, name) = if shown.folded {
+                                        (icons::CHEVRON_RIGHT, "Show all controls")
+                                    } else {
+                                        (icons::CHEVRON_LEFT, "Show only Pause and Stop")
+                                    };
+                                    let fold = IconButton::new(palette, Kind::Ghost, icon, name)
+                                        .size(FOLD_WIDTH, 16.0);
+                                    if ui.add(fold).on_hover_text(name).clicked() {
+                                        asked = Some(Asked::Folded(!shown.folded));
                                     }
-                                } else {
-                                    asked = recording_controls(ui, palette, shown);
-                                }
-                                let (icon, name) = if shown.folded {
-                                    (icons::CHEVRON_RIGHT, "Show all controls")
-                                } else {
-                                    (icons::CHEVRON_LEFT, "Show only Pause and Stop")
-                                };
-                                let fold = IconButton::new(palette, Kind::Ghost, icon, name)
-                                    .size(FOLD_WIDTH, 16.0);
-                                if ui.add(fold).on_hover_text(name).clicked() {
-                                    asked = Some(Asked::Folded(!shown.folded));
-                                }
-                                asked
-                            })
-                            .inner
+                                    asked
+                                })
+                                .inner;
+                            if !shown.folded
+                                && shown.camera_shown == Some(true)
+                                && let Some(picture) = &camera_picture
+                            {
+                                camera_window(ui, palette, picture);
+                            }
+                            asked
                         })
                         .inner
                 },
@@ -926,5 +1358,54 @@ mod tests {
             shown_at: 0,
         };
         assert_eq!(shrunk(&picture, 320).size, [100, 50]);
+    }
+
+    #[test]
+    fn the_overlay_starts_near_the_top_right_corner_below_window_buttons() {
+        let size = overlay_size(false, None);
+        let at = overlay_start(vec2(1920.0, 1080.0), size);
+        assert_eq!(at.x + size.x, 1920.0 - OVERLAY_MARGIN);
+        assert_eq!(at.y, OVERLAY_TOP);
+        assert!(at.y > 48.0, "below a full-screen window's buttons");
+        assert_eq!(
+            overlay_start(vec2(100.0, 100.0), size).x,
+            0.0,
+            "never off screen"
+        );
+    }
+
+    #[test]
+    fn the_overlay_grows_for_the_camera_and_folds_down_to_pause_and_stop() {
+        let plain = overlay_size(false, None);
+        let with_camera = overlay_size(false, Some(false));
+        let showing = overlay_size(false, Some(true));
+        assert_eq!(with_camera.x, plain.x + CONTROL_SIZE + CONTROL_SPACING);
+        assert_eq!(with_camera.y, plain.y);
+        assert_eq!(showing.x, with_camera.x);
+        let inner = with_camera.x - 2.0 * f32::from(OVERLAY_PADDING);
+        assert_eq!(
+            showing.y,
+            with_camera.y + CAMERA_GAP + camera_picture_height(inner)
+        );
+        // Folded, it's the same with or without the camera.
+        assert_eq!(overlay_size(true, Some(true)), overlay_size(true, None));
+        assert!(overlay_size(true, None).x < plain.x);
+    }
+
+    #[test]
+    fn the_cameras_box_sits_in_the_bottom_right_corner_at_picture_in_pictures_size() {
+        let share = camera_box_share((1280, 720), (1920, 1080));
+        // 30% of the picture, 4% of the shorter side in from the edges.
+        assert!((share.width() - 0.3).abs() < 0.01, "{share:?}");
+        assert!((share.height() - 0.3).abs() < 0.01, "{share:?}");
+        let margin = 1080.0 * 0.04;
+        assert!(
+            (share.right() - (1.0 - margin / 1920.0)).abs() < 0.002,
+            "{share:?}"
+        );
+        assert!(
+            (share.bottom() - (1.0 - margin / 1080.0)).abs() < 0.002,
+            "{share:?}"
+        );
     }
 }

@@ -227,6 +227,16 @@ pub fn remove_warning(name: &str, clips: usize) -> String {
     }
 }
 
+/// The warning shown before a recording is deleted.
+pub fn delete_recording_warning(name: &str, clips: usize) -> String {
+    let file = format!("{name} will be moved to the Recycle Bin and removed from this project");
+    match clips {
+        0 => format!("{file}."),
+        1 => format!("{file}, with its 1 clip on the timeline."),
+        count => format!("{file}, with its {count} clips on the timeline."),
+    }
+}
+
 /// The warning shown before several videos and their clips leave the project.
 pub fn remove_many_warning(videos: usize, clips: usize) -> String {
     match clips {

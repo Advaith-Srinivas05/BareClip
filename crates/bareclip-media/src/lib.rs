@@ -27,6 +27,7 @@ pub use full::{
     VideoSettings, VideoWriter,
 };
 pub use gif::GifWriter;
+pub use media_foundation::take_turn as media_foundation_turn;
 pub use preview::{
     AudioChunk, AudioPreview, AudioStep, DecodeStep, PreviewFrame, PreviewPlanes, VideoPreview,
     fit_preview_size,

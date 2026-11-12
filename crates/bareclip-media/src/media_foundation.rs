@@ -19,7 +19,13 @@ fn is_media_foundation(name: &str) -> bool {
 }
 
 fn wait_for_turn(media_foundation: bool) -> Option<MutexGuard<'static, ()>> {
-    media_foundation.then(|| CHANGING.lock().unwrap_or_else(PoisonError::into_inner))
+    media_foundation.then(take_turn)
+}
+
+/// Waits until nothing else is starting or shutting down Media Foundation. Anything else that
+/// starts or shuts it down, such as a camera, holds this while it does.
+pub fn take_turn() -> MutexGuard<'static, ()> {
+    CHANGING.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// An encoder that takes its turn to close when it is dropped.
