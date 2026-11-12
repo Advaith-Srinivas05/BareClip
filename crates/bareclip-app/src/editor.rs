@@ -1011,6 +1011,19 @@ impl Editor {
         self.app_folder = Some(folder);
     }
 
+    /// Where the window was when it last closed.
+    pub fn saved_window(&self) -> Option<storage::WindowPlace> {
+        self.settings.window
+    }
+
+    /// Keeps where the window is as it closes, for the next run.
+    pub fn remember_window(&mut self, place: storage::WindowPlace) {
+        if self.settings.window != Some(place) {
+            self.settings.window = Some(place);
+            self.save_settings();
+        }
+    }
+
     fn save_settings(&mut self) {
         if let Some(folder) = &self.app_folder
             && let Err(error) = self.settings.save(folder)

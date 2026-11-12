@@ -9,6 +9,7 @@ use std::{
 };
 
 pub use crate::hotkeys::Shortcut;
+pub use crate::window_place::WindowPlace;
 use bareclip_core::{
     project::{ProjectFile, write_atomic},
     splice::CutMode,
@@ -243,6 +244,8 @@ pub struct Settings {
     pub stop_key: Shortcut,
     pub pause_key: Shortcut,
     pub microphone_key: Shortcut,
+    /// Where the window was when it last closed. `None` opens it in the middle of the screen.
+    pub window: Option<WindowPlace>,
 }
 
 impl Default for Settings {
@@ -271,6 +274,7 @@ impl Default for Settings {
             stop_key: Shortcut::STOP,
             pause_key: Shortcut::PAUSE,
             microphone_key: Shortcut::MICROPHONE,
+            window: None,
         }
     }
 }
@@ -624,6 +628,13 @@ mod tests {
                 shift: false,
                 key: 0x7B,
             },
+            window: Some(WindowPlace {
+                left: -1500,
+                top: 40,
+                right: -220,
+                bottom: 840,
+                maximized: true,
+            }),
         };
 
         settings.save(&folder).expect("they can be saved");

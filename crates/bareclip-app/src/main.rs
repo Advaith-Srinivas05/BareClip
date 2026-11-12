@@ -15,6 +15,7 @@ mod text;
 mod theme;
 mod timeline;
 mod title_frames;
+mod window_place;
 
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
@@ -128,6 +129,10 @@ fn open_window(wanted: Option<GpuId>, waiting: WaitingLaunch) -> eframe::Result 
             if let Some(folder) = storage::app_folder() {
                 editor.use_storage(&creation_context.egui_ctx, folder);
             }
+            // The window is still hidden here, so it never shows anywhere else first.
+            let window = window_handle(creation_context);
+            let maximize =
+                window.is_some_and(|window| window_place::restore(window, editor.saved_window()));
             if let Some(gpu) = &creation_context.wgpu_render_state {
                 let chips = gpu
                     .available_adapters
@@ -144,7 +149,12 @@ fn open_window(wanted: Option<GpuId>, waiting: WaitingLaunch) -> eframe::Result 
                 editor.import(&creation_context.egui_ctx, &launch.paths);
             }
             inbox.wake(&creation_context.egui_ctx);
-            Ok(Box::new(BareClipApp { editor, inbox }))
+            Ok(Box::new(BareClipApp {
+                editor,
+                inbox,
+                window,
+                maximize,
+            }))
         }),
     )
 }
@@ -166,19 +176,42 @@ fn window_gpu_options(wanted: Option<GpuId>) -> eframe::egui_wgpu::WgpuConfigura
     }
 }
 
+/// The window as Windows knows it.
+fn window_handle(
+    window: &impl eframe::wgpu::rwh::HasWindowHandle,
+) -> Option<windows_sys::Win32::Foundation::HWND> {
+    match window.window_handle().ok()?.as_raw() {
+        eframe::wgpu::rwh::RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as _),
+        _ => None,
+    }
+}
+
 struct BareClipApp {
     editor: editor::Editor,
     /// Files from "Edit with BareClip" launches after this window opened.
     inbox: handoff::Inbox,
+    window: Option<windows_sys::Win32::Foundation::HWND>,
+    /// Whether the window closed maximized last time and has yet to be maximized again.
+    maximize: bool,
 }
 
 impl eframe::App for BareClipApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if std::mem::take(&mut self.maximize) {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
         let arrived = self.inbox.take();
         if !arrived.is_empty() {
             self.editor.edit_files(&arrived);
         }
         self.editor.show(ui);
+    }
+
+    fn on_exit(&mut self) {
+        if let Some(place) = self.window.and_then(window_place::read) {
+            self.editor.remember_window(place);
+        }
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
