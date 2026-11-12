@@ -136,10 +136,44 @@ const SKIP_ARROW_SIZE: f32 = 22.0;
 const SKIP_ARROW_RAISE: f32 = 6.0;
 const SKIP_NUMBER_SIZE: f32 = 12.0;
 const SKIP_NUMBER_DROP: f32 = 7.0;
-const SETTINGS_WIDTH: f32 = 440.0;
+/// The whole Settings dialog: its tabs down the left, a line, and the open tab's page beside them.
+const SETTINGS_WIDTH: f32 = 626.0;
+const SETTINGS_TABS_WIDTH: f32 = 124.0;
+/// The room either side of the line between the tabs and the page.
+const SETTINGS_TABS_GAP: f32 = 14.0;
+/// As tall as the tallest tab's page, so the dialog keeps its size when tabs are switched.
+const SETTINGS_PAGE_HEIGHT: f32 = 390.0;
 const SETTINGS_CHOICE_WIDTH: f32 = 96.0;
 /// Room for a whole chip name, such as NVIDIA GeForce RTX 3060 Laptop GPU.
-const GPU_DROPDOWN_WIDTH: f32 = 240.0;
+const GPU_DROPDOWN_WIDTH: f32 = 250.0;
+
+/// The tabs of the Settings dialog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsTab {
+    General,
+    Export,
+    Recording,
+}
+
+impl SettingsTab {
+    /// Each tab's symbol, label and name for screen readers, which can't be confused with the
+    /// Export button.
+    const ALL: [(Self, icons::Icon, &'static str, &'static str); 3] = [
+        (
+            Self::General,
+            icons::SLIDERS_HORIZONTAL,
+            "General",
+            "General settings",
+        ),
+        (Self::Export, icons::UPLOAD, "Export", "Export settings"),
+        (
+            Self::Recording,
+            icons::VIDEO,
+            "Recording",
+            "Recording settings",
+        ),
+    ];
+}
 
 /// A graphics chip, as Settings lists it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -580,6 +614,10 @@ pub struct Editor {
     closing: bool,
     settings: Settings,
     settings_open: bool,
+    settings_tab: SettingsTab,
+    /// The microphones Settings offers as the default, read when its Recording tab is first
+    /// shown and let go when it closes, so devices aren't listed every frame.
+    settings_microphones: Option<Vec<bareclip_audio::Microphone>>,
     /// Where settings and recovery copies live. Without it, the app keeps nothing.
     app_folder: Option<PathBuf>,
     recovery: Option<Recovery>,
@@ -621,6 +659,10 @@ pub struct Editor {
     list_cameras: camera_recording::ListCameras,
     /// How a folder to save recordings in is picked, which tests replace too.
     pick_folder: recording::PickFolder,
+    /// Swapped in tests, so no test starts a real BareClip.
+    relaunch: Relaunch,
+    /// Restart now was pressed in Settings this frame.
+    restart_asked: bool,
     /// Files from "Edit with BareClip", waiting for any dialog that decides what the project is.
     waiting_edits: Vec<PathBuf>,
     /// Videos ticked in the panel, in the order they were ticked.
@@ -701,6 +743,19 @@ enum LeaveFor {
     OpenPicked,
     Open(PathBuf),
     CloseWindow,
+    /// Opens BareClip again on the same project, for a new graphics chip to take effect.
+    Restart,
+}
+
+/// Starts another BareClip, opening this project file if there is one.
+type Relaunch = fn(Option<&Path>) -> std::io::Result<()>;
+
+fn relaunch_bareclip(project: Option<&Path>) -> std::io::Result<()> {
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    if let Some(project) = project {
+        command.arg(project);
+    }
+    command.spawn().map(drop)
 }
 
 /// Auto Save writing the project to its file on another thread.
@@ -849,6 +904,8 @@ impl Editor {
             closing: false,
             settings: Settings::default(),
             settings_open: false,
+            settings_tab: SettingsTab::General,
+            settings_microphones: None,
             app_folder: None,
             recovery: None,
             seek_bar_held: false,
@@ -873,6 +930,8 @@ impl Editor {
             open_camera: camera_recording::open_real_camera,
             list_cameras: camera_recording::list_real_cameras,
             pick_folder: recording::pick_real_folder,
+            relaunch: relaunch_bareclip,
+            restart_asked: false,
             waiting_edits: Vec::new(),
             selected_media: Vec::new(),
             media_panel_open: true,
@@ -1005,6 +1064,51 @@ impl Editor {
                 self.closing = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
+            LeaveFor::Restart => match (self.relaunch)(self.project_path.as_deref()) {
+                Ok(()) => self.carry_out(ctx, LeaveFor::CloseWindow),
+                Err(error) => {
+                    self.notice = Some(format!("{} {error}", text::RESTART_FAILED));
+                }
+            },
+        }
+    }
+
+    /// Restart now in Settings: finishes any recording, asks about unsaved changes like closing
+    /// does, then opens BareClip again on the same project and closes this window.
+    fn restart_for_new_chip(&mut self, ctx: &egui::Context) {
+        self.settings_open = false;
+        self.settings_microphones = None;
+        self.finish_recordings(ctx);
+        self.flush_auto_save();
+        if self.has_unsaved_changes() {
+            self.leave_for = Some(LeaveFor::Restart);
+        } else {
+            self.carry_out(ctx, LeaveFor::Restart);
+        }
+    }
+
+    /// Finishes and adds any recording under way, so it's in the project before leaving it.
+    fn finish_recordings(&mut self, ctx: &egui::Context) {
+        if self
+            .record_bar
+            .as_ref()
+            .is_some_and(recording::RecordBar::is_recording)
+        {
+            self.stop_recording(ctx);
+        }
+        if self
+            .screen_bar
+            .as_ref()
+            .is_some_and(screen_recording::ScreenBar::is_recording)
+        {
+            self.stop_screen_recording(ctx);
+        }
+        if self
+            .camera_bar
+            .as_ref()
+            .is_some_and(camera_recording::CameraBar::is_recording)
+        {
+            self.stop_camera_recording(ctx);
         }
     }
 
@@ -1396,27 +1500,7 @@ impl Editor {
         }
         // A recording is finished and added first, so it is in the project the save question
         // asks about.
-        if self
-            .record_bar
-            .as_ref()
-            .is_some_and(recording::RecordBar::is_recording)
-        {
-            self.stop_recording(ctx);
-        }
-        if self
-            .screen_bar
-            .as_ref()
-            .is_some_and(screen_recording::ScreenBar::is_recording)
-        {
-            self.stop_screen_recording(ctx);
-        }
-        if self
-            .camera_bar
-            .as_ref()
-            .is_some_and(camera_recording::CameraBar::is_recording)
-        {
-            self.stop_camera_recording(ctx);
-        }
+        self.finish_recordings(ctx);
         self.flush_auto_save();
         if self.has_unsaved_changes() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -3479,86 +3563,68 @@ impl Editor {
         let mut changed = false;
         let mut strip_changed = false;
         let mut close = false;
+        if self.settings_tab == SettingsTab::Recording && self.settings_microphones.is_none() {
+            self.settings_microphones = Some((self.list_microphones)());
+        }
         let modal = egui::Modal::new(egui::Id::unique("settings_dialog"))
             .frame(dialog_frame(ctx))
             .show(ctx, |ui| {
                 ui.set_width(SETTINGS_WIDTH);
                 components::dialog_title(ui, &icons::SETTINGS, palette.accent, "Settings");
                 ui.add_space(SETTINGS_ROW_GAP);
-
-                components::settings_group(ui, palette, "Appearance", |ui| {
-                    components::settings_row(
-                        ui,
-                        palette,
-                        ("Theme", None),
-                        theme::THEME_PICKER_WIDTH,
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.allocate_ui_with_layout(
+                        vec2(SETTINGS_TABS_WIDTH, SETTINGS_PAGE_HEIGHT),
+                        Layout::top_down(Align::Min),
                         |ui| {
-                            theme::theme_picker(ui, palette);
+                            ui.set_width(SETTINGS_TABS_WIDTH);
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            for (tab, icon, label, name) in SettingsTab::ALL {
+                                let chosen = self.settings_tab == tab;
+                                let side_tab =
+                                    components::SideTab::new(palette, icon, (label, name), chosen);
+                                if ui.add(side_tab).clicked() {
+                                    self.settings_tab = tab;
+                                }
+                            }
                         },
                     );
-                });
-                let theme = ui.ctx().options(|options| options.theme_preference).into();
-                if theme != self.settings.theme {
-                    self.settings.theme = theme;
-                    changed = true;
-                }
-                ui.add_space(SETTINGS_ROW_GAP);
-
-                components::settings_group(ui, palette, "Export", |ui| {
-                    components::settings_row(
-                        ui,
-                        palette,
-                        ("Export cuts", Some("Where the export window starts")),
-                        SETTINGS_CHOICE_WIDTH * 2.0 + CONTROL_SPACING,
+                    // A line down between the tabs and the page, so they read as apart.
+                    ui.add_space(SETTINGS_TABS_GAP);
+                    let (line, _) = ui
+                        .allocate_exact_size(vec2(1.0, SETTINGS_PAGE_HEIGHT), egui::Sense::hover());
+                    ui.painter().vline(
+                        line.center().x,
+                        line.y_range(),
+                        egui::Stroke::new(1.0, palette.border),
+                    );
+                    ui.add_space(SETTINGS_TABS_GAP);
+                    let page_width = ui.available_width();
+                    ui.allocate_ui_with_layout(
+                        vec2(page_width, SETTINGS_PAGE_HEIGHT),
+                        Layout::top_down(Align::Min),
                         |ui| {
-                            ui.spacing_mut().item_spacing.x = CONTROL_SPACING;
-                            for (cuts, name) in [
-                                (ExportCuts::FrameExact, "Frame-exact"),
-                                (ExportCuts::Fastest, "Fastest"),
-                            ] {
-                                let chosen = self.settings.export_cuts == cuts;
-                                let button = ActionButton::new(palette, Kind::Ghost, name)
-                                    .small()
-                                    .width(SETTINGS_CHOICE_WIDTH)
-                                    .selected(chosen);
-                                if ui.add(button).clicked() && !chosen {
-                                    self.settings.export_cuts = cuts;
-                                    self.mode = cuts.into();
-                                    changed = true;
+                            ui.set_width(page_width);
+                            ui.set_min_height(SETTINGS_PAGE_HEIGHT);
+                            match self.settings_tab {
+                                SettingsTab::General => {
+                                    let (page_changed, page_strip) =
+                                        self.general_settings(ui, palette);
+                                    changed |= page_changed;
+                                    strip_changed |= page_strip;
+                                }
+                                SettingsTab::Export => changed |= self.export_settings(ui, palette),
+                                SettingsTab::Recording => {
+                                    changed |= self.recording_settings(ui, palette);
                                 }
                             }
                         },
                     );
                 });
-                ui.add_space(SETTINGS_ROW_GAP);
-
-                if !self.gpu_chips.is_empty() {
-                    changed |= self.gpu_setting(ui, palette);
-                    ui.add_space(SETTINGS_ROW_GAP);
-                }
-
-                changed |= self.recording_settings(ui, palette);
-                ui.add_space(SETTINGS_ROW_GAP);
-
-                components::settings_group(ui, palette, "Waveforms", |ui| {
-                    let on_clips = self.settings.waveforms_on_clips;
-                    let row = SwitchRow::new(palette, "Waveforms on clips", on_clips);
-                    if ui.add(row).clicked() {
-                        self.settings.waveforms_on_clips = !on_clips;
-                        strip_changed = true;
-                    }
-                    components::settings_divider(ui, palette);
-                    let on_audio = self.settings.waveforms_on_audio;
-                    let row = SwitchRow::new(palette, "Waveforms on audio", on_audio);
-                    if ui.add(row).clicked() {
-                        self.settings.waveforms_on_audio = !on_audio;
-                        strip_changed = true;
-                    }
-                });
-                ui.add_space(20.0);
-                ui.colored_label(palette.text_muted, text::version_line());
                 ui.add_space(12.0);
-                components::dialog_buttons(ui, |ui| {
+                // The version sits at the bottom left whichever tab is open, level with Done.
+                components::dialog_footer(ui, palette, &text::version_line(), |ui| {
                     close = ui.add(dialog_button(palette, "Done")).clicked();
                 });
             });
@@ -3570,7 +3636,87 @@ impl Editor {
         }
         if close || modal.should_close() {
             self.settings_open = false;
+            self.settings_microphones = None;
         }
+        if std::mem::take(&mut self.restart_asked) {
+            self.restart_for_new_chip(ctx);
+        }
+    }
+
+    /// Settings' General tab: the theme, the graphics chip and waveforms. Returns
+    /// whether anything changed, and whether it was the waveforms.
+    fn general_settings(&mut self, ui: &mut egui::Ui, palette: &Palette) -> (bool, bool) {
+        let mut changed = false;
+        let mut strip_changed = false;
+        components::settings_group(ui, palette, "Appearance", |ui| {
+            components::settings_row(
+                ui,
+                palette,
+                ("Theme", None),
+                theme::THEME_PICKER_WIDTH,
+                |ui| {
+                    theme::theme_picker(ui, palette);
+                },
+            );
+        });
+        let theme = ui.ctx().options(|options| options.theme_preference).into();
+        if theme != self.settings.theme {
+            self.settings.theme = theme;
+            changed = true;
+        }
+        ui.add_space(SETTINGS_ROW_GAP);
+        if !self.gpu_chips.is_empty() {
+            changed |= self.gpu_setting(ui, palette);
+            ui.add_space(SETTINGS_ROW_GAP);
+        }
+        components::settings_group(ui, palette, "Waveforms", |ui| {
+            let on_clips = self.settings.waveforms_on_clips;
+            let row = SwitchRow::new(palette, "Waveforms on clips", on_clips);
+            if ui.add(row).clicked() {
+                self.settings.waveforms_on_clips = !on_clips;
+                strip_changed = true;
+            }
+            components::settings_divider(ui, palette);
+            let on_audio = self.settings.waveforms_on_audio;
+            let row = SwitchRow::new(palette, "Waveforms on audio", on_audio);
+            if ui.add(row).clicked() {
+                self.settings.waveforms_on_audio = !on_audio;
+                strip_changed = true;
+            }
+        });
+        (changed, strip_changed)
+    }
+
+    /// Settings' Export tab. Returns whether anything changed.
+    fn export_settings(&mut self, ui: &mut egui::Ui, palette: &Palette) -> bool {
+        let mut changed = false;
+        components::settings_group(ui, palette, "Export", |ui| {
+            components::settings_row(
+                ui,
+                palette,
+                ("Export cuts", Some("Where the export window starts")),
+                SETTINGS_CHOICE_WIDTH * 2.0 + CONTROL_SPACING,
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = CONTROL_SPACING;
+                    for (cuts, name) in [
+                        (ExportCuts::FrameExact, "Frame-exact"),
+                        (ExportCuts::Fastest, "Fastest"),
+                    ] {
+                        let chosen = self.settings.export_cuts == cuts;
+                        let button = ActionButton::new(palette, Kind::Ghost, name)
+                            .small()
+                            .width(SETTINGS_CHOICE_WIDTH)
+                            .selected(chosen);
+                        if ui.add(button).clicked() && !chosen {
+                            self.settings.export_cuts = cuts;
+                            self.mode = cuts.into();
+                            changed = true;
+                        }
+                    }
+                },
+            );
+        });
+        changed
     }
 
     /// The graphics chip choice in Settings. Returns whether it changed.
@@ -3588,11 +3734,15 @@ impl Editor {
             .running_gpu
             .as_ref()
             .map_or("", |chip| chip.name.as_str());
+        let gone = chosen.is_some_and(|id| name_of(id).is_none());
         let note = text::gpu_note(
             running,
             (chosen != self.gpu_at_start).then_some(shown),
-            chosen.is_some_and(|id| name_of(id).is_none()),
+            gone,
         );
+        // Only a chip that's there to switch to is worth restarting for.
+        let waiting = chosen != self.gpu_at_start && !gone;
+        let mut restart = false;
         let chips = self.gpu_chips.clone();
         components::settings_group(ui, palette, "Graphics", |ui| {
             components::settings_row(
@@ -3608,15 +3758,18 @@ impl Editor {
                         shown,
                         GPU_DROPDOWN_WIDTH,
                     ));
+                    let width = components::menu_width(&button);
                     egui::Popup::menu(&button).show(|ui| {
                         let automatic =
-                            MenuItem::choice(palette, text::AUTOMATIC_GPU, chosen.is_none());
+                            MenuItem::choice(palette, text::AUTOMATIC_GPU, chosen.is_none())
+                                .width(width);
                         if ui.add(automatic).clicked() {
                             picked = Some(None);
                         }
                         for chip in &chips {
                             let item =
-                                MenuItem::choice(palette, &chip.name, chosen == Some(chip.id));
+                                MenuItem::choice(palette, &chip.name, chosen == Some(chip.id))
+                                    .width(width);
                             if ui.add(item).clicked() {
                                 picked = Some(Some(chip.id));
                             }
@@ -3624,9 +3777,17 @@ impl Editor {
                     });
                 },
             );
-            ui.colored_label(palette.text_muted, note);
-            ui.add_space(4.0);
+            components::settings_note(ui, palette, &note, None);
+            if waiting {
+                components::settings_wide_control(ui, |ui, _| {
+                    let button = ActionButton::new(palette, Kind::Secondary, "Restart now")
+                        .icon(icons::ROTATE_CW)
+                        .small();
+                    restart |= ui.add(button).clicked();
+                });
+            }
         });
+        self.restart_asked |= restart;
         match picked {
             Some(choice) if choice != chosen => {
                 self.settings.gpu = choice;
@@ -3990,7 +4151,7 @@ impl Editor {
             .show(ui, |ui| {
                 for (tab, icon, name) in [
                     (LeftPanel::Media, &icons::FILM, "My media"),
-                    (LeftPanel::Record, &icons::CIRCLE_DOT, "Record"),
+                    (LeftPanel::Record, &icons::VIDEO, "Record"),
                     (LeftPanel::Library, &icons::LIBRARY_BIG, "Content library"),
                     (LeftPanel::Text, &icons::TYPE, "Text"),
                     (LeftPanel::Transitions, &icons::BLEND, "Transitions"),
@@ -6645,6 +6806,11 @@ mod tests {
             name: &str,
         ) {
             let output = run_frame(ctx, editor, events);
+            self.save(ctx, output, name);
+        }
+
+        /// Draws a frame that has already run, wherever it came from, and saves it.
+        fn save(&mut self, ctx: &egui::Context, output: egui::FullOutput, name: &str) {
             let mut textures = KEPT_TEXTURES
                 .with_borrow_mut(|kept| std::mem::take(kept.as_mut().expect("the camera is on")));
             for delta in &textures {
@@ -7655,6 +7821,23 @@ mod tests {
             gather(&clipped.shape, area, &mut found);
         }
         found
+    }
+
+    /// Where this exact text is drawn, if it is.
+    fn text_rect(output: &egui::FullOutput, wanted: &str) -> Option<egui::Rect> {
+        fn find(shape: &egui::Shape, wanted: &str) -> Option<egui::Rect> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == wanted => {
+                    Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| find(shape, wanted)),
+                _ => None,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .find_map(|clipped| find(&clipped.shape, wanted))
     }
 
     /// Runs enough frames for everything that animates to finish, so a frame asks for no more.
@@ -12258,6 +12441,112 @@ mod tests {
         assert!(is_named(&ctx, &mut editor, "Graphics chip: AMD test chip"));
     }
 
+    thread_local! {
+        /// What each restart asked to open, on this test's thread.
+        static RELAUNCHED: std::cell::RefCell<Vec<Option<PathBuf>>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn noted_relaunch(project: Option<&Path>) -> std::io::Result<()> {
+        RELAUNCHED.with(|asked| asked.borrow_mut().push(project.map(Path::to_path_buf)));
+        Ok(())
+    }
+
+    fn failed_relaunch(_project: Option<&Path>) -> std::io::Result<()> {
+        Err(std::io::Error::other("made-up failure"))
+    }
+
+    fn relaunched() -> Vec<Option<PathBuf>> {
+        RELAUNCHED.with(|asked| asked.borrow().clone())
+    }
+
+    /// Opens Settings and picks the AMD chip, so a switch is waiting for a restart.
+    fn pick_another_chip(ctx: &egui::Context, editor: &mut Editor) {
+        laptop_chips(editor);
+        click_named(ctx, editor, "Settings");
+        let_dialog_open(ctx, editor);
+        assert!(
+            !is_named(ctx, editor, "Restart now"),
+            "nothing to restart for"
+        );
+        click_named(ctx, editor, "Graphics chip: Automatic");
+        settle_animations(ctx, editor);
+        click_named(ctx, editor, "AMD test chip");
+        run_frame(ctx, editor, vec![]);
+    }
+
+    #[test]
+    fn restart_now_opens_the_saved_project_again_and_closes() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let path = project_folder("restart-saved").join("a.bareclip");
+        assert!(editor.save_to(&path));
+        editor.relaunch = noted_relaunch;
+        pick_another_chip(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Restart now");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert_eq!(relaunched(), vec![Some(path)]);
+        assert!(editor.closing);
+        assert!(!editor.settings_open);
+    }
+
+    #[test]
+    fn restart_now_asks_about_unsaved_changes_first() {
+        let ctx = context();
+        let (mut editor, path) = with_a_change_since_saving(&ctx, "restart-unsaved");
+        editor.relaunch = noted_relaunch;
+        pick_another_chip(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Restart now");
+        let_dialog_open(&ctx, &mut editor);
+        assert!(relaunched().is_empty(), "it waits for an answer");
+        assert!(!editor.closing);
+
+        click_named(&ctx, &mut editor, "Cancel");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(relaunched().is_empty());
+        assert!(!editor.closing);
+
+        click_named(&ctx, &mut editor, "Settings");
+        let_dialog_open(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Restart now");
+        let_dialog_open(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Save");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(relaunched(), vec![Some(path)]);
+        assert!(editor.closing);
+        assert!(!editor.has_unsaved_changes(), "the change was saved first");
+    }
+
+    #[test]
+    fn restart_now_starts_an_untitled_project_with_nothing_to_open() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        editor.relaunch = noted_relaunch;
+        pick_another_chip(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Restart now");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(relaunched(), vec![None]);
+        assert!(editor.closing);
+    }
+
+    #[test]
+    fn a_restart_that_fails_says_so_and_stays_open() {
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        editor.relaunch = failed_relaunch;
+        pick_another_chip(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Restart now");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(!editor.closing);
+        assert!(
+            editor
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.starts_with(text::RESTART_FAILED))
+        );
+    }
+
     #[test]
     fn going_back_to_automatic_saves_that_too() {
         let ctx = context();
@@ -12294,15 +12583,34 @@ mod tests {
     }
 
     #[test]
-    fn the_settings_window_says_which_version_this_is() {
+    fn the_settings_window_says_which_version_this_is_at_its_bottom_left_on_every_tab() {
         let ctx = context();
         let mut editor = Editor::new(&ctx, false);
 
         click_named(&ctx, &mut editor, "Settings");
         let_dialog_open(&ctx, &mut editor);
 
-        let output = run_frame(&ctx, &mut editor, vec![]);
-        assert!(text_in(&output, egui::Rect::EVERYTHING).contains(&text::version_line()));
+        for tab in ["General settings", "Export settings", "Recording settings"] {
+            click_named(&ctx, &mut editor, tab);
+            let_dialog_open(&ctx, &mut editor);
+            // Under the tabs, level with Done.
+            let tabs = named_rect(&ctx, &mut editor, "General settings");
+            let done = named_rect(&ctx, &mut editor, "Done");
+            let bottom_left = egui::Rect::from_min_max(
+                pos2(tabs.left(), done.top()),
+                pos2(tabs.right(), done.bottom()),
+            );
+            let output = run_frame(&ctx, &mut editor, vec![]);
+            assert!(
+                text_in(&output, bottom_left).contains(&text::version_line()),
+                "{tab}"
+            );
+            let version = text_rect(&output, &text::version_line()).expect("it is drawn");
+            assert!(
+                (version.center().y - done.center().y).abs() < 1.0,
+                "{tab}: the version at {version:?} is level with Done at {done:?}"
+            );
+        }
     }
 
     #[test]
@@ -13345,6 +13653,8 @@ mod tests {
         let_dialog_open(&ctx, &mut editor);
         click_named(&ctx, &mut editor, "Light");
         run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Export settings");
+        run_frame(&ctx, &mut editor, vec![]);
         click_named(&ctx, &mut editor, "Fastest");
         assert_eq!(editor.mode, CutMode::Keyframe);
         click_named(&ctx, &mut editor, "Done");
@@ -13386,6 +13696,8 @@ mod tests {
 
         click_named(&ctx, &mut editor, "Settings");
         let_dialog_open(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Export settings");
+        run_frame(&ctx, &mut editor, vec![]);
 
         assert!(is_named(&ctx, &mut editor, "Fastest"));
         assert!(!is_named(&ctx, &mut editor, "5 seconds"));
@@ -17585,7 +17897,10 @@ mod tests {
 
         editor.export_state = ExportState::Closed;
         run_frame(&ctx, &mut editor, vec![]);
-        click_named(&ctx, &mut editor, "Audio");
+        // The Audio panel stays open from before, and pressing its lit button would close it.
+        if !is_named(&ctx, &mut editor, "Noise suppression") {
+            click_named(&ctx, &mut editor, "Audio");
+        }
         let_dialog_open(&ctx, &mut editor);
         click_named(&ctx, &mut editor, "Noise suppression");
         let_dialog_open(&ctx, &mut editor);
@@ -19720,6 +20035,34 @@ mod tests {
         })
     }
 
+    thread_local! {
+        /// Every microphone this test's thread opened, by name, `None` being Windows' default.
+        static MICROPHONES_OPENED: std::cell::RefCell<Vec<Option<String>>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// The made-up microphone, noting each time one is opened and which.
+    fn counted_microphone(name: Option<&str>) -> Result<recording::MicSource, String> {
+        MICROPHONES_OPENED.with(|opened| opened.borrow_mut().push(name.map(str::to_owned)));
+        made_up_microphone(name)
+    }
+
+    fn microphones_opened() -> Vec<Option<String>> {
+        MICROPHONES_OPENED.with(|opened| opened.borrow().clone())
+    }
+
+    /// The control with this name furthest right, which tells a recording window's control from
+    /// the Record panel's card of the same name.
+    fn click_rightmost_named(ctx: &egui::Context, editor: &mut Editor, name: &str) {
+        let rect = named_nodes(ctx, editor)
+            .into_iter()
+            .filter(|(label, ..)| label == name)
+            .map(|(_, rect, _)| rect)
+            .max_by(|a, b| a.center().x.total_cmp(&b.center().x))
+            .unwrap_or_else(|| panic!("nothing is named {name}"));
+        click(ctx, editor, rect.center());
+    }
+
     fn no_microphone(_name: Option<&str>) -> Result<recording::MicSource, String> {
         Err("No microphone was found.".to_owned())
     }
@@ -19969,11 +20312,47 @@ mod tests {
     }
 
     #[test]
-    fn choosing_a_microphone_is_remembered() {
+    fn a_microphone_picked_in_the_bar_lasts_for_that_recording_only() {
         let ctx = context();
         let (mut editor, _folder) = ready_to_record(&ctx, "choose");
+        editor.open_microphone = counted_microphone;
         open_record_bar_by_hand(&ctx, &mut editor);
         click_named(&ctx, &mut editor, "Microphone: Desk microphone");
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Headset microphone");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(is_named(
+            &ctx,
+            &mut editor,
+            "Microphone: Headset microphone"
+        ));
+        assert_eq!(
+            microphones_opened().last(),
+            Some(&Some("Headset microphone".to_owned())),
+            "it listens to the one picked"
+        );
+        assert_eq!(editor.settings.microphone, None, "the default stays");
+
+        click_named(&ctx, &mut editor, "Cancel");
+        run_frame(&ctx, &mut editor, vec![]);
+        open_record_bar_by_hand(&ctx, &mut editor);
+        assert!(is_named(&ctx, &mut editor, "Microphone: Desk microphone"));
+    }
+
+    #[test]
+    fn the_default_microphone_in_settings_is_where_each_recording_starts() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record(&ctx, "default-microphone");
+        click_named(&ctx, &mut editor, "Settings");
+        let_dialog_open(&ctx, &mut editor);
+        assert!(!is_named(
+            &ctx,
+            &mut editor,
+            "Default microphone: Windows default"
+        ));
+        click_named(&ctx, &mut editor, "Recording settings");
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Default microphone: Windows default");
         run_frame(&ctx, &mut editor, vec![]);
         click_named(&ctx, &mut editor, "Headset microphone");
         run_frame(&ctx, &mut editor, vec![]);
@@ -19984,8 +20363,93 @@ mod tests {
         assert!(is_named(
             &ctx,
             &mut editor,
+            "Default microphone: Headset microphone"
+        ));
+        click_named(&ctx, &mut editor, "Done");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.settings_microphones.is_none(), "the list is let go");
+
+        open_record_bar_by_hand(&ctx, &mut editor);
+        assert!(is_named(
+            &ctx,
+            &mut editor,
             "Microphone: Headset microphone"
         ));
+        click_named(&ctx, &mut editor, "Cancel");
+        run_frame(&ctx, &mut editor, vec![]);
+        editor.open_screen = made_up_screen;
+        editor.open_pc_sound = made_up_pc_sound;
+        editor.list_sources = made_up_sources;
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        assert!(is_named(
+            &ctx,
+            &mut editor,
+            "Microphone: Headset microphone"
+        ));
+    }
+
+    #[test]
+    fn a_default_microphone_that_is_unplugged_says_so_and_windows_default_is_used() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record(&ctx, "default-gone");
+        editor.settings.microphone = Some("Old microphone".to_owned());
+        editor.settings_tab = SettingsTab::Recording;
+        editor.settings_open = true;
+        let_dialog_open(&ctx, &mut editor);
+        let output = run_frame(&ctx, &mut editor, vec![]);
+        assert!(
+            text_in(&output, egui::Rect::EVERYTHING)
+                .iter()
+                .any(|shown| shown == text::DEFAULT_MICROPHONE_GONE)
+        );
+        assert!(is_named(
+            &ctx,
+            &mut editor,
+            "Default microphone: Old microphone"
+        ));
+        editor.settings_open = false;
+        run_frame(&ctx, &mut editor, vec![]);
+
+        editor.open_microphone = counted_microphone;
+        open_record_bar_by_hand(&ctx, &mut editor);
+        assert!(is_named(&ctx, &mut editor, "Microphone: Desk microphone"));
+        assert_eq!(microphones_opened().last(), Some(&None));
+    }
+
+    #[test]
+    fn settings_shows_one_tab_at_a_time_and_keeps_its_size() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record(&ctx, "settings-tabs");
+        click_named(&ctx, &mut editor, "Settings");
+        let_dialog_open(&ctx, &mut editor);
+        let done = named_rect(&ctx, &mut editor, "Done");
+        assert!(is_named(&ctx, &mut editor, "Waveforms on clips"));
+        assert!(!is_named(&ctx, &mut editor, "Fastest"));
+        assert!(!is_named(&ctx, &mut editor, "Count down from 3"));
+
+        click_named(&ctx, &mut editor, "Export settings");
+        let_dialog_open(&ctx, &mut editor);
+        assert!(is_named(&ctx, &mut editor, "Fastest"));
+        assert!(!is_named(&ctx, &mut editor, "Waveforms on clips"));
+        assert_eq!(
+            named_rect(&ctx, &mut editor, "Done"),
+            done,
+            "it keeps its size"
+        );
+
+        click_named(&ctx, &mut editor, "Recording settings");
+        let_dialog_open(&ctx, &mut editor);
+        assert!(is_named(&ctx, &mut editor, "Count down from 3"));
+        assert!(is_named(
+            &ctx,
+            &mut editor,
+            "Default microphone: Windows default"
+        ));
+        assert_eq!(
+            named_rect(&ctx, &mut editor, "Done"),
+            done,
+            "it keeps its size"
+        );
     }
 
     #[test]
@@ -20075,12 +20539,15 @@ mod tests {
             run_frame(&ctx, &mut editor, vec![]);
         }
         camera.shoot(&ctx, &mut editor, vec![], "record-06-added");
+        editor.settings_tab = SettingsTab::Recording;
         editor.settings_open = true;
         for _ in 0..12 {
             run_frame(&ctx, &mut editor, vec![]);
         }
         camera.shoot(&ctx, &mut editor, vec![], "record-07-settings");
         editor.settings_open = false;
+        editor.settings_microphones = None;
+        editor.settings_tab = SettingsTab::General;
         editor.open_screen = made_up_screen;
         editor.open_pc_sound = made_up_pc_sound;
         editor.list_sources = made_up_sources;
@@ -20135,6 +20602,47 @@ mod tests {
             run_frame(&ctx, &mut editor, vec![]);
         }
         camera.shoot(&ctx, &mut editor, vec![], "record-17-three-clips");
+
+        // Long names go onto a second line in their menus rather than out of them.
+        editor.list_sources = long_named_sources;
+        editor.list_microphones = long_named_microphones;
+        editor.screen_bar = None;
+        editor.camera_bar = None;
+        run_frame(&ctx, &mut editor, vec![]);
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        run_for(&ctx, &mut editor, 0.3);
+        click_named(&ctx, &mut editor, "Record: Screen 1 (main), 640 x 360");
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "record-18-long-window-names");
+        let microphone = format!("Microphone: {}", long_named_microphones()[0].name);
+        click_named(&ctx, &mut editor, &microphone);
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "record-19-long-microphone-names");
+        editor.screen_bar = None;
+        run_frame(&ctx, &mut editor, vec![]);
+
+        // Each tab of Settings, with a chip whose name and note are long.
+        laptop_chips(&mut editor);
+        editor.settings.gpu = Some(GpuChoice {
+            vendor: 0x1002,
+            device: 0x1638,
+        });
+        editor.settings_tab = SettingsTab::General;
+        editor.settings_open = true;
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "record-20-settings-general");
+        click_named(&ctx, &mut editor, "Export settings");
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "record-21-settings-export");
+        click_named(&ctx, &mut editor, "Recording settings");
+        let_dialog_open(&ctx, &mut editor);
+        let default = format!("Default microphone: {}", text::WINDOWS_DEFAULT_MICROPHONE);
+        click_named(&ctx, &mut editor, &default);
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "record-22-settings-microphones");
+        editor.settings_open = false;
+        editor.settings_microphones = None;
+        run_frame(&ctx, &mut editor, vec![]);
         // Pictures still arriving from the video leave texture changes nobody will draw.
         KEPT_TEXTURES.with_borrow_mut(|kept| {
             for delta in kept.iter_mut().flatten() {
@@ -20197,6 +20705,35 @@ mod tests {
                 is_main: false,
             },
         ]
+    }
+
+    /// Screens and windows whose names are too long for one line of a menu.
+    fn long_named_sources() -> Vec<bareclip_capture::Offered> {
+        let mut offered = made_up_sources();
+        offered.push(bareclip_capture::Offered {
+            source: bareclip_capture::Source::Window(3),
+            name: "Ranking the fifty best players in the league this season, purely on form \
+                   this time : r/soccer - Zen Browser"
+                .to_owned(),
+            size: (640, 360),
+            is_main: false,
+        });
+        offered
+    }
+
+    /// Microphones whose names are too long for one line of a menu.
+    fn long_named_microphones() -> Vec<bareclip_audio::Microphone> {
+        [
+            "Headset Microphone (HyperX Virtual Surround Sound)",
+            "Microphone Array (Realtek(R) Audio) with a much longer name than most",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(index, name)| bareclip_audio::Microphone {
+            name: (*name).to_owned(),
+            is_default: index == 0,
+        })
+        .collect()
     }
 
     /// An editor ready to record a made-up screen with made-up PC sound and no microphone.
@@ -20329,6 +20866,13 @@ mod tests {
         assert!(editor.project.tracks.clip(id).is_some());
     }
 
+    /// Presses a control by name, giving the moments just before and just after the press.
+    fn timed_click(ctx: &egui::Context, editor: &mut Editor, name: &str) -> (Instant, Instant) {
+        let before = Instant::now();
+        click_named(ctx, editor, name);
+        (before, Instant::now())
+    }
+
     /// How loud a recording is between two moments, from 0 to 1 against its loudest.
     fn loudness_between(path: &Path, from: f64, to: f64) -> f32 {
         let shape = bareclip_media::read_sound_shape(path, &AtomicBool::new(false), |_| {})
@@ -20344,7 +20888,9 @@ mod tests {
         editor.settings.screen_pc_sound = false;
         open_screen_bar_by_hand(&ctx, &mut editor);
         click_named(&ctx, &mut editor, "Start recording");
+        let started = Instant::now();
         run_for(&ctx, &mut editor, 1.0);
+        let on_pressed = Instant::now();
         click_named(&ctx, &mut editor, "Turn the microphone on");
         run_frame(&ctx, &mut editor, vec![]);
         assert!(is_named(&ctx, &mut editor, "Turn the microphone off"));
@@ -20355,8 +20901,12 @@ mod tests {
         let file = recorded_files(&folder).pop().expect("a file");
         let info = bareclip_media::probe(&file).expect("it can be read");
         assert_eq!(info.audio.len(), 1);
-        let silent = loudness_between(&file, 0.1, 0.7);
-        let heard = loudness_between(&file, 1.4, 1.8);
+        // A press can take seconds on a busy machine, so the microphone is only known to be off
+        // until the press began, and heard somewhere between then and the end.
+        let turned_on_after = (on_pressed - started).as_secs_f64();
+        let silent = loudness_between(&file, 0.1, turned_on_after - 0.2);
+        let heard = loudness_between(&file, turned_on_after + 0.2, seconds_of(&file));
+
         assert!(silent < 0.05, "{silent} before it was turned on");
         assert!(heard > 0.5, "{heard} after it was turned on");
     }
@@ -20664,14 +21214,30 @@ mod tests {
         (editor, folder)
     }
 
+    /// Runs frames until the camera has started or failed, which it does on a thread of its own
+    /// and can take a while on a busy machine. Pressing Start before then would do nothing.
+    fn wait_for_the_camera(ctx: &egui::Context, editor: &mut Editor) {
+        let started = Instant::now();
+        loop {
+            run_frame(ctx, editor, vec![]);
+            let starting = editor.camera_pick().is_some_and(|pick| {
+                matches!(pick.state(), bareclip_capture::CameraState::Starting)
+            });
+            if !starting || started.elapsed() > Duration::from_secs(5) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        run_for(ctx, editor, 0.1);
+    }
+
     fn open_camera_bar_by_hand(ctx: &egui::Context, editor: &mut Editor) {
         if !is_named(ctx, editor, "Camera") {
             click_named(ctx, editor, "Record");
             run_frame(ctx, editor, vec![]);
         }
         click_named(ctx, editor, "Camera");
-        // The camera starts on a thread of its own.
-        run_for(ctx, editor, 0.2);
+        wait_for_the_camera(ctx, editor);
     }
 
     fn is_disabled(ctx: &egui::Context, editor: &mut Editor, name: &str) -> bool {
@@ -20752,7 +21318,7 @@ mod tests {
     }
 
     #[test]
-    fn the_camera_its_size_and_the_microphone_are_chosen_before_recording_and_remembered() {
+    fn the_camera_and_its_size_are_remembered_and_the_microphone_lasts_one_recording() {
         let ctx = context();
         let (mut editor, folder) = ready_to_record_the_camera(&ctx, "camera-choose");
         open_camera_bar_by_hand(&ctx, &mut editor);
@@ -20777,23 +21343,21 @@ mod tests {
         run_frame(&ctx, &mut editor, vec![]);
         click_named(&ctx, &mut editor, "Headset microphone");
         run_frame(&ctx, &mut editor, vec![]);
-        assert_eq!(
-            editor.settings.microphone.as_deref(),
-            Some("Headset microphone")
-        );
+        assert!(is_named(
+            &ctx,
+            &mut editor,
+            "Microphone: Headset microphone"
+        ));
+        assert_eq!(editor.settings.microphone, None, "Settings' default stays");
 
-        // Opened again, it starts on all three.
+        // Opened again, it starts on the camera and size, and on the default microphone.
         click_named(&ctx, &mut editor, "Cancel");
         run_frame(&ctx, &mut editor, vec![]);
         assert!(editor.camera_bar.is_none());
         open_camera_bar_by_hand(&ctx, &mut editor);
         assert!(is_named(&ctx, &mut editor, "Camera: Phone camera"));
         assert!(is_named(&ctx, &mut editor, "Size: 320 x 180, 15 fps"));
-        assert!(is_named(
-            &ctx,
-            &mut editor,
-            "Microphone: Headset microphone"
-        ));
+        assert!(is_named(&ctx, &mut editor, "Microphone: Desk microphone"));
         click_named(&ctx, &mut editor, "Start recording");
         run_for(&ctx, &mut editor, 0.6);
         click_named(&ctx, &mut editor, "Stop");
@@ -20816,11 +21380,23 @@ mod tests {
     fn with_the_microphone_off_a_camera_records_only_the_picture() {
         let ctx = context();
         let (mut editor, folder) = ready_to_record_the_camera(&ctx, "camera-silent");
+        editor.open_microphone = counted_microphone;
         open_camera_bar_by_hand(&ctx, &mut editor);
         click_named(&ctx, &mut editor, "Record the microphone");
         run_frame(&ctx, &mut editor, vec![]);
         assert!(!editor.settings.camera_microphone);
-        assert!(!is_named(&ctx, &mut editor, "Microphone: Desk microphone"));
+        // The list stays, and picking from it while it's off listens to nothing.
+        let opened = microphones_opened().len();
+        click_named(&ctx, &mut editor, "Microphone: Desk microphone");
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Headset microphone");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(is_named(
+            &ctx,
+            &mut editor,
+            "Microphone: Headset microphone"
+        ));
+        assert_eq!(microphones_opened().len(), opened);
         click_named(&ctx, &mut editor, "Start recording");
         run_for(&ctx, &mut editor, 0.6);
         click_named(&ctx, &mut editor, "Stop");
@@ -21015,8 +21591,7 @@ mod tests {
             run_frame(ctx, editor, vec![]);
         }
         click_named(ctx, editor, "Screen and camera");
-        // The camera starts on a thread of its own.
-        run_for(ctx, editor, 0.2);
+        wait_for_the_camera(ctx, editor);
     }
 
     /// The clip on the timeline playing a file whose name starts with `kind`, and its row.
@@ -21180,26 +21755,26 @@ mod tests {
         let (mut editor, folder) =
             ready_to_record_the_screen_and_camera(&ctx, "screen-camera-paused");
         open_screen_and_camera_bar_by_hand(&ctx, &mut editor);
-        // Timed as it really runs, since a busy machine stretches every wait.
-        click_named(&ctx, &mut editor, "Start recording");
-        let started = Instant::now();
+        // Timed as it really runs, since a busy machine stretches every wait. Each press is timed
+        // before and after, because on a busy machine a press itself takes a while, and the
+        // recording only knows it happened somewhere between the two.
+        let started = timed_click(&ctx, &mut editor, "Start recording");
         run_for(&ctx, &mut editor, 0.7);
-        click_named(&ctx, &mut editor, "Pause recording");
-        let paused = Instant::now();
+        let paused = timed_click(&ctx, &mut editor, "Pause recording");
         run_for(&ctx, &mut editor, 1.0);
-        click_named(&ctx, &mut editor, "Resume recording");
-        let resumed = Instant::now();
+        let resumed = timed_click(&ctx, &mut editor, "Resume recording");
         run_for(&ctx, &mut editor, 0.7);
-        let stopping = Instant::now();
-        click_named(&ctx, &mut editor, "Stop");
+        let stopped = timed_click(&ctx, &mut editor, "Stop");
         run_frame(&ctx, &mut editor, vec![]);
-        let recorded = (paused - started + (stopping - resumed)).as_secs_f64();
+        let seconds = |later: Instant, earlier: Instant| (later - earlier).as_secs_f64();
+        let shortest = seconds(paused.0, started.1) + seconds(stopped.0, resumed.1);
+        let longest = seconds(paused.1, started.0) + seconds(stopped.1, resumed.0);
         let lengths = ["Screen ", "Camera ", "Microphone "]
             .map(|kind| seconds_of(&file_of_kind(&folder, kind).expect("a file")));
         for length in lengths {
             assert!(
-                (length - recorded).abs() < 0.3,
-                "{lengths:?} against {recorded}"
+                length > shortest - 0.3 && length < longest + 0.3,
+                "{lengths:?} against {shortest} to {longest}"
             );
         }
         let [screen, camera, microphone] = lengths;
@@ -21263,24 +21838,35 @@ mod tests {
     }
 
     #[test]
-    fn the_screen_bars_microphone_can_be_chosen_and_is_remembered() {
+    fn the_screen_bars_microphone_can_be_chosen_while_off_and_is_used_once_on() {
         let ctx = context();
         let (mut editor, _folder) = ready_to_record_the_screen(&ctx, "screen-choose-mic");
-        editor.settings.screen_microphone = true;
+        editor.open_microphone = counted_microphone;
         open_screen_bar_by_hand(&ctx, &mut editor);
+        let opened = microphones_opened().len();
         click_named(&ctx, &mut editor, "Microphone: Desk microphone");
         run_frame(&ctx, &mut editor, vec![]);
         click_named(&ctx, &mut editor, "Headset microphone");
         run_frame(&ctx, &mut editor, vec![]);
-        assert_eq!(
-            editor.settings.microphone.as_deref(),
-            Some("Headset microphone")
-        );
         assert!(is_named(
             &ctx,
             &mut editor,
             "Microphone: Headset microphone"
         ));
+        assert_eq!(
+            microphones_opened().len(),
+            opened,
+            "nothing is listened to while it's off"
+        );
+        assert_eq!(editor.settings.microphone, None, "Settings' default stays");
+
+        click_rightmost_named(&ctx, &mut editor, "Microphone");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.settings.screen_microphone);
+        assert_eq!(
+            microphones_opened().last(),
+            Some(&Some("Headset microphone".to_owned()))
+        );
     }
 
     /// Four two-second clips: three on the top row at 0, 3 and 6 seconds, and one on the row

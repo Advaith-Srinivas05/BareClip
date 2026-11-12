@@ -30,6 +30,8 @@ const CARD_PAUSE_SECONDS: f32 = 0.5;
 const CARDS_DRAWN_PER_FRAME: usize = 3;
 /// A card's picture, and how much of the card's width its height is.
 const CARD_SHAPE: f32 = 0.625;
+/// The room under a card's picture for its name, which takes up to two lines.
+const CARD_NAME_HEIGHT: f32 = 36.0;
 /// The sliders reach this far, and a longer fade can be typed in.
 const LONGEST_FADE_SLIDER_SECONDS: f64 = 2.0;
 /// How long an effect's card plays before it starts again.
@@ -87,6 +89,25 @@ enum CardPress {
     Nothing,
     Card,
     Settings,
+}
+
+/// A card's name under its picture, going onto a second line rather than past the card's edge,
+/// and cut short with an ellipsis after that.
+fn card_name(painter: &egui::Painter, picture: egui::Rect, name: &str, colour: Color32) {
+    let mut job = egui::text::LayoutJob::simple(
+        name.to_owned(),
+        egui::FontId::proportional(12.0),
+        colour,
+        picture.width() - 4.0,
+    );
+    job.wrap.max_rows = 2;
+    job.wrap.overflow_character = Some('…');
+    let words = painter.layout_job(job);
+    painter.galley(
+        pos2(picture.left() + 2.0, picture.bottom() + 3.0),
+        words,
+        colour,
+    );
 }
 
 fn press_of(card: bool, settings: bool) -> CardPress {
@@ -396,10 +417,9 @@ impl Editor {
         chosen: bool,
         left_to_draw: &mut usize,
     ) -> bool {
-        let name_height = 18.0;
         let picture_height = width * CARD_SHAPE;
         let (whole, response) = ui.allocate_exact_size(
-            vec2(width, picture_height + name_height),
+            vec2(width, picture_height + CARD_NAME_HEIGHT),
             Sense::click_and_drag(),
         );
         response.widget_info(|| {
@@ -467,13 +487,7 @@ impl Editor {
                 .clone()
                 .on_hover_text(format!("{}: drag between two clips", kind.name()));
         }
-        painter.text(
-            pos2(whole.left() + 2.0, picture.bottom() + 3.0),
-            egui::Align2::LEFT_TOP,
-            kind.name(),
-            egui::FontId::proportional(12.0),
-            palette.text_muted,
-        );
+        card_name(&painter, picture, kind.name(), palette.text_muted);
         response.clicked()
     }
 
@@ -973,10 +987,11 @@ impl Editor {
         width: f32,
         left_to_draw: &mut usize,
     ) -> CardPress {
-        let name_height = 30.0;
         let picture_height = width * CARD_SHAPE;
-        let (whole, response) =
-            ui.allocate_exact_size(vec2(width, picture_height + name_height), Sense::click());
+        let (whole, response) = ui.allocate_exact_size(
+            vec2(width, picture_height + CARD_NAME_HEIGHT),
+            Sense::click(),
+        );
         let name = kind.map_or("None", EffectKind::name);
         let on = kind.map_or(!clip.look.effects.any(), |kind| {
             clip.look.effects.is_on(kind)
@@ -1033,17 +1048,7 @@ impl Editor {
                 egui::StrokeKind::Inside,
             );
         }
-        let text = painter.layout(
-            name.to_owned(),
-            egui::FontId::proportional(12.0),
-            palette.text_muted,
-            width - 4.0,
-        );
-        painter.galley(
-            pos2(whole.left() + 2.0, picture.bottom() + 3.0),
-            text,
-            palette.text_muted,
-        );
+        card_name(&painter, picture, name, palette.text_muted);
         // The settings button sits in the corner of an effect that is on and has settings.
         let mut settings_clicked = false;
         if let Some(kind) = kind
@@ -1191,11 +1196,15 @@ impl Editor {
                         ui.available_width(),
                     ));
                     let mut picked = None;
+                    let menu_width = components::menu_width(&button);
                     egui::Popup::menu(&button).show(|ui| {
                         for (option, option_name) in options.iter().enumerate() {
                             let chosen = option as i32 == value;
                             if ui
-                                .add(MenuItem::choice(palette, option_name, chosen))
+                                .add(
+                                    MenuItem::choice(palette, option_name, chosen)
+                                        .width(menu_width),
+                                )
                                 .clicked()
                             {
                                 picked = Some(option as i32);
@@ -1247,10 +1256,11 @@ impl Editor {
         width: f32,
         left_to_draw: &mut usize,
     ) -> bool {
-        let name_height = 30.0;
         let picture_height = width * CARD_SHAPE;
-        let (whole, response) =
-            ui.allocate_exact_size(vec2(width, picture_height + name_height), Sense::click());
+        let (whole, response) = ui.allocate_exact_size(
+            vec2(width, picture_height + CARD_NAME_HEIGHT),
+            Sense::click(),
+        );
         response.widget_info(|| {
             egui::WidgetInfo::labeled(
                 egui::Role::Button,
@@ -1299,17 +1309,7 @@ impl Editor {
                 egui::StrokeKind::Inside,
             );
         }
-        let name = painter.layout(
-            filter.name().to_owned(),
-            egui::FontId::proportional(12.0),
-            palette.text_muted,
-            width - 4.0,
-        );
-        painter.galley(
-            pos2(whole.left() + 2.0, picture.bottom() + 3.0),
-            name,
-            palette.text_muted,
-        );
+        card_name(&painter, picture, filter.name(), palette.text_muted);
         response.clicked()
     }
 

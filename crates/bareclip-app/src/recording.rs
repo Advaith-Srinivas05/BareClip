@@ -31,6 +31,10 @@ const BAR_REDRAW: Duration = Duration::from_millis(33);
 const FOLDER_NAME: &str = "BareClip recordings";
 /// How wide the running time is kept, so the buttons beside it don't move as it grows.
 pub(super) const TIME_WIDTH: f32 = 72.0;
+/// The room between the cards of a recording window.
+pub(super) const GROUP_GAP: f32 = 12.0;
+pub(super) const HEADPHONES_NOTE: &str =
+    "Wear headphones, or the microphone will hear the video too.";
 
 /// A microphone being listened to, or something standing in for one in tests.
 pub(super) struct MicSource {
@@ -173,6 +177,9 @@ impl LiveRecording {
 /// The recording bar, while it's open.
 pub(super) struct RecordBar {
     microphones: Vec<Microphone>,
+    /// The microphone picked for this recording, starting on Settings' default. `None` is
+    /// Windows' default.
+    chosen_microphone: Option<String>,
     source: Result<MicSource, String>,
     shown_level: f32,
     /// A folder picked with Browse for this recording only.
@@ -194,6 +201,54 @@ impl RecordBar {
 /// The level meter, for the screen recording bar too.
 pub(super) fn meter(ui: &mut egui::Ui, palette: &Palette, fill: f32) {
     level_meter(ui, palette, fill);
+}
+
+/// A sound to record, as a switch with how loud it is beside it while it's on, or why it can't
+/// be heard under it. Says whether the switch was pressed.
+pub(super) fn sound_switch(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    (name, on): (&str, bool),
+    source: Option<&Result<MicSource, String>>,
+    level: f32,
+) -> bool {
+    let row = ui.add(SwitchRow::new(palette, name, on).compact());
+    match source {
+        Some(Ok(_)) if on => {
+            let spot =
+                components::beside_switch(row.rect, components::METER_BESIDE_SWITCH, METER_HEIGHT);
+            let id = row.id.with("level");
+            paint_meter(ui, palette, spot, id, (name, level));
+        }
+        Some(Err(problem)) => components::settings_note(ui, palette, problem, Some(palette.danger)),
+        _ => {}
+    }
+    row.clicked()
+}
+
+/// A level meter drawn into `spot`, named for screen readers after the sound it measures.
+fn paint_meter(
+    ui: &egui::Ui,
+    palette: &Palette,
+    spot: egui::Rect,
+    id: egui::Id,
+    (name, fill): (&str, f32),
+) {
+    let response = ui.interact(spot, id, Sense::hover());
+    let percent = (fill * 100.0).round();
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::Role::ProgressIndicator,
+            true,
+            format!("{name} level {percent}%"),
+        )
+    });
+    let radius = spot.height() / 2.0;
+    ui.painter().rect_filled(spot, radius, palette.border);
+    if fill > 0.0 {
+        let filled = egui::Rect::from_min_size(spot.min, vec2(spot.width() * fill, spot.height()));
+        ui.painter().rect_filled(filled, radius, palette.accent);
+    }
 }
 
 /// How full the meter is for a level from 0 to 1, on a decibel scale, since that's how loudness
@@ -385,13 +440,10 @@ impl Editor {
 
     pub(super) fn open_record_bar(&mut self) {
         let microphones = (self.list_microphones)();
-        let wanted = self.settings.microphone.as_deref().filter(|name| {
-            microphones
-                .iter()
-                .any(|microphone| microphone.name == *name)
-        });
+        let wanted = self.default_microphone(&microphones);
         self.record_bar = Some(RecordBar {
-            source: (self.open_microphone)(wanted),
+            source: (self.open_microphone)(wanted.as_deref()),
+            chosen_microphone: wanted,
             microphones,
             shown_level: 0.0,
             folder: None,
@@ -400,19 +452,19 @@ impl Editor {
     }
 
     fn microphone_name(&self) -> String {
-        let microphones = self
-            .record_bar
-            .as_ref()
-            .map_or(&[][..], |bar| &bar.microphones[..]);
-        shown_microphone(self.settings.microphone.as_ref(), microphones)
+        self.record_bar.as_ref().map_or_else(
+            || shown_microphone(None, &[]),
+            |bar| shown_microphone(bar.chosen_microphone.as_ref(), &bar.microphones),
+        )
     }
 
+    /// Picks a microphone for this recording only. Settings' default stays as it is.
     fn choose_microphone(&mut self, name: String) {
-        self.settings.microphone = Some(name.clone());
-        self.save_settings();
+        let open = self.open_microphone;
         if let Some(bar) = &mut self.record_bar {
             // The old one stops being listened to as it's replaced.
-            bar.source = (self.open_microphone)(Some(&name));
+            bar.source = open(Some(&name));
+            bar.chosen_microphone = Some(name);
             bar.shown_level = 0.0;
         }
     }
@@ -686,10 +738,12 @@ impl Editor {
                             let width = ui.available_width();
                             let button =
                                 ui.add(components::Dropdown::new(palette, &name, &shown, width));
+                            let menu_width = components::menu_width(&button);
                             egui::Popup::menu(&button).show(|ui| {
                                 for microphone in &microphones {
                                     let item =
-                                        MenuItem::choice(palette, microphone, *microphone == shown);
+                                        MenuItem::choice(palette, microphone, *microphone == shown)
+                                            .width(menu_width);
                                     if ui.add(item).clicked() {
                                         asked = Asked::Microphone(microphone.clone());
                                     }
@@ -701,23 +755,27 @@ impl Editor {
                     level_meter(ui, palette, level);
                     ui.add_space(12.0);
                     if counting.is_none() {
-                        let row =
-                            SwitchRow::new(palette, "Play the video while recording", play_along);
-                        if ui.add(row).clicked() {
-                            asked = Asked::PlayAlong(!play_along);
-                        }
-                        let row = SwitchRow::new(palette, "Count down from 3", countdown);
-                        if ui.add(row).clicked() {
-                            asked = Asked::Countdown(!countdown);
-                        }
-                        ui.add_space(6.0);
-                        if play_along {
-                            ui.colored_label(
-                                palette.text_muted,
-                                "Wear headphones, or the microphone will hear the video too.",
-                            );
-                        }
-                        ui.add_space(6.0);
+                        components::settings_group(ui, palette, "Options", |ui| {
+                            let row = SwitchRow::new(
+                                palette,
+                                "Play the video while recording",
+                                play_along,
+                            )
+                            .compact();
+                            if ui.add(row).clicked() {
+                                asked = Asked::PlayAlong(!play_along);
+                            }
+                            if play_along {
+                                components::settings_note(ui, palette, HEADPHONES_NOTE, None);
+                            }
+                            components::settings_divider(ui, palette);
+                            let row =
+                                SwitchRow::new(palette, "Count down from 3", countdown).compact();
+                            if ui.add(row).clicked() {
+                                asked = Asked::Countdown(!countdown);
+                            }
+                        });
+                        ui.add_space(8.0);
                         if save_in_row(ui, palette, &folder) {
                             asked = Asked::Browse;
                         }
@@ -727,7 +785,7 @@ impl Editor {
                         if counting.is_none() {
                             let record =
                                 ActionButton::new(palette, Kind::Primary, "Start recording")
-                                    .icon(icons::CIRCLE_DOT)
+                                    .icon(icons::VIDEO)
                                     .width(DIALOG_BUTTON_WIDTH * 1.5);
                             if ui.add_enabled(problem.is_none(), record).clicked() {
                                 asked = Asked::Record;
@@ -861,24 +919,12 @@ impl Editor {
                 },
             );
             // A long path wraps under its name rather than running under the button.
-            let room = Margin {
-                left: 12,
-                right: 12,
-                top: 0,
-                bottom: 0,
-            };
-            Frame::new().inner_margin(room).show(ui, |ui| {
-                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(folder.display().to_string())
-                            .size(12.0)
-                            .color(palette.text_muted),
-                    )
-                    .wrap(),
-                );
-            });
-            ui.add_space(8.0);
+            components::settings_note(ui, palette, &folder.display().to_string(), None);
+            components::settings_divider(ui, palette);
+            if let Some(name) = self.default_microphone_row(ui, palette) {
+                self.settings.microphone = name;
+                changed = true;
+            }
             components::settings_divider(ui, palette);
             let along = self.settings.play_while_recording;
             if ui
@@ -904,26 +950,62 @@ impl Editor {
         });
         changed
     }
+
+    /// The microphone every recording starts on, as a row with its list under it. Gives the new
+    /// choice if one was picked, `None` inside it being Windows' default.
+    fn default_microphone_row(
+        &self,
+        ui: &mut egui::Ui,
+        palette: &Palette,
+    ) -> Option<Option<String>> {
+        let microphones = self.settings_microphones.as_deref().unwrap_or_default();
+        let chosen = self.settings.microphone.as_deref();
+        let shown = chosen.unwrap_or(text::WINDOWS_DEFAULT_MICROPHONE);
+        let gone = chosen
+            .is_some_and(|name| !microphones.iter().any(|microphone| microphone.name == name));
+        let mut picked = None;
+        components::settings_row(
+            ui,
+            palette,
+            ("Default microphone", Some("Where each recording starts")),
+            0.0,
+            |_| {},
+        );
+        components::settings_wide_control(ui, |ui, width| {
+            let name = format!("Default microphone: {shown}");
+            let button = ui.add(components::Dropdown::new(palette, &name, shown, width));
+            let width = components::menu_width(&button);
+            egui::Popup::menu(&button).show(|ui| {
+                let windows =
+                    MenuItem::choice(palette, text::WINDOWS_DEFAULT_MICROPHONE, chosen.is_none())
+                        .width(width);
+                if ui.add(windows).clicked() {
+                    picked = Some(None);
+                }
+                for microphone in microphones {
+                    let item = MenuItem::choice(
+                        palette,
+                        &microphone.name,
+                        chosen == Some(&microphone.name),
+                    )
+                    .width(width);
+                    if ui.add(item).clicked() {
+                        picked = Some(Some(microphone.name.clone()));
+                    }
+                }
+            });
+        });
+        if gone {
+            components::settings_note(ui, palette, text::DEFAULT_MICROPHONE_GONE, None);
+        }
+        picked.filter(|choice| choice.as_deref() != chosen)
+    }
 }
 
 /// How loud the microphone is, as a bar that fills from the left.
 fn level_meter(ui: &mut egui::Ui, palette: &Palette, fill: f32) {
-    let (rect, response) =
-        ui.allocate_exact_size(vec2(ui.available_width(), METER_HEIGHT), Sense::hover());
-    let percent = (fill * 100.0).round();
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(
-            egui::Role::ProgressIndicator,
-            true,
-            format!("Microphone level {percent}%"),
-        )
-    });
-    let radius = METER_HEIGHT / 2.0;
-    ui.painter().rect_filled(rect, radius, palette.border);
-    if fill > 0.0 {
-        let filled = egui::Rect::from_min_size(rect.min, vec2(rect.width() * fill, rect.height()));
-        ui.painter().rect_filled(filled, radius, palette.accent);
-    }
+    let (id, rect) = ui.allocate_space(vec2(ui.available_width(), METER_HEIGHT));
+    paint_meter(ui, palette, rect, id, ("Microphone", fill));
 }
 
 #[cfg(test)]

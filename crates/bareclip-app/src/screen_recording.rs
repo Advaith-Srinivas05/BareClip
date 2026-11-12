@@ -25,8 +25,8 @@ use super::camera_recording::{
     microphone_choice,
 };
 use super::recording::{
-    MicSource, TIME_WIDTH, local_time, meter, meter_fill, pause_button, recording_name,
-    save_in_row, shown_microphone, stop_button, time_label, unused_path,
+    GROUP_GAP, MicSource, TIME_WIDTH, local_time, meter_fill, pause_button, recording_name,
+    save_in_row, shown_microphone, sound_switch, stop_button, time_label, unused_path,
 };
 use super::*;
 use crate::{
@@ -35,6 +35,8 @@ use crate::{
 };
 
 const SCREEN_BAR_WIDTH: f32 = 420.0;
+/// Each frame rate's button in the Options card.
+const FRAME_RATE_WIDTH: f32 = 64.0;
 const PREVIEW_HEIGHT: f32 = 150.0;
 /// How often the small picture of what will be recorded is redrawn, in seconds.
 const PREVIEW_EVERY: f64 = 0.2;
@@ -219,6 +221,9 @@ pub(super) struct ScreenBar {
     preview_at: f64,
     pc_sound: Option<Result<MicSource, String>>,
     microphones: Vec<Microphone>,
+    /// The microphone picked for this recording, starting on Settings' default. `None` is
+    /// Windows' default.
+    chosen_microphone: Option<String>,
     microphone: Option<Result<MicSource, String>>,
     pc_level: f32,
     microphone_level: f32,
@@ -333,10 +338,11 @@ impl Editor {
             .screen_pc_sound
             .then(|| (self.open_pc_sound)());
         let microphones = (self.list_microphones)();
+        let chosen_microphone = self.default_microphone(&microphones);
         let microphone = self
             .settings
             .screen_microphone
-            .then(|| (self.open_microphone)(self.wanted_microphone(&microphones)));
+            .then(|| (self.open_microphone)(chosen_microphone.as_deref()));
         let camera = with_camera.then(|| CameraPick::new((self.list_cameras)()));
         self.screen_bar = Some(ScreenBar {
             offered,
@@ -347,6 +353,7 @@ impl Editor {
             preview_at: 0.0,
             pc_sound,
             microphones,
+            chosen_microphone,
             microphone,
             pc_level: 0.0,
             microphone_level: 0.0,
@@ -371,16 +378,17 @@ impl Editor {
         }
     }
 
+    /// Picks a microphone for this recording only, and listens to it if it's switched on.
+    /// Settings' default stays as it is.
     fn choose_screen_microphone(&mut self, name: String) {
-        self.settings.microphone = Some(name.clone());
-        self.save_settings();
-        let opened = (self.open_microphone)(Some(&name));
-        if let Some(bar) = &mut self.screen_bar
-            && bar.microphone.is_some()
-        {
-            // The old one stops being listened to as it's replaced.
-            bar.microphone = Some(opened);
-            bar.microphone_level = 0.0;
+        let open = self.open_microphone;
+        if let Some(bar) = &mut self.screen_bar {
+            if bar.microphone.is_some() {
+                // The old one stops being listened to as it's replaced.
+                bar.microphone = Some(open(Some(&name)));
+                bar.microphone_level = 0.0;
+            }
+            bar.chosen_microphone = Some(name);
         }
     }
 
@@ -388,7 +396,10 @@ impl Editor {
         let default_folder = self.recordings_folder();
         let lands_at = self.position();
         let open_microphone = self.open_microphone;
-        let microphone_name = self.settings.microphone.clone();
+        let microphone_name = self
+            .screen_bar
+            .as_ref()
+            .and_then(|bar| bar.chosen_microphone.clone());
         let microphone_on = self.settings.screen_microphone;
         let monitor = ctx
             .input(|input| input.viewport().monitor_size)
@@ -841,7 +852,7 @@ impl Editor {
         };
         let stage = self.stage_rect;
         let settings = self.settings.clone();
-        let shown_mic = shown_microphone(settings.microphone.as_ref(), &bar.microphones);
+        let shown_mic = shown_microphone(bar.chosen_microphone.as_ref(), &bar.microphones);
         let folder = bar
             .folder
             .clone()
@@ -951,6 +962,7 @@ impl Editor {
                     let shown = bar.chosen_name();
                     let name = format!("Record: {shown}");
                     let button = ui.add(components::Dropdown::new(palette, &name, &shown, width));
+                    let menu_width = components::menu_width(&button);
                     egui::Popup::menu(&button).show(|ui| {
                         egui::ScrollArea::vertical()
                             .max_height(320.0)
@@ -960,7 +972,8 @@ impl Editor {
                                         palette,
                                         &offered.name,
                                         bar.chosen == Some(offered.source),
-                                    );
+                                    )
+                                    .width(menu_width);
                                     if ui.add(item).clicked() {
                                         asked = Asked::Source(offered.source);
                                     }
@@ -973,85 +986,71 @@ impl Editor {
                             asked = Asked::Camera(choice);
                         }
                     }
-                    ui.add_space(8.0);
-                    let sound_row = |ui: &mut egui::Ui,
-                                     name: &str,
-                                     on: bool,
-                                     source: &Option<Result<MicSource, String>>,
-                                     level: f32|
-                     -> bool {
-                        let clicked = ui.add(SwitchRow::new(palette, name, on)).clicked();
-                        match source {
-                            Some(Ok(_)) => meter(ui, palette, level),
-                            Some(Err(problem)) => {
-                                ui.colored_label(palette.danger, problem);
-                            }
-                            None => {}
-                        }
-                        clicked
-                    };
-                    if sound_row(
-                        ui,
-                        "PC sound",
-                        settings.screen_pc_sound,
-                        &bar.pc_sound,
-                        bar.pc_level,
-                    ) {
-                        asked = Asked::PcSound(!settings.screen_pc_sound);
-                    }
-                    if sound_row(
-                        ui,
-                        "Microphone",
-                        settings.screen_microphone,
-                        &bar.microphone,
-                        bar.microphone_level,
-                    ) {
-                        asked = Asked::Microphone(!settings.screen_microphone);
-                    }
-                    if settings.screen_microphone {
-                        ui.add_space(4.0);
-                        if let Some(name) =
-                            microphone_choice(ui, palette, &bar.microphones, &shown_mic, width)
-                        {
-                            asked = Asked::ChooseMicrophone(name);
-                        }
-                        ui.add_space(4.0);
-                    }
-                    if ui
-                        .add(SwitchRow::new(
+                    ui.add_space(GROUP_GAP);
+                    components::settings_group(ui, palette, "Sound", |ui| {
+                        if sound_switch(
+                            ui,
                             palette,
-                            "Show the mouse pointer",
-                            settings.screen_pointer,
-                        ))
-                        .clicked()
-                    {
-                        asked = Asked::Pointer(!settings.screen_pointer);
-                    }
-                    if ui
-                        .add(SwitchRow::new(
+                            ("PC sound", settings.screen_pc_sound),
+                            bar.pc_sound.as_ref(),
+                            bar.pc_level,
+                        ) {
+                            asked = Asked::PcSound(!settings.screen_pc_sound);
+                        }
+                        components::settings_divider(ui, palette);
+                        if sound_switch(
+                            ui,
                             palette,
-                            "Count down from 3",
-                            settings.countdown,
-                        ))
-                        .clicked()
-                    {
-                        asked = Asked::Countdown(!settings.countdown);
-                    }
-                    ui.horizontal(|ui| {
-                        ui.add_space(12.0);
-                        ui.label("Frame rate");
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            for rate in [60, 30] {
-                                let chosen = settings.screen_frame_rate == rate;
-                                let label = format!("{rate} fps");
-                                let button = ActionButton::new(palette, Kind::Ghost, &label)
-                                    .small()
-                                    .selected(chosen);
-                                if ui.add(button).clicked() && !chosen {
-                                    asked = Asked::FrameRate(rate);
-                                }
+                            ("Microphone", settings.screen_microphone),
+                            bar.microphone.as_ref(),
+                            bar.microphone_level,
+                        ) {
+                            asked = Asked::Microphone(!settings.screen_microphone);
+                        }
+                        // Shown even while it's off, so it can be picked before switching it on.
+                        components::settings_wide_control(ui, |ui, width| {
+                            if let Some(name) =
+                                microphone_choice(ui, palette, &bar.microphones, &shown_mic, width)
+                            {
+                                asked = Asked::ChooseMicrophone(name);
                             }
                         });
+                    });
+                    ui.add_space(GROUP_GAP);
+                    components::settings_group(ui, palette, "Options", |ui| {
+                        let pointer = settings.screen_pointer;
+                        let row =
+                            SwitchRow::new(palette, "Show the mouse pointer", pointer).compact();
+                        if ui.add(row).clicked() {
+                            asked = Asked::Pointer(!pointer);
+                        }
+                        components::settings_divider(ui, palette);
+                        let row = SwitchRow::new(palette, "Count down from 3", settings.countdown)
+                            .compact();
+                        if ui.add(row).clicked() {
+                            asked = Asked::Countdown(!settings.countdown);
+                        }
+                        components::settings_divider(ui, palette);
+                        components::compact_settings_row(
+                            ui,
+                            palette,
+                            "Frame rate",
+                            FRAME_RATE_WIDTH * 2.0 + CONTROL_SPACING,
+                            |ui| {
+                                ui.spacing_mut().item_spacing.x = CONTROL_SPACING;
+                                for rate in [30, 60] {
+                                    let chosen = settings.screen_frame_rate == rate;
+                                    let label = format!("{rate} fps");
+                                    let button = ActionButton::new(palette, Kind::Ghost, &label)
+                                        .small()
+                                        .width(FRAME_RATE_WIDTH)
+                                        .selected(chosen);
+                                    if ui.add(button).clicked() && !chosen {
+                                        asked = Asked::FrameRate(rate);
+                                    }
+                                }
+                            },
+                        );
                     });
                     ui.add_space(8.0);
                     if save_in_row(ui, palette, &folder) {
@@ -1068,7 +1067,7 @@ impl Editor {
                     ui.add_space(12.0);
                     components::dialog_buttons(ui, |ui| {
                         let record = ActionButton::new(palette, Kind::Primary, "Start recording")
-                            .icon(icons::CIRCLE_DOT)
+                            .icon(icons::VIDEO)
                             .width(DIALOG_BUTTON_WIDTH * 1.5);
                         if ui.add_enabled(bar.ready(), record).clicked() {
                             asked = Asked::Record;
@@ -1124,15 +1123,9 @@ impl Editor {
             }
             Asked::Microphone(on) => {
                 self.settings.screen_microphone = on;
-                let microphones = self
-                    .screen_bar
-                    .as_ref()
-                    .map(|bar| bar.microphones.clone())
-                    .unwrap_or_default();
-                let opened =
-                    on.then(|| (self.open_microphone)(self.wanted_microphone(&microphones)));
+                let open = self.open_microphone;
                 if let Some(bar) = &mut self.screen_bar {
-                    bar.microphone = opened;
+                    bar.microphone = on.then(|| open(bar.chosen_microphone.as_deref()));
                 }
                 save(self);
             }

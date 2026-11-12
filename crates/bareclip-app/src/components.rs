@@ -46,6 +46,12 @@ const CHECK_BOX_SIZE: f32 = 20.0;
 const MENU_ITEM_HEIGHT: f32 = 30.0;
 const MENU_WIDTH: f32 = 210.0;
 const MENU_ITEM_PADDING: f32 = 8.0;
+/// How many lines a long name in a menu takes before it is cut short.
+const MENU_ITEM_ROWS: usize = 2;
+const MENU_ICON_SIZE: f32 = 16.0;
+const MENU_ARROW_SIZE: f32 = 14.0;
+/// The room between a menu line's name and its shortcut or arrow.
+const MENU_SHORTCUT_GAP: f32 = 12.0;
 /// The room for the drawing of a shape on a line of a menu.
 const MENU_SHAPE_ROOM: egui::Vec2 = vec2(18.0, 16.0);
 /// How long the pointer rests on something before its note shows, and how the note arrives.
@@ -58,6 +64,8 @@ const NOTE_PADDING: egui::Vec2 = vec2(8.0, 5.0);
 const SETTINGS_CARD_RADIUS: u8 = 8;
 const SETTINGS_ROW_PADDING: f32 = 12.0;
 const SETTINGS_ROW_HEIGHT: f32 = 44.0;
+/// A row in a recording window, where height is short.
+const COMPACT_ROW_HEIGHT: f32 = 36.0;
 const SPOT_BUTTON_SIZE: f32 = 26.0;
 const SETTINGS_ROW_WITH_DETAIL_HEIGHT: f32 = 54.0;
 const SWITCH_SIZE: egui::Vec2 = vec2(34.0, 18.0);
@@ -65,6 +73,9 @@ const SWITCH_SIZE: egui::Vec2 = vec2(34.0, 18.0);
 const INFO_SIZE: f32 = 14.0;
 const SWITCH_KNOB_RADIUS: f32 = 6.0;
 const SWITCH_SECONDS: f32 = 0.12;
+const SIDE_TAB_HEIGHT: f32 = 36.0;
+/// How wide a level meter is when it sits beside a switch.
+pub const METER_BESIDE_SWITCH: f32 = 120.0;
 
 /// How much attention a button asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -542,6 +553,7 @@ pub struct MenuItem<'a> {
     detail: &'a str,
     /// Leaves room for a tick before the symbol, and whether it is ticked.
     tick: Option<bool>,
+    width: Option<f32>,
 }
 
 impl<'a> MenuItem<'a> {
@@ -555,7 +567,14 @@ impl<'a> MenuItem<'a> {
             shape: None,
             detail: "",
             tick: None,
+            width: None,
         }
+    }
+
+    /// Takes this width rather than the usual one, such as a dropdown's, from [`menu_width`].
+    pub fn width(mut self, width: f32) -> Self {
+        self.width = Some(width);
+        self
     }
 
     /// One choice among several that has a symbol of its own, with a tick before it if it is the
@@ -586,6 +605,7 @@ impl<'a> MenuItem<'a> {
             shape: None,
             detail: "",
             tick: None,
+            width: None,
         }
     }
 
@@ -613,11 +633,73 @@ fn menu_shape_size((width, height): (u32, u32)) -> egui::Vec2 {
     vec2(width * scale, height * scale)
 }
 
+/// Where a menu line's words start, after any tick, symbol and drawing of a shape.
+fn menu_text_left(tick: bool, shape: bool) -> f32 {
+    let mut left = MENU_ITEM_PADDING + MENU_ICON_SIZE + ICON_GAP + 2.0;
+    if tick {
+        left += MENU_ICON_SIZE + ICON_GAP;
+    }
+    if shape {
+        left += MENU_SHAPE_ROOM.x + ICON_GAP + 2.0;
+    }
+    left
+}
+
+/// A menu line's name and any detail after it, going onto a second line rather than past the
+/// menu's edge, and cut short with an ellipsis after that.
+fn menu_words(
+    ui: &Ui,
+    (label, detail): (&str, &str),
+    detail_colour: Color32,
+    room: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let font = FontId::new(13.0, FontFamily::Proportional);
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        label,
+        0.0,
+        egui::TextFormat::simple(font.clone(), Color32::PLACEHOLDER),
+    );
+    if !detail.is_empty() {
+        job.append(detail, 5.0, egui::TextFormat::simple(font, detail_colour));
+    }
+    job.wrap.max_width = room;
+    job.wrap.max_rows = MENU_ITEM_ROWS;
+    job.wrap.overflow_character = Some('…');
+    ui.painter().layout_job(job)
+}
+
 impl Widget for MenuItem<'_> {
     fn ui(self, ui: &mut Ui) -> Response {
-        let size = vec2(MENU_WIDTH, MENU_ITEM_HEIGHT);
-        let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-        let enabled = response.enabled();
+        let palette = self.palette;
+        let width = self.width.unwrap_or(MENU_WIDTH).max(MENU_WIDTH);
+        let enabled = ui.is_enabled();
+        let shortcut_colour = if enabled {
+            palette.text_muted
+        } else {
+            look(palette, Kind::Ghost, State::Disabled).content
+        };
+        let shortcut_font = FontId::new(12.0, FontFamily::Proportional);
+        let shortcut_room = if self.shortcut.is_empty() {
+            0.0
+        } else {
+            let shortcut = ui.painter().layout_no_wrap(
+                self.shortcut.to_owned(),
+                shortcut_font.clone(),
+                shortcut_colour,
+            );
+            shortcut.size().x + MENU_SHORTCUT_GAP
+        };
+        let arrow_room = if self.opens_more {
+            MENU_ARROW_SIZE + MENU_SHORTCUT_GAP
+        } else {
+            0.0
+        };
+        let text_left = menu_text_left(self.tick.is_some(), self.shape.is_some());
+        let room = (width - text_left - MENU_ITEM_PADDING - shortcut_room - arrow_room).max(24.0);
+        let words = menu_words(ui, (self.label, self.detail), shortcut_colour, room);
+        let height = MENU_ITEM_HEIGHT.max(words.size().y + MENU_ITEM_PADDING * 1.5);
+        let (rect, mut response) = ui.allocate_exact_size(vec2(width, height), Sense::click());
         let label = self.label;
         let (detail, chosen) = (self.detail, self.icon.is_some());
         let tick = self.tick;
@@ -635,10 +717,9 @@ impl Widget for MenuItem<'_> {
             }
         });
         if ui.is_rect_visible(rect) {
-            let palette = self.palette;
             let look = look(palette, Kind::Ghost, state_of(&response));
             paint_box(ui, rect, f32::from(RADIUS), &look, &response, palette);
-            let icon_size = 16.0;
+            let icon_size = MENU_ICON_SIZE;
             let mut left = rect.left() + MENU_ITEM_PADDING;
             if let Some(ticked) = self.tick {
                 if ticked {
@@ -659,10 +740,9 @@ impl Widget for MenuItem<'_> {
                     look.content,
                 );
             }
-            let font = FontId::new(13.0, FontFamily::Proportional);
-            let mut text_left = left + icon_size + ICON_GAP + 2.0;
             if let Some(shape) = self.shape {
-                let middle = pos2(text_left + MENU_SHAPE_ROOM.x / 2.0, rect.center().y);
+                let shape_left = left + icon_size + ICON_GAP + 2.0;
+                let middle = pos2(shape_left + MENU_SHAPE_ROOM.x / 2.0, rect.center().y);
                 let drawing = Rect::from_center_size(middle, menu_shape_size(shape));
                 if chosen {
                     ui.painter().rect_filled(drawing, 2.0, look.content);
@@ -674,36 +754,21 @@ impl Widget for MenuItem<'_> {
                         StrokeKind::Inside,
                     );
                 }
-                text_left += MENU_SHAPE_ROOM.x + ICON_GAP + 2.0;
             }
-            let name = ui.painter().text(
-                pos2(text_left, rect.center().y),
-                Align2::LEFT_CENTER,
-                label,
-                font.clone(),
-                look.content,
+            let words_at = pos2(
+                rect.left() + text_left,
+                rect.center().y - words.size().y / 2.0,
             );
-            let shortcut = if enabled {
-                palette.text_muted
-            } else {
-                look.content
-            };
-            ui.painter().text(
-                pos2(name.right() + 5.0, rect.center().y),
-                Align2::LEFT_CENTER,
-                detail,
-                font,
-                shortcut,
-            );
+            ui.painter().galley(words_at, words.clone(), look.content);
             ui.painter().text(
                 pos2(rect.right() - MENU_ITEM_PADDING, rect.center().y),
                 Align2::RIGHT_CENTER,
                 self.shortcut,
-                FontId::new(12.0, FontFamily::Proportional),
-                shortcut,
+                shortcut_font,
+                shortcut_colour,
             );
             if self.opens_more {
-                let arrow_size = 14.0;
+                let arrow_size = MENU_ARROW_SIZE;
                 icons::paint(
                     ui.painter(),
                     icons::square_at(
@@ -718,8 +783,17 @@ impl Widget for MenuItem<'_> {
                 );
             }
         }
+        if words.elided {
+            response = response.on_hover_text(label);
+        }
         response
     }
+}
+
+/// How wide a dropdown's menu lines are, so the menu lines up with the dropdown itself.
+pub fn menu_width(dropdown: &Response) -> f32 {
+    let margin = dropdown.ctx.global_style().spacing.menu_margin.sum().x;
+    (dropdown.rect.width() - margin).max(MENU_WIDTH)
 }
 
 /// Explains something once the pointer has rested on it, the way a clip's name arrives: a wait,
@@ -784,6 +858,7 @@ pub struct SwitchRow<'a> {
     on: bool,
     info: bool,
     width: Option<f32>,
+    height: f32,
 }
 
 impl<'a> SwitchRow<'a> {
@@ -794,7 +869,14 @@ impl<'a> SwitchRow<'a> {
             on,
             info: false,
             width: None,
+            height: SETTINGS_ROW_HEIGHT,
         }
+    }
+
+    /// A shorter row, for a window that needs to save height, such as a recording's.
+    pub fn compact(mut self) -> Self {
+        self.height = COMPACT_ROW_HEIGHT;
+        self
     }
 
     /// Keeps to this width rather than taking all there is, which in a menu is a great deal.
@@ -814,7 +896,7 @@ impl Widget for SwitchRow<'_> {
     fn ui(self, ui: &mut Ui) -> Response {
         let size = vec2(
             self.width.unwrap_or_else(|| ui.available_width()),
-            SETTINGS_ROW_HEIGHT,
+            self.height,
         );
         let (rect, response) = ui.allocate_exact_size(size, Sense::click());
         let (name, on) = (self.name, self.on);
@@ -922,6 +1004,39 @@ pub fn settings_row(
     } else {
         SETTINGS_ROW_HEIGHT
     };
+    row_with_control(
+        ui,
+        palette,
+        (name, detail),
+        (control_width, height),
+        add_control,
+    );
+}
+
+/// A [`settings_row`] as short as a [`SwitchRow::compact`], with no explanation.
+pub fn compact_settings_row(
+    ui: &mut Ui,
+    palette: &Palette,
+    name: &str,
+    control_width: f32,
+    add_control: impl FnOnce(&mut Ui),
+) {
+    row_with_control(
+        ui,
+        palette,
+        (name, None),
+        (control_width, COMPACT_ROW_HEIGHT),
+        add_control,
+    );
+}
+
+fn row_with_control(
+    ui: &mut Ui,
+    palette: &Palette,
+    (name, detail): (&str, Option<&str>),
+    (control_width, height): (f32, f32),
+    add_control: impl FnOnce(&mut Ui),
+) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
     let left = rect.left() + SETTINGS_ROW_PADDING;
     let name_y = rect.center().y - if detail.is_some() { 9.0 } else { 0.0 };
@@ -962,6 +1077,53 @@ pub fn settings_divider(ui: &mut Ui, palette: &Palette) {
         rect.center().y,
         Stroke::new(1.0, palette.border),
     );
+}
+
+/// Quieter words under a row of a group of settings, lined up with its name and going onto more
+/// lines rather than past the card's edge.
+pub fn settings_note(ui: &mut Ui, palette: &Palette, note: &str, colour: Option<Color32>) {
+    let room = egui::Margin {
+        left: SETTINGS_ROW_PADDING as i8,
+        right: SETTINGS_ROW_PADDING as i8,
+        top: 0,
+        bottom: 8,
+    };
+    egui::Frame::new().inner_margin(room).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(note)
+                    .size(12.0)
+                    .color(colour.unwrap_or(palette.text_muted)),
+            )
+            .wrap(),
+        );
+    });
+}
+
+/// A control that fills a row of a group of settings, inside the row's padding, such as a
+/// dropdown under a switch.
+pub fn settings_wide_control(ui: &mut Ui, add: impl FnOnce(&mut Ui, f32)) {
+    let room = egui::Margin {
+        left: SETTINGS_ROW_PADDING as i8,
+        right: SETTINGS_ROW_PADDING as i8,
+        top: 0,
+        bottom: 10,
+    };
+    egui::Frame::new().inner_margin(room).show(ui, |ui| {
+        let width = ui.available_width();
+        add(ui, width);
+    });
+}
+
+/// The room just before a [`SwitchRow`]'s switch, `width` wide and as tall as `height`, for
+/// something that belongs with it, such as how loud it is.
+pub fn beside_switch(row: Rect, width: f32, height: f32) -> Rect {
+    let right = row.right() - SETTINGS_ROW_PADDING - SWITCH_SIZE.x - 12.0;
+    Rect::from_min_max(
+        pos2(right - width, row.center().y - height / 2.0),
+        pos2(right, row.center().y + height / 2.0),
+    )
 }
 
 /// A round colour to pick, with a ring around the chosen one. It shows the colour itself, so it
@@ -1189,10 +1351,22 @@ impl<'a> Dropdown<'a> {
 impl Widget for Dropdown<'_> {
     fn ui(self, ui: &mut Ui) -> Response {
         let size = vec2(self.width, SMALL_BUTTON_HEIGHT + 4.0);
-        let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+        let (rect, mut response) = ui.allocate_exact_size(size, Sense::click());
         let enabled = response.enabled();
         let name = self.name;
         response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, name));
+        let icon_size = 14.0;
+        // The choice is cut short before the arrow rather than running under it.
+        let mut job = egui::text::LayoutJob::simple_singleline(
+            self.current.to_owned(),
+            FontId::new(12.0, FontFamily::Proportional),
+            self.palette.text,
+        );
+        job.wrap.max_width = (self.width - NAME_BAR_PADDING * 2.0 - icon_size - ICON_GAP).max(0.0);
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        job.wrap.overflow_character = Some('…');
+        let words = ui.painter().layout_job(job);
         if ui.is_rect_visible(rect) {
             let palette = self.palette;
             let border = if response.hovered() || response.has_focus() {
@@ -1207,14 +1381,14 @@ impl Widget for Dropdown<'_> {
                 Stroke::new(1.0, border),
                 StrokeKind::Inside,
             );
-            ui.painter().text(
-                pos2(rect.left() + NAME_BAR_PADDING, rect.center().y),
-                Align2::LEFT_CENTER,
-                self.current,
-                FontId::new(12.0, FontFamily::Proportional),
+            ui.painter().galley(
+                pos2(
+                    rect.left() + NAME_BAR_PADDING,
+                    rect.center().y - words.size().y / 2.0,
+                ),
+                words.clone(),
                 palette.text,
             );
-            let icon_size = 14.0;
             icons::paint(
                 ui.painter(),
                 icons::square_at(
@@ -1228,6 +1402,100 @@ impl Widget for Dropdown<'_> {
                 palette.text_muted,
             );
         }
+        if words.elided {
+            response = response.on_hover_text(self.current);
+        }
+        response
+    }
+}
+
+/// A tab in a list down the side of a dialog, with its symbol before its label. `name` is what
+/// screen readers are told, which can say more than the label.
+pub struct SideTab<'a> {
+    palette: &'a Palette,
+    icon: Icon,
+    label: &'a str,
+    name: &'a str,
+    selected: bool,
+}
+
+impl<'a> SideTab<'a> {
+    pub fn new(
+        palette: &'a Palette,
+        icon: Icon,
+        (label, name): (&'a str, &'a str),
+        selected: bool,
+    ) -> Self {
+        Self {
+            palette,
+            icon,
+            label,
+            name,
+            selected,
+        }
+    }
+}
+
+impl Widget for SideTab<'_> {
+    fn ui(self, ui: &mut Ui) -> Response {
+        let size = vec2(ui.available_width(), SIDE_TAB_HEIGHT);
+        let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+        let (label, name, selected) = (self.label, self.name, self.selected);
+        response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, selected, name));
+        if !ui.is_rect_visible(rect) {
+            return response;
+        }
+        let palette = self.palette;
+        let state = state_of(&response);
+        // Picked like a rail tab: a raised card with the accent's bar down its edge.
+        let fill = match state {
+            State::Pressed => palette.text.gamma_multiply(GHOST_PRESSED),
+            State::Hover if !selected => palette.text.gamma_multiply(GHOST_HOVER),
+            _ if selected => palette.raised,
+            _ => Color32::TRANSPARENT,
+        };
+        let (symbol_colour, text_colour) = if selected {
+            (palette.accent, palette.text)
+        } else if state == State::Rest {
+            (palette.text_muted, palette.text_muted)
+        } else {
+            (palette.text, palette.text)
+        };
+        let look = Look {
+            fill,
+            stroke: Stroke::NONE,
+            content: text_colour,
+        };
+        paint_box(ui, rect, f32::from(RADIUS), &look, &response, palette);
+        if selected {
+            ui.painter().rect_filled(
+                Rect::from_min_size(
+                    rect.left_top() + vec2(0.0, 8.0),
+                    vec2(3.0, rect.height() - 16.0),
+                ),
+                1.0,
+                palette.accent,
+            );
+        }
+        let symbol = 16.0;
+        let left = rect.left() + SETTINGS_ROW_PADDING;
+        icons::paint(
+            ui.painter(),
+            icons::square_at(pos2(left + symbol / 2.0, rect.center().y), symbol),
+            &self.icon,
+            symbol_colour,
+        );
+        ui.painter().text(
+            pos2(left + symbol + ICON_GAP + 2.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            label,
+            if selected {
+                fonts::strong(13.0)
+            } else {
+                FontId::new(13.0, FontFamily::Proportional)
+            },
+            text_colour,
+        );
         response
     }
 }
@@ -1330,6 +1598,19 @@ pub fn dialog_buttons(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     ui.allocate_ui_with_layout(size, Layout::right_to_left(Align::Center), |ui| {
         ui.spacing_mut().item_spacing.x = DIALOG_BUTTON_SPACING;
         add(ui);
+    });
+}
+
+/// A dialog's bottom row: quieter words on the left and its buttons on the right, both centred
+/// on the same line.
+pub fn dialog_footer(ui: &mut Ui, palette: &Palette, note: &str, add: impl FnOnce(&mut Ui)) {
+    let size = vec2(ui.available_width(), BUTTON_HEIGHT);
+    ui.allocate_ui_with_layout(size, Layout::left_to_right(Align::Center), |ui| {
+        ui.colored_label(palette.text_muted, note);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = DIALOG_BUTTON_SPACING;
+            add(ui);
+        });
     });
 }
 

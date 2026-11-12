@@ -17,14 +17,18 @@ use bareclip_capture::{
 use bareclip_media::Quality;
 
 use super::recording::{
-    MicSource, local_time, meter, meter_fill, pause_button, recording_name, save_in_row,
-    shown_microphone, stop_button, time_label, unused_path,
+    GROUP_GAP, HEADPHONES_NOTE, MicSource, local_time, meter, meter_fill, pause_button,
+    recording_name, save_in_row, shown_microphone, sound_switch, stop_button, time_label,
+    unused_path,
 };
 use super::screen_recording::shrunk;
 use super::*;
 use crate::storage::RecordingMarker;
 
 const CAMERA_BAR_WIDTH: f32 = 420.0;
+/// How much of the line the camera's size takes, beside the camera's name.
+const SIZE_SHARE: f32 = 0.42;
+const CAMERA_CHOICE_GAP: f32 = 8.0;
 const PREVIEW_HEIGHT: f32 = 150.0;
 /// How often the live picture is redrawn, in seconds, smooth enough to see yourself move.
 const PREVIEW_EVERY: f64 = 0.04;
@@ -215,41 +219,54 @@ pub(super) fn camera_choices(
         }
         return asked;
     }
-    let shown = pick.chosen_name();
-    let name = format!("Camera: {shown}");
-    let button = ui.add(components::Dropdown::new(palette, &name, &shown, width));
-    egui::Popup::menu(&button).show(|ui| {
-        for camera in &pick.cameras {
-            let item = MenuItem::choice(palette, &camera.name, camera.name == shown);
-            if ui.add(item).clicked() {
-                asked = Some(CameraAsk::Camera(camera.name.clone()));
-            }
-        }
-    });
-    ui.add_space(6.0);
-    let (modes, mode) = match pick.state() {
-        CameraState::Running { modes, mode } => (modes, Some(mode)),
-        _ => (Vec::new(), None),
-    };
-    let shown = mode.map_or_else(|| "Waiting for the camera".to_owned(), |mode| mode.label());
-    let name = format!("Size: {shown}");
-    let button = ui.add_enabled(
-        mode.is_some(),
-        components::Dropdown::new(palette, &name, &shown, width),
-    );
-    egui::Popup::menu(&button).show(|ui| {
-        egui::ScrollArea::vertical()
-            .max_height(280.0)
-            .show(ui, |ui| {
-                for offered in &modes {
-                    let chosen = mode.is_some_and(|mode| mode == *offered);
-                    let label = offered.label();
-                    let item = MenuItem::choice(palette, &label, chosen);
-                    if ui.add(item).clicked() && !chosen {
-                        asked = Some(CameraAsk::Mode(*offered));
-                    }
+    // The camera and its size share a line, since each is short.
+    let size_width = (width * SIZE_SHARE).round();
+    let camera_width = width - size_width - CAMERA_CHOICE_GAP;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = CAMERA_CHOICE_GAP;
+        let shown = pick.chosen_name();
+        let name = format!("Camera: {shown}");
+        let button = ui.add(components::Dropdown::new(
+            palette,
+            &name,
+            &shown,
+            camera_width,
+        ));
+        let menu_width = components::menu_width(&button);
+        egui::Popup::menu(&button).show(|ui| {
+            for camera in &pick.cameras {
+                let item =
+                    MenuItem::choice(palette, &camera.name, camera.name == shown).width(menu_width);
+                if ui.add(item).clicked() {
+                    asked = Some(CameraAsk::Camera(camera.name.clone()));
                 }
-            });
+            }
+        });
+        let (modes, mode) = match pick.state() {
+            CameraState::Running { modes, mode } => (modes, Some(mode)),
+            _ => (Vec::new(), None),
+        };
+        let shown = mode.map_or_else(|| "Waiting for the camera".to_owned(), |mode| mode.label());
+        let name = format!("Size: {shown}");
+        let button = ui.add_enabled(
+            mode.is_some(),
+            components::Dropdown::new(palette, &name, &shown, size_width),
+        );
+        let menu_width = components::menu_width(&button);
+        egui::Popup::menu(&button).show(|ui| {
+            egui::ScrollArea::vertical()
+                .max_height(280.0)
+                .show(ui, |ui| {
+                    for offered in &modes {
+                        let chosen = mode.is_some_and(|mode| mode == *offered);
+                        let label = offered.label();
+                        let item = MenuItem::choice(palette, &label, chosen).width(menu_width);
+                        if ui.add(item).clicked() && !chosen {
+                            asked = Some(CameraAsk::Mode(*offered));
+                        }
+                    }
+                });
+        });
     });
     asked
 }
@@ -265,9 +282,11 @@ pub(super) fn microphone_choice(
     let mut picked = None;
     let name = format!("Microphone: {shown}");
     let button = ui.add(components::Dropdown::new(palette, &name, shown, width));
+    let menu_width = components::menu_width(&button);
     egui::Popup::menu(&button).show(|ui| {
         for microphone in microphones {
-            let item = MenuItem::choice(palette, &microphone.name, microphone.name == shown);
+            let item = MenuItem::choice(palette, &microphone.name, microphone.name == shown)
+                .width(menu_width);
             if ui.add(item).clicked() {
                 picked = Some(microphone.name.clone());
             }
@@ -338,6 +357,9 @@ impl LiveCamera {
 pub(super) struct CameraBar {
     pick: CameraPick,
     microphones: Vec<Microphone>,
+    /// The microphone picked for this recording, starting on Settings' default. `None` is
+    /// Windows' default.
+    chosen_microphone: Option<String>,
     microphone: Option<Result<MicSource, String>>,
     microphone_level: f32,
     /// A folder picked with Browse for this recording only.
@@ -355,13 +377,15 @@ impl Editor {
     pub(super) fn open_camera_bar(&mut self) {
         let cameras = (self.list_cameras)();
         let microphones = (self.list_microphones)();
+        let wanted = self.default_microphone(&microphones);
         let microphone = self
             .settings
             .camera_microphone
-            .then(|| (self.open_microphone)(self.wanted_microphone(&microphones)));
+            .then(|| (self.open_microphone)(wanted.as_deref()));
         self.camera_bar = Some(CameraBar {
             pick: CameraPick::new(cameras),
             microphones,
+            chosen_microphone: wanted,
             microphone,
             microphone_level: 0.0,
             folder: None,
@@ -370,9 +394,10 @@ impl Editor {
         self.open_chosen_camera();
     }
 
-    /// The microphone picked before, if it's still plugged in, or `None` for Windows' default.
-    pub(super) fn wanted_microphone<'a>(&'a self, microphones: &[Microphone]) -> Option<&'a str> {
-        self.settings.microphone.as_deref().filter(|name| {
+    /// Settings' default microphone, if it's plugged in, or `None` for Windows' default. Every
+    /// recording window starts on it.
+    pub(super) fn default_microphone(&self, microphones: &[Microphone]) -> Option<String> {
+        self.settings.microphone.clone().filter(|name| {
             microphones
                 .iter()
                 .any(|microphone| microphone.name == *name)
@@ -380,7 +405,7 @@ impl Editor {
     }
 
     /// The camera choices of whichever bar is open: the camera's, or the screen and camera's.
-    fn camera_pick(&mut self) -> Option<&mut CameraPick> {
+    pub(super) fn camera_pick(&mut self) -> Option<&mut CameraPick> {
         if let Some(bar) = &mut self.camera_bar {
             return Some(&mut bar.pick);
         }
@@ -426,26 +451,27 @@ impl Editor {
     fn set_camera_microphone(&mut self, on: bool) {
         self.settings.camera_microphone = on;
         self.save_settings();
-        let microphones = self
-            .camera_bar
-            .as_ref()
-            .map(|bar| bar.microphones.clone())
-            .unwrap_or_default();
-        let opened = on.then(|| (self.open_microphone)(self.wanted_microphone(&microphones)));
+        let open = self.open_microphone;
         if let Some(bar) = &mut self.camera_bar {
+            let opened = on.then(|| open(bar.chosen_microphone.as_deref()));
             // The old one stops being listened to as it's replaced.
             bar.microphone = opened;
             bar.microphone_level = 0.0;
         }
     }
 
+    /// Picks a microphone for this recording only, and listens to it if it's switched on.
+    /// Settings' default stays as it is.
     fn choose_camera_microphone(&mut self, name: String) {
-        self.settings.microphone = Some(name.clone());
-        self.save_settings();
-        let opened = (self.open_microphone)(Some(&name));
+        let open = self.open_microphone;
+        let on = self.settings.camera_microphone;
         if let Some(bar) = &mut self.camera_bar {
-            bar.microphone = Some(opened);
-            bar.microphone_level = 0.0;
+            if on {
+                // The old one stops being listened to as it's replaced.
+                bar.microphone = Some(open(Some(&name)));
+                bar.microphone_level = 0.0;
+            }
+            bar.chosen_microphone = Some(name);
         }
     }
 
@@ -679,7 +705,7 @@ impl Editor {
             _ => None,
         };
         let settings = self.settings.clone();
-        let shown_mic = shown_microphone(settings.microphone.as_ref(), &bar.microphones);
+        let shown_mic = shown_microphone(bar.chosen_microphone.as_ref(), &bar.microphones);
         let folder = bar
             .folder
             .clone()
@@ -763,49 +789,44 @@ impl Editor {
                     if let Some(choice) = camera_choices(ui, palette, &bar.pick, width) {
                         asked = Asked::Camera(choice);
                     }
-                    ui.add_space(8.0);
-                    let microphone_row = SwitchRow::new(
-                        palette,
-                        "Record the microphone",
-                        settings.camera_microphone,
-                    );
-                    if ui.add(microphone_row).clicked() {
-                        asked = Asked::Microphone(!settings.camera_microphone);
-                    }
-                    if settings.camera_microphone {
-                        if let Some(name) =
-                            microphone_choice(ui, palette, &bar.microphones, &shown_mic, width)
-                        {
-                            asked = Asked::ChooseMicrophone(name);
+                    ui.add_space(GROUP_GAP);
+                    components::settings_group(ui, palette, "Sound", |ui| {
+                        if sound_switch(
+                            ui,
+                            palette,
+                            ("Record the microphone", settings.camera_microphone),
+                            bar.microphone.as_ref(),
+                            bar.microphone_level,
+                        ) {
+                            asked = Asked::Microphone(!settings.camera_microphone);
                         }
-                        ui.add_space(6.0);
-                        match &bar.microphone {
-                            Some(Err(problem)) => {
-                                ui.colored_label(palette.danger, problem);
+                        // Shown even while it's off, so it can be picked before switching it on.
+                        components::settings_wide_control(ui, |ui, width| {
+                            if let Some(name) =
+                                microphone_choice(ui, palette, &bar.microphones, &shown_mic, width)
+                            {
+                                asked = Asked::ChooseMicrophone(name);
                             }
-                            _ => meter(ui, palette, bar.microphone_level),
+                        });
+                    });
+                    ui.add_space(GROUP_GAP);
+                    components::settings_group(ui, palette, "Options", |ui| {
+                        let along = settings.play_while_recording;
+                        let row = SwitchRow::new(palette, "Play the video while recording", along)
+                            .compact();
+                        if ui.add(row).clicked() {
+                            asked = Asked::PlayAlong(!along);
                         }
-                        ui.add_space(6.0);
-                    }
-                    let row = SwitchRow::new(
-                        palette,
-                        "Play the video while recording",
-                        settings.play_while_recording,
-                    );
-                    if ui.add(row).clicked() {
-                        asked = Asked::PlayAlong(!settings.play_while_recording);
-                    }
-                    let row = SwitchRow::new(palette, "Count down from 3", settings.countdown);
-                    if ui.add(row).clicked() {
-                        asked = Asked::Countdown(!settings.countdown);
-                    }
-                    if settings.play_while_recording && settings.camera_microphone {
-                        ui.add_space(4.0);
-                        ui.colored_label(
-                            palette.text_muted,
-                            "Wear headphones, or the microphone will hear the video too.",
-                        );
-                    }
+                        if along && settings.camera_microphone {
+                            components::settings_note(ui, palette, HEADPHONES_NOTE, None);
+                        }
+                        components::settings_divider(ui, palette);
+                        let row = SwitchRow::new(palette, "Count down from 3", settings.countdown)
+                            .compact();
+                        if ui.add(row).clicked() {
+                            asked = Asked::Countdown(!settings.countdown);
+                        }
+                    });
                     ui.add_space(8.0);
                     if save_in_row(ui, palette, &folder) {
                         asked = Asked::Browse;
@@ -813,7 +834,7 @@ impl Editor {
                     ui.add_space(12.0);
                     components::dialog_buttons(ui, |ui| {
                         let record = ActionButton::new(palette, Kind::Primary, "Start recording")
-                            .icon(icons::CIRCLE_DOT)
+                            .icon(icons::VIDEO)
                             .width(DIALOG_BUTTON_WIDTH * 1.5);
                         let ready = matches!(state, CameraState::Running { .. });
                         if ui.add_enabled(ready, record).clicked() {

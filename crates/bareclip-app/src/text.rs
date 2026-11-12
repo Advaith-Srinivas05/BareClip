@@ -268,6 +268,17 @@ pub fn version_line() -> String {
 /// The choice that leaves the graphics chip to BareClip.
 pub const AUTOMATIC_GPU: &str = "Automatic";
 
+/// Said when Restart now couldn't open BareClip again, before the reason.
+pub const RESTART_FAILED: &str =
+    "BareClip couldn't open itself again, so it stays open. Close it and open it to switch chips.";
+
+/// The default microphone choice that follows Windows' own default.
+pub const WINDOWS_DEFAULT_MICROPHONE: &str = "Windows default";
+
+/// The line under the default microphone, if the one picked isn't plugged in.
+pub const DEFAULT_MICROPHONE_GONE: &str =
+    "It isn't plugged in now, so recordings start on Windows' default until it is.";
+
 /// The line under the graphics chip choice. `pending` names a choice not yet in use, and `gone`
 /// says the picked chip isn't in this PC any more.
 pub fn gpu_note(running: &str, pending: Option<&str>, gone: bool) -> String {
