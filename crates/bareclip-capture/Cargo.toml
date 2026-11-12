@@ -6,9 +6,12 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+bareclip-audio.workspace = true
 bareclip-media.workspace = true
 rtrb.workspace = true
 windows.workspace = true
+windows-core.workspace = true
 
 [dev-dependencies]
+cpal.workspace = true
 ffmpeg-next.workspace = true

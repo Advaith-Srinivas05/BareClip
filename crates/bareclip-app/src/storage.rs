@@ -8,6 +8,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+pub use crate::hotkeys::Shortcut;
 use bareclip_core::{
     project::{ProjectFile, write_atomic},
     splice::CutMode,
@@ -97,6 +98,76 @@ impl From<GpuId> for GpuChoice {
     }
 }
 
+/// How much detail a recording keeps, named as in the export window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingQuality {
+    MatchSource,
+    #[default]
+    Balanced,
+    Smaller,
+}
+
+impl RecordingQuality {
+    pub const ALL: [Self; 3] = [Self::MatchSource, Self::Balanced, Self::Smaller];
+}
+
+impl From<RecordingQuality> for bareclip_media::Quality {
+    fn from(quality: RecordingQuality) -> Self {
+        match quality {
+            RecordingQuality::MatchSource => Self::MatchSource,
+            RecordingQuality::Balanced => Self::Balanced,
+            RecordingQuality::Smaller => Self::Smaller,
+        }
+    }
+}
+
+/// How large a screen recording is: the size of what is recorded, or smaller, named by its
+/// shorter side.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingSize {
+    #[default]
+    Full,
+    P1080,
+    P720,
+    P480,
+}
+
+impl RecordingSize {
+    pub const ALL: [Self; 4] = [Self::Full, Self::P1080, Self::P720, Self::P480];
+
+    /// The shorter side it shrinks to, or `None` for the full size.
+    pub fn shorter_side(self) -> Option<u32> {
+        match self {
+            Self::Full => None,
+            Self::P1080 => Some(1080),
+            Self::P720 => Some(720),
+            Self::P480 => Some(480),
+        }
+    }
+
+    /// Whether it makes something of this size smaller. The full size always fits.
+    pub fn fits(self, source: (u32, u32)) -> bool {
+        self.shorter_side()
+            .is_none_or(|shorter| shorter < source.0.min(source.1))
+    }
+
+    /// What it means for something of this size: the size to record at, keeping its shape, or
+    /// `None` for its own size, which is also what a size too large for it gives.
+    pub fn video_size(self, source: (u32, u32)) -> Option<(u32, u32)> {
+        let shorter = self.shorter_side()?;
+        self.fits(source)
+            .then(|| bareclip_export::size_with_shorter_side(source, shorter))
+    }
+
+    /// What it means for something of this size, falling back to the full size where it's too
+    /// large, as a menu shows it.
+    pub fn for_source(self, source: (u32, u32)) -> Self {
+        if self.fits(source) { self } else { Self::Full }
+    }
+}
+
 /// A camera's size and frame rate, as picked in the camera's recording bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CameraModeChoice {
@@ -161,6 +232,17 @@ pub struct Settings {
     pub camera_mode: Option<CameraModeChoice>,
     /// Whether a camera recording takes the microphone too.
     pub camera_microphone: bool,
+    /// The quality every screen and camera recording starts on.
+    pub recording_quality: RecordingQuality,
+    /// The size every screen recording starts on.
+    pub screen_size: RecordingSize,
+    /// Whether recording one window takes only its program's sound rather than all PC sound.
+    pub screen_app_sound_only: bool,
+    /// The keys that stop and pause a screen recording, and turn its microphone on or off, from
+    /// any program.
+    pub stop_key: Shortcut,
+    pub pause_key: Shortcut,
+    pub microphone_key: Shortcut,
 }
 
 impl Default for Settings {
@@ -183,6 +265,12 @@ impl Default for Settings {
             camera: None,
             camera_mode: None,
             camera_microphone: true,
+            recording_quality: RecordingQuality::Balanced,
+            screen_size: RecordingSize::Full,
+            screen_app_sound_only: true,
+            stop_key: Shortcut::STOP,
+            pause_key: Shortcut::PAUSE,
+            microphone_key: Shortcut::MICROPHONE,
         }
     }
 }
@@ -515,11 +603,70 @@ mod tests {
                 rate: (10_000_000, 333_333),
             }),
             camera_microphone: false,
+            recording_quality: RecordingQuality::Smaller,
+            screen_size: RecordingSize::P720,
+            screen_app_sound_only: false,
+            stop_key: Shortcut {
+                ctrl: false,
+                alt: false,
+                shift: false,
+                key: 0x78,
+            },
+            pause_key: Shortcut {
+                ctrl: true,
+                alt: true,
+                shift: false,
+                key: u32::from(b'9'),
+            },
+            microphone_key: Shortcut {
+                ctrl: false,
+                alt: true,
+                shift: false,
+                key: 0x7B,
+            },
         };
 
         settings.save(&folder).expect("they can be saved");
 
         assert_eq!(Settings::load(&folder), settings);
+    }
+
+    #[test]
+    fn a_smaller_recording_size_keeps_the_shape_and_never_grows() {
+        let screen = (2560, 1440);
+        assert_eq!(RecordingSize::Full.video_size(screen), None);
+        assert_eq!(RecordingSize::P1080.video_size(screen), Some((1920, 1080)));
+        assert_eq!(RecordingSize::P720.video_size(screen), Some((1280, 720)));
+        assert_eq!(RecordingSize::P480.video_size(screen), Some((854, 480)));
+        // An odd-shaped window keeps its shape, at even sizes.
+        assert_eq!(
+            RecordingSize::P480.video_size((1000, 601)),
+            Some((798, 480))
+        );
+        // A size as large as what's recorded, or larger, means its own size.
+        let laptop = (1920, 1080);
+        assert!(!RecordingSize::P1080.fits(laptop));
+        assert_eq!(RecordingSize::P1080.video_size(laptop), None);
+        assert_eq!(RecordingSize::P1080.for_source(laptop), RecordingSize::Full);
+        assert_eq!(RecordingSize::P720.for_source(laptop), RecordingSize::P720);
+        assert!(RecordingSize::Full.fits((2, 2)));
+    }
+
+    #[test]
+    fn recording_quality_is_the_export_windows_quality() {
+        use bareclip_media::Quality;
+        let qualities: Vec<Quality> = RecordingQuality::ALL.into_iter().map(Into::into).collect();
+        assert_eq!(qualities, Quality::ALL);
+        assert_eq!(RecordingQuality::default(), RecordingQuality::Balanced);
+    }
+
+    #[test]
+    fn the_recording_keys_start_where_they_always_were() {
+        let settings = Settings::default();
+        assert_eq!(settings.stop_key.name(), "Ctrl+Alt+Shift+R");
+        assert_eq!(settings.pause_key.name(), "Ctrl+Alt+Shift+P");
+        assert_eq!(settings.microphone_key.name(), "Ctrl+Alt+Shift+M");
+        assert!(settings.screen_app_sound_only);
     }
 
     #[test]

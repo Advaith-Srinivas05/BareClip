@@ -274,6 +274,60 @@ pub const RESTART_FAILED: &str =
 
 /// The default microphone choice that follows Windows' own default.
 pub const WINDOWS_DEFAULT_MICROPHONE: &str = "Windows default";
+/// The switch that records only the chosen window's program.
+pub const ONLY_THIS_APPS_SOUND: &str = "Only this app's sound";
+/// Said after why one program's sound couldn't be listened to.
+pub const ALL_PC_SOUND_INSTEAD: &str = "All PC sound will be recorded instead.";
+/// Under the size in Settings, which can't make anything larger.
+pub const SCREEN_SIZE_NOTE: &str = "Only used when what you record is larger.";
+/// Under the recording keys in Settings.
+pub const KEYBINDS_NOTE: &str = "These work from any program while a screen is being recorded. Press a button, then the new keys. Escape keeps the old ones.";
+/// Said while waiting for keys to be pressed in Settings.
+pub const PRESS_KEYS: &str = "Press the keys…";
+
+/// A size a screen recording can have, with the size it gives something of `source`'s size
+/// when that's known, such as `720p (1280 x 720)`.
+pub fn recording_size_name(
+    size: crate::storage::RecordingSize,
+    source: Option<(u32, u32)>,
+) -> String {
+    use crate::storage::RecordingSize;
+    let name = match size {
+        RecordingSize::Full => "Full size",
+        RecordingSize::P1080 => "1080p",
+        RecordingSize::P720 => "720p",
+        RecordingSize::P480 => "480p",
+    };
+    match source {
+        Some(source) => {
+            let (width, height) = size.video_size(source).unwrap_or(source);
+            format!("{name} ({width} x {height})")
+        }
+        None => name.to_owned(),
+    }
+}
+
+/// What hovering Start recording says: which keys stop, pause and turn the microphone on or off.
+pub fn recording_keys_line(
+    stop: crate::hotkeys::Shortcut,
+    pause: crate::hotkeys::Shortcut,
+    microphone: crate::hotkeys::Shortcut,
+) -> String {
+    format!(
+        "From any program, {} stops, {} pauses and {} turns the microphone on or off.",
+        stop.name(),
+        pause.name(),
+        microphone.name()
+    )
+}
+
+/// The warning under a recording key that games and typing use.
+pub fn plain_key_warning(key: crate::hotkeys::Shortcut) -> String {
+    format!(
+        "While recording, {} won't work in other programs, including games and typing.",
+        key.name()
+    )
+}
 
 /// The line under the default microphone, if the one picked isn't plugged in.
 pub const DEFAULT_MICROPHONE_GONE: &str =

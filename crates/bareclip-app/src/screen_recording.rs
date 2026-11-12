@@ -14,35 +14,35 @@ use std::sync::mpsc;
 
 use bareclip_audio::{Microphone, SoundRecording};
 use bareclip_capture::{
-    Offered, PictureSource, ScreenRecording, ScreenSettings, SoundFeed, Source,
+    AppSound, Offered, PictureSource, ScreenRecording, ScreenSettings, SoundFeed, Source,
 };
 use bareclip_core::placement::{CanvasCorner, Placement};
 use bareclip_core::tracks::TrackTarget;
-use bareclip_media::{Quality, SoundLabel};
+use bareclip_media::SoundLabel;
 
 use super::camera_recording::{
     CameraPick, camera_choices, camera_settings, camera_state_text, draw_live_picture,
     microphone_choice,
 };
 use super::recording::{
-    GROUP_GAP, MicSource, TIME_WIDTH, local_time, meter_fill, pause_button, recording_name,
-    save_in_row, shown_microphone, sound_switch, stop_button, time_label, unused_path,
+    COLUMN_GAP, GROUP_GAP, MicSource, PICTURE_WIDTH, TIME_WIDTH, WIDE_BAR_WIDTH, choice_heading,
+    folder_box, in_column, local_time, meter_fill, pause_button, picture_spot, place_bar,
+    recording_name, shown_microphone, sound_switch, stop_button, time_label, unused_path,
 };
 use super::*;
 use crate::{
-    hotkeys::{self, PAUSE_KEY, RecordingKey, RecordingKeys, STOP_KEY},
-    storage::RecordingMarker,
+    hotkeys::{self, RecordingKey, RecordingKeys},
+    storage::{RecordingMarker, RecordingQuality, RecordingSize},
 };
 
-const SCREEN_BAR_WIDTH: f32 = 420.0;
 /// Each frame rate's button in the Options card.
 const FRAME_RATE_WIDTH: f32 = 64.0;
-const PREVIEW_HEIGHT: f32 = 150.0;
+/// The size and quality menus in the Options card.
+const CHOICE_WIDTH: f32 = 196.0;
 /// How often the small picture of what will be recorded is redrawn, in seconds.
 const PREVIEW_EVERY: f64 = 0.2;
-const PREVIEW_WIDTH: u32 = 320;
+const PREVIEW_WIDTH: u32 = 336;
 const COUNTDOWN_SECONDS: f64 = 3.0;
-const BAR_LIFT: f32 = 16.0;
 /// How far in from the screen's edge the overlay sits.
 const OVERLAY_MARGIN: f32 = 24.0;
 /// How far down from the screen's top the overlay starts, below where full-screen windows keep
@@ -64,6 +64,8 @@ const CAMERA_CORNER: CanvasCorner = CanvasCorner::BottomRight;
 pub(super) type OpenScreen = fn(Source, bool) -> Result<Box<dyn PictureSource>, String>;
 /// Starts listening to the PC's sound.
 pub(super) type OpenPcSound = fn() -> Result<MicSource, String>;
+/// Starts listening to the sound of the program that owns a window.
+pub(super) type OpenAppSound = fn(Source) -> Result<MicSource, String>;
 /// Everything that can be recorded: screens first, then windows.
 pub(super) type ListSources = fn() -> Vec<Offered>;
 
@@ -82,6 +84,16 @@ pub(super) fn open_real_pc_sound() -> Result<MicSource, String> {
         rate: input.sample_rate(),
         level: input.level(),
         _keep: Box::new(input),
+    })
+}
+
+pub(super) fn open_real_app_sound(source: Source) -> Result<MicSource, String> {
+    let mut sound = AppSound::for_window(source)?;
+    Ok(MicSource {
+        queue: sound.take_queue(),
+        rate: sound.sample_rate(),
+        level: sound.level(),
+        _keep: Box::new(sound),
     })
 }
 
@@ -220,6 +232,10 @@ pub(super) struct ScreenBar {
     preview_count: u64,
     preview_at: f64,
     pc_sound: Option<Result<MicSource, String>>,
+    /// Whether `pc_sound` is only the chosen window's program.
+    app_sound: bool,
+    /// Why only the window's program couldn't be listened to, when all PC sound is instead.
+    app_sound_problem: Option<String>,
     microphones: Vec<Microphone>,
     /// The microphone picked for this recording, starting on Settings' default. `None` is
     /// Windows' default.
@@ -231,7 +247,17 @@ pub(super) struct ScreenBar {
     pub(super) camera: Option<CameraPick>,
     /// A folder picked with Browse for this recording only.
     pub(super) folder: Option<PathBuf>,
+    /// The quality and size picked for this recording, starting on Settings' defaults.
+    quality: RecordingQuality,
+    size: RecordingSize,
     pub(super) stage: ScreenStage,
+}
+
+/// The PC's sound as a recording bar listens to it: all of it, or only a window's program.
+struct ScreenSound {
+    source: Option<Result<MicSource, String>>,
+    app: bool,
+    problem: Option<String>,
 }
 
 impl ScreenBar {
@@ -246,6 +272,38 @@ impl ScreenBar {
                 || "Nothing to record".to_owned(),
                 |offered| offered.name.clone(),
             )
+    }
+
+    /// The size of what will be recorded, as it is now.
+    fn source_size(&self) -> (u32, u32) {
+        match &self.capture {
+            Ok(capture) => capture.size(),
+            Err(_) => self
+                .chosen
+                .and_then(|source| self.offered.iter().find(|offered| offered.source == source))
+                .map_or((1920, 1080), |offered| offered.size),
+        }
+    }
+
+    /// How the screen will be recorded at this frame rate, with the size and quality picked.
+    pub(super) fn screen_settings(&self, frame_rate: u32) -> ScreenSettings {
+        ScreenSettings {
+            frame_rate,
+            size: self.size.video_size(self.source_size()),
+            quality: self.quality.into(),
+        }
+    }
+
+    fn is_window(&self) -> bool {
+        matches!(self.chosen, Some(Source::Window(_)))
+    }
+
+    fn set_sound(&mut self, sound: ScreenSound) {
+        // The old one stops being listened to as it's replaced.
+        self.pc_sound = sound.source;
+        self.app_sound = sound.app;
+        self.app_sound_problem = sound.problem;
+        self.pc_level = 0.0;
     }
 
     /// Whether everything to be recorded is ready.
@@ -321,6 +379,58 @@ pub(super) fn camera_box_share(camera: (u32, u32), screen: (u32, u32)) -> egui::
 }
 
 impl Editor {
+    /// Listens to the PC's sound for a recording of `source`, if it's switched on: only the
+    /// window's program when Settings say so, falling back to all of it if that can't be done.
+    fn open_screen_sound(&self, source: Option<Source>) -> ScreenSound {
+        if !self.settings.screen_pc_sound {
+            return ScreenSound {
+                source: None,
+                app: false,
+                problem: None,
+            };
+        }
+        if self.settings.screen_app_sound_only
+            && let Some(window @ Source::Window(_)) = source
+        {
+            match (self.open_app_sound)(window) {
+                Ok(sound) => {
+                    return ScreenSound {
+                        source: Some(Ok(sound)),
+                        app: true,
+                        problem: None,
+                    };
+                }
+                Err(problem) => {
+                    return ScreenSound {
+                        source: Some((self.open_pc_sound)()),
+                        app: false,
+                        problem: Some(format!("{problem} {}", text::ALL_PC_SOUND_INSTEAD)),
+                    };
+                }
+            }
+        }
+        ScreenSound {
+            source: Some((self.open_pc_sound)()),
+            app: false,
+            problem: None,
+        }
+    }
+
+    /// Listens to the PC's sound again, after the source or a sound choice changed.
+    fn reopen_screen_sound(&mut self) {
+        let Some(chosen) = self.screen_bar.as_ref().map(|bar| bar.chosen) else {
+            return;
+        };
+        // The old sound is let go first, so a program's sound is never listened to twice.
+        if let Some(bar) = &mut self.screen_bar {
+            bar.pc_sound = None;
+        }
+        let sound = self.open_screen_sound(chosen);
+        if let Some(bar) = &mut self.screen_bar {
+            bar.set_sound(sound);
+        }
+    }
+
     /// Opens the screen recording bar, with the camera's choices too for Screen and camera.
     pub(super) fn open_screen_bar(&mut self, with_camera: bool) {
         let offered = (self.list_sources)();
@@ -333,10 +443,7 @@ impl Editor {
             Some(source) => (self.open_screen)(source, self.settings.screen_pointer),
             None => Err("There is nothing to record.".to_owned()),
         };
-        let pc_sound = self
-            .settings
-            .screen_pc_sound
-            .then(|| (self.open_pc_sound)());
+        let sound = self.open_screen_sound(chosen);
         let microphones = (self.list_microphones)();
         let chosen_microphone = self.default_microphone(&microphones);
         let microphone = self
@@ -351,7 +458,9 @@ impl Editor {
             preview: None,
             preview_count: 0,
             preview_at: 0.0,
-            pc_sound,
+            pc_sound: sound.source,
+            app_sound: sound.app,
+            app_sound_problem: sound.problem,
             microphones,
             chosen_microphone,
             microphone,
@@ -359,6 +468,8 @@ impl Editor {
             microphone_level: 0.0,
             camera,
             folder: None,
+            quality: self.settings.recording_quality,
+            size: self.settings.screen_size,
             stage: ScreenStage::Waiting,
         });
         if with_camera {
@@ -375,6 +486,10 @@ impl Editor {
             bar.capture = open(source, pointer);
             bar.preview = None;
             bar.preview_count = 0;
+        }
+        // Another window can belong to another program.
+        if self.settings.screen_pc_sound && self.settings.screen_app_sound_only {
+            self.reopen_screen_sound();
         }
     }
 
@@ -404,13 +519,21 @@ impl Editor {
         let monitor = ctx
             .input(|input| input.viewport().monitor_size)
             .unwrap_or(vec2(1920.0, 1080.0));
-        let settings = ScreenSettings {
-            frame_rate: self.settings.screen_frame_rate,
-            size: None,
-            quality: Quality::Balanced,
-        };
+        let frame_rate = self.settings.screen_frame_rate;
+        let shortcuts = [
+            (RecordingKey::Stop, self.settings.stop_key),
+            (RecordingKey::Pause, self.settings.pause_key),
+            (RecordingKey::Microphone, self.settings.microphone_key),
+        ];
         let Some(bar) = &mut self.screen_bar else {
             return;
+        };
+        let settings = bar.screen_settings(frame_rate);
+        let quality = bar.quality;
+        let pc_sound_name = if bar.app_sound {
+            "App sound"
+        } else {
+            "PC sound"
         };
         let with_camera = bar.camera.is_some();
         let overlay_at = overlay_start(monitor, overlay_size(false, with_camera.then_some(false)));
@@ -444,7 +567,7 @@ impl Editor {
             sounds.push(SoundFeed {
                 queue,
                 rate: source.rate,
-                name: "PC sound".to_owned(),
+                name: pc_sound_name.to_owned(),
                 muted: false,
             });
         }
@@ -478,7 +601,7 @@ impl Editor {
         // The keys are taken first, so the file starts only once they are ready.
         let (sender, pressed) = mpsc::channel();
         let wake = ctx.clone();
-        let keys = RecordingKeys::listen(sender, move || wake.request_repaint());
+        let keys = RecordingKeys::listen(shortcuts, sender, move || wake.request_repaint());
         let marker_for = |editor: &Self, path: &Path| {
             editor
                 .app_folder
@@ -508,7 +631,7 @@ impl Editor {
                 &camera_path,
                 Box::new(source),
                 Vec::new(),
-                camera_settings(mode),
+                camera_settings(mode, quality),
             ) {
                 Ok(camera_recording) => {
                     camera_file = Some(LiveCameraFile {
@@ -566,8 +689,12 @@ impl Editor {
         hotkeys::hide_from_captures(true);
         if !keys.taken {
             self.notice = Some(format!(
-                "Another program uses {} or {}, so pause and stop with the recording bar.",
-                STOP_KEY.1, PAUSE_KEY.1
+                "Another program uses one of {}, so use the recording bar instead.",
+                shortcuts
+                    .iter()
+                    .map(|(_, shortcut)| shortcut.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
         if let Some(bar) = &mut self.screen_bar {
@@ -723,6 +850,28 @@ impl Editor {
         self.after_clip_added();
     }
 
+    /// Does what a recording key pressed in any program asks. Gives whether it stopped the
+    /// recording.
+    pub(super) fn recording_key_pressed(&mut self, ctx: &egui::Context, key: RecordingKey) -> bool {
+        match key {
+            RecordingKey::Stop => {
+                self.stop_screen_recording(ctx);
+                return true;
+            }
+            RecordingKey::Pause => self.with_live_screen(|live| {
+                let paused = live.recording.is_paused();
+                live.set_paused(!paused);
+            }),
+            // Nothing to turn on without a microphone.
+            RecordingKey::Microphone => self.with_live_screen(|live| {
+                if let Some(muted) = live.microphone_muted() {
+                    live.set_microphone_muted(!muted);
+                }
+            }),
+        }
+        false
+    }
+
     fn with_live_screen(&mut self, change: impl FnOnce(&mut LiveScreen)) {
         if let Some(ScreenBar {
             stage: ScreenStage::Recording(live),
@@ -790,25 +939,20 @@ impl Editor {
             self.start_screen_recording(ctx);
         }
         // Keys pressed in another program.
-        let mut keyed = None;
+        let mut keyed = Vec::new();
         if let Some(ScreenBar {
             stage: ScreenStage::Recording(live),
             ..
         }) = &self.screen_bar
         {
             while let Ok(key) = live.pressed.try_recv() {
-                keyed = Some((key, live.recording.is_paused()));
+                keyed.push(key);
             }
         }
-        match keyed {
-            Some((RecordingKey::Stop, _)) => {
-                self.stop_screen_recording(ctx);
+        for key in keyed {
+            if self.recording_key_pressed(ctx, key) {
                 return;
             }
-            Some((RecordingKey::Pause, paused)) => {
-                self.with_live_screen(|live| live.set_paused(!paused));
-            }
-            None => {}
         }
         let Some(bar) = &self.screen_bar else {
             return;
@@ -821,10 +965,13 @@ impl Editor {
             Pause(bool),
             Source(Source),
             PcSound(bool),
+            AppSoundOnly(bool),
             Microphone(bool),
             ChooseMicrophone(String),
             Camera(super::camera_recording::CameraAsk),
             FrameRate(u32),
+            Size(RecordingSize),
+            Quality(RecordingQuality),
             Pointer(bool),
             Countdown(bool),
             MicrophoneMuted(bool),
@@ -868,15 +1015,20 @@ impl Editor {
             }
             _ => None,
         });
+        let source_size = bar.source_size();
+        let size_shown = bar.size.for_source(source_size);
+        let keys_line = text::recording_keys_line(
+            settings.stop_key,
+            settings.pause_key,
+            settings.microphone_key,
+        );
         let title = if bar.camera.is_some() {
             "Record screen and camera"
         } else {
             "Record screen"
         };
-        egui::Area::new(egui::Id::unique("screen_bar"))
-            .order(egui::Order::Foreground)
-            .pivot(egui::Align2::CENTER_BOTTOM)
-            .fixed_pos(pos2(stage.center().x, stage.bottom() - BAR_LIFT))
+        let area = egui::Area::new(egui::Id::unique("screen_bar")).order(egui::Order::Foreground);
+        place_bar(area, ctx, stage, recording.is_some())
             .constrain(true)
             .show(ctx, |ui| {
                 if let Some((shown, _)) = recording {
@@ -898,7 +1050,7 @@ impl Editor {
                     return;
                 }
                 dialog_frame(ctx).show(ui, |ui| {
-                    ui.set_width(SCREEN_BAR_WIDTH);
+                    ui.set_width(WIDE_BAR_WIDTH);
                     components::dialog_title(ui, &icons::MONITOR, palette.accent, title);
                     ui.add_space(12.0);
                     if let Some(left) = counting {
@@ -918,158 +1070,242 @@ impl Editor {
                         });
                         return;
                     }
-                    // What will be recorded, as it looks now, with the camera where it will land.
                     let width = ui.available_width();
-                    let (spot, _) =
-                        ui.allocate_exact_size(vec2(width, PREVIEW_HEIGHT), Sense::hover());
-                    ui.painter().rect_filled(spot, 6.0, palette.stage);
-                    match (&bar.capture, &bar.preview) {
-                        (Ok(_), Some(texture)) => {
-                            let size = texture.size_vec2();
-                            let scale = (spot.width() / size.x).min(spot.height() / size.y);
-                            let shown = egui::Rect::from_center_size(spot.center(), size * scale);
-                            ui.painter().image(
-                                texture.id(),
-                                shown,
-                                egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                                Color32::WHITE,
-                            );
-                            if let (Some(share), Some(picture)) = (camera_box, &camera_picture) {
-                                let inside = egui::Rect::from_min_size(
-                                    shown.min + share.min.to_vec2() * shown.size(),
-                                    share.size() * shown.size(),
+                    let right = width - PICTURE_WIDTH - COLUMN_GAP;
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = COLUMN_GAP;
+                        // What will be recorded, as it looks now, with the camera where it will
+                        // land.
+                        let spot = picture_spot(ui, palette);
+                        match (&bar.capture, &bar.preview) {
+                            (Ok(_), Some(texture)) => {
+                                let size = texture.size_vec2();
+                                let scale = (spot.width() / size.x).min(spot.height() / size.y);
+                                let shown =
+                                    egui::Rect::from_center_size(spot.center(), size * scale);
+                                ui.painter().image(
+                                    texture.id(),
+                                    shown,
+                                    egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                                    Color32::WHITE,
                                 );
-                                ui.painter().rect_filled(inside, 0.0, palette.stage);
-                                draw_live_picture(ui.painter(), inside, picture);
-                            }
-                        }
-                        (Err(problem), _) => {
-                            ui.painter().text(
-                                spot.center(),
-                                egui::Align2::CENTER_CENTER,
-                                problem,
-                                egui::FontId::proportional(12.0),
-                                palette.danger,
-                            );
-                        }
-                        _ => {}
-                    }
-                    if let Some(pick) = &bar.camera {
-                        // Until the camera runs, the reason it doesn't goes over the picture.
-                        camera_state_text(ui, palette, spot, &pick.state());
-                    }
-                    ui.add_space(10.0);
-                    let shown = bar.chosen_name();
-                    let name = format!("Record: {shown}");
-                    let button = ui.add(components::Dropdown::new(palette, &name, &shown, width));
-                    let menu_width = components::menu_width(&button);
-                    egui::Popup::menu(&button).show(|ui| {
-                        egui::ScrollArea::vertical()
-                            .max_height(320.0)
-                            .show(ui, |ui| {
-                                for offered in &bar.offered {
-                                    let item = MenuItem::choice(
-                                        palette,
-                                        &offered.name,
-                                        bar.chosen == Some(offered.source),
-                                    )
-                                    .width(menu_width);
-                                    if ui.add(item).clicked() {
-                                        asked = Asked::Source(offered.source);
-                                    }
+                                if let (Some(share), Some(picture)) = (camera_box, &camera_picture)
+                                {
+                                    let inside = egui::Rect::from_min_size(
+                                        shown.min + share.min.to_vec2() * shown.size(),
+                                        share.size() * shown.size(),
+                                    );
+                                    ui.painter().rect_filled(inside, 0.0, palette.stage);
+                                    draw_live_picture(ui.painter(), inside, picture);
                                 }
+                            }
+                            (Err(problem), _) => {
+                                ui.painter().text(
+                                    spot.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    problem,
+                                    egui::FontId::proportional(12.0),
+                                    palette.danger,
+                                );
+                            }
+                            _ => {}
+                        }
+                        if let Some(pick) = &bar.camera {
+                            // Until the camera runs, the reason it doesn't goes over the picture.
+                            camera_state_text(ui, palette, spot, &pick.state());
+                        }
+                        // What and where, beside the picture.
+                        in_column(ui, right, |ui| {
+                            choice_heading(ui, palette, "Record");
+                            let shown = bar.chosen_name();
+                            let name = format!("Record: {shown}");
+                            let button =
+                                ui.add(components::Dropdown::new(palette, &name, &shown, right));
+                            let menu_width = components::menu_width(&button);
+                            egui::Popup::menu(&button).show(|ui| {
+                                egui::ScrollArea::vertical()
+                                    .max_height(320.0)
+                                    .show(ui, |ui| {
+                                        for offered in &bar.offered {
+                                            let item = MenuItem::choice(
+                                                palette,
+                                                &offered.name,
+                                                bar.chosen == Some(offered.source),
+                                            )
+                                            .width(menu_width);
+                                            if ui.add(item).clicked() {
+                                                asked = Asked::Source(offered.source);
+                                            }
+                                        }
+                                    });
                             });
-                    });
-                    if let Some(pick) = &bar.camera {
-                        ui.add_space(6.0);
-                        if let Some(choice) = camera_choices(ui, palette, pick, width) {
-                            asked = Asked::Camera(choice);
-                        }
-                    }
-                    ui.add_space(GROUP_GAP);
-                    components::settings_group(ui, palette, "Sound", |ui| {
-                        if sound_switch(
-                            ui,
-                            palette,
-                            ("PC sound", settings.screen_pc_sound),
-                            bar.pc_sound.as_ref(),
-                            bar.pc_level,
-                        ) {
-                            asked = Asked::PcSound(!settings.screen_pc_sound);
-                        }
-                        components::settings_divider(ui, palette);
-                        if sound_switch(
-                            ui,
-                            palette,
-                            ("Microphone", settings.screen_microphone),
-                            bar.microphone.as_ref(),
-                            bar.microphone_level,
-                        ) {
-                            asked = Asked::Microphone(!settings.screen_microphone);
-                        }
-                        // Shown even while it's off, so it can be picked before switching it on.
-                        components::settings_wide_control(ui, |ui, width| {
-                            if let Some(name) =
-                                microphone_choice(ui, palette, &bar.microphones, &shown_mic, width)
-                            {
-                                asked = Asked::ChooseMicrophone(name);
+                            if let Some(pick) = &bar.camera {
+                                ui.add_space(10.0);
+                                choice_heading(ui, palette, "Camera");
+                                if let Some(choice) = camera_choices(ui, palette, pick, right) {
+                                    asked = Asked::Camera(choice);
+                                }
+                            }
+                            ui.add_space(10.0);
+                            choice_heading(ui, palette, "Save in");
+                            if folder_box(ui, palette, &folder, right) {
+                                asked = Asked::Browse;
                             }
                         });
                     });
                     ui.add_space(GROUP_GAP);
-                    components::settings_group(ui, palette, "Options", |ui| {
-                        let pointer = settings.screen_pointer;
-                        let row =
-                            SwitchRow::new(palette, "Show the mouse pointer", pointer).compact();
-                        if ui.add(row).clicked() {
-                            asked = Asked::Pointer(!pointer);
-                        }
-                        components::settings_divider(ui, palette);
-                        let row = SwitchRow::new(palette, "Count down from 3", settings.countdown)
-                            .compact();
-                        if ui.add(row).clicked() {
-                            asked = Asked::Countdown(!settings.countdown);
-                        }
-                        components::settings_divider(ui, palette);
-                        components::compact_settings_row(
-                            ui,
-                            palette,
-                            "Frame rate",
-                            FRAME_RATE_WIDTH * 2.0 + CONTROL_SPACING,
+                    // Sound and Options side by side, so the window stays short enough for a
+                    // laptop's screen.
+                    let column = (width - COLUMN_GAP) / 2.0;
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = COLUMN_GAP;
+                        ui.allocate_ui_with_layout(
+                            vec2(column, 0.0),
+                            Layout::top_down(Align::Min),
                             |ui| {
-                                ui.spacing_mut().item_spacing.x = CONTROL_SPACING;
-                                for rate in [30, 60] {
-                                    let chosen = settings.screen_frame_rate == rate;
-                                    let label = format!("{rate} fps");
-                                    let button = ActionButton::new(palette, Kind::Ghost, &label)
-                                        .small()
-                                        .width(FRAME_RATE_WIDTH)
-                                        .selected(chosen);
-                                    if ui.add(button).clicked() && !chosen {
-                                        asked = Asked::FrameRate(rate);
+                                ui.set_width(column);
+                                components::settings_group(ui, palette, "Sound", |ui| {
+                                    if sound_switch(
+                                        ui,
+                                        palette,
+                                        ("PC sound", settings.screen_pc_sound),
+                                        bar.pc_sound.as_ref(),
+                                        bar.pc_level,
+                                    ) {
+                                        asked = Asked::PcSound(!settings.screen_pc_sound);
                                     }
-                                }
+                                    // Recording a window can take only its program's sound.
+                                    if bar.is_window() && settings.screen_pc_sound {
+                                        let only = settings.screen_app_sound_only;
+                                        let row = SwitchRow::new(
+                                            palette,
+                                            text::ONLY_THIS_APPS_SOUND,
+                                            only,
+                                        )
+                                        .compact();
+                                        if ui.add(row).clicked() {
+                                            asked = Asked::AppSoundOnly(!only);
+                                        }
+                                        if let Some(problem) = &bar.app_sound_problem {
+                                            components::settings_note(ui, palette, problem, None);
+                                        }
+                                    }
+                                    components::settings_divider(ui, palette);
+                                    if sound_switch(
+                                        ui,
+                                        palette,
+                                        ("Microphone", settings.screen_microphone),
+                                        bar.microphone.as_ref(),
+                                        bar.microphone_level,
+                                    ) {
+                                        asked = Asked::Microphone(!settings.screen_microphone);
+                                    }
+                                    // Shown even while it's off, so it can be picked before switching it on.
+                                    components::settings_wide_control(ui, |ui, width| {
+                                        if let Some(name) = microphone_choice(
+                                            ui,
+                                            palette,
+                                            &bar.microphones,
+                                            &shown_mic,
+                                            width,
+                                        ) {
+                                            asked = Asked::ChooseMicrophone(name);
+                                        }
+                                    });
+                                });
+                            },
+                        );
+                        ui.allocate_ui_with_layout(
+                            vec2(column, 0.0),
+                            Layout::top_down(Align::Min),
+                            |ui| {
+                                ui.set_width(column);
+                                components::settings_group(ui, palette, "Options", |ui| {
+                                    let pointer = settings.screen_pointer;
+                                    let row =
+                                        SwitchRow::new(palette, "Show the mouse pointer", pointer)
+                                            .compact();
+                                    if ui.add(row).clicked() {
+                                        asked = Asked::Pointer(!pointer);
+                                    }
+                                    components::settings_divider(ui, palette);
+                                    let row = SwitchRow::new(
+                                        palette,
+                                        "Count down from 3",
+                                        settings.countdown,
+                                    )
+                                    .compact();
+                                    if ui.add(row).clicked() {
+                                        asked = Asked::Countdown(!settings.countdown);
+                                    }
+                                    components::settings_divider(ui, palette);
+                                    components::compact_settings_row(
+                                        ui,
+                                        palette,
+                                        "Frame rate",
+                                        FRAME_RATE_WIDTH * 2.0 + CONTROL_SPACING,
+                                        |ui| {
+                                            ui.spacing_mut().item_spacing.x = CONTROL_SPACING;
+                                            for rate in [30, 60] {
+                                                let chosen = settings.screen_frame_rate == rate;
+                                                let label = format!("{rate} fps");
+                                                let button =
+                                                    ActionButton::new(palette, Kind::Ghost, &label)
+                                                        .small()
+                                                        .width(FRAME_RATE_WIDTH)
+                                                        .selected(chosen);
+                                                if ui.add(button).clicked() && !chosen {
+                                                    asked = Asked::FrameRate(rate);
+                                                }
+                                            }
+                                        },
+                                    );
+                                    components::settings_divider(ui, palette);
+                                    components::compact_settings_row(
+                                        ui,
+                                        palette,
+                                        "Size",
+                                        CHOICE_WIDTH,
+                                        |ui| {
+                                            if let Some(size) = size_menu(
+                                                ui,
+                                                palette,
+                                                (size_shown, source_size),
+                                                CHOICE_WIDTH,
+                                            ) {
+                                                asked = Asked::Size(size);
+                                            }
+                                        },
+                                    );
+                                    components::settings_divider(ui, palette);
+                                    components::compact_settings_row(
+                                        ui,
+                                        palette,
+                                        "Quality",
+                                        CHOICE_WIDTH,
+                                        |ui| {
+                                            if let Some(quality) =
+                                                quality_menu(ui, palette, bar.quality, CHOICE_WIDTH)
+                                            {
+                                                asked = Asked::Quality(quality);
+                                            }
+                                        },
+                                    );
+                                });
                             },
                         );
                     });
-                    ui.add_space(8.0);
-                    if save_in_row(ui, palette, &folder) {
-                        asked = Asked::Browse;
-                    }
-                    ui.add_space(4.0);
-                    ui.colored_label(
-                        palette.text_muted,
-                        format!(
-                            "{} stops and {} pauses from any program.",
-                            STOP_KEY.1, PAUSE_KEY.1,
-                        ),
-                    );
-                    ui.add_space(12.0);
+                    ui.add_space(16.0);
                     components::dialog_buttons(ui, |ui| {
                         let record = ActionButton::new(palette, Kind::Primary, "Start recording")
                             .icon(icons::VIDEO)
                             .width(DIALOG_BUTTON_WIDTH * 1.5);
-                        if ui.add_enabled(bar.ready(), record).clicked() {
+                        // The keys that stop and pause it, for whoever wonders.
+                        if ui
+                            .add_enabled(bar.ready(), record)
+                            .on_hover_text(&keys_line)
+                            .clicked()
+                        {
                             asked = Asked::Record;
                         }
                         if ui.add(dialog_button(palette, "Cancel")).clicked() {
@@ -1115,10 +1351,12 @@ impl Editor {
             Asked::Source(source) => self.choose_source(source),
             Asked::PcSound(on) => {
                 self.settings.screen_pc_sound = on;
-                let opened = on.then(|| (self.open_pc_sound)());
-                if let Some(bar) = &mut self.screen_bar {
-                    bar.pc_sound = opened;
-                }
+                self.reopen_screen_sound();
+                save(self);
+            }
+            Asked::AppSoundOnly(on) => {
+                self.settings.screen_app_sound_only = on;
+                self.reopen_screen_sound();
                 save(self);
             }
             Asked::Microphone(on) => {
@@ -1134,6 +1372,17 @@ impl Editor {
             Asked::FrameRate(rate) => {
                 self.settings.screen_frame_rate = rate;
                 save(self);
+            }
+            // Both last for this recording only. Settings keep the defaults.
+            Asked::Size(size) => {
+                if let Some(bar) = &mut self.screen_bar {
+                    bar.size = size;
+                }
+            }
+            Asked::Quality(quality) => {
+                if let Some(bar) = &mut self.screen_bar {
+                    bar.quality = quality;
+                }
             }
             Asked::Pointer(on) => {
                 self.settings.screen_pointer = on;
@@ -1323,6 +1572,58 @@ impl Editor {
             )
         }
     }
+}
+
+/// A menu of the sizes something of `source`'s size can be recorded at: its own, and each
+/// named size smaller than it. Gives the one picked.
+pub(super) fn size_menu(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    (shown, source): (RecordingSize, (u32, u32)),
+    width: f32,
+) -> Option<RecordingSize> {
+    let current = text::recording_size_name(shown, Some(source));
+    let name = format!("Size: {current}");
+    let button = ui.add(components::Dropdown::new(palette, &name, &current, width));
+    let menu_width = components::menu_width(&button);
+    let mut picked = None;
+    egui::Popup::menu(&button).show(|ui| {
+        for size in RecordingSize::ALL
+            .into_iter()
+            .filter(|size| size.fits(source))
+        {
+            let label = text::recording_size_name(size, Some(source));
+            let item = MenuItem::choice(palette, &label, size == shown).width(menu_width);
+            if ui.add(item).clicked() {
+                picked = Some(size);
+            }
+        }
+    });
+    picked
+}
+
+/// A menu of the three qualities, named as in the export window. Gives the one picked.
+pub(super) fn quality_menu(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    shown: RecordingQuality,
+    width: f32,
+) -> Option<RecordingQuality> {
+    let current = text::quality_name(shown.into());
+    let name = format!("Quality: {current}");
+    let button = ui.add(components::Dropdown::new(palette, &name, current, width));
+    let menu_width = components::menu_width(&button);
+    let mut picked = None;
+    egui::Popup::menu(&button).show(|ui| {
+        for quality in RecordingQuality::ALL {
+            let label = text::quality_name(quality.into());
+            let item = MenuItem::choice(palette, label, quality == shown).width(menu_width);
+            if ui.add(item).clicked() {
+                picked = Some(quality);
+            }
+        }
+    });
+    picked
 }
 
 #[cfg(test)]

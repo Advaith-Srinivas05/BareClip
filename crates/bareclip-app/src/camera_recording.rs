@@ -14,22 +14,22 @@ use bareclip_capture::{
     Camera, CameraCapture, CameraMode, CameraState, CameraView, Picture, PictureSource,
     ScreenRecording, ScreenSettings, SoundFeed,
 };
-use bareclip_media::Quality;
 
 use super::recording::{
-    GROUP_GAP, HEADPHONES_NOTE, MicSource, local_time, meter, meter_fill, pause_button,
-    recording_name, save_in_row, shown_microphone, sound_switch, stop_button, time_label,
-    unused_path,
+    COLUMN_GAP, GROUP_GAP, HEADPHONES_NOTE, MicSource, PICTURE_WIDTH, WIDE_BAR_WIDTH,
+    choice_heading, folder_box, in_column, local_time, meter, meter_fill, pause_button,
+    picture_spot, place_bar, recording_name, shown_microphone, sound_switch, stop_button,
+    time_label, unused_path,
 };
-use super::screen_recording::shrunk;
+use super::screen_recording::{quality_menu, shrunk};
 use super::*;
-use crate::storage::RecordingMarker;
+use crate::storage::{RecordingMarker, RecordingQuality};
 
-const CAMERA_BAR_WIDTH: f32 = 420.0;
+/// The quality menu in the Options card.
+const QUALITY_WIDTH: f32 = 196.0;
 /// How much of the line the camera's size takes, beside the camera's name.
 const SIZE_SHARE: f32 = 0.42;
 const CAMERA_CHOICE_GAP: f32 = 8.0;
-const PREVIEW_HEIGHT: f32 = 150.0;
 /// How often the live picture is redrawn, in seconds, smooth enough to see yourself move.
 const PREVIEW_EVERY: f64 = 0.04;
 const PREVIEW_WIDTH: u32 = 360;
@@ -37,7 +37,6 @@ const PREVIEW_WIDTH: u32 = 360;
 const SLIM_PREVIEW_HEIGHT: f32 = 36.0;
 const SLIM_METER_WIDTH: f32 = 96.0;
 const COUNTDOWN_SECONDS: f64 = 3.0;
-const BAR_LIFT: f32 = 16.0;
 /// How long to wait for the video to start moving before recording without it.
 const START_WAIT_SECONDS: f64 = 1.0;
 
@@ -364,6 +363,8 @@ pub(super) struct CameraBar {
     microphone_level: f32,
     /// A folder picked with Browse for this recording only.
     pub(super) folder: Option<PathBuf>,
+    /// The quality picked for this recording, starting on Settings' default.
+    quality: RecordingQuality,
     pub(super) stage: CameraStage,
 }
 
@@ -389,6 +390,7 @@ impl Editor {
             microphone,
             microphone_level: 0.0,
             folder: None,
+            quality: self.settings.recording_quality,
             stage: CameraStage::Waiting,
         });
         self.open_chosen_camera();
@@ -510,7 +512,7 @@ impl Editor {
             return;
         }
         let path = unused_path(&folder, &recording_name("Camera", local_time(), "mp4"));
-        let settings = camera_settings(mode);
+        let settings = camera_settings(mode, bar.quality);
         let start = if along {
             ScreenRecording::start_paused
         } else {
@@ -686,6 +688,7 @@ impl Editor {
             ChooseMicrophone(String),
             PlayAlong(bool),
             Countdown(bool),
+            Quality(RecordingQuality),
             Browse,
         }
         let mut asked = Asked::Nothing;
@@ -716,10 +719,8 @@ impl Editor {
                 draw_live_picture(ui.painter(), spot, texture);
             }
         };
-        egui::Area::new(egui::Id::unique("camera_bar"))
-            .order(egui::Order::Foreground)
-            .pivot(egui::Align2::CENTER_BOTTOM)
-            .fixed_pos(pos2(stage.center().x, stage.bottom() - BAR_LIFT))
+        let area = egui::Area::new(egui::Id::unique("camera_bar")).order(egui::Order::Foreground);
+        place_bar(area, ctx, stage, recording.is_some())
             .constrain(true)
             .show(ctx, |ui| {
                 // While recording it's one slim row, so it covers as little of the video as it can.
@@ -757,26 +758,44 @@ impl Editor {
                     return;
                 }
                 dialog_frame(ctx).show(ui, |ui| {
-                    ui.set_width(CAMERA_BAR_WIDTH);
+                    ui.set_width(WIDE_BAR_WIDTH);
                     components::dialog_title(ui, &icons::WEBCAM, palette.accent, "Record camera");
                     ui.add_space(12.0);
                     let width = ui.available_width();
-                    let (spot, _) =
-                        ui.allocate_exact_size(vec2(width, PREVIEW_HEIGHT), Sense::hover());
-                    ui.painter().rect_filled(spot, 6.0, palette.stage);
-                    camera_state_text(ui, palette, spot, &state);
-                    if matches!(state, CameraState::Running { .. }) {
-                        live_picture(ui, spot);
-                    }
-                    if let Some(left) = counting {
-                        // The number sits over the live picture, so you can still see yourself.
-                        ui.painter().text(
-                            spot.center(),
-                            egui::Align2::CENTER_CENTER,
-                            left.to_string(),
-                            fonts::strong(56.0),
-                            crate::theme::DARK.text,
-                        );
+                    let right = width - PICTURE_WIDTH - COLUMN_GAP;
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = COLUMN_GAP;
+                        let spot = picture_spot(ui, palette);
+                        camera_state_text(ui, palette, spot, &state);
+                        if matches!(state, CameraState::Running { .. }) {
+                            live_picture(ui, spot);
+                        }
+                        if let Some(left) = counting {
+                            // The number sits over the live picture, so you can still see
+                            // yourself.
+                            ui.painter().text(
+                                spot.center(),
+                                egui::Align2::CENTER_CENTER,
+                                left.to_string(),
+                                fonts::strong(56.0),
+                                crate::theme::DARK.text,
+                            );
+                            return;
+                        }
+                        // What and where, beside the picture.
+                        in_column(ui, right, |ui| {
+                            choice_heading(ui, palette, "Camera");
+                            if let Some(choice) = camera_choices(ui, palette, &bar.pick, right) {
+                                asked = Asked::Camera(choice);
+                            }
+                            ui.add_space(10.0);
+                            choice_heading(ui, palette, "Save in");
+                            if folder_box(ui, palette, &folder, right) {
+                                asked = Asked::Browse;
+                            }
+                        });
+                    });
+                    if counting.is_some() {
                         ui.add_space(12.0);
                         components::dialog_buttons(ui, |ui| {
                             if ui.add(dialog_button(palette, "Cancel")).clicked() {
@@ -785,53 +804,79 @@ impl Editor {
                         });
                         return;
                     }
-                    ui.add_space(10.0);
-                    if let Some(choice) = camera_choices(ui, palette, &bar.pick, width) {
-                        asked = Asked::Camera(choice);
-                    }
+                    // Sound and Options side by side.
+                    let column = (width - COLUMN_GAP) / 2.0;
                     ui.add_space(GROUP_GAP);
-                    components::settings_group(ui, palette, "Sound", |ui| {
-                        if sound_switch(
-                            ui,
-                            palette,
-                            ("Record the microphone", settings.camera_microphone),
-                            bar.microphone.as_ref(),
-                            bar.microphone_level,
-                        ) {
-                            asked = Asked::Microphone(!settings.camera_microphone);
-                        }
-                        // Shown even while it's off, so it can be picked before switching it on.
-                        components::settings_wide_control(ui, |ui, width| {
-                            if let Some(name) =
-                                microphone_choice(ui, palette, &bar.microphones, &shown_mic, width)
-                            {
-                                asked = Asked::ChooseMicrophone(name);
-                            }
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = COLUMN_GAP;
+                        in_column(ui, column, |ui| {
+                            components::settings_group(ui, palette, "Sound", |ui| {
+                                if sound_switch(
+                                    ui,
+                                    palette,
+                                    ("Record the microphone", settings.camera_microphone),
+                                    bar.microphone.as_ref(),
+                                    bar.microphone_level,
+                                ) {
+                                    asked = Asked::Microphone(!settings.camera_microphone);
+                                }
+                                // Shown even while it's off, so it can be picked before switching it on.
+                                components::settings_wide_control(ui, |ui, width| {
+                                    if let Some(name) = microphone_choice(
+                                        ui,
+                                        palette,
+                                        &bar.microphones,
+                                        &shown_mic,
+                                        width,
+                                    ) {
+                                        asked = Asked::ChooseMicrophone(name);
+                                    }
+                                });
+                            });
+                        });
+                        in_column(ui, column, |ui| {
+                            components::settings_group(ui, palette, "Options", |ui| {
+                                let along = settings.play_while_recording;
+                                let row = SwitchRow::new(
+                                    palette,
+                                    "Play the video while recording",
+                                    along,
+                                )
+                                .compact();
+                                if ui.add(row).clicked() {
+                                    asked = Asked::PlayAlong(!along);
+                                }
+                                if along && settings.camera_microphone {
+                                    components::settings_note(ui, palette, HEADPHONES_NOTE, None);
+                                }
+                                components::settings_divider(ui, palette);
+                                let row = SwitchRow::new(
+                                    palette,
+                                    "Count down from 3",
+                                    settings.countdown,
+                                )
+                                .compact();
+                                if ui.add(row).clicked() {
+                                    asked = Asked::Countdown(!settings.countdown);
+                                }
+                                components::settings_divider(ui, palette);
+                                components::compact_settings_row(
+                                    ui,
+                                    palette,
+                                    "Quality",
+                                    QUALITY_WIDTH,
+                                    |ui| {
+                                        if let Some(quality) =
+                                            quality_menu(ui, palette, bar.quality, QUALITY_WIDTH)
+                                        {
+                                            asked = Asked::Quality(quality);
+                                        }
+                                    },
+                                );
+                            });
                         });
                     });
-                    ui.add_space(GROUP_GAP);
-                    components::settings_group(ui, palette, "Options", |ui| {
-                        let along = settings.play_while_recording;
-                        let row = SwitchRow::new(palette, "Play the video while recording", along)
-                            .compact();
-                        if ui.add(row).clicked() {
-                            asked = Asked::PlayAlong(!along);
-                        }
-                        if along && settings.camera_microphone {
-                            components::settings_note(ui, palette, HEADPHONES_NOTE, None);
-                        }
-                        components::settings_divider(ui, palette);
-                        let row = SwitchRow::new(palette, "Count down from 3", settings.countdown)
-                            .compact();
-                        if ui.add(row).clicked() {
-                            asked = Asked::Countdown(!settings.countdown);
-                        }
-                    });
-                    ui.add_space(8.0);
-                    if save_in_row(ui, palette, &folder) {
-                        asked = Asked::Browse;
-                    }
-                    ui.add_space(12.0);
+                    ui.add_space(16.0);
                     components::dialog_buttons(ui, |ui| {
                         let record = ActionButton::new(palette, Kind::Primary, "Start recording")
                             .icon(icons::VIDEO)
@@ -888,6 +933,12 @@ impl Editor {
                 self.settings.countdown = on;
                 self.save_settings();
             }
+            // For this recording only. Settings keep the default.
+            Asked::Quality(quality) => {
+                if let Some(bar) = &mut self.camera_bar {
+                    bar.quality = quality;
+                }
+            }
             Asked::Browse => {
                 if let Some(picked) = (self.pick_folder)(&folder)
                     && let Some(bar) = &mut self.camera_bar
@@ -899,18 +950,31 @@ impl Editor {
     }
 }
 
-/// How a camera is recorded: at its own size and frame rate.
-pub(super) fn camera_settings(mode: CameraMode) -> ScreenSettings {
+/// How a camera is recorded: at its own size and frame rate, at the quality picked.
+pub(super) fn camera_settings(mode: CameraMode, quality: RecordingQuality) -> ScreenSettings {
     ScreenSettings {
         frame_rate: mode.whole_frame_rate(),
         size: Some((mode.width, mode.height)),
-        quality: Quality::Balanced,
+        quality: quality.into(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_camera_is_recorded_at_its_own_size_and_the_quality_picked() {
+        let mode = CameraMode {
+            width: 1280,
+            height: 720,
+            rate: (30, 1),
+        };
+        let settings = camera_settings(mode, RecordingQuality::Smaller);
+        assert_eq!(settings.size, Some((1280, 720)));
+        assert_eq!(settings.frame_rate, 30);
+        assert_eq!(settings.quality, bareclip_media::Quality::Smaller);
+    }
 
     #[test]
     fn the_live_picture_is_mirrored_by_swapping_its_sides() {

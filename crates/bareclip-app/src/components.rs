@@ -1328,6 +1328,99 @@ impl Widget for NameBar<'_> {
     }
 }
 
+/// A folder shown as one box with a folder symbol, its path and "Change", which can be clicked
+/// anywhere to pick another folder. A long path is cut short at its end and shown whole when
+/// hovered.
+pub struct FolderBox<'a> {
+    palette: &'a Palette,
+    folder: &'a std::path::Path,
+    width: f32,
+}
+
+impl<'a> FolderBox<'a> {
+    pub fn new(palette: &'a Palette, folder: &'a std::path::Path, width: f32) -> Self {
+        Self {
+            palette,
+            folder,
+            width,
+        }
+    }
+
+    /// What screen readers call it.
+    pub fn name(folder: &std::path::Path) -> String {
+        format!("Save in {}", folder.display())
+    }
+}
+
+impl Widget for FolderBox<'_> {
+    fn ui(self, ui: &mut Ui) -> Response {
+        let size = vec2(self.width, SMALL_BUTTON_HEIGHT + 4.0);
+        let (rect, mut response) = ui.allocate_exact_size(size, Sense::click());
+        let enabled = response.enabled();
+        let name = Self::name(self.folder);
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, &name));
+        let palette = self.palette;
+        let icon_size = 14.0;
+        let change = ui.painter().layout_no_wrap(
+            "Change".to_owned(),
+            FontId::new(12.0, FontFamily::Proportional),
+            palette.accent,
+        );
+        let path = self.folder.display().to_string();
+        let room =
+            self.width - NAME_BAR_PADDING * 2.0 - icon_size - ICON_GAP * 2.0 - change.size().x;
+        let mut job = egui::text::LayoutJob::simple_singleline(
+            path.clone(),
+            FontId::new(12.0, FontFamily::Proportional),
+            palette.text,
+        );
+        job.wrap.max_width = room.max(0.0);
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        job.wrap.overflow_character = Some('…');
+        let words = ui.painter().layout_job(job);
+        if ui.is_rect_visible(rect) {
+            let border = if response.hovered() || response.has_focus() {
+                palette.accent
+            } else {
+                palette.border
+            };
+            ui.painter().rect(
+                rect,
+                f32::from(RADIUS),
+                palette.bg_app,
+                Stroke::new(1.0, border),
+                StrokeKind::Inside,
+            );
+            let mut x = rect.left() + NAME_BAR_PADDING;
+            icons::paint(
+                ui.painter(),
+                icons::square_at(pos2(x + icon_size / 2.0, rect.center().y), icon_size),
+                &icons::FOLDER_OPEN,
+                palette.text_muted,
+            );
+            x += icon_size + ICON_GAP;
+            ui.painter().galley(
+                pos2(x, rect.center().y - words.size().y / 2.0),
+                words.clone(),
+                palette.text,
+            );
+            ui.painter().galley(
+                pos2(
+                    rect.right() - NAME_BAR_PADDING - change.size().x,
+                    rect.center().y - change.size().y / 2.0,
+                ),
+                change,
+                palette.accent,
+            );
+        }
+        if words.elided {
+            response = response.on_hover_text(path);
+        }
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
+}
+
 /// A button showing the current one of several choices, which opens them in a menu. Its name can
 /// say more than it shows, because several can show the same choice.
 pub struct Dropdown<'a> {

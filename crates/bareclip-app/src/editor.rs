@@ -53,7 +53,7 @@ use crate::{
         self, ActionButton, CheckBox, ColourSwatch, IconButton, Kind, MenuItem, NAME_BAR_PADDING,
         NameBar, SwitchRow,
     },
-    fonts, icons,
+    fonts, hotkeys, icons,
     layers::{LayerDisplay, LayerPictures, Moment},
     preview::{PREPARE_AHEAD_SECONDS, Preview},
     stage::{self, StageClip, StageState, StageView},
@@ -142,7 +142,7 @@ const SETTINGS_TABS_WIDTH: f32 = 124.0;
 /// The room either side of the line between the tabs and the page.
 const SETTINGS_TABS_GAP: f32 = 14.0;
 /// As tall as the tallest tab's page, so the dialog keeps its size when tabs are switched.
-const SETTINGS_PAGE_HEIGHT: f32 = 390.0;
+const SETTINGS_PAGE_HEIGHT: f32 = 450.0;
 const SETTINGS_CHOICE_WIDTH: f32 = 96.0;
 /// Room for a whole chip name, such as NVIDIA GeForce RTX 3060 Laptop GPU.
 const GPU_DROPDOWN_WIDTH: f32 = 250.0;
@@ -151,8 +151,8 @@ const GPU_DROPDOWN_WIDTH: f32 = 250.0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsTab {
     General,
-    Export,
     Recording,
+    Keybinds,
 }
 
 impl SettingsTab {
@@ -165,12 +165,17 @@ impl SettingsTab {
             "General",
             "General settings",
         ),
-        (Self::Export, icons::UPLOAD, "Export", "Export settings"),
         (
             Self::Recording,
             icons::VIDEO,
             "Recording",
             "Recording settings",
+        ),
+        (
+            Self::Keybinds,
+            icons::KEYBOARD,
+            "Keybinds",
+            "Keybinds settings",
         ),
     ];
 }
@@ -618,6 +623,10 @@ pub struct Editor {
     /// The microphones Settings offers as the default, read when its Recording tab is first
     /// shown and let go when it closes, so devices aren't listed every frame.
     settings_microphones: Option<Vec<bareclip_audio::Microphone>>,
+    /// The recording key Settings is waiting for new keys for, and why the last ones pressed
+    /// couldn't be used.
+    waiting_for_key: Option<hotkeys::RecordingKey>,
+    key_problem: Option<String>,
     /// Where settings and recovery copies live. Without it, the app keeps nothing.
     app_folder: Option<PathBuf>,
     recovery: Option<Recovery>,
@@ -651,6 +660,7 @@ pub struct Editor {
     screen_bar: Option<screen_recording::ScreenBar>,
     open_screen: screen_recording::OpenScreen,
     open_pc_sound: screen_recording::OpenPcSound,
+    open_app_sound: screen_recording::OpenAppSound,
     list_sources: screen_recording::ListSources,
     /// The camera recording bar, while it is open, and how cameras are found and opened, which
     /// tests replace with a made-up camera.
@@ -906,6 +916,8 @@ impl Editor {
             settings_open: false,
             settings_tab: SettingsTab::General,
             settings_microphones: None,
+            waiting_for_key: None,
+            key_problem: None,
             app_folder: None,
             recovery: None,
             seek_bar_held: false,
@@ -925,6 +937,7 @@ impl Editor {
             screen_bar: None,
             open_screen: screen_recording::open_real_screen,
             open_pc_sound: screen_recording::open_real_pc_sound,
+            open_app_sound: screen_recording::open_real_app_sound,
             list_sources: screen_recording::list_real_sources,
             camera_bar: None,
             open_camera: camera_recording::open_real_camera,
@@ -3566,6 +3579,12 @@ impl Editor {
         if self.settings_tab == SettingsTab::Recording && self.settings_microphones.is_none() {
             self.settings_microphones = Some((self.list_microphones)());
         }
+        if self.settings_tab != SettingsTab::Keybinds {
+            self.waiting_for_key = None;
+        }
+        // Keys pressed while waiting for a recording key go to it, Escape backing out, before
+        // anything else sees them, so Escape doesn't close Settings.
+        changed |= self.take_recording_keys(ctx);
         let modal = egui::Modal::new(egui::Id::unique("settings_dialog"))
             .frame(dialog_frame(ctx))
             .show(ctx, |ui| {
@@ -3614,10 +3633,10 @@ impl Editor {
                                     changed |= page_changed;
                                     strip_changed |= page_strip;
                                 }
-                                SettingsTab::Export => changed |= self.export_settings(ui, palette),
                                 SettingsTab::Recording => {
                                     changed |= self.recording_settings(ui, palette);
                                 }
+                                SettingsTab::Keybinds => self.keybind_settings(ui, palette),
                             }
                         },
                     );
@@ -3637,13 +3656,15 @@ impl Editor {
         if close || modal.should_close() {
             self.settings_open = false;
             self.settings_microphones = None;
+            self.waiting_for_key = None;
+            self.key_problem = None;
         }
         if std::mem::take(&mut self.restart_asked) {
             self.restart_for_new_chip(ctx);
         }
     }
 
-    /// Settings' General tab: the theme, the graphics chip and waveforms. Returns
+    /// Settings' General tab: the theme, the graphics chip, waveforms and exports. Returns
     /// whether anything changed, and whether it was the waveforms.
     fn general_settings(&mut self, ui: &mut egui::Ui, palette: &Palette) -> (bool, bool) {
         let mut changed = false;
@@ -3684,10 +3705,12 @@ impl Editor {
                 strip_changed = true;
             }
         });
+        ui.add_space(SETTINGS_ROW_GAP);
+        changed |= self.export_settings(ui, palette);
         (changed, strip_changed)
     }
 
-    /// Settings' Export tab. Returns whether anything changed.
+    /// The export choice on Settings' General tab. Returns whether it changed.
     fn export_settings(&mut self, ui: &mut egui::Ui, palette: &Palette) -> bool {
         let mut changed = false;
         components::settings_group(ui, palette, "Export", |ui| {
@@ -12590,7 +12613,11 @@ mod tests {
         click_named(&ctx, &mut editor, "Settings");
         let_dialog_open(&ctx, &mut editor);
 
-        for tab in ["General settings", "Export settings", "Recording settings"] {
+        for tab in [
+            "General settings",
+            "Recording settings",
+            "Keybinds settings",
+        ] {
             click_named(&ctx, &mut editor, tab);
             let_dialog_open(&ctx, &mut editor);
             // Under the tabs, level with Done.
@@ -13653,8 +13680,6 @@ mod tests {
         let_dialog_open(&ctx, &mut editor);
         click_named(&ctx, &mut editor, "Light");
         run_frame(&ctx, &mut editor, vec![]);
-        click_named(&ctx, &mut editor, "Export settings");
-        run_frame(&ctx, &mut editor, vec![]);
         click_named(&ctx, &mut editor, "Fastest");
         assert_eq!(editor.mode, CutMode::Keyframe);
         click_named(&ctx, &mut editor, "Done");
@@ -13696,8 +13721,6 @@ mod tests {
 
         click_named(&ctx, &mut editor, "Settings");
         let_dialog_open(&ctx, &mut editor);
-        click_named(&ctx, &mut editor, "Export settings");
-        run_frame(&ctx, &mut editor, vec![]);
 
         assert!(is_named(&ctx, &mut editor, "Fastest"));
         assert!(!is_named(&ctx, &mut editor, "5 seconds"));
@@ -20423,19 +20446,11 @@ mod tests {
         click_named(&ctx, &mut editor, "Settings");
         let_dialog_open(&ctx, &mut editor);
         let done = named_rect(&ctx, &mut editor, "Done");
+        // Export's one choice lives on General, with no tab of its own.
         assert!(is_named(&ctx, &mut editor, "Waveforms on clips"));
-        assert!(!is_named(&ctx, &mut editor, "Fastest"));
-        assert!(!is_named(&ctx, &mut editor, "Count down from 3"));
-
-        click_named(&ctx, &mut editor, "Export settings");
-        let_dialog_open(&ctx, &mut editor);
         assert!(is_named(&ctx, &mut editor, "Fastest"));
-        assert!(!is_named(&ctx, &mut editor, "Waveforms on clips"));
-        assert_eq!(
-            named_rect(&ctx, &mut editor, "Done"),
-            done,
-            "it keeps its size"
-        );
+        assert!(!is_named(&ctx, &mut editor, "Export settings"));
+        assert!(!is_named(&ctx, &mut editor, "Count down from 3"));
 
         click_named(&ctx, &mut editor, "Recording settings");
         let_dialog_open(&ctx, &mut editor);
@@ -20445,6 +20460,21 @@ mod tests {
             &mut editor,
             "Default microphone: Windows default"
         ));
+        assert!(is_named(&ctx, &mut editor, "Recording quality: Balanced"));
+        assert_eq!(
+            named_rect(&ctx, &mut editor, "Done"),
+            done,
+            "it keeps its size"
+        );
+
+        click_named(&ctx, &mut editor, "Keybinds settings");
+        let_dialog_open(&ctx, &mut editor);
+        assert!(is_named(
+            &ctx,
+            &mut editor,
+            "Stop recording: Ctrl+Alt+Shift+R"
+        ));
+        assert!(!is_named(&ctx, &mut editor, "Count down from 3"));
         assert_eq!(
             named_rect(&ctx, &mut editor, "Done"),
             done,
@@ -20550,11 +20580,22 @@ mod tests {
         editor.settings_tab = SettingsTab::General;
         editor.open_screen = made_up_screen;
         editor.open_pc_sound = made_up_pc_sound;
+        editor.open_app_sound = made_up_app_sound;
         editor.list_sources = made_up_sources;
         editor.settings.countdown = false;
         open_screen_bar_by_hand(&ctx, &mut editor);
         run_for(&ctx, &mut editor, 0.5);
         camera.shoot(&ctx, &mut editor, vec![], "record-08-screen-bar");
+        choose_the_game_window(&ctx, &mut editor);
+        run_for(&ctx, &mut editor, 0.3);
+        camera.shoot(&ctx, &mut editor, vec![], "record-08b-window-app-sound");
+        click_named(&ctx, &mut editor, "Size: Full size (640 x 360)");
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "record-08c-size-menu");
+        editor.screen_bar = None;
+        run_frame(&ctx, &mut editor, vec![]);
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        run_for(&ctx, &mut editor, 0.3);
         click_named(&ctx, &mut editor, "Start recording");
         run_for(&ctx, &mut editor, 0.8);
         camera.shoot(&ctx, &mut editor, vec![], "record-09-screen-recording");
@@ -20631,15 +20672,34 @@ mod tests {
         editor.settings_open = true;
         let_dialog_open(&ctx, &mut editor);
         camera.shoot(&ctx, &mut editor, vec![], "record-20-settings-general");
-        click_named(&ctx, &mut editor, "Export settings");
-        let_dialog_open(&ctx, &mut editor);
-        camera.shoot(&ctx, &mut editor, vec![], "record-21-settings-export");
         click_named(&ctx, &mut editor, "Recording settings");
         let_dialog_open(&ctx, &mut editor);
         let default = format!("Default microphone: {}", text::WINDOWS_DEFAULT_MICROPHONE);
         click_named(&ctx, &mut editor, &default);
         let_dialog_open(&ctx, &mut editor);
         camera.shoot(&ctx, &mut editor, vec![], "record-22-settings-microphones");
+        run_frame(&ctx, &mut editor, press(Key::Escape));
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "record-23-settings-recording");
+        click_named(&ctx, &mut editor, "Keybinds settings");
+        let_dialog_open(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Stop recording: Ctrl+Alt+Shift+R");
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(&ctx, &mut editor, vec![], "record-24-keybinds-waiting");
+        run_frame(&ctx, &mut editor, press(Key::K));
+        let_dialog_open(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Pause or resume: Ctrl+Alt+Shift+P");
+        run_frame(&ctx, &mut editor, vec![]);
+        run_frame(&ctx, &mut editor, press(Key::K));
+        let_dialog_open(&ctx, &mut editor);
+        camera.shoot(
+            &ctx,
+            &mut editor,
+            vec![],
+            "record-25-keybinds-plain-and-refused",
+        );
+        editor.settings.stop_key = hotkeys::Shortcut::STOP;
+        editor.key_problem = None;
         editor.settings_open = false;
         editor.settings_microphones = None;
         run_frame(&ctx, &mut editor, vec![]);
@@ -20655,17 +20715,19 @@ mod tests {
     /// Stands in for the screen: a picture that changes colour every so often.
     struct MadeUpScreen {
         started: Instant,
+        size: (u32, u32),
     }
 
     impl bareclip_capture::PictureSource for MadeUpScreen {
         fn latest(&self) -> Option<(bareclip_capture::Picture, u64)> {
             let tick = (self.started.elapsed().as_millis() / 250) as u64;
             let shade = (tick * 40 % 200) as u8;
+            let (width, height) = self.size;
             Some((
                 bareclip_capture::Picture {
-                    width: 640,
-                    height: 360,
-                    bgra: [shade, 80, 200, 255].repeat(640 * 360),
+                    width,
+                    height,
+                    bgra: [shade, 80, 200, 255].repeat((width * height) as usize),
                     shown_at: 0,
                 },
                 tick + 1,
@@ -20673,7 +20735,7 @@ mod tests {
         }
 
         fn size(&self) -> (u32, u32) {
-            (640, 360)
+            self.size
         }
     }
 
@@ -20683,11 +20745,35 @@ mod tests {
     ) -> Result<Box<dyn bareclip_capture::PictureSource>, String> {
         Ok(Box::new(MadeUpScreen {
             started: Instant::now(),
+            size: (640, 360),
+        }))
+    }
+
+    /// A screen twice as large, which smaller sizes can be picked for.
+    fn made_up_large_screen(
+        _source: bareclip_capture::Source,
+        _pointer: bool,
+    ) -> Result<Box<dyn bareclip_capture::PictureSource>, String> {
+        Ok(Box::new(MadeUpScreen {
+            started: Instant::now(),
+            size: (1280, 720),
         }))
     }
 
     fn made_up_pc_sound() -> Result<recording::MicSource, String> {
         made_up_microphone(None)
+    }
+
+    /// Stands in for one program's sound, as `made_up_pc_sound` does for all of it.
+    fn made_up_app_sound(
+        _source: bareclip_capture::Source,
+    ) -> Result<recording::MicSource, String> {
+        made_up_microphone(None)
+    }
+
+    /// One program's sound, on a PC where that can't be done.
+    fn no_app_sound(_source: bareclip_capture::Source) -> Result<recording::MicSource, String> {
+        Err("Only this app's sound can't be recorded on this PC.".to_owned())
     }
 
     fn made_up_sources() -> Vec<bareclip_capture::Offered> {
@@ -20741,6 +20827,7 @@ mod tests {
         let (mut editor, folder) = ready_to_record(ctx, name);
         editor.open_screen = made_up_screen;
         editor.open_pc_sound = made_up_pc_sound;
+        editor.open_app_sound = made_up_app_sound;
         editor.list_sources = made_up_sources;
         editor.settings.screen_pc_sound = true;
         editor.settings.screen_microphone = false;
@@ -20814,6 +20901,389 @@ mod tests {
             editor.project.tracks, tracks_before,
             "one step, and nothing moved"
         );
+    }
+
+    fn choose_the_game_window(ctx: &egui::Context, editor: &mut Editor) {
+        click_named(ctx, editor, "Record: Screen 1 (main), 640 x 360");
+        run_frame(ctx, editor, vec![]);
+        click_named(ctx, editor, "A game");
+        run_frame(ctx, editor, vec![]);
+    }
+
+    /// Records the screen bar that's open for a moment, and gives the new file.
+    fn record_a_moment(ctx: &egui::Context, editor: &mut Editor, folder: &Path) -> PathBuf {
+        let before = recorded_files(folder);
+        click_named(ctx, editor, "Start recording");
+        run_for(ctx, editor, 0.6);
+        click_named(ctx, editor, "Stop");
+        run_frame(ctx, editor, vec![]);
+        recorded_files(folder)
+            .into_iter()
+            .find(|file| !before.contains(file))
+            .expect("a new file")
+    }
+
+    #[test]
+    fn recording_a_window_takes_only_its_apps_sound_unless_switched_off() {
+        let ctx = context();
+        let (mut editor, folder) = ready_to_record_the_screen(&ctx, "screen-app-sound");
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        assert!(
+            !is_named(&ctx, &mut editor, text::ONLY_THIS_APPS_SOUND),
+            "a whole screen records all PC sound"
+        );
+        choose_the_game_window(&ctx, &mut editor);
+        assert!(is_named(&ctx, &mut editor, text::ONLY_THIS_APPS_SOUND));
+        let file = record_a_moment(&ctx, &mut editor, &folder);
+        assert_eq!(
+            sound_track_names(&file),
+            [Some("App sound".to_owned()), Some("Microphone".to_owned())]
+        );
+
+        // Switched off, the same window records everything the PC plays, and that's remembered.
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        choose_the_game_window(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, text::ONLY_THIS_APPS_SOUND);
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(!editor.settings.screen_app_sound_only);
+        let file = record_a_moment(&ctx, &mut editor, &folder);
+        assert_eq!(
+            sound_track_names(&file),
+            [Some("PC sound".to_owned()), Some("Microphone".to_owned())]
+        );
+    }
+
+    #[test]
+    fn without_one_apps_sound_all_pc_sound_is_recorded_and_it_says_so() {
+        let ctx = context();
+        let (mut editor, folder) = ready_to_record_the_screen(&ctx, "screen-no-app-sound");
+        editor.open_app_sound = no_app_sound;
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        choose_the_game_window(&ctx, &mut editor);
+        let said = format!(
+            "Only this app's sound can't be recorded on this PC. {}",
+            text::ALL_PC_SOUND_INSTEAD
+        );
+        assert!(shows_text(&ctx, &mut editor, &said));
+        let file = record_a_moment(&ctx, &mut editor, &folder);
+        assert_eq!(
+            sound_track_names(&file),
+            [Some("PC sound".to_owned()), Some("Microphone".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_smaller_size_picked_for_one_recording_shrinks_it_and_leaves_settings_alone() {
+        let ctx = context();
+        let (mut editor, folder) = ready_to_record_the_screen(&ctx, "screen-smaller");
+        editor.open_screen = made_up_large_screen;
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Size: Full size (1280 x 720)");
+        run_frame(&ctx, &mut editor, vec![]);
+        // Only sizes smaller than the screen are offered.
+        assert!(!is_named(&ctx, &mut editor, "1080p (1280 x 720)"));
+        assert!(!is_named(&ctx, &mut editor, "720p (1280 x 720)"));
+        click_named(&ctx, &mut editor, "480p (854 x 480)");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(is_named(&ctx, &mut editor, "Size: 480p (854 x 480)"));
+        assert_eq!(
+            editor.settings.screen_size,
+            storage::RecordingSize::Full,
+            "Settings keep the default"
+        );
+        let file = record_a_moment(&ctx, &mut editor, &folder);
+        let info = bareclip_media::probe(&file).expect("it can be read");
+        assert_eq!((info.video.width, info.video.height), (854, 480));
+
+        // The next recording starts on Settings' default again.
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        assert!(is_named(&ctx, &mut editor, "Size: Full size (1280 x 720)"));
+    }
+
+    #[test]
+    fn the_size_in_settings_is_where_each_window_starts_unless_its_too_large() {
+        let ctx = context();
+        let (mut editor, folder) = ready_to_record_the_screen(&ctx, "screen-size-default");
+        editor.settings.screen_size = storage::RecordingSize::P480;
+        editor.open_screen = made_up_large_screen;
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        assert!(is_named(&ctx, &mut editor, "Size: 480p (854 x 480)"));
+        editor.screen_bar = None;
+        run_frame(&ctx, &mut editor, vec![]);
+
+        // 480p would make a 640 x 360 screen larger, so it's recorded at its own size.
+        editor.open_screen = made_up_screen;
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        assert!(is_named(&ctx, &mut editor, "Size: Full size (640 x 360)"));
+        let file = record_a_moment(&ctx, &mut editor, &folder);
+        let info = bareclip_media::probe(&file).expect("it can be read");
+        assert_eq!((info.video.width, info.video.height), (640, 360));
+    }
+
+    #[test]
+    fn the_quality_and_size_picked_are_what_the_screen_is_recorded_with() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record_the_screen(&ctx, "screen-quality");
+        editor.open_screen = made_up_large_screen;
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        assert!(is_named(&ctx, &mut editor, "Quality: Balanced"));
+        click_named(&ctx, &mut editor, "Quality: Balanced");
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Smaller file");
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Size: Full size (1280 x 720)");
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "480p (854 x 480)");
+        run_frame(&ctx, &mut editor, vec![]);
+        let bar = editor.screen_bar.as_ref().expect("the bar is open");
+        assert_eq!(
+            bar.screen_settings(60),
+            bareclip_capture::ScreenSettings {
+                frame_rate: 60,
+                size: Some((854, 480)),
+                quality: Quality::Smaller,
+            }
+        );
+        assert_eq!(
+            editor.settings.recording_quality,
+            storage::RecordingQuality::Balanced,
+            "Settings keep the default"
+        );
+    }
+
+    #[test]
+    fn the_quality_in_settings_is_where_screen_and_camera_windows_start() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record_the_screen(&ctx, "quality-default");
+        editor.open_camera = made_up_camera;
+        editor.list_cameras = made_up_cameras;
+        editor.settings.recording_quality = storage::RecordingQuality::MatchSource;
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        assert!(is_named(&ctx, &mut editor, "Quality: Match source"));
+        editor.screen_bar = None;
+        run_frame(&ctx, &mut editor, vec![]);
+        open_camera_bar_by_hand(&ctx, &mut editor);
+        run_for(&ctx, &mut editor, 0.3);
+        assert!(is_named(&ctx, &mut editor, "Quality: Match source"));
+        click_named(&ctx, &mut editor, "Quality: Match source");
+        run_frame(&ctx, &mut editor, vec![]);
+        click_named(&ctx, &mut editor, "Smaller file");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(is_named(&ctx, &mut editor, "Quality: Smaller file"));
+        assert_eq!(
+            editor.settings.recording_quality,
+            storage::RecordingQuality::MatchSource
+        );
+    }
+
+    /// Opens Settings on its Keybinds tab.
+    fn open_keybind_settings(ctx: &egui::Context, editor: &mut Editor) {
+        editor.settings_tab = SettingsTab::Keybinds;
+        editor.settings_open = true;
+        let_dialog_open(ctx, editor);
+    }
+
+    #[test]
+    fn a_recording_key_is_changed_by_pressing_the_new_keys_in_settings() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record_the_screen(&ctx, "keys-changed");
+        open_keybind_settings(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Stop recording: Ctrl+Alt+Shift+R");
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(is_named(
+            &ctx,
+            &mut editor,
+            &format!("Stop recording: {}", text::PRESS_KEYS)
+        ));
+        run_frame(
+            &ctx,
+            &mut editor,
+            key_event(Key::F9, Modifiers::CTRL | Modifiers::SHIFT),
+        );
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.settings.stop_key.name(), "Ctrl+Shift+F9");
+        assert!(is_named(&ctx, &mut editor, "Stop recording: Ctrl+Shift+F9"));
+        assert!(editor.settings_open);
+        editor.settings_open = false;
+        run_frame(&ctx, &mut editor, vec![]);
+
+        // Hovering Start recording in the screen window says which keys.
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        let keys = "From any program, Ctrl+Shift+F9 stops, Ctrl+Alt+Shift+P pauses and \
+                    Ctrl+Alt+Shift+M turns the microphone on or off.";
+        assert!(!shows_text(&ctx, &mut editor, keys), "only when hovered");
+        // Tests don't wait for the pointer to rest, so the hint shows straight away.
+        ctx.all_styles_mut(|style| {
+            style.interaction.tooltip_delay = 0.0;
+            style.interaction.show_tooltips_only_when_still = false;
+        });
+        let start = named_rect(&ctx, &mut editor, "Start recording");
+        run_frame(
+            &ctx,
+            &mut editor,
+            vec![egui::Event::PointerMoved(start.center())],
+        );
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(shows_text(&ctx, &mut editor, keys));
+    }
+
+    #[test]
+    fn the_recording_keys_pause_turn_the_microphone_on_and_off_and_stop() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record_the_screen(&ctx, "keys-pressed");
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.3);
+        assert!(is_named(&ctx, &mut editor, "Turn the microphone on"));
+
+        let press = |editor: &mut Editor, key| editor.recording_key_pressed(&ctx, key);
+        assert!(!press(&mut editor, hotkeys::RecordingKey::Microphone));
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(is_named(&ctx, &mut editor, "Turn the microphone off"));
+        assert!(!press(&mut editor, hotkeys::RecordingKey::Microphone));
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(is_named(&ctx, &mut editor, "Turn the microphone on"));
+
+        assert!(!press(&mut editor, hotkeys::RecordingKey::Pause));
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(is_named(&ctx, &mut editor, "Resume recording"));
+        assert!(press(&mut editor, hotkeys::RecordingKey::Stop));
+        assert!(editor.screen_bar.is_none());
+    }
+
+    #[test]
+    fn the_microphone_key_can_be_changed_like_the_others() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record(&ctx, "keys-microphone");
+        open_keybind_settings(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Microphone on or off: Ctrl+Alt+Shift+M");
+        run_frame(&ctx, &mut editor, vec![]);
+        run_frame(&ctx, &mut editor, key_event(Key::F8, Modifiers::ALT));
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.settings.microphone_key.name(), "Alt+F8");
+        // And can't take another's keys.
+        click_named(&ctx, &mut editor, "Microphone on or off: Alt+F8");
+        run_frame(&ctx, &mut editor, vec![]);
+        run_frame(
+            &ctx,
+            &mut editor,
+            key_event(Key::P, Modifiers::CTRL | Modifiers::ALT | Modifiers::SHIFT),
+        );
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.settings.microphone_key.name(), "Alt+F8");
+    }
+
+    #[test]
+    fn escape_keeps_the_recording_key_and_settings_open() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record(&ctx, "keys-escape");
+        open_keybind_settings(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Pause or resume: Ctrl+Alt+Shift+P");
+        run_frame(&ctx, &mut editor, vec![]);
+        run_frame(&ctx, &mut editor, press(Key::Escape));
+        run_frame(&ctx, &mut editor, vec![]);
+        assert!(editor.settings_open, "Escape backed out of the key only");
+        assert_eq!(editor.settings.pause_key, hotkeys::Shortcut::PAUSE);
+        assert!(is_named(
+            &ctx,
+            &mut editor,
+            "Pause or resume: Ctrl+Alt+Shift+P"
+        ));
+    }
+
+    #[test]
+    fn the_other_recording_key_cant_be_used_twice() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record(&ctx, "keys-twice");
+        open_keybind_settings(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Pause or resume: Ctrl+Alt+Shift+P");
+        run_frame(&ctx, &mut editor, vec![]);
+        run_frame(
+            &ctx,
+            &mut editor,
+            key_event(Key::R, Modifiers::CTRL | Modifiers::ALT | Modifiers::SHIFT),
+        );
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.settings.pause_key, hotkeys::Shortcut::PAUSE);
+        assert!(shows_text(
+            &ctx,
+            &mut editor,
+            "Ctrl+Alt+Shift+R is already another recording key."
+        ));
+    }
+
+    #[test]
+    fn a_plain_key_is_kept_with_a_warning() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record(&ctx, "keys-plain");
+        open_keybind_settings(&ctx, &mut editor);
+        click_named(&ctx, &mut editor, "Stop recording: Ctrl+Alt+Shift+R");
+        run_frame(&ctx, &mut editor, vec![]);
+        run_frame(&ctx, &mut editor, press(Key::Backtick));
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.settings.stop_key.name(), "`");
+        let warning = text::plain_key_warning(editor.settings.stop_key);
+        assert!(shows_text(&ctx, &mut editor, &warning));
+        // A function key alone isn't warned about.
+        click_named(&ctx, &mut editor, "Stop recording: `");
+        run_frame(&ctx, &mut editor, vec![]);
+        run_frame(&ctx, &mut editor, press(Key::F10));
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(editor.settings.stop_key.name(), "F10");
+        assert!(!shows_text(&ctx, &mut editor, &warning));
+        let warning = text::plain_key_warning(editor.settings.stop_key);
+        assert!(!shows_text(&ctx, &mut editor, &warning));
+    }
+
+    /// Where a recording window sits on screen, by the name of its area.
+    fn bar_rect(ctx: &egui::Context, area: &str) -> egui::Rect {
+        ctx.memory(|memory| memory.area_rect(egui::Id::unique(area)))
+            .expect("it's shown")
+    }
+
+    #[test]
+    fn recording_windows_open_in_the_middle_and_record_over_the_bottom_of_the_video() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record_the_screen(&ctx, "bars-centred");
+        editor.open_camera = made_up_camera;
+        editor.list_cameras = made_up_cameras;
+        let middle = ctx.content_rect().center();
+        let centred = |rect: egui::Rect| (rect.center() - middle).length() < 1.5;
+
+        open_record_bar_by_hand(&ctx, &mut editor);
+        run_for(&ctx, &mut editor, 0.2);
+        let open = bar_rect(&ctx, "record_bar");
+        assert!(centred(open), "{open:?} against {middle:?}");
+        click_named(&ctx, &mut editor, "Start recording");
+        run_for(&ctx, &mut editor, 0.4);
+        let slim = bar_rect(&ctx, "record_bar");
+        assert!(
+            (slim.bottom() - (editor.stage_rect.bottom() - 16.0)).abs() < 1.5,
+            "{slim:?} over the bottom of {:?}",
+            editor.stage_rect
+        );
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+
+        open_screen_bar_by_hand(&ctx, &mut editor);
+        run_for(&ctx, &mut editor, 0.2);
+        let screen = bar_rect(&ctx, "screen_bar");
+        assert!(centred(screen), "{screen:?}");
+        editor.screen_bar = None;
+        run_frame(&ctx, &mut editor, vec![]);
+
+        open_camera_bar_by_hand(&ctx, &mut editor);
+        run_for(&ctx, &mut editor, 0.3);
+        let camera = bar_rect(&ctx, "camera_bar");
+        assert!(centred(camera), "{camera:?}");
+        editor.camera_bar = None;
+        run_frame(&ctx, &mut editor, vec![]);
+
+        open_screen_and_camera_bar_by_hand(&ctx, &mut editor);
+        run_for(&ctx, &mut editor, 0.3);
+        let both = bar_rect(&ctx, "screen_bar");
+        assert!(centred(both), "{both:?}");
+        assert!(both.top() >= 0.0 && both.bottom() <= ctx.content_rect().bottom());
     }
 
     #[test]
@@ -21056,7 +21526,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&browsed);
         editor.pick_folder = picks_screen_folder;
         open_screen_bar_by_hand(&ctx, &mut editor);
-        click_named(&ctx, &mut editor, "Browse");
+        click_named(&ctx, &mut editor, &components::FolderBox::name(&folder));
         run_frame(&ctx, &mut editor, vec![]);
         click_named(&ctx, &mut editor, "Start recording");
         run_for(&ctx, &mut editor, 0.5);
@@ -21092,7 +21562,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&browsed);
         editor.pick_folder = picks_microphone_folder;
         open_record_bar_by_hand(&ctx, &mut editor);
-        click_named(&ctx, &mut editor, "Browse");
+        click_named(&ctx, &mut editor, &components::FolderBox::name(&folder));
         run_frame(&ctx, &mut editor, vec![]);
         click_named(&ctx, &mut editor, "Start recording");
         run_for(&ctx, &mut editor, 0.5);

@@ -10,7 +10,10 @@ use bareclip_media::SoundLabel;
 use rtrb::Consumer;
 
 use super::*;
-use crate::storage::{CutShort, RecordingMarker};
+use crate::{
+    hotkeys::{RecordingKey, Shortcut, shortcut_problem},
+    storage::{CutShort, RecordingMarker, RecordingQuality, RecordingSize},
+};
 
 /// How long the countdown before a recording lasts, in seconds.
 const COUNTDOWN_SECONDS: f64 = 3.0;
@@ -33,8 +36,19 @@ const FOLDER_NAME: &str = "BareClip recordings";
 pub(super) const TIME_WIDTH: f32 = 72.0;
 /// The room between the cards of a recording window.
 pub(super) const GROUP_GAP: f32 = 12.0;
+/// Recording windows with a picture: wide enough for the picture beside its choices, and for the
+/// Sound and Options cards side by side.
+pub(super) const WIDE_BAR_WIDTH: f32 = 760.0;
+/// The room between the columns of a wide recording window.
+pub(super) const COLUMN_GAP: f32 = 16.0;
+/// How wide the live picture is in a wide recording window.
+pub(super) const PICTURE_WIDTH: f32 = 336.0;
 pub(super) const HEADPHONES_NOTE: &str =
     "Wear headphones, or the microphone will hear the video too.";
+/// The size and quality menus in Settings.
+const SETTINGS_MENU_WIDTH: f32 = 168.0;
+/// The buttons showing each recording key in Settings.
+const KEY_BUTTON_WIDTH: f32 = 168.0;
 
 /// A microphone being listened to, or something standing in for one in tests.
 pub(super) struct MicSource {
@@ -103,29 +117,57 @@ pub(super) fn stop_button(ui: &mut egui::Ui, palette: &Palette) -> bool {
     ui.add(button).on_hover_text("Stop recording").clicked()
 }
 
-/// Where the next recording is saved, with Browse to pick another folder for it. Says whether
-/// Browse was clicked.
-pub(super) fn save_in_row(ui: &mut egui::Ui, palette: &Palette, folder: &Path) -> bool {
-    let mut browse = false;
-    ui.horizontal(|ui| {
-        let width = (ui.available_width() - 96.0).max(80.0);
-        ui.allocate_ui_with_layout(
-            vec2(width, 26.0),
-            Layout::left_to_right(Align::Center),
-            |ui| {
-                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-                ui.colored_label(palette.text_muted, format!("Save in {}", folder.display()))
-                    .on_hover_text(folder.display().to_string());
-            },
-        );
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let button = ActionButton::new(palette, Kind::Secondary, "Browse")
-                .icon(icons::FOLDER_OPEN)
-                .small();
-            browse = ui.add(button).clicked();
-        });
+/// Where a recording is saved, as one box that picks another folder when clicked. Gives whether
+/// it was clicked.
+pub(super) fn folder_box(ui: &mut egui::Ui, palette: &Palette, folder: &Path, width: f32) -> bool {
+    ui.add(components::FolderBox::new(palette, folder, width))
+        .clicked()
+}
+
+/// A small name over a choice in a recording window, such as "Save in".
+pub(super) fn choice_heading(ui: &mut egui::Ui, palette: &Palette, name: &str) {
+    ui.label(
+        egui::RichText::new(name)
+            .size(12.0)
+            .color(palette.text_muted),
+    );
+    ui.add_space(2.0);
+}
+
+/// Lays `add` out in a column exactly `width` wide, beside whatever came before it on the line.
+pub(super) fn in_column(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui)) {
+    ui.allocate_ui_with_layout(vec2(width, 0.0), Layout::top_down(Align::Min), |ui| {
+        ui.set_width(width);
+        add(ui);
     });
-    browse
+}
+
+/// The space for a recording window's live picture, at 16:9 on the left of its top row.
+pub(super) fn picture_spot(ui: &mut egui::Ui, palette: &Palette) -> egui::Rect {
+    let (spot, _) = ui.allocate_exact_size(
+        vec2(PICTURE_WIDTH, (PICTURE_WIDTH * 9.0 / 16.0).round()),
+        Sense::hover(),
+    );
+    ui.painter().rect_filled(spot, 6.0, palette.stage);
+    spot
+}
+
+/// Places a recording window: in the middle of BareClip's window while its choices are made, and
+/// over the bottom of the video once it's a slim bar recording, so it covers as little of the
+/// video as it can.
+pub(super) fn place_bar(
+    area: egui::Area,
+    ctx: &egui::Context,
+    stage: egui::Rect,
+    slim: bool,
+) -> egui::Area {
+    if slim {
+        area.pivot(egui::Align2::CENTER_BOTTOM)
+            .fixed_pos(pos2(stage.center().x, stage.bottom() - BAR_LIFT))
+    } else {
+        area.pivot(egui::Align2::CENTER_CENTER)
+            .fixed_pos(ctx.content_rect().center())
+    }
 }
 
 pub(super) fn open_real_microphone(name: Option<&str>) -> Result<MicSource, String> {
@@ -685,10 +727,8 @@ impl Editor {
             ),
         };
         let stage = self.stage_rect;
-        egui::Area::new(egui::Id::unique("record_bar"))
-            .order(egui::Order::Foreground)
-            .pivot(egui::Align2::CENTER_BOTTOM)
-            .fixed_pos(pos2(stage.center().x, stage.bottom() - BAR_LIFT))
+        let area = egui::Area::new(egui::Id::unique("record_bar")).order(egui::Order::Foreground);
+        place_bar(area, ctx, stage, recording.is_some())
             .constrain(true)
             .show(ctx, |ui| {
                 // While recording it's one slim row, so it covers as little of the video as it can.
@@ -755,6 +795,12 @@ impl Editor {
                     level_meter(ui, palette, level);
                     ui.add_space(12.0);
                     if counting.is_none() {
+                        choice_heading(ui, palette, "Save in");
+                        let width = ui.available_width();
+                        if folder_box(ui, palette, &folder, width) {
+                            asked = Asked::Browse;
+                        }
+                        ui.add_space(GROUP_GAP);
                         components::settings_group(ui, palette, "Options", |ui| {
                             let row = SwitchRow::new(
                                 palette,
@@ -775,10 +821,6 @@ impl Editor {
                                 asked = Asked::Countdown(!countdown);
                             }
                         });
-                        ui.add_space(8.0);
-                        if save_in_row(ui, palette, &folder) {
-                            asked = Asked::Browse;
-                        }
                         ui.add_space(12.0);
                     }
                     components::dialog_buttons(ui, |ui| {
@@ -948,7 +990,208 @@ impl Editor {
                 changed = true;
             }
         });
+        ui.add_space(SETTINGS_ROW_GAP);
+        changed |= self.recording_video_settings(ui, palette);
         changed
+    }
+
+    /// The size and quality every recording starts on. Each window can change them for one
+    /// recording.
+    fn recording_video_settings(&mut self, ui: &mut egui::Ui, palette: &Palette) -> bool {
+        let mut changed = false;
+        components::settings_group(ui, palette, "Video", |ui| {
+            components::settings_row(
+                ui,
+                palette,
+                ("Screen recording size", Some(text::SCREEN_SIZE_NOTE)),
+                SETTINGS_MENU_WIDTH,
+                |ui| {
+                    let shown = self.settings.screen_size;
+                    let current = text::recording_size_name(shown, None);
+                    let name = format!("Screen recording size: {current}");
+                    let button = ui.add(components::Dropdown::new(
+                        palette,
+                        &name,
+                        &current,
+                        SETTINGS_MENU_WIDTH,
+                    ));
+                    let width = components::menu_width(&button);
+                    egui::Popup::menu(&button).show(|ui| {
+                        for size in RecordingSize::ALL {
+                            let label = text::recording_size_name(size, None);
+                            let item =
+                                MenuItem::choice(palette, &label, size == shown).width(width);
+                            if ui.add(item).clicked() && size != shown {
+                                self.settings.screen_size = size;
+                                changed = true;
+                            }
+                        }
+                    });
+                },
+            );
+            components::settings_divider(ui, palette);
+            components::settings_row(
+                ui,
+                palette,
+                ("Recording quality", Some("For screen and camera")),
+                SETTINGS_MENU_WIDTH,
+                |ui| {
+                    let shown = self.settings.recording_quality;
+                    let current = text::quality_name(shown.into());
+                    let name = format!("Recording quality: {current}");
+                    let button = ui.add(components::Dropdown::new(
+                        palette,
+                        &name,
+                        current,
+                        SETTINGS_MENU_WIDTH,
+                    ));
+                    let width = components::menu_width(&button);
+                    egui::Popup::menu(&button).show(|ui| {
+                        for quality in RecordingQuality::ALL {
+                            let label = text::quality_name(quality.into());
+                            let item =
+                                MenuItem::choice(palette, label, quality == shown).width(width);
+                            if ui.add(item).clicked() && quality != shown {
+                                self.settings.recording_quality = quality;
+                                changed = true;
+                            }
+                        }
+                    });
+                },
+            );
+        });
+        changed
+    }
+
+    /// Settings' Keybinds tab: the keys that stop and pause a screen recording from any
+    /// program. Pressing one's button waits for the new keys, which `take_recording_keys` takes.
+    pub(super) fn keybind_settings(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        let rows = [
+            (RecordingKey::Stop, "Stop recording", self.settings.stop_key),
+            (
+                RecordingKey::Pause,
+                "Pause or resume",
+                self.settings.pause_key,
+            ),
+            (
+                RecordingKey::Microphone,
+                "Microphone on or off",
+                self.settings.microphone_key,
+            ),
+        ];
+        components::settings_group(ui, palette, "Screen recording", |ui| {
+            for (index, (key, label, shortcut)) in rows.into_iter().enumerate() {
+                if index > 0 {
+                    components::settings_divider(ui, palette);
+                }
+                let waiting = self.waiting_for_key == Some(key);
+                components::settings_row(ui, palette, (label, None), KEY_BUTTON_WIDTH, |ui| {
+                    let shown = if waiting {
+                        text::PRESS_KEYS.to_owned()
+                    } else {
+                        shortcut.name()
+                    };
+                    let name = format!("{label}: {shown}");
+                    // Outlined like any button, so it reads as one to press, and filled while it
+                    // waits for keys.
+                    let kind = if waiting {
+                        Kind::Chosen
+                    } else {
+                        Kind::Secondary
+                    };
+                    let button = ActionButton::new(palette, kind, &shown)
+                        .small()
+                        .width(KEY_BUTTON_WIDTH);
+                    let clicked = ui
+                        .add(button)
+                        .on_hover_text("Press, then press the new keys. Escape keeps these.");
+                    clicked
+                        .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &name));
+                    if clicked.clicked() {
+                        self.waiting_for_key = (!waiting).then_some(key);
+                        self.key_problem = None;
+                    }
+                });
+                if shortcut.is_plain() {
+                    components::settings_note(
+                        ui,
+                        palette,
+                        &text::plain_key_warning(shortcut),
+                        Some(palette.danger),
+                    );
+                }
+            }
+            if let Some(problem) = &self.key_problem {
+                components::settings_note(ui, palette, problem, Some(palette.danger));
+            }
+        });
+        components::settings_note(ui, palette, text::KEYBINDS_NOTE, None);
+    }
+
+    /// While Settings waits for a recording key, takes every key pressed: Escape backs out, and
+    /// any other key with what's held becomes that recording key, unless another program or the
+    /// other recording key already has it. Returns whether a key changed.
+    pub(super) fn take_recording_keys(&mut self, ctx: &egui::Context) -> bool {
+        let Some(waiting) = self.waiting_for_key else {
+            return false;
+        };
+        let mut pressed = Vec::new();
+        ctx.input_mut(|input| {
+            input.events.retain(|event| match event {
+                egui::Event::Key {
+                    key,
+                    pressed: down,
+                    modifiers,
+                    ..
+                } => {
+                    if *down {
+                        pressed.push((*key, *modifiers));
+                    }
+                    false
+                }
+                _ => true,
+            });
+        });
+        let Some(&(key, modifiers)) = pressed.first() else {
+            return false;
+        };
+        if key == Key::Escape {
+            self.waiting_for_key = None;
+            self.key_problem = None;
+            return false;
+        }
+        // A key no shortcut can use is passed over, and it goes on waiting.
+        let Some(wanted) = Shortcut::from_pressed(key, modifiers) else {
+            return false;
+        };
+        let settings = &self.settings;
+        let all = [
+            (RecordingKey::Stop, settings.stop_key),
+            (RecordingKey::Pause, settings.pause_key),
+            (RecordingKey::Microphone, settings.microphone_key),
+        ];
+        let current = all
+            .iter()
+            .find(|(key, _)| *key == waiting)
+            .map_or(wanted, |(_, shortcut)| *shortcut);
+        let others: Vec<Shortcut> = all
+            .iter()
+            .filter(|(key, _)| *key != waiting)
+            .map(|(_, shortcut)| *shortcut)
+            .collect();
+        self.waiting_for_key = None;
+        if let Some(problem) = shortcut_problem(wanted, current, &others) {
+            self.key_problem = Some(problem);
+            return false;
+        }
+        self.key_problem = None;
+        let settings = &mut self.settings;
+        match waiting {
+            RecordingKey::Stop => settings.stop_key = wanted,
+            RecordingKey::Pause => settings.pause_key = wanted,
+            RecordingKey::Microphone => settings.microphone_key = wanted,
+        }
+        wanted != current
     }
 
     /// The microphone every recording starts on, as a row with its list under it. Gives the new

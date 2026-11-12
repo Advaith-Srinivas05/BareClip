@@ -22,9 +22,11 @@ BareClip runs on 64-bit Windows and has been tested on Windows 11.
 **Editing**
 
 - Several video and sound rows, with clips you can split, trim, move, copy and duplicate
+- Select several clips with Ctrl or Shift and move, copy, duplicate or delete them together
 - Snapping, timeline zoom, and undo and redo for every change
 - Gaps left by deleted clips stay until you remove them, and export as black and silence
 - Project files that save themselves as you work and recover after a crash
+- Rename videos within a project
 - Right-click a video or song in File Explorer and choose **Edit with BareClip** to add it to the timeline. On Windows 11 it's under **Show more options**.
 
 **Picture**
@@ -33,10 +35,11 @@ BareClip runs on 64-bit Windows and has been tested on Windows 11.
 - A background colour, and project sizes for wide, tall and square videos
 - Speed changes from slow motion to fast-forward, with the sound kept at its pitch
 - Images, and phone videos shown the right way up
+- A content library of shapes, arrows, callouts, frames, borders, overlays and backgrounds
 
 **Titles, looks and effects**
 
-- Over 70 title styles, many of them moving, and captions you can type or import from an SRT file
+- Over 70 title styles, many of them moving, and captions you can type, import from an SRT file or save as one
 - 44 transitions, 49 colour filters with adjustable strength, colour adjustments and fades
 - 27 effects such as blur, glow, glitch, VHS, spin and slow zoom, several at once on one clip
 
@@ -47,12 +50,21 @@ BareClip runs on 64-bit Windows and has been tested on Windows 11.
 - Noise suppression for voices, to quieten fans, hum and hiss
 - Sound waveforms on clips
 
+**Recording**
+
+- Record your screen or one window, your webcam, both at once, or just your microphone, straight onto the timeline
+- The PC's sound and the microphone on separate tracks, or only the recorded window's app sound
+- 30 or 60 fps, with a smaller size and a quality choice
+- A small bar that stays on top while you play, and keys that stop, pause and mute the microphone from any program, which you can change
+- BareClip's own windows stay out of the recording, and a crash keeps what was recorded
+
 **Export**
 
 - Copies the video wherever it can, and re-encodes only the few frames around each exact cut
 - Redraws on the graphics card when it has to, and says why before you start
 - Resolution, quality and frame rate choices, each starting on Match source
-- Encodes with your NVIDIA, AMD or Intel graphics card, or Windows' own encoder or the processor when there isn't one
+- H.264 or AV1 in MP4, or an animated GIF
+- Encodes with your NVIDIA, AMD or Intel graphics card, or Windows' own encoder or the processor when there isn't one, and you can choose which graphics card BareClip uses
 - Sound-only export to M4A
 
 ## Files it opens
@@ -70,14 +82,16 @@ BareClip runs on 64-bit Windows and has been tested on Windows 11.
 |---|---|
 | Space | Play or pause |
 | S | Split the clip at the playhead |
-| Delete or Backspace | Delete the selected clip or gap |
+| Delete or Backspace | Delete the selected clips or gap |
 | Left and Right | Move 5 seconds back or forward |
 | Shift + Left and Right | Move one frame back or forward |
 | Home and End | Go to the start or end |
 | Ctrl + Z | Undo |
 | Ctrl + Y or Ctrl + Shift + Z | Redo |
-| Ctrl + C and Ctrl + V | Copy and paste a clip |
-| Ctrl + D | Duplicate the selected clip |
+| Ctrl + click or Shift + click | Select several clips |
+| Ctrl + A | Select every clip on the selected clip's row |
+| Ctrl + C and Ctrl + V | Copy and paste the selected clips |
+| Ctrl + D | Duplicate the selected clips |
 | Ctrl + mouse wheel | Zoom the timeline |
 | Ctrl + Alt + 3 | Show or hide the timeline |
 | Ctrl + O | Add files |
@@ -86,15 +100,23 @@ BareClip runs on 64-bit Windows and has been tested on Windows 11.
 | Ctrl + S and Ctrl + Shift + S | Save and Save as |
 | Ctrl + E | Export |
 
+While recording the screen, these work from any program, and can be changed in Settings:
+
+| Key | Action |
+|---|---|
+| Ctrl + Alt + Shift + R | Stop recording |
+| Ctrl + Alt + Shift + P | Pause or resume |
+| Ctrl + Alt + Shift + M | Turn the microphone on or off |
+
 ## Limitations
 
 - Windows only.
-- Redrawn videos are saved as H.264 in MP4. HEVC and AV1 export aren't offered.
+- Redrawn videos are saved as H.264 or AV1 in MP4, or as a GIF. HEVC export isn't offered.
 - HDR recordings are shown and exported as standard range.
 - An animated GIF shows only its first picture.
 - Slow motion repeats frames rather than blending them.
 - Sound that gets mixed is saved as stereo. Surround sound is only kept when it's copied unchanged.
-- Captions can't be saved back out as an SRT file.
+- Recording only one app's sound needs Windows 10 version 2004 or later. Before that, all PC sound is recorded.
 
 ## Building from source
 
