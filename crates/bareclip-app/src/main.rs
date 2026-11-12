@@ -90,7 +90,7 @@ fn open_window(wanted: Option<GpuId>, waiting: WaitingLaunch) -> eframe::Result 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("BareClip")
         .with_inner_size([1280.0, 800.0])
-        .with_min_inner_size([960.0, 600.0])
+        .with_min_inner_size(editor::SMALLEST_WINDOW)
         .with_decorations(false)
         .with_drag_and_drop(true);
     if let Ok(icon) = eframe::icon_data::from_png_bytes(WINDOW_ICON) {

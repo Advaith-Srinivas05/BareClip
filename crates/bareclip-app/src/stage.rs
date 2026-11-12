@@ -468,11 +468,12 @@ fn selected_rotate_handle_at(shown: &Shown, view: &StageView) -> Pos2 {
 }
 
 /// Where a toolbar this wide goes: just above the clip and centred on it, staying on the video
-/// area. When the row above the picture is free it can go up there, so it never has to cover a
-/// full-size clip.
-fn toolbar_rect(width: f32, clip: Rect, area: Rect, row_above_is_free: bool) -> Rect {
+/// area. Where the row above the picture has a free stretch wide enough, it can go up there,
+/// keeping to that stretch, so it never has to cover a full-size clip or the row's buttons.
+fn toolbar_rect(width: f32, clip: Rect, area: Rect, row_above: Option<egui::Rangef>) -> Rect {
     let size = vec2(width, TOOLBAR_HEIGHT);
-    let highest = if row_above_is_free {
+    let free = row_above.filter(|free| free.span() >= size.x);
+    let highest = if free.is_some() {
         area.top() - ROW_ABOVE
     } else {
         area.top()
@@ -481,7 +482,7 @@ fn toolbar_rect(width: f32, clip: Rect, area: Rect, row_above_is_free: bool) -> 
         clip.center().x - size.x / 2.0,
         clip.top() - TOOLBAR_GAP - size.y,
     );
-    let at = pos2(
+    let mut at = pos2(
         wanted
             .x
             .clamp(area.left(), (area.right() - size.x).max(area.left())),
@@ -489,6 +490,11 @@ fn toolbar_rect(width: f32, clip: Rect, area: Rect, row_above_is_free: bool) -> 
             .y
             .clamp(highest, (area.bottom() - size.y).max(highest)),
     );
+    if let Some(free) = free
+        && at.y < area.top()
+    {
+        at.x = at.x.clamp(free.min, free.max - size.x);
+    }
     Rect::from_min_size(at, size)
 }
 
@@ -639,8 +645,8 @@ pub struct StageView<'a> {
     pub canvas: (u32, u32),
     pub clips: &'a [StageClip],
     pub selected: Option<ClipId>,
-    /// Nothing is being said in the row above the picture, so the toolbar can use it.
-    pub row_above_is_free: bool,
+    /// The stretch of the row above the picture with nothing in it, which the toolbar can use.
+    pub row_above: Option<egui::Rangef>,
     /// Whether the selected clip can go further forward, and further back.
     pub can_go_forward: bool,
     pub can_go_back: bool,
@@ -1460,7 +1466,7 @@ fn crop_toolbar(
     );
     let whole = CORNERS.map(|corner| on_screen(full.corner(corner), view.frame));
     let all: Vec<Pos2> = corners.iter().chain(&whole).copied().collect();
-    let rect = toolbar_rect(width, around(&all), view.area, view.row_above_is_free);
+    let rect = toolbar_rect(width, around(&all), view.area, view.row_above);
     let id = ui.scope_id().with("crop-toolbar");
     egui::Area::new(id)
         .order(egui::Order::Middle)
@@ -1523,7 +1529,7 @@ fn toolbar(
     let is_title = view.selected_is_title;
     let buttons = if is_title { 2.0 } else { 4.0 };
     let width = TOOLBAR_PADDING * 2.0 + TOOLBAR_BUTTON * buttons;
-    let rect = toolbar_rect(width, clip_rect, view.area, view.row_above_is_free);
+    let rect = toolbar_rect(width, clip_rect, view.area, view.row_above);
     let id = ui.scope_id().with("stage-toolbar");
     egui::Area::new(id)
         .order(egui::Order::Middle)
@@ -1610,7 +1616,7 @@ fn art_toolbar(
     let has_outline = bar.outline.is_some();
     let buttons = if has_outline { 5.0 } else { 4.0 };
     let width = TOOLBAR_PADDING * 2.0 + TOOLBAR_BUTTON * buttons;
-    let rect = toolbar_rect(width, clip_rect, view.area, view.row_above_is_free);
+    let rect = toolbar_rect(width, clip_rect, view.area, view.row_above);
     let id = ui.scope_id().with("stage-art-toolbar");
     egui::Area::new(id)
         .order(egui::Order::Middle)
@@ -2378,7 +2384,7 @@ mod tests {
         let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
         let clip = Rect::from_min_size(pos2(200.0, 200.0), vec2(400.0, 200.0));
 
-        let toolbar = toolbar_rect(WIDTH, clip, area, true);
+        let toolbar = toolbar_rect(WIDTH, clip, area, Some(WHOLE_ROW));
 
         assert_eq!(toolbar.bottom(), 200.0 - TOOLBAR_GAP);
         assert_eq!(toolbar.center().x, clip.center().x);
@@ -2388,7 +2394,7 @@ mod tests {
     fn the_toolbar_goes_up_into_the_row_above_rather_than_covering_a_full_size_clip() {
         let area = Rect::from_min_size(pos2(100.0, 100.0), vec2(800.0, 600.0));
 
-        let toolbar = toolbar_rect(WIDTH, area, area, true);
+        let toolbar = toolbar_rect(WIDTH, area, area, Some(WHOLE_ROW));
 
         assert_eq!(toolbar.top(), 100.0 - ROW_ABOVE);
         assert!(toolbar.bottom() <= area.top());
@@ -2398,7 +2404,31 @@ mod tests {
     fn the_toolbar_stays_below_the_row_above_while_something_is_being_said_there() {
         let area = Rect::from_min_size(pos2(100.0, 100.0), vec2(800.0, 600.0));
 
-        assert_eq!(toolbar_rect(WIDTH, area, area, false).top(), 100.0);
+        assert_eq!(toolbar_rect(WIDTH, area, area, None).top(), 100.0);
+    }
+
+    const WHOLE_ROW: egui::Rangef = egui::Rangef {
+        min: 0.0,
+        max: 2000.0,
+    };
+
+    #[test]
+    fn the_toolbar_keeps_to_the_free_part_of_the_row_above() {
+        let area = Rect::from_min_size(pos2(100.0, 100.0), vec2(800.0, 600.0));
+        let free = egui::Rangef::new(600.0, 900.0);
+
+        let toolbar = toolbar_rect(WIDTH, area, area, Some(free));
+
+        assert!(toolbar.bottom() <= area.top());
+        assert!(toolbar.left() >= free.min && toolbar.right() <= free.max);
+    }
+
+    #[test]
+    fn the_toolbar_stays_on_the_video_when_the_free_part_of_the_row_is_too_narrow() {
+        let area = Rect::from_min_size(pos2(100.0, 100.0), vec2(800.0, 600.0));
+        let free = egui::Rangef::new(400.0, 400.0 + WIDTH - 1.0);
+
+        assert_eq!(toolbar_rect(WIDTH, area, area, Some(free)).top(), 100.0);
     }
 
     #[test]
@@ -2409,7 +2439,7 @@ mod tests {
             Rect::from_min_size(pos2(5000.0, 5000.0), vec2(40.0, 30.0)),
             Rect::from_min_size(pos2(-5000.0, -5000.0), vec2(40.0, 30.0)),
         ] {
-            let toolbar = toolbar_rect(WIDTH, clip, area, false);
+            let toolbar = toolbar_rect(WIDTH, clip, area, None);
 
             assert!(area.contains_rect(toolbar), "{clip:?} {toolbar:?}");
         }

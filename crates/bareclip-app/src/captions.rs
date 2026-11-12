@@ -98,49 +98,43 @@ impl Editor {
     pub(super) fn captions_panel(&mut self, ui: &mut egui::Ui, palette: &Palette) {
         let frame = panel_card(palette.surface, Margin::same(14))
             .corner_radius(CornerRadius::same(PANEL_RADIUS));
-        egui::Panel::right("captions_panel")
-            .exact_size(looks::LOOK_PANEL_WIDTH)
-            .show_separator_line(false)
-            .frame(frame)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Captions").font(fonts::strong(15.0)));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let close =
-                            IconButton::new(palette, Kind::Ghost, icons::X, "Close captions")
-                                .size(PANEL_CLOSE_SIZE, 16.0);
-                        if ui.add(close).clicked() {
-                            self.right_panel = None;
-                        }
-                    });
-                });
-                ui.add_space(10.0);
-                let rows = self.caption_rows();
-                ui.horizontal(|ui| {
-                    let import =
-                        ActionButton::new(palette, Kind::Secondary, "Import SRT file").small();
-                    if ui.add(import).clicked() {
-                        self.pick_captions_requested = true;
-                    }
-                    let save = ActionButton::new(palette, Kind::Secondary, "Save SRT file").small();
-                    if ui.add_enabled(!rows.is_empty(), save).clicked() {
-                        self.save_captions_requested = true;
+        self.right_side_panel(ui, "captions_panel", frame, |this, ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Captions").font(fonts::strong(15.0)));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let close = IconButton::new(palette, Kind::Ghost, icons::X, "Close captions")
+                        .size(PANEL_CLOSE_SIZE, 16.0);
+                    if ui.add(close).clicked() {
+                        this.right_panel = None;
                     }
                 });
-                ui.add_space(10.0);
-                if rows.is_empty() {
-                    ui.colored_label(
-                        palette.text_muted,
-                        RichText::new(
-                            "No captions yet. Import an SRT file, or add a Caption from Text on \
-                             the left.",
-                        )
-                        .size(12.0),
-                    );
-                    return;
-                }
-                self.caption_list(ui, palette, &rows);
             });
+            ui.add_space(10.0);
+            let rows = this.caption_rows();
+            ui.horizontal(|ui| {
+                let import = ActionButton::new(palette, Kind::Secondary, "Import SRT file").small();
+                if ui.add(import).clicked() {
+                    this.pick_captions_requested = true;
+                }
+                let save = ActionButton::new(palette, Kind::Secondary, "Save SRT file").small();
+                if ui.add_enabled(!rows.is_empty(), save).clicked() {
+                    this.save_captions_requested = true;
+                }
+            });
+            ui.add_space(10.0);
+            if rows.is_empty() {
+                ui.colored_label(
+                    palette.text_muted,
+                    RichText::new(
+                        "No captions yet. Import an SRT file, or add a Caption from Text on \
+                             the left.",
+                    )
+                    .size(12.0),
+                );
+                return;
+            }
+            this.caption_list(ui, palette, &rows);
+        });
     }
 
     fn caption_list(&mut self, ui: &mut egui::Ui, palette: &Palette, rows: &[CaptionRow]) {

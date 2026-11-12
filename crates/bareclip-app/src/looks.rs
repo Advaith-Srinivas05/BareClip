@@ -623,57 +623,69 @@ impl Editor {
             top: 0,
             bottom: 8,
         });
-        egui::Panel::right("clip_rail")
-            .exact_size(RAIL_WIDTH)
+        let compact = self.fit.compact_rails();
+        let rail = egui::Panel::right("clip_rail")
+            .exact_size(self.fit.rail_width())
             .show_separator_line(false)
             .frame(frame)
             .show(ui, |ui| {
-                let open = self.right_panel == Some(RightPanel::Captions);
-                let hint = if open {
-                    "Close Captions"
-                } else {
-                    "Open Captions"
-                };
-                if components::rail_tab(ui, palette, &icons::CAPTIONS, "Captions", "Captions", open)
+                components::rail_scroll(ui, |ui| {
+                    let open = self.right_panel == Some(RightPanel::Captions);
+                    let hint = if open {
+                        "Close Captions"
+                    } else {
+                        "Open Captions"
+                    };
+                    if components::rail_tab(
+                        ui,
+                        palette,
+                        &icons::CAPTIONS,
+                        "Captions",
+                        "Captions",
+                        open,
+                        compact,
+                    )
                     .on_hover_text(hint)
                     .clicked()
-                {
-                    self.press_rail(RightPanel::Captions);
-                }
-                ui.add_space(4.0);
-                let (line, _) =
-                    ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
-                ui.painter().hline(
-                    line.x_range(),
-                    line.center().y,
-                    Stroke::new(1.0, palette.border),
-                );
-                ui.add_space(4.0);
-                for (tab, name, short, icon) in &LOOK_TABS {
-                    if !tabs.contains(tab) {
-                        continue;
-                    }
-                    let panel = RightPanel::Tool(*tab);
-                    let open = self.right_panel == Some(panel);
-                    let hint = if open {
-                        format!("Close {name}")
-                    } else {
-                        format!("Open {name}")
-                    };
-                    // The panel on the left has a Text button as well.
-                    let spoken = if *tab == LookTab::Text {
-                        "Edit text"
-                    } else {
-                        short
-                    };
-                    if components::rail_tab(ui, palette, icon, short, spoken, open)
-                        .on_hover_text(hint)
-                        .clicked()
                     {
-                        self.press_rail(panel);
+                        self.press_rail(RightPanel::Captions);
                     }
-                }
+                    ui.add_space(4.0);
+                    let (line, _) =
+                        ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+                    ui.painter().hline(
+                        line.x_range(),
+                        line.center().y,
+                        Stroke::new(1.0, palette.border),
+                    );
+                    ui.add_space(4.0);
+                    for (tab, name, short, icon) in &LOOK_TABS {
+                        if !tabs.contains(tab) {
+                            continue;
+                        }
+                        let panel = RightPanel::Tool(*tab);
+                        let open = self.right_panel == Some(panel);
+                        let hint = if open {
+                            format!("Close {name}")
+                        } else {
+                            format!("Open {name}")
+                        };
+                        // The panel on the left has a Text button as well.
+                        let spoken = if *tab == LookTab::Text {
+                            "Edit text"
+                        } else {
+                            short
+                        };
+                        if components::rail_tab(ui, palette, icon, short, spoken, open, compact)
+                            .on_hover_text(hint)
+                            .clicked()
+                        {
+                            self.press_rail(panel);
+                        }
+                    }
+                });
             });
+        self.right_rail_rect = rail.response.rect;
     }
 
     /// Whatever the right-hand panel is showing, or nothing if it is closed.
@@ -728,52 +740,48 @@ impl Editor {
     fn look_panel(&mut self, ui: &mut egui::Ui, palette: &Palette, clip: Clip, tab: LookTab) {
         let frame = panel_card(palette.surface, Margin::same(14))
             .corner_radius(CornerRadius::same(PANEL_RADIUS));
-        egui::Panel::right("look_panel")
-            .exact_size(LOOK_PANEL_WIDTH)
-            .show_separator_line(false)
-            .frame(frame)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let name = LOOK_TABS
-                        .iter()
-                        .find(|(listed, ..)| *listed == tab)
-                        .map_or("", |(_, name, ..)| name);
-                    ui.label(RichText::new(name).font(fonts::strong(15.0)));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let close = IconButton::new(palette, Kind::Ghost, icons::X, "Close look")
-                            .size(PANEL_CLOSE_SIZE, 16.0);
-                        if ui.add(close).clicked() {
-                            self.right_panel = None;
-                        }
-                    });
+        self.right_side_panel(ui, "look_panel", frame, |this, ui| {
+            ui.horizontal(|ui| {
+                let name = LOOK_TABS
+                    .iter()
+                    .find(|(listed, ..)| *listed == tab)
+                    .map_or("", |(_, name, ..)| name);
+                ui.label(RichText::new(name).font(fonts::strong(15.0)));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let close = IconButton::new(palette, Kind::Ghost, icons::X, "Close look")
+                        .size(PANEL_CLOSE_SIZE, 16.0);
+                    if ui.add(close).clicked() {
+                        this.right_panel = None;
+                    }
                 });
-                ui.add_space(10.0);
-                match tab {
-                    LookTab::Text => {
-                        if let Some((id, title)) = self.selected_title() {
-                            egui::ScrollArea::vertical()
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| self.title_controls(ui, palette, id, &title));
-                        }
-                    }
-                    LookTab::Filters => self.filter_cards(ui, palette, clip),
-                    LookTab::Effects => self.effect_cards(ui, palette, clip),
-                    LookTab::Colours => {
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| self.colour_controls(ui, palette, clip));
-                    }
-                    LookTab::Fade => self.fade_controls(ui, palette, clip),
-                    LookTab::Shape => {
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| self.shape_controls(ui, palette));
-                    }
-                    LookTab::Animate => self.animate_choices(ui, palette),
-                    LookTab::Speed => self.speed_controls(ui, palette),
-                    LookTab::Audio => self.audio_controls(ui, palette),
-                }
             });
+            ui.add_space(10.0);
+            match tab {
+                LookTab::Text => {
+                    if let Some((id, title)) = this.selected_title() {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| this.title_controls(ui, palette, id, &title));
+                    }
+                }
+                LookTab::Filters => this.filter_cards(ui, palette, clip),
+                LookTab::Effects => this.effect_cards(ui, palette, clip),
+                LookTab::Colours => {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| this.colour_controls(ui, palette, clip));
+                }
+                LookTab::Fade => this.fade_controls(ui, palette, clip),
+                LookTab::Shape => {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| this.shape_controls(ui, palette));
+                }
+                LookTab::Animate => this.animate_choices(ui, palette),
+                LookTab::Speed => this.speed_controls(ui, palette),
+                LookTab::Audio => this.audio_controls(ui, palette),
+            }
+        });
     }
 
     /// Gets the selected clip's picture for the filter cards, without holding up the window.

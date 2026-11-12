@@ -555,6 +555,27 @@ impl TrackLayout {
         (Self::content_height(count, thin) - height).max(0.0)
     }
 
+    /// How far to scroll for the first row of pictures to sit in the middle, which matters in
+    /// a short window where only about one row fits.
+    fn first_pictures_in_view(count: usize, thin: u64, height: f32) -> f32 {
+        if count == 0 {
+            return 0.0;
+        }
+        let row = (0..count)
+            .find(|row| Self::height_of(*row, thin) == TRACK_HEIGHT)
+            .unwrap_or(0);
+        let lane = if Self::has_lanes(count) {
+            NEW_LANE_HEIGHT
+        } else {
+            0.0
+        };
+        let above: f32 = (0..row)
+            .map(|above| Self::height_of(above, thin) + TRACK_GAP)
+            .sum();
+        let middle = lane + TRACK_GAP + above + Self::height_of(row, thin) / 2.0;
+        (middle - height / 2.0).clamp(0.0, Self::furthest_scroll(count, thin, height))
+    }
+
     /// How far down a row starts from the first one.
     fn offset_of(&self, row: usize) -> f32 {
         (0..row)
@@ -796,6 +817,9 @@ pub struct TimelineState {
     frozen_total: Option<Ticks>,
     /// How far down through the tracks the view has scrolled, in pixels.
     pub track_scroll: f32,
+    /// Whether the tracks have been scrolled by hand. Until then, when they don't all fit,
+    /// the first row with pictures stays in view.
+    pub track_scroll_moved: bool,
     /// Where things were drawn in the last frame. `track` is the top track, or the whole
     /// area while there are none.
     pub track: Rect,
@@ -839,6 +863,7 @@ impl Default for TimelineState {
             drag: TimelineDrag::None,
             frozen_total: None,
             track_scroll: 0.0,
+            track_scroll_moved: false,
             track: Rect::NOTHING,
             ruler: Rect::NOTHING,
             layout: TrackLayout {
@@ -2070,6 +2095,7 @@ fn track_scrollbar(
     let thumb = (area.height() / content * area.height()).max(MIN_THUMB_WIDTH);
     let travel = (area.height() - thumb).max(1.0);
     if response.dragged() {
+        state.track_scroll_moved = true;
         state.track_scroll =
             (state.track_scroll + response.drag_delta().y / travel * furthest).clamp(0.0, furthest);
     }
@@ -2288,6 +2314,9 @@ pub fn timeline(
     let track_count = view.tracks.tracks().len();
     let thin = TrackLayout::thin_rows(view.tracks);
     let furthest = TrackLayout::furthest_scroll(track_count, thin, area.height());
+    if !state.track_scroll_moved {
+        state.track_scroll = TrackLayout::first_pictures_in_view(track_count, thin, area.height());
+    }
     state.track_scroll = state.track_scroll.clamp(0.0, furthest);
     let layout = TrackLayout {
         area,
@@ -2324,6 +2353,7 @@ pub fn timeline(
             } else {
                 let through_tracks = furthest > 0.0 && area.contains(hover);
                 let along = if through_tracks {
+                    state.track_scroll_moved = true;
                     state.track_scroll = (state.track_scroll - down).clamp(0.0, furthest);
                     across
                 } else {
@@ -2434,8 +2464,10 @@ pub fn timeline(
                     let landing = view.tracks.landing(target, Some(id), snapped, length);
                     move_landing = Some((id, landing, Ticks(landing.0 + length.0), target));
                     state.snap_line = snap_target(landing, length, &targets);
-                    state.track_scroll =
+                    let scrolled =
                         scroll_toward_edge(ui, state.track_scroll, furthest, area, pointer.y);
+                    state.track_scroll_moved |= scrolled != state.track_scroll;
+                    state.track_scroll = scrolled;
                     let group = group_of(view, id);
                     if group.len() > 1 {
                         let (by, rows, landings) =
@@ -2693,7 +2725,9 @@ pub fn timeline(
             .landing(target, None, drop_at(&drag, time), drag.length);
         let end = Ticks(start.0 + drag.length.0);
         state.snap_line = snap_target(start, drag.length, &snap_targets(view, None));
-        state.track_scroll = scroll_toward_edge(ui, state.track_scroll, furthest, area, pointer.y);
+        let scrolled = scroll_toward_edge(ui, state.track_scroll, furthest, area, pointer.y);
+        state.track_scroll_moved |= scrolled != state.track_scroll;
+        state.track_scroll = scrolled;
         draw_drop(
             &area_painter,
             palette,
@@ -3689,6 +3723,40 @@ mod tests {
     fn tracks_only_scroll_when_they_do_not_all_fit() {
         assert_eq!(TrackLayout::furthest_scroll(2, 0, 400.0), 0.0);
         assert!(TrackLayout::furthest_scroll(8, 0, 200.0) > 0.0);
+    }
+
+    #[test]
+    fn in_a_short_timeline_the_first_row_of_pictures_starts_in_view() {
+        let height = TRACK_HEIGHT + 14.0;
+        let scroll = TrackLayout::first_pictures_in_view(1, 0, height);
+        let shown = TrackLayout {
+            area: Rect::from_min_size(pos2(0.0, 100.0), vec2(600.0, height)),
+            count: 1,
+            scroll,
+            thin: 0,
+        };
+
+        assert!(scroll > 0.0, "the Add text lane is scrolled past");
+        assert!(shown.area.contains_rect(shown.track(0)));
+    }
+
+    #[test]
+    fn a_row_of_titles_on_top_is_scrolled_past_to_the_pictures_below_it() {
+        let height = TRACK_HEIGHT + 14.0;
+        let scroll = TrackLayout::first_pictures_in_view(2, 0b1, height);
+        let shown = TrackLayout {
+            area: Rect::from_min_size(pos2(0.0, 100.0), vec2(600.0, height)),
+            count: 2,
+            scroll,
+            thin: 0b1,
+        };
+
+        assert!(shown.area.contains_rect(shown.track(1)));
+    }
+
+    #[test]
+    fn a_timeline_where_everything_fits_does_not_scroll() {
+        assert_eq!(TrackLayout::first_pictures_in_view(1, 0, 400.0), 0.0);
     }
 
     #[test]

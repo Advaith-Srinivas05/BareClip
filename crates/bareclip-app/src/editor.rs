@@ -272,15 +272,25 @@ const TIMELINE_SLIDE_SECONDS: f32 = 0.2;
 const TOOL_SLOT: f32 = 36.0;
 const TIME_READOUT_WIDTH: f32 = 170.0;
 const EMPTY_HINT_MAX_HEIGHT: f32 = 200.0;
+/// The logo on an empty stage, the gap under it and the room for the words under that.
+const EMPTY_LOGO_SIZE: egui::Vec2 = vec2(96.0, 111.0);
+const EMPTY_LOGO_GAP: f32 = 18.0;
+const EMPTY_LOGO_SMALLEST: f32 = 40.0;
+const EMPTY_HINT_TEXT_ROOM: f32 = 28.0;
 const DIALOG_RADIUS: u8 = 10;
 /// A dialog's own buttons are never narrower than this, so short names still feel solid.
 const DIALOG_BUTTON_WIDTH: f32 = 84.0;
+/// How far a dialog stays from the window's edges.
+const DIALOG_WINDOW_MARGIN: f32 = 16.0;
 const STILL_THUMBNAIL_WIDTH: usize = 320;
 const SNAPPED_CLOSE_ENOUGH: i64 = 64;
 const EXPORT_DROPDOWN_WIDTH: f32 = 128.0;
 const MATCH_SOURCE: &str = "Match source";
 /// The playback buttons: four of 32, the play button, and the spaces between them.
 const TRANSPORT_WIDTH: f32 = 180.0;
+/// Without the buttons for the start and end, and with whole seconds.
+const TINY_TRANSPORT_WIDTH: f32 = 100.0;
+const TINY_TIME_READOUT_WIDTH: f32 = 100.0;
 const CONTROL_SPACING: f32 = 4.0;
 const CARD_TOP_ROW_HEIGHT: f32 = 48.0;
 /// These include the transport row.
@@ -290,6 +300,92 @@ const TIMELINE_MIN_HEIGHT: f32 = 230.0;
 const TIMELINE_MAX_SHARE: f32 = 0.65;
 /// How far the arrow keys step in dead space, which has no frames of its own.
 const GAP_STEP_SECONDS: f64 = 1.0 / 30.0;
+/// The smallest the window can be, which fits a quarter of a 1080p screen at 150% scaling.
+pub const SMALLEST_WINDOW: [f32; 2] = [640.0, 340.0];
+/// Below this width the side panels float over the video, and the rails lose their names.
+const NARROW_WIDTH: f32 = 1000.0;
+/// Below this height the rails lose their names and the bars get a little shorter.
+const SHORT_HEIGHT: f32 = 600.0;
+/// Below this width the rows hold only what they can't do without.
+const TINY_WIDTH: f32 = 720.0;
+const COMPACT_RAIL_WIDTH: f32 = 56.0;
+const SHORT_BAR_HEIGHT: f32 = 40.0;
+const SHORT_TRANSPORT_HEIGHT: f32 = 44.0;
+const TINY_PROJECT_NAME_WIDTH: f32 = 120.0;
+/// What a short window's timeline needs below its transport row: the ruler, one row and the
+/// scroll bar.
+const SHORT_TIMELINE_ROOM: f32 = 130.0;
+/// How much a short window keeps for the video before the timeline can grow.
+const SHORT_PREVIEW_ROOM: f32 = 0.5;
+/// How far a floating panel stays from the window's bottom edge.
+const FLOATING_PANEL_GAP: f32 = 8.0;
+
+/// How the window's size shapes the screen this frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Fit {
+    narrow: bool,
+    short: bool,
+    tiny: bool,
+}
+
+impl Fit {
+    fn of(size: egui::Vec2) -> Self {
+        Self {
+            narrow: size.x < NARROW_WIDTH,
+            short: size.y < SHORT_HEIGHT,
+            tiny: size.x < TINY_WIDTH,
+        }
+    }
+
+    /// The rails show symbols only, and say their names when hovered.
+    fn compact_rails(self) -> bool {
+        self.narrow || self.short
+    }
+
+    fn rail_width(self) -> f32 {
+        if self.compact_rails() {
+            COMPACT_RAIL_WIDTH
+        } else {
+            RAIL_WIDTH
+        }
+    }
+
+    /// The panels beside the rails go over the video instead of squeezing it.
+    fn floating_panels(self) -> bool {
+        self.narrow
+    }
+
+    fn title_height(self) -> f32 {
+        if self.short {
+            SHORT_BAR_HEIGHT
+        } else {
+            TITLE_STRIP_HEIGHT
+        }
+    }
+
+    fn top_row_height(self) -> f32 {
+        if self.short {
+            SHORT_BAR_HEIGHT
+        } else {
+            CARD_TOP_ROW_HEIGHT
+        }
+    }
+
+    fn transport_height(self) -> f32 {
+        if self.short {
+            SHORT_TRANSPORT_HEIGHT
+        } else {
+            TRANSPORT_HEIGHT
+        }
+    }
+}
+
+/// Which side of the window a panel opens from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Side {
+    Left,
+    Right,
+}
 
 /// What the reader of a video's pictures and sound sends back.
 enum StripMessage {
@@ -740,7 +836,17 @@ pub struct Editor {
     /// The logo in the top strip, and the theme and shrinking it was loaded with.
     strip_logo: Option<(bool, usize, TextureHandle)>,
     loaded_fallbacks: Vec<&'static str>,
+    /// How the window's size shapes the screen, and whether panels floated last frame.
+    fit: Fit,
+    floated: bool,
+    /// The timeline's height in a short window, once dragged there. Until then it is as short
+    /// as it goes, so the video gets the room.
+    short_timeline_height: Option<f32>,
+    /// The free stretch of the row above the picture, for the clip's toolbar.
+    row_above: Option<egui::Rangef>,
     /// Where things were drawn in the last frame.
+    left_rail_rect: egui::Rect,
+    right_rail_rect: egui::Rect,
     media_panel_rect: egui::Rect,
     timeline_panel_rect: egui::Rect,
     card_thumbnails: Vec<(MediaId, egui::Rect)>,
@@ -988,6 +1094,12 @@ impl Editor {
             logo: None,
             strip_logo: None,
             loaded_fallbacks: Vec::new(),
+            fit: Fit::default(),
+            floated: false,
+            short_timeline_height: None,
+            row_above: None,
+            left_rail_rect: egui::Rect::NOTHING,
+            right_rail_rect: egui::Rect::NOTHING,
             media_panel_rect: egui::Rect::NOTHING,
             timeline_panel_rect: egui::Rect::NOTHING,
             card_thumbnails: Vec::new(),
@@ -3376,6 +3488,13 @@ impl Editor {
         self.take_waiting_edits(&ctx);
         self.autosave(&ctx);
         self.update_window_title(&ctx);
+        self.fit = Fit::of(ui.max_rect().size());
+        // Going narrow closes the panels once, so the video isn't suddenly covered.
+        if self.fit.floating_panels() && !self.floated {
+            self.media_panel_open = false;
+            self.right_panel = None;
+        }
+        self.floated = self.fit.floating_panels();
 
         self.title_strip(ui, palette);
         self.rail(ui, palette);
@@ -3416,7 +3535,7 @@ impl Editor {
             bottom: 0,
         });
         egui::Panel::top("title_strip")
-            .exact_size(TITLE_STRIP_HEIGHT)
+            .exact_size(self.fit.title_height())
             .show_separator_line(false)
             .frame(frame)
             .show(ui, |ui| {
@@ -3442,11 +3561,13 @@ impl Editor {
                                 .fit_to_exact_size(vec2(width, STRIP_LOGO_HEIGHT)),
                         );
                     }
-                    ui.label(
-                        RichText::new("BareClip")
-                            .font(fonts::strong(components::NAME_BAR_TEXT))
-                            .color(palette.accent),
-                    );
+                    if !self.fit.tiny {
+                        ui.label(
+                            RichText::new("BareClip")
+                                .font(fonts::strong(components::NAME_BAR_TEXT))
+                                .color(palette.accent),
+                        );
+                    }
                     ui.add_space(10.0);
                     self.project_name_controls(ui, palette);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -3498,6 +3619,11 @@ impl Editor {
     /// The project's name, which a click renames, and the menu of things to do with files.
     fn project_name_controls(&mut self, ui: &mut egui::Ui, palette: &Palette) {
         let ctx = ui.ctx().clone();
+        let width = if self.fit.tiny {
+            TINY_PROJECT_NAME_WIDTH
+        } else {
+            PROJECT_NAME_WIDTH
+        };
         if let Some(mut typed) = self.renaming.take() {
             let edit = ui.add(
                 egui::TextEdit::singleline(&mut typed)
@@ -3507,9 +3633,9 @@ impl Editor {
                         FontFamily::Proportional,
                     ))
                     .margin(Margin::symmetric(NAME_BAR_PADDING as i8, 0))
-                    .min_size(vec2(PROJECT_NAME_WIDTH, components::NAME_BAR_HEIGHT))
+                    .min_size(vec2(width, components::NAME_BAR_HEIGHT))
                     .align(egui::Align2::LEFT_CENTER)
-                    .desired_width(PROJECT_NAME_WIDTH - 2.0 * NAME_BAR_PADDING),
+                    .desired_width(width - 2.0 * NAME_BAR_PADDING),
             );
             let cancelled = ui.input(|input| input.key_pressed(Key::Escape));
             if edit.lost_focus() {
@@ -3526,7 +3652,7 @@ impl Editor {
         } else {
             let unsaved = self.has_unsaved_changes();
             let label = text::project_title(&self.project_name, unsaved);
-            let name = NameBar::new(palette, &label, PROJECT_NAME_WIDTH);
+            let name = NameBar::new(palette, &label, width);
             if ui
                 .add(name)
                 .on_hover_text("Rename this project and its exported video")
@@ -3601,63 +3727,72 @@ impl Editor {
         let modal = egui::Modal::new(egui::Id::unique("settings_dialog"))
             .frame(dialog_frame(ctx))
             .show(ctx, |ui| {
-                ui.set_width(SETTINGS_WIDTH);
-                components::dialog_title(ui, &icons::SETTINGS, palette.accent, "Settings");
-                ui.add_space(SETTINGS_ROW_GAP);
-                ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    ui.allocate_ui_with_layout(
-                        vec2(SETTINGS_TABS_WIDTH, SETTINGS_PAGE_HEIGHT),
-                        Layout::top_down(Align::Min),
-                        |ui| {
-                            ui.set_width(SETTINGS_TABS_WIDTH);
-                            ui.spacing_mut().item_spacing.y = 2.0;
-                            for (tab, icon, label, name) in SettingsTab::ALL {
-                                let chosen = self.settings_tab == tab;
-                                let side_tab =
-                                    components::SideTab::new(palette, icon, (label, name), chosen);
-                                if ui.add(side_tab).clicked() {
-                                    self.settings_tab = tab;
+                let room = dialog_room(ctx);
+                dialog_scroll(ui, |ui| {
+                    ui.set_width(SETTINGS_WIDTH.min(room.x));
+                    components::dialog_title(ui, &icons::SETTINGS, palette.accent, "Settings");
+                    ui.add_space(SETTINGS_ROW_GAP);
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.allocate_ui_with_layout(
+                            vec2(SETTINGS_TABS_WIDTH, SETTINGS_PAGE_HEIGHT),
+                            Layout::top_down(Align::Min),
+                            |ui| {
+                                ui.set_width(SETTINGS_TABS_WIDTH);
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                for (tab, icon, label, name) in SettingsTab::ALL {
+                                    let chosen = self.settings_tab == tab;
+                                    let side_tab = components::SideTab::new(
+                                        palette,
+                                        icon,
+                                        (label, name),
+                                        chosen,
+                                    );
+                                    if ui.add(side_tab).clicked() {
+                                        self.settings_tab = tab;
+                                    }
                                 }
-                            }
-                        },
-                    );
-                    // A line down between the tabs and the page, so they read as apart.
-                    ui.add_space(SETTINGS_TABS_GAP);
-                    let (line, _) = ui
-                        .allocate_exact_size(vec2(1.0, SETTINGS_PAGE_HEIGHT), egui::Sense::hover());
-                    ui.painter().vline(
-                        line.center().x,
-                        line.y_range(),
-                        egui::Stroke::new(1.0, palette.border),
-                    );
-                    ui.add_space(SETTINGS_TABS_GAP);
-                    let page_width = ui.available_width();
-                    ui.allocate_ui_with_layout(
-                        vec2(page_width, SETTINGS_PAGE_HEIGHT),
-                        Layout::top_down(Align::Min),
-                        |ui| {
-                            ui.set_width(page_width);
-                            ui.set_min_height(SETTINGS_PAGE_HEIGHT);
-                            match self.settings_tab {
-                                SettingsTab::General => {
-                                    let (page_changed, page_strip) =
-                                        self.general_settings(ui, palette);
-                                    changed |= page_changed;
-                                    strip_changed |= page_strip;
+                            },
+                        );
+                        // A line down between the tabs and the page, so they read as apart.
+                        ui.add_space(SETTINGS_TABS_GAP);
+                        let (line, _) = ui.allocate_exact_size(
+                            vec2(1.0, SETTINGS_PAGE_HEIGHT),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().vline(
+                            line.center().x,
+                            line.y_range(),
+                            egui::Stroke::new(1.0, palette.border),
+                        );
+                        ui.add_space(SETTINGS_TABS_GAP);
+                        let page_width = ui.available_width();
+                        ui.allocate_ui_with_layout(
+                            vec2(page_width, SETTINGS_PAGE_HEIGHT),
+                            Layout::top_down(Align::Min),
+                            |ui| {
+                                ui.set_width(page_width);
+                                ui.set_min_height(SETTINGS_PAGE_HEIGHT);
+                                match self.settings_tab {
+                                    SettingsTab::General => {
+                                        let (page_changed, page_strip) =
+                                            self.general_settings(ui, palette);
+                                        changed |= page_changed;
+                                        strip_changed |= page_strip;
+                                    }
+                                    SettingsTab::Recording => {
+                                        changed |= self.recording_settings(ui, palette);
+                                    }
+                                    SettingsTab::Keybinds => self.keybind_settings(ui, palette),
                                 }
-                                SettingsTab::Recording => {
-                                    changed |= self.recording_settings(ui, palette);
-                                }
-                                SettingsTab::Keybinds => self.keybind_settings(ui, palette),
-                            }
-                        },
-                    );
-                });
-                ui.add_space(12.0);
-                // The version sits at the bottom left whichever tab is open, level with Done.
-                components::dialog_footer(ui, palette, &text::version_line(), |ui| {
-                    close = ui.add(dialog_button(palette, "Done")).clicked();
+                            },
+                        );
+                    });
+                    ui.add_space(12.0);
+                    // The version sits at the bottom left whichever tab is open, level with Done.
+                    components::dialog_footer(ui, palette, &text::version_line(), |ui| {
+                        close = ui.add(dialog_button(palette, "Done")).clicked();
+                    });
                 });
             });
         if strip_changed {
@@ -4007,11 +4142,14 @@ impl Editor {
     fn size_picker(&mut self, ui: &mut egui::Ui, palette: &Palette) {
         let name = format!("Size: {}", self.project.canvas.name());
         let (width, height) = self.project.canvas.size();
-        let button = ui
-            .add(ActionButton::new(palette, Kind::Ghost, &name).icon(icons::RATIO))
-            .on_hover_text(format!(
-                "The shape of the finished video, now {width} x {height}"
-            ));
+        let button = if self.fit.narrow {
+            ui.add(IconButton::new(palette, Kind::Ghost, icons::RATIO, &name))
+        } else {
+            ui.add(ActionButton::new(palette, Kind::Ghost, &name).icon(icons::RATIO))
+        };
+        let button = button.on_hover_text(format!(
+            "{name}. The shape of the finished video, now {width} x {height}"
+        ));
         egui::Popup::menu(&button).show(|ui| {
             if let Some(original) = self.project.canvas.original {
                 let chosen = self.project.canvas.is_chosen(None);
@@ -4097,9 +4235,10 @@ impl Editor {
 
     /// The top of the card: undo and redo, anything that needs saying, and Export.
     fn card_top_row(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        let short = self.fit.short;
         let frame = Frame::new()
             .fill(palette.surface)
-            .inner_margin(Margin::symmetric(14, 8))
+            .inner_margin(Margin::symmetric(14, if short { 4 } else { 8 }))
             .outer_margin(Margin {
                 left: 0,
                 right: PANEL_GAP,
@@ -4112,64 +4251,91 @@ impl Editor {
                 sw: 0,
                 se: 0,
             });
+        let mut row_above = None;
         egui::Panel::top("card_top_row")
-            .exact_size(CARD_TOP_ROW_HEIGHT)
+            .exact_size(self.fit.top_row_height())
             .show_separator_line(false)
             .frame(frame)
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = CONTROL_SPACING;
-                    let can_undo = self.history.can_undo();
-                    let can_redo = self.history.can_redo();
-                    if ui
-                        .add_enabled(
-                            can_undo,
-                            IconButton::new(palette, Kind::Ghost, icons::UNDO_2, "Undo"),
-                        )
-                        .on_hover_text("Undo (Ctrl+Z)")
-                        .clicked()
-                    {
-                        self.undo();
-                    }
-                    if ui
-                        .add_enabled(
-                            can_redo,
-                            IconButton::new(palette, Kind::Ghost, icons::REDO_2, "Redo"),
-                        )
-                        .on_hover_text("Redo (Ctrl+Y)")
-                        .clicked()
-                    {
-                        self.redo();
-                    }
-                    ui.add_space(8.0);
-                    self.size_picker(ui, palette);
-                    self.background_picker(ui, palette);
-                    if let Some(notice) = self.notice.clone() {
-                        ui.add_space(8.0);
-                        components::symbol(ui, &icons::CIRCLE_ALERT, 16.0, palette.danger);
-                        ui.colored_label(palette.danger, notice);
-                    } else if !self.preview.sound_works() {
-                        ui.add_space(8.0);
-                        ui.colored_label(palette.text_muted, "Preview is silent on this computer");
-                    }
-
+                    // Export goes in first, so whatever is said on the left gives way to it.
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let can_export = !self.project.tracks.is_empty();
-                        let export = ui.add_enabled(
-                            can_export,
-                            ActionButton::new(palette, Kind::Primary, "Export").icon(icons::UPLOAD),
-                        );
-                        let export = if can_export {
-                            export.on_hover_text("Export the timeline (Ctrl+E)")
-                        } else {
-                            export.on_disabled_hover_text("Add a video to the timeline first")
-                        };
-                        if export.clicked() {
-                            self.open_export();
-                        }
+                        let export = self.export_button(ui, palette);
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            self.top_row_left(ui, palette);
+                            let free =
+                                egui::Rangef::new(ui.cursor().left() + 8.0, export.left() - 8.0);
+                            row_above = (free.span() > 0.0).then_some(free);
+                        });
                     });
                 });
             });
+        self.row_above = row_above;
+    }
+
+    fn export_button(&mut self, ui: &mut egui::Ui, palette: &Palette) -> egui::Rect {
+        let can_export = !self.project.tracks.is_empty();
+        let export = if self.fit.tiny {
+            ui.add_enabled(
+                can_export,
+                IconButton::new(palette, Kind::Primary, icons::UPLOAD, "Export").solid(),
+            )
+        } else {
+            ui.add_enabled(
+                can_export,
+                ActionButton::new(palette, Kind::Primary, "Export").icon(icons::UPLOAD),
+            )
+        };
+        let export = if can_export {
+            export.on_hover_text("Export the timeline (Ctrl+E)")
+        } else {
+            export.on_disabled_hover_text("Add a video to the timeline first")
+        };
+        if export.clicked() {
+            self.open_export();
+        }
+        export.rect
+    }
+
+    /// Undo and redo, the project's size and background, and anything that needs saying.
+    fn top_row_left(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        let can_undo = self.history.can_undo();
+        let can_redo = self.history.can_redo();
+        if ui
+            .add_enabled(
+                can_undo,
+                IconButton::new(palette, Kind::Ghost, icons::UNDO_2, "Undo"),
+            )
+            .on_hover_text("Undo (Ctrl+Z)")
+            .clicked()
+        {
+            self.undo();
+        }
+        if ui
+            .add_enabled(
+                can_redo,
+                IconButton::new(palette, Kind::Ghost, icons::REDO_2, "Redo"),
+            )
+            .on_hover_text("Redo (Ctrl+Y)")
+            .clicked()
+        {
+            self.redo();
+        }
+        ui.add_space(8.0);
+        self.size_picker(ui, palette);
+        self.background_picker(ui, palette);
+        if let Some(notice) = self.notice.clone() {
+            ui.add_space(8.0);
+            components::symbol(ui, &icons::CIRCLE_ALERT, 16.0, palette.danger);
+            ui.add(egui::Label::new(RichText::new(&notice).color(palette.danger)).truncate())
+                .on_hover_text(notice);
+        } else if !self.preview.sound_works() {
+            ui.add_space(8.0);
+            let silent =
+                RichText::new("Preview is silent on this computer").color(palette.text_muted);
+            ui.add(egui::Label::new(silent).truncate());
+        }
     }
 
     /// The list of tools down the left. It only ever shows what works today.
@@ -4180,38 +4346,59 @@ impl Editor {
             top: 0,
             bottom: 8,
         });
-        egui::Panel::left("rail")
-            .exact_size(RAIL_WIDTH)
+        let compact = self.fit.compact_rails();
+        let rail = egui::Panel::left("rail")
+            .exact_size(self.fit.rail_width())
             .show_separator_line(false)
             .frame(frame)
             .show(ui, |ui| {
-                for (tab, icon, name) in [
-                    (LeftPanel::Media, &icons::FILM, "My media"),
-                    (LeftPanel::Record, &icons::VIDEO, "Record"),
-                    (LeftPanel::Library, &icons::LIBRARY_BIG, "Content library"),
-                    (LeftPanel::Text, &icons::TYPE, "Text"),
-                    (LeftPanel::Transitions, &icons::BLEND, "Transitions"),
-                ] {
-                    let open = self.media_panel_open && self.left_panel == tab;
-                    let hint = if open {
-                        format!("Close {name}")
-                    } else {
-                        format!("Open {name}")
-                    };
-                    if components::rail_tab(ui, palette, icon, name, name, open)
-                        .on_hover_text(hint)
-                        .clicked()
-                    {
-                        self.media_panel_open = !open;
-                        self.left_panel = tab;
+                components::rail_scroll(ui, |ui| {
+                    for (tab, icon, name) in [
+                        (LeftPanel::Media, &icons::FILM, "My media"),
+                        (LeftPanel::Record, &icons::VIDEO, "Record"),
+                        (LeftPanel::Library, &icons::LIBRARY_BIG, "Content library"),
+                        (LeftPanel::Text, &icons::TYPE, "Text"),
+                        (LeftPanel::Transitions, &icons::BLEND, "Transitions"),
+                    ] {
+                        let open = self.media_panel_open && self.left_panel == tab;
+                        let hint = if open {
+                            format!("Close {name}")
+                        } else {
+                            format!("Open {name}")
+                        };
+                        if components::rail_tab(ui, palette, icon, name, name, open, compact)
+                            .on_hover_text(hint)
+                            .clicked()
+                        {
+                            self.media_panel_open = !open;
+                            self.left_panel = tab;
+                        }
                     }
-                }
+                });
             });
+        self.left_rail_rect = rail.response.rect;
     }
 
     fn media_panel(&mut self, ui: &mut egui::Ui, palette: &Palette) {
         let frame = panel_card(palette.surface, Margin::same(14))
             .corner_radius(CornerRadius::same(PANEL_RADIUS));
+        if self.fit.floating_panels() {
+            self.media_panel_rect = egui::Rect::NOTHING;
+            if !self.media_panel_open {
+                return;
+            }
+            let ctx = ui.ctx().clone();
+            let rect = self.floating_rect(&ctx, Side::Left, MEDIA_PANEL_WIDTH);
+            let mut close = false;
+            let shown = floating_panel(&ctx, "media_panel_floating", rect, frame, |ui| {
+                close = self.media_panel_body(ui, palette);
+            });
+            if close || pressed_elsewhere(&ctx, [shown, self.left_rail_rect]) {
+                self.media_panel_open = false;
+            }
+            self.media_panel_rect = shown;
+            return;
+        }
         // Only the close button and the rail close the panel. Its edge stops at the smallest
         // size, so whatever the drag asks for here is left out.
         let mut expanded = self.media_panel_open;
@@ -4224,150 +4411,203 @@ impl Editor {
             .size_range(MEDIA_PANEL_MIN_WIDTH..=MEDIA_PANEL_MAX_WIDTH)
             .frame(frame)
             .show_collapsible(ui, &mut expanded, |ui| {
-                let on_text = self.left_panel == LeftPanel::Text;
-                let on_transitions = self.left_panel == LeftPanel::Transitions;
-                let on_library = self.left_panel == LeftPanel::Library;
-                ui.horizontal(|ui| {
-                    let heading = match self.left_panel {
-                        LeftPanel::Media => "My media",
-                        LeftPanel::Record => "Record",
-                        LeftPanel::Library => "Content library",
-                        LeftPanel::Text => "Text",
-                        LeftPanel::Transitions => "Transitions",
-                    };
-                    ui.label(RichText::new(heading).font(fonts::strong(15.0)));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        close = ui
-                            .add(
-                                IconButton::new(
-                                    palette,
-                                    Kind::Ghost,
-                                    icons::PANEL_LEFT_CLOSE,
-                                    "Close media panel",
-                                )
-                                .size(PANEL_CLOSE_SIZE, 16.0),
-                            )
-                            .on_hover_text("Close this panel. My media on the left opens it again.")
-                            .clicked();
-                    });
-                });
-                ui.add_space(10.0);
-                if on_text {
-                    self.text_panel(ui, palette);
-                    return;
-                }
-                if on_transitions {
-                    self.transitions_panel(ui, palette);
-                    return;
-                }
-                if on_library {
-                    self.library_panel(ui, palette);
-                    return;
-                }
-                if self.left_panel == LeftPanel::Record {
-                    self.record_panel(ui, palette);
-                    return;
-                }
-                let width = ui.available_width();
-                // Once there are videos, what comes next is on the cards and the timeline.
-                let kind = if self.visible_media().next().is_none() {
-                    Kind::Primary
-                } else {
-                    Kind::Secondary
-                };
-                let clicked = ui
-                    .add(
-                        ActionButton::new(palette, kind, "Add media")
-                            .icon(icons::PLUS)
-                            .width(width),
-                    )
-                    .on_hover_text("Add videos and audio to this project (Ctrl+O)")
-                    .clicked();
-                if clicked {
-                    let ctx = ui.ctx().clone();
-                    self.pick_files(&ctx);
-                }
-                ui.add_space(12.0);
-
-                if self.visible_media().next().is_none() {
-                    if self.project.library.is_empty() {
-                        empty_media_hint(ui, palette);
-                    } else {
-                        egui::ScrollArea::vertical()
-                            .auto_shrink(false)
-                            .show(ui, |ui| self.library_media_cards(ui, palette));
-                    }
-                    return;
-                }
-
-                self.media_selection_row(ui, palette);
-                ui.add_space(10.0);
-
-                let mut actions = CardActions::default();
-                let mut rename = self.media_rename.take();
-                let mut thumbnails = Vec::new();
-                egui::ScrollArea::vertical()
-                    .auto_shrink(false)
-                    .show(ui, |ui| {
-                        let entries = self.listed_media();
-                        if entries.is_empty() {
-                            ui.colored_label(palette.text_muted, "No videos match this filter");
-                        }
-                        let width = ui.available_width();
-                        let stacked: f32 = entries
-                            .iter()
-                            .map(|entry| stacked_card_height(ui, entry, width))
-                            .sum();
-                        let columns = media_columns(width, stacked, ui.available_height());
-                        let compact = cards_are_compact(width, columns);
-                        let selecting = !self.selected_media.is_empty();
-                        for row in entries.chunks(columns) {
-                            ui.columns(columns, |cells| {
-                                for (cell, entry) in cells.iter_mut().zip(row) {
-                                    let state = self.card_state(entry.id);
-                                    let thumbnail = media_card(
-                                        cell,
-                                        palette,
-                                        entry,
-                                        state,
-                                        CardMode { compact, selecting },
-                                        &mut rename,
-                                        &mut actions,
-                                    );
-                                    thumbnails.push((entry.id, thumbnail));
-                                }
-                            });
-                            ui.add_space(MEDIA_CARD_SPACING);
-                        }
-                        if !self.project.library.is_empty() {
-                            ui.add_space(4.0);
-                            ui.separator();
-                            ui.add_space(6.0);
-                            self.library_media_cards(ui, palette);
-                        }
-                    });
-                self.card_thumbnails = thumbnails;
-                if let Some(id) = actions.add {
-                    self.add_to_timeline(id);
-                }
-                if let Some(id) = actions.remove {
-                    self.request_remove(id);
-                }
-                if let Some(id) = actions.delete_recording {
-                    self.confirm_delete_recording = Some(id);
-                }
-                self.media_rename = rename;
-                if let Some((id, typed)) = actions.rename {
-                    self.rename_media(id, &typed);
-                }
-                if let Some(id) = actions.toggle {
-                    self.toggle_media(id);
-                }
+                close = self.media_panel_body(ui, palette);
             });
         if close {
             self.media_panel_open = false;
         }
         self.media_panel_rect = panel.map_or(egui::Rect::NOTHING, |panel| panel.response.rect);
+    }
+
+    /// What the left panel holds, whichever way it is shown. Says whether it was closed.
+    fn media_panel_body(&mut self, ui: &mut egui::Ui, palette: &Palette) -> bool {
+        let mut close = false;
+        let on_text = self.left_panel == LeftPanel::Text;
+        let on_transitions = self.left_panel == LeftPanel::Transitions;
+        let on_library = self.left_panel == LeftPanel::Library;
+        ui.horizontal(|ui| {
+            let heading = match self.left_panel {
+                LeftPanel::Media => "My media",
+                LeftPanel::Record => "Record",
+                LeftPanel::Library => "Content library",
+                LeftPanel::Text => "Text",
+                LeftPanel::Transitions => "Transitions",
+            };
+            ui.label(RichText::new(heading).font(fonts::strong(15.0)));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                close = ui
+                    .add(
+                        IconButton::new(
+                            palette,
+                            Kind::Ghost,
+                            icons::PANEL_LEFT_CLOSE,
+                            "Close media panel",
+                        )
+                        .size(PANEL_CLOSE_SIZE, 16.0),
+                    )
+                    .on_hover_text("Close this panel. My media on the left opens it again.")
+                    .clicked();
+            });
+        });
+        ui.add_space(10.0);
+        if on_text {
+            self.text_panel(ui, palette);
+            return close;
+        }
+        if on_transitions {
+            self.transitions_panel(ui, palette);
+            return close;
+        }
+        if on_library {
+            self.library_panel(ui, palette);
+            return close;
+        }
+        if self.left_panel == LeftPanel::Record {
+            self.record_panel(ui, palette);
+            return close;
+        }
+        let width = ui.available_width();
+        // Once there are videos, what comes next is on the cards and the timeline.
+        let kind = if self.visible_media().next().is_none() {
+            Kind::Primary
+        } else {
+            Kind::Secondary
+        };
+        let clicked = ui
+            .add(
+                ActionButton::new(palette, kind, "Add media")
+                    .icon(icons::PLUS)
+                    .width(width),
+            )
+            .on_hover_text("Add videos and audio to this project (Ctrl+O)")
+            .clicked();
+        if clicked {
+            let ctx = ui.ctx().clone();
+            self.pick_files(&ctx);
+        }
+        ui.add_space(12.0);
+
+        if self.visible_media().next().is_none() {
+            if self.project.library.is_empty() {
+                empty_media_hint(ui, palette);
+            } else {
+                egui::ScrollArea::vertical()
+                    .auto_shrink(false)
+                    .show(ui, |ui| self.library_media_cards(ui, palette));
+            }
+            return close;
+        }
+
+        self.media_selection_row(ui, palette);
+        ui.add_space(10.0);
+
+        let mut actions = CardActions::default();
+        let mut rename = self.media_rename.take();
+        let mut thumbnails = Vec::new();
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                let entries = self.listed_media();
+                if entries.is_empty() {
+                    ui.colored_label(palette.text_muted, "No videos match this filter");
+                }
+                let width = ui.available_width();
+                let stacked: f32 = entries
+                    .iter()
+                    .map(|entry| stacked_card_height(ui, entry, width))
+                    .sum();
+                let columns = media_columns(width, stacked, ui.available_height());
+                let compact = cards_are_compact(width, columns);
+                let selecting = !self.selected_media.is_empty();
+                for row in entries.chunks(columns) {
+                    ui.columns(columns, |cells| {
+                        for (cell, entry) in cells.iter_mut().zip(row) {
+                            let state = self.card_state(entry.id);
+                            let thumbnail = media_card(
+                                cell,
+                                palette,
+                                entry,
+                                state,
+                                CardMode { compact, selecting },
+                                &mut rename,
+                                &mut actions,
+                            );
+                            thumbnails.push((entry.id, thumbnail));
+                        }
+                    });
+                    ui.add_space(MEDIA_CARD_SPACING);
+                }
+                if !self.project.library.is_empty() {
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    self.library_media_cards(ui, palette);
+                }
+            });
+        self.card_thumbnails = thumbnails;
+        if let Some(id) = actions.add {
+            self.add_to_timeline(id);
+        }
+        if let Some(id) = actions.remove {
+            self.request_remove(id);
+        }
+        if let Some(id) = actions.delete_recording {
+            self.confirm_delete_recording = Some(id);
+        }
+        self.media_rename = rename;
+        if let Some((id, typed)) = actions.rename {
+            self.rename_media(id, &typed);
+        }
+        if let Some(id) = actions.toggle {
+            self.toggle_media(id);
+        }
+        close
+    }
+
+    /// Where a side panel goes when it floats over the card, beside its rail.
+    fn floating_rect(&self, ctx: &egui::Context, side: Side, width: f32) -> egui::Rect {
+        let screen = ctx.content_rect();
+        let rail = match side {
+            Side::Left => self.left_rail_rect,
+            Side::Right => self.right_rail_rect,
+        };
+        let room = screen.width() - self.fit.rail_width() * 2.0 - FLOATING_PANEL_GAP;
+        let width = width.min(room);
+        let left = match side {
+            Side::Left => rail.right(),
+            Side::Right => rail.left() - width,
+        };
+        egui::Rect::from_min_max(
+            pos2(left, rail.top()),
+            pos2(left + width, screen.bottom() - FLOATING_PANEL_GAP),
+        )
+    }
+
+    /// A panel on the right: beside the card, or over it in a narrow window, where a press
+    /// anywhere else closes it.
+    pub(super) fn right_side_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: &'static str,
+        frame: Frame,
+        add: impl FnOnce(&mut Self, &mut egui::Ui),
+    ) {
+        if self.fit.floating_panels() {
+            let ctx = ui.ctx().clone();
+            let rect = self.floating_rect(&ctx, Side::Right, looks::LOOK_PANEL_WIDTH);
+            let shown = floating_panel(&ctx, id, rect, frame, |ui| add(self, ui));
+            if pressed_elsewhere(&ctx, [shown, self.right_rail_rect]) {
+                self.right_panel = None;
+            }
+            // Counts as the one widget a docked panel would, so nothing after it is renumbered.
+            ui.skip_ahead_auto_ids(1);
+        } else {
+            egui::Panel::right(id)
+                .exact_size(looks::LOOK_PANEL_WIDTH)
+                .show_separator_line(false)
+                .frame(frame)
+                .show(ui, |ui| add(self, ui));
+        }
     }
 
     /// The row above the cards, for working on several videos at once.
@@ -4507,15 +4747,28 @@ impl Editor {
                 sw: PANEL_RADIUS,
                 se: PANEL_RADIUS,
             });
-        let tallest = (ui.available_height() * TIMELINE_MAX_SHARE).max(TIMELINE_MIN_HEIGHT);
-        self.timeline_height = self.timeline_height.clamp(TIMELINE_MIN_HEIGHT, tallest);
+        let available = ui.available_height();
+        let transport = self.fit.transport_height();
+        // In a short window the video comes first: the timeline shows one row until dragged
+        // taller, and can only take half the room.
+        let full = if self.fit.short {
+            let lowest = transport + SHORT_TIMELINE_ROOM;
+            let tallest = (available * (1.0 - SHORT_PREVIEW_ROOM)).max(lowest);
+            self.short_timeline_height
+                .unwrap_or(lowest)
+                .clamp(lowest, tallest)
+        } else {
+            let tallest = (available * TIMELINE_MAX_SHARE).max(TIMELINE_MIN_HEIGHT);
+            self.timeline_height = self.timeline_height.clamp(TIMELINE_MIN_HEIGHT, tallest);
+            self.timeline_height
+        };
         let openness = ui.ctx().animate_bool_with_time(
             egui::Id::unique("timeline_open"),
             self.timeline_open,
             TIMELINE_SLIDE_SECONDS,
         );
-        let closed_height = TRANSPORT_HEIGHT + f32::from(PANEL_GAP);
-        let height = closed_height + (self.timeline_height - closed_height) * openness;
+        let closed_height = transport + f32::from(PANEL_GAP);
+        let height = closed_height + (full - closed_height) * openness;
         let panel = egui::Panel::bottom("timeline")
             .exact_size(height)
             .show_separator_line(false)
@@ -4528,12 +4781,12 @@ impl Editor {
             });
         self.timeline_panel_rect = panel.response.rect;
         if self.timeline_open {
-            self.timeline_resize_edge(ui, panel.response.rect);
+            self.timeline_resize_edge(ui, panel.response.rect, full);
         }
     }
 
     /// Dragging the line above the transport row changes the timeline's height.
-    fn timeline_resize_edge(&mut self, ui: &mut egui::Ui, panel: egui::Rect) {
+    fn timeline_resize_edge(&mut self, ui: &mut egui::Ui, panel: egui::Rect, full: f32) {
         let edge = egui::Rect::from_min_max(
             pos2(panel.left(), panel.top() - TIMELINE_RESIZE_GRAB),
             pos2(
@@ -4546,15 +4799,22 @@ impl Editor {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
         }
         if response.dragged() {
-            self.timeline_height -= response.drag_delta().y;
+            let height = full - response.drag_delta().y;
+            if self.fit.short {
+                self.short_timeline_height = Some(height);
+            } else {
+                self.timeline_height = height;
+            }
         }
     }
 
     /// The row between the video and the timeline. When the timeline is collapsed it is
     /// all that is left of it, so it takes over the job of moving the playhead.
     fn transport_row(&mut self, ui: &mut egui::Ui, palette: &Palette) {
-        let (row, _) =
-            ui.allocate_exact_size(vec2(ui.available_width(), TRANSPORT_HEIGHT), Sense::hover());
+        let (row, _) = ui.allocate_exact_size(
+            vec2(ui.available_width(), self.fit.transport_height()),
+            Sense::hover(),
+        );
         let line = Stroke::new(1.0, palette.border);
         ui.painter().hline(row.x_range(), row.top(), line);
         let left_to_right = Layout::left_to_right(Align::Center);
@@ -4565,7 +4825,11 @@ impl Editor {
                 })
                 .response
                 .rect;
-            let wanted = TRANSPORT_WIDTH + TIME_READOUT_WIDTH;
+            let wanted = if self.fit.tiny {
+                TINY_TRANSPORT_WIDTH + TINY_TIME_READOUT_WIDTH
+            } else {
+                TRANSPORT_WIDTH + TIME_READOUT_WIDTH
+            };
             let left = (row.center().x - wanted / 2.0).max(tools.right() + 8.0);
             let rest = row.with_min_x(left);
             ui.scope_builder(
@@ -4621,10 +4885,13 @@ impl Editor {
         let total = self.project.tracks.duration();
         let playing = self.preview.is_playing();
         let quiet = |icon, name| IconButton::new(palette, Kind::Ghost, icon, name);
-        if ui
-            .add_enabled(has_clips, quiet(icons::SKIP_BACK, "Go to start"))
-            .on_hover_text("Go to the start (Home)")
-            .clicked()
+        // A very small window keeps Home and End for these.
+        let ends = !self.fit.tiny;
+        if ends
+            && ui
+                .add_enabled(has_clips, quiet(icons::SKIP_BACK, "Go to start"))
+                .on_hover_text("Go to the start (Home)")
+                .clicked()
         {
             self.seek(Ticks(0));
         }
@@ -4668,10 +4935,11 @@ impl Editor {
         {
             self.skip(true);
         }
-        if ui
-            .add_enabled(has_clips, quiet(icons::SKIP_FORWARD, "Go to end"))
-            .on_hover_text("Go to the end (End)")
-            .clicked()
+        if ends
+            && ui
+                .add_enabled(has_clips, quiet(icons::SKIP_FORWARD, "Go to end"))
+                .on_hover_text("Go to the end (End)")
+                .clicked()
         {
             self.seek(total);
         }
@@ -4679,10 +4947,19 @@ impl Editor {
 
     fn time_readout(&mut self, ui: &mut egui::Ui, palette: &Palette) {
         ui.add_space(8.0);
-        ui.label(RichText::new(format_timecode(self.position())).font(fonts::strong(15.0)));
+        // A very small window shows whole seconds.
+        let shown = |time| {
+            let full = format_timecode(time);
+            if self.fit.tiny {
+                whole_seconds(&full).to_owned()
+            } else {
+                full
+            }
+        };
+        ui.label(RichText::new(shown(self.position())).font(fonts::strong(15.0)));
         ui.colored_label(
             palette.text_muted,
-            format!("/ {}", format_timecode(self.project.tracks.duration())),
+            format!("/ {}", shown(self.project.tracks.duration())),
         );
     }
 
@@ -5099,12 +5376,22 @@ impl Editor {
             } else {
                 "Press + on a video to put it on the timeline"
             };
+            // In a short window the logo shrinks, and goes once it would be too small to read.
+            let logo_height =
+                (rect.height() - EMPTY_HINT_TEXT_ROOM - EMPTY_LOGO_GAP).min(EMPTY_LOGO_SIZE.y);
+            let logo = logo.filter(|_| logo_height >= EMPTY_LOGO_SMALLEST);
+            let content = if logo.is_some() {
+                logo_height + EMPTY_LOGO_GAP + EMPTY_HINT_TEXT_ROOM
+            } else {
+                EMPTY_HINT_TEXT_ROOM
+            };
             ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.add_space((rect.height() - 200.0).max(0.0) / 2.0);
+                    ui.add_space(((rect.height() - content) / 2.0).max(0.0));
                     if let Some(logo) = logo {
-                        ui.add(egui::Image::new(&logo).fit_to_exact_size(vec2(96.0, 111.0)));
-                        ui.add_space(18.0);
+                        let size = EMPTY_LOGO_SIZE * (logo_height / EMPTY_LOGO_SIZE.y);
+                        ui.add(egui::Image::new(&logo).fit_to_exact_size(size));
+                        ui.add_space(EMPTY_LOGO_GAP);
                     }
                     ui.label(
                         RichText::new(hint)
@@ -5230,7 +5517,7 @@ impl Editor {
             clips: &clips,
             // With several selected, the picture's controls step aside, as they change one clip.
             selected: self.selected.filter(|_| !self.several_selected()),
-            row_above_is_free: self.notice.is_none(),
+            row_above: self.row_above,
             can_go_forward: self.selected.is_some_and(|id| {
                 self.project
                     .tracks
@@ -5514,6 +5801,7 @@ impl Editor {
         let gif_seconds = self.gif_seconds();
 
         egui::Modal::new(egui::Id::unique("export_dialog")).frame(dialog_frame(ctx)).show(ctx, |ui| {
+            dialog_scroll(ui, |ui| {
             ui.set_width(440.0);
             match &self.export_state {
                 ExportState::GapWarning => {
@@ -5801,6 +6089,7 @@ impl Editor {
                 ExportState::Closed => {}
             }
         });
+        });
 
         if remove_gaps {
             self.remove_all_gaps();
@@ -6018,6 +6307,58 @@ fn fitted(size: egui::Vec2, within: egui::Rect) -> egui::Rect {
     egui::Rect::from_center_size(within.center(), size * scale)
 }
 
+/// Shows a side panel over the card, as it is in a narrow window, and says where it went.
+fn floating_panel(
+    ctx: &egui::Context,
+    id: &'static str,
+    rect: egui::Rect,
+    frame: Frame,
+    add: impl FnOnce(&mut egui::Ui),
+) -> egui::Rect {
+    let frame = frame
+        .outer_margin(Margin::ZERO)
+        .shadow(ctx.global_style().visuals.popup_shadow);
+    let inner = (rect.size() - frame.total_margin().sum()).max(vec2(0.0, 0.0));
+    let shown = egui::Area::new(egui::Id::unique(id))
+        .order(egui::Order::Middle)
+        .fixed_pos(rect.min)
+        .constrain(false)
+        .show(ctx, |ui| {
+            frame.show(ui, |ui| {
+                ui.set_min_size(inner);
+                ui.set_max_size(inner);
+                add(ui);
+            });
+        })
+        .response;
+    // It stays above the clip's toolbar, which floats on the video too.
+    ctx.move_to_top(shown.layer_id);
+    shown.rect
+}
+
+/// Whether a press this frame landed on the screen outside these places, which closes a
+/// floating panel. Presses on menus and dialogs don't count, as they belong to what is open.
+fn pressed_elsewhere(ctx: &egui::Context, keep: [egui::Rect; 2]) -> bool {
+    let Some(at) = ctx.input(|input| {
+        input
+            .pointer
+            .primary_pressed()
+            .then(|| input.pointer.press_origin())
+            .flatten()
+    }) else {
+        return false;
+    };
+    !keep.iter().any(|rect| rect.contains(at))
+        && ctx
+            .layer_id_at(at)
+            .is_none_or(|layer| layer.order == egui::Order::Background)
+}
+
+/// A time as shown, without its hundredths.
+fn whole_seconds(time: &str) -> &str {
+    time.split('.').next().unwrap_or(time)
+}
+
 /// A rounded panel. The gap on its right and below it keeps it clear of its neighbours,
 /// and the rail or panel before it keeps it clear on the left.
 fn panel_card(fill: Color32, inner: Margin) -> Frame {
@@ -6030,6 +6371,25 @@ fn panel_card(fill: Color32, inner: Margin) -> Frame {
             top: 0,
             bottom: PANEL_GAP,
         })
+}
+
+/// How much of the window a dialog's contents can take, leaving its frame and a margin clear,
+/// so a long one scrolls in a small window instead of running off it.
+fn dialog_room(ctx: &egui::Context) -> egui::Vec2 {
+    let around = 2.0 * (20.0 + DIALOG_WINDOW_MARGIN);
+    (ctx.content_rect().size() - vec2(around, around)).max(vec2(200.0, 120.0))
+}
+
+/// Lets a dialog's contents scroll when the window is too short for them. Its height comes from
+/// the window, not from where the dialog sat last frame, so a dialog never shrinks itself.
+fn dialog_scroll<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let room = dialog_room(ui.ctx());
+    egui::ScrollArea::vertical()
+        .max_height(room.y)
+        .min_scrolled_height(room.y)
+        .auto_shrink([true, true])
+        .show(ui, add)
+        .inner
 }
 
 fn dialog_frame(ctx: &egui::Context) -> Frame {
@@ -6764,10 +7124,7 @@ mod tests {
         events: Vec<egui::Event>,
     ) -> egui::FullOutput {
         let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                pos2(0.0, 0.0),
-                vec2(1280.0, 800.0),
-            )),
+            screen_rect: Some(screen()),
             events,
             ..Default::default()
         };
@@ -6795,7 +7152,15 @@ mod tests {
     }
 
     const CAMERA_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
-    const CAMERA_SIZE: [u32; 2] = [1280, 800];
+    thread_local! {
+        /// The window's size in tests, which a test can change for its own thread.
+        static SCREEN: std::cell::Cell<[u32; 2]> = const { std::cell::Cell::new([1280, 800]) };
+    }
+
+    fn screen() -> egui::Rect {
+        let [width, height] = SCREEN.get();
+        egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(width as f32, height as f32))
+    }
 
     fn block_on<F: std::future::Future>(future: F) -> F::Output {
         let mut future = std::pin::pin!(future);
@@ -6860,12 +7225,12 @@ mod tests {
             }
             let jobs = ctx.tessellate(output.shapes, output.pixels_per_point);
             let screen = egui_wgpu::ScreenDescriptor {
-                size_in_pixels: CAMERA_SIZE,
+                size_in_pixels: SCREEN.get(),
                 pixels_per_point: output.pixels_per_point,
             };
             let size = wgpu::Extent3d {
-                width: CAMERA_SIZE[0],
-                height: CAMERA_SIZE[1],
+                width: SCREEN.get()[0],
+                height: SCREEN.get()[1],
                 depth_or_array_layers: 1,
             };
             let target = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -6880,10 +7245,10 @@ mod tests {
             });
             let view = target.create_view(&Default::default());
             let row_bytes =
-                (CAMERA_SIZE[0] * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+                (SCREEN.get()[0] * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
             let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
-                size: u64::from(row_bytes * CAMERA_SIZE[1]),
+                size: u64::from(row_bytes * SCREEN.get()[1]),
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
@@ -6938,9 +7303,9 @@ mod tests {
                 .get_mapped_range(..)
                 .expect("the picture was mapped");
             let mut picture =
-                format!("P6 {} {} 255\n", CAMERA_SIZE[0], CAMERA_SIZE[1]).into_bytes();
+                format!("P6 {} {} 255\n", SCREEN.get()[0], SCREEN.get()[1]).into_bytes();
             for row in data.chunks(row_bytes as usize) {
-                for pixel in row[..CAMERA_SIZE[0] as usize * 4].chunks(4) {
+                for pixel in row[..SCREEN.get()[0] as usize * 4].chunks(4) {
                     picture.extend_from_slice(&pixel[..3]);
                 }
             }
@@ -7087,6 +7452,326 @@ mod tests {
         editor.renaming = Some("Final round".to_owned());
         run_frame(&ctx, &mut editor, vec![]);
         camera.shoot(&ctx, &mut editor, vec![], "name-3-typing");
+    }
+
+    /// The usual size, half and a quarter of a 1080p screen at 125%, and the smallest allowed.
+    const WINDOW_SIZES: [[u32; 2]; 4] = [[1280, 800], [768, 816], [768, 408], [640, 340]];
+
+    /// An editor with a clip on the timeline and selected, so its toolbar and tools show.
+    fn editor_with_a_selected_clip(ctx: &egui::Context) -> Editor {
+        let mut editor = with_videos(ctx, &[test_clip()]);
+        let clip = editor.project.tracks.tracks()[0].clips()[0].id;
+        editor.selected = Some(clip);
+        settle_animations(ctx, &mut editor);
+        editor
+    }
+
+    #[test]
+    fn every_main_control_is_inside_the_window_and_clear_of_the_others_at_every_size() {
+        for size in WINDOW_SIZES {
+            SCREEN.set(size);
+            let ctx = context();
+            let mut editor = editor_with_a_selected_clip(&ctx);
+            let nodes = named_nodes(&ctx, &mut editor);
+            let mut must_show = vec![
+                "Close window",
+                "Maximise window",
+                "Minimise window",
+                "Settings",
+                "Project menu",
+                "Undo",
+                "Redo",
+                "Background colour",
+                "Export",
+                "Split",
+                "5 seconds back",
+                "Play",
+                "5 seconds forward",
+                "Zoom out",
+                "Zoom in",
+                "My media",
+                "Captions",
+                "Crop",
+                "Flip",
+                "More",
+            ];
+            if size[0] as f32 >= TINY_WIDTH {
+                must_show.extend(["Go to start", "Go to end", "Fit"]);
+            }
+            let found: Vec<(&str, egui::Rect)> = must_show
+                .iter()
+                .map(|name| {
+                    let rect = nodes
+                        .iter()
+                        .find(|(label, ..)| label == name)
+                        .unwrap_or_else(|| panic!("{name} is missing at {size:?}"))
+                        .1;
+                    (*name, rect)
+                })
+                .collect();
+            for (name, rect) in &found {
+                assert!(
+                    screen().contains_rect(*rect),
+                    "{name} at {rect:?} is outside the {size:?} window"
+                );
+            }
+            for (index, (name, rect)) in found.iter().enumerate() {
+                for (other, other_rect) in &found[index + 1..] {
+                    assert!(
+                        !rect.shrink(1.0).intersects(other_rect.shrink(1.0)),
+                        "{name} {rect:?} and {other} {other_rect:?} overlap at {size:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_time_is_shown_whole_and_clear_of_the_right_rail_at_every_size() {
+        for size in WINDOW_SIZES {
+            SCREEN.set(size);
+            let ctx = context();
+            let mut editor = editor_with_a_selected_clip(&ctx);
+            let output = run_frame(&ctx, &mut editor, vec![]);
+            let time = if size[0] as f32 >= TINY_WIDTH {
+                "0:00.00"
+            } else {
+                "0:00"
+            };
+            let shown = text_rect(&output, time)
+                .unwrap_or_else(|| panic!("the time is missing at {size:?}"));
+            assert!(
+                shown.right() <= editor.right_rail_rect.left(),
+                "the time {shown:?} runs under the rail at {size:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_rails_lose_their_names_in_a_narrow_or_short_window_only() {
+        for (size, compact) in [
+            ([1280, 800], false),
+            ([768, 816], true),
+            ([1280, 500], true),
+        ] {
+            SCREEN.set(size);
+            let ctx = context();
+            let mut editor = Editor::new(&ctx, false);
+            let output = run_frame(&ctx, &mut editor, vec![]);
+            let rail = editor.left_rail_rect;
+            assert_eq!(
+                text_in(&output, rail).iter().any(|text| text == "My media"),
+                !compact,
+                "{size:?}"
+            );
+            let width = if compact {
+                COMPACT_RAIL_WIDTH
+            } else {
+                RAIL_WIDTH
+            };
+            assert!((rail.width() - width).abs() < 1.0, "{size:?} {rail:?}");
+        }
+    }
+
+    #[test]
+    fn in_a_narrow_window_my_media_floats_over_the_video_and_a_press_elsewhere_closes_it() {
+        SCREEN.set([1280, 800]);
+        let ctx = context();
+        let mut editor = editor_with_a_selected_clip(&ctx);
+        editor.media_panel_open = true;
+        settle_animations(&ctx, &mut editor);
+        SCREEN.set([768, 816]);
+        settle_animations(&ctx, &mut editor);
+        assert!(!editor.media_panel_open, "going narrow closes the panel");
+        let timeline_left = editor.timeline_panel_rect.left();
+
+        click_named(&ctx, &mut editor, "My media");
+        settle_animations(&ctx, &mut editor);
+
+        assert!(editor.media_panel_open);
+        let panel = editor.media_panel_rect;
+        assert!((panel.left() - editor.left_rail_rect.right()).abs() < 1.0);
+        assert!(panel.right() > timeline_left, "it covers the card");
+        assert!(
+            (editor.timeline_panel_rect.left() - timeline_left).abs() < 1.0,
+            "the video and timeline stay put"
+        );
+        assert!(screen().contains_rect(panel));
+
+        let elsewhere = editor.stage_rect.right_bottom() - vec2(20.0, 20.0);
+        click(&ctx, &mut editor, elsewhere);
+
+        assert!(!editor.media_panel_open);
+    }
+
+    #[test]
+    fn in_a_narrow_window_a_clips_tools_float_and_close_on_a_press_elsewhere() {
+        SCREEN.set([768, 816]);
+        let ctx = context();
+        let mut editor = editor_with_a_selected_clip(&ctx);
+        let timeline_right = editor.timeline_panel_rect.right();
+
+        click_named(&ctx, &mut editor, "Captions");
+        settle_animations(&ctx, &mut editor);
+
+        assert_eq!(editor.right_panel, Some(RightPanel::Captions));
+        assert!(
+            (editor.timeline_panel_rect.right() - timeline_right).abs() < 1.0,
+            "the video and timeline stay put"
+        );
+        let elsewhere = editor.stage_rect.left_bottom() + vec2(20.0, -20.0);
+        click(&ctx, &mut editor, elsewhere);
+
+        assert_eq!(editor.right_panel, None);
+    }
+
+    #[test]
+    fn in_a_wide_window_my_media_still_sits_beside_the_video() {
+        SCREEN.set([1280, 800]);
+        let ctx = context();
+        let mut editor = editor_with_a_selected_clip(&ctx);
+        if !editor.media_panel_open {
+            click_named(&ctx, &mut editor, "My media");
+            settle_animations(&ctx, &mut editor);
+        }
+
+        assert!(editor.timeline_panel_rect.left() >= editor.media_panel_rect.right());
+
+        let video = editor.stage_rect.center();
+        click(&ctx, &mut editor, video);
+
+        assert!(
+            editor.media_panel_open,
+            "a press on the video leaves it open"
+        );
+    }
+
+    #[test]
+    fn in_a_short_window_the_timeline_shows_one_row_so_the_video_gets_the_room() {
+        SCREEN.set([768, 408]);
+        let ctx = context();
+        let editor = editor_with_a_selected_clip(&ctx);
+        let timeline = editor.timeline_panel_rect.height();
+
+        assert!(
+            timeline <= SHORT_TRANSPORT_HEIGHT + SHORT_TIMELINE_ROOM + f32::from(PANEL_GAP) + 1.0,
+            "{timeline}"
+        );
+        assert!(
+            editor.stage_rect.height() >= 100.0,
+            "{:?}",
+            editor.stage_rect
+        );
+    }
+
+    #[test]
+    fn a_short_window_keeps_the_timeline_height_for_when_it_is_tall_again() {
+        let ctx = context();
+        SCREEN.set([1280, 800]);
+        let mut editor = editor_with_a_selected_clip(&ctx);
+        let tall = editor.timeline_panel_rect.height();
+
+        SCREEN.set([1280, 420]);
+        settle_animations(&ctx, &mut editor);
+        assert!(editor.timeline_panel_rect.height() < tall);
+        SCREEN.set([1280, 800]);
+        settle_animations(&ctx, &mut editor);
+
+        assert!((editor.timeline_panel_rect.height() - tall).abs() < 1.0);
+    }
+
+    #[test]
+    fn settings_fit_in_the_smallest_window() {
+        SCREEN.set([640, 340]);
+        let ctx = context();
+        let mut editor = Editor::new(&ctx, false);
+        editor.settings_open = true;
+        settle_animations(&ctx, &mut editor);
+
+        for name in ["General settings", "Recording settings", "Keybinds"] {
+            let shown = named_nodes(&ctx, &mut editor)
+                .into_iter()
+                .find(|(label, ..)| label.starts_with(name))
+                .unwrap_or_else(|| panic!("{name} is missing"))
+                .1;
+            assert!(screen().contains_rect(shown), "{name} {shown:?}");
+        }
+    }
+
+    #[test]
+    fn an_empty_projects_hint_fits_on_the_stage_at_every_size() {
+        for size in WINDOW_SIZES {
+            SCREEN.set(size);
+            let ctx = context();
+            let mut editor = Editor::new(&ctx, false);
+            settle_animations(&ctx, &mut editor);
+            let output = run_frame(&ctx, &mut editor, vec![]);
+            let hint = text_rect(&output, "Add a video to get started")
+                .unwrap_or_else(|| panic!("the hint is missing at {size:?}"));
+
+            assert!(
+                editor.stage_rect.contains_rect(hint),
+                "{hint:?} runs off the stage {:?} at {size:?}",
+                editor.stage_rect
+            );
+        }
+    }
+
+    #[test]
+    fn whole_seconds_drop_the_hundredths_only() {
+        assert_eq!(whole_seconds("0:04.25"), "0:04");
+        assert_eq!(whole_seconds("1:02:03.99"), "1:02:03");
+        assert_eq!(whole_seconds("0:04"), "0:04");
+    }
+
+    #[test]
+    fn the_window_never_goes_below_a_quarter_of_a_1080p_screen_at_150_percent() {
+        let quarter = [1920.0 / 1.5 / 2.0, 1020.0 / 1.5 / 2.0];
+        assert!(SMALLEST_WINDOW[0] <= quarter[0] && SMALLEST_WINDOW[1] <= quarter[1]);
+    }
+
+    /// Saves pictures of the editor at half, a quarter and the smallest size, with the side
+    /// panels shut and open, in the folder named by `BARECLIP_SCREENS`.
+    #[test]
+    #[ignore = "needs a GPU, and writes pictures to look at"]
+    fn draw_the_small_window_screens() {
+        let folder = std::env::var_os("BARECLIP_SCREENS").map_or_else(
+            || std::env::temp_dir().join("bareclip-screens"),
+            PathBuf::from,
+        );
+        for size in WINDOW_SIZES {
+            SCREEN.set(size);
+            let [width, height] = size;
+            let ctx = context();
+            let mut camera = Camera::new(folder.clone());
+            let mut editor = editor_with_a_selected_clip(&ctx);
+            camera.shoot(&ctx, &mut editor, vec![], &format!("{width}x{height}-shut"));
+            click_named(&ctx, &mut editor, "My media");
+            settle_animations(&ctx, &mut editor);
+            camera.shoot(
+                &ctx,
+                &mut editor,
+                vec![],
+                &format!("{width}x{height}-my-media"),
+            );
+            click_named(&ctx, &mut editor, "Captions");
+            settle_animations(&ctx, &mut editor);
+            camera.shoot(
+                &ctx,
+                &mut editor,
+                vec![],
+                &format!("{width}x{height}-captions"),
+            );
+            editor.right_panel = None;
+            editor.settings_open = true;
+            settle_animations(&ctx, &mut editor);
+            camera.shoot(
+                &ctx,
+                &mut editor,
+                vec![],
+                &format!("{width}x{height}-settings"),
+            );
+        }
     }
 
     /// Saves pictures of the screen to look at, in the folder named by `BARECLIP_SCREENS`.

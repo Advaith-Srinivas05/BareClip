@@ -1606,6 +1606,17 @@ fn rail_label(ui: &Ui, label: &str, width: f32) -> std::sync::Arc<egui::Galley> 
     ui.painter().layout_job(job)
 }
 
+/// Lets a rail's tabs scroll when the window is too short for them all, with no bar taking room
+/// from the tabs.
+pub fn rail_scroll(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+    egui::ScrollArea::vertical()
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        .auto_shrink([false, true])
+        .show(ui, add);
+}
+
+/// A tab on a tool rail. A compact one is its symbol alone, square, and says its name when
+/// hovered like any symbol-only button.
 pub fn rail_tab(
     ui: &mut Ui,
     palette: &Palette,
@@ -1613,11 +1624,20 @@ pub fn rail_tab(
     label: &str,
     name: &str,
     selected: bool,
+    compact: bool,
 ) -> Response {
     let width = ui.available_width();
-    let words = rail_label(ui, label, width);
-    let content = RAIL_SYMBOL + RAIL_SYMBOL_GAP + words.rect.height();
-    let size = vec2(width, RAIL_TAB_HEIGHT.max(content + RAIL_LABEL_INSET * 4.0));
+    let words = rail_label(ui, if compact { "" } else { label }, width);
+    let content = if compact {
+        RAIL_SYMBOL
+    } else {
+        RAIL_SYMBOL + RAIL_SYMBOL_GAP + words.rect.height()
+    };
+    let size = if compact {
+        vec2(width, width)
+    } else {
+        vec2(width, RAIL_TAB_HEIGHT.max(content + RAIL_LABEL_INSET * 4.0))
+    };
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, name));
     if !ui.is_rect_visible(rect) {
@@ -1644,10 +1664,11 @@ pub fn rail_tab(
     };
     paint_box(ui, rect, f32::from(RADIUS), &look, &response, palette);
     if selected {
+        let inset = (rect.height() / 4.0).min(12.0);
         ui.painter().rect_filled(
             Rect::from_min_size(
-                rect.left_top() + vec2(0.0, 12.0),
-                vec2(3.0, rect.height() - 24.0),
+                rect.left_top() + vec2(0.0, inset),
+                vec2(3.0, rect.height() - inset * 2.0),
             ),
             1.0,
             palette.accent,
@@ -1661,11 +1682,13 @@ pub fn rail_tab(
         icon,
         symbol_color,
     );
-    ui.painter().galley(
-        pos2(rect.center().x, top + RAIL_SYMBOL + RAIL_SYMBOL_GAP),
-        words,
-        text_color,
-    );
+    if !compact {
+        ui.painter().galley(
+            pos2(rect.center().x, top + RAIL_SYMBOL + RAIL_SYMBOL_GAP),
+            words,
+            text_color,
+        );
+    }
     response
 }
 
@@ -1878,10 +1901,36 @@ mod tests {
         let ctx = context();
         run_ui(&ctx, egui::RawInput::default(), |ui| {
             ui.set_width(62.0);
-            let short = rail_tab(ui, &DARK, &icons::TYPE, "Text", "Text", false);
-            let long = rail_tab(ui, &DARK, &icons::LIBRARY_BIG, "Content library", "", false);
+            let short = rail_tab(ui, &DARK, &icons::TYPE, "Text", "Text", false, false);
+            let long = rail_tab(
+                ui,
+                &DARK,
+                &icons::LIBRARY_BIG,
+                "Content library",
+                "",
+                false,
+                false,
+            );
             assert_eq!(short.rect.height(), RAIL_TAB_HEIGHT);
             assert!(long.rect.height() > RAIL_TAB_HEIGHT);
+        });
+    }
+
+    #[test]
+    fn a_compact_rail_tab_is_square_whatever_its_name() {
+        let ctx = context();
+        run_ui(&ctx, egui::RawInput::default(), |ui| {
+            ui.set_width(40.0);
+            let tab = rail_tab(
+                ui,
+                &DARK,
+                &icons::LIBRARY_BIG,
+                "Content library",
+                "Content library",
+                false,
+                true,
+            );
+            assert_eq!(tab.rect.size(), vec2(40.0, 40.0));
         });
     }
 
@@ -1908,7 +1957,8 @@ mod tests {
             &icons::FILM,
             "Tool",
             "Tool",
-            true
+            true,
+            false
         )));
         assert!(clicked(|ui| ui.add(MenuItem::new(
             &DARK,
