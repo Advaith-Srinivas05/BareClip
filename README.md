@@ -28,6 +28,7 @@ BareClip runs on 64-bit Windows and has been tested on Windows 11.
 - Project files that save themselves as you work and recover after a crash
 - Rename videos within a project
 - Right-click a video or song in File Explorer and choose **Edit with BareClip** to add it to the timeline. On Windows 11 it's under **Show more options**.
+- The window reopens where and at the size you left it, and still works snapped to half or a quarter of the screen
 
 **Picture**
 
