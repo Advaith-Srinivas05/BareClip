@@ -15,7 +15,7 @@ Get the latest installer: [BareClip.msi](https://github.com/Advaith-Srinivas05/B
 
 The installer asks whether to install for just you or for everyone on the PC, where to install, and which shortcuts to add. Windows may show "Windows protected your PC" the first time you run it. Choose **More info**, then **Run anyway**.
 
-BareClip runs on 64-bit Windows and has been tested on Windows 11.
+BareClip runs on 64-bit Windows with an Intel or AMD processor, and has been tested on Windows 11. PCs with an ARM processor, such as Snapdragon laptops, aren't supported yet.
 
 ## What it does
 
@@ -111,12 +111,8 @@ While recording the screen, these work from any program, and can be changed in S
 
 ## Limitations
 
-- Windows only.
+- Windows only, on Intel or AMD processors. There's no ARM version yet.
 - Redrawn videos are saved as H.264 or AV1 in MP4, or as a GIF. HEVC export isn't offered.
-- HDR recordings are shown and exported as standard range.
-- An animated GIF shows only its first picture.
-- Slow motion repeats frames rather than blending them.
-- Sound that gets mixed is saved as stereo. Surround sound is only kept when it's copied unchanged.
 - Recording only one app's sound needs Windows 10 version 2004 or later. Before that, all PC sound is recorded.
 
 ## Building from source
