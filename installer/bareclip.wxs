@@ -39,6 +39,7 @@
          even when installing for everyone. It only shows after a fresh install or upgrade. -->
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch BareClip" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <CustomAction Id="NeedsAdminToUpdate" Error="BareClip is installed for everyone on this PC, so updating it needs administrator permission. Open the installer by double-clicking it, or add MSIINSTALLPERUSER=&quot;&quot; to the command line so Windows asks for permission." />
     <CustomAction Id="LaunchBareClip" BinaryKey="WixCA" DllEntry="WixShellExec" Impersonate="yes" Return="ignore" />
 
     <!-- An upgrade keeps the earlier choices, and stays in the same place so there is only
@@ -90,6 +91,10 @@
          is known that an earlier copy was for everyone. Otherwise that copy stays alongside. -->
     <InstallExecuteSequence>
       <FindRelatedProducts After="RestoreEveryoneAllUsers" />
+      <!-- Windows settles whether to ask for administrator permission before it is known that the
+           earlier copy was for everyone, so an unattended upgrade not told so would remove that
+           copy and then fail to install. It stops here instead, before anything is removed. -->
+      <Custom Action="NeedsAdminToUpdate" After="FindRelatedProducts"><![CDATA[WIX_UPGRADE_DETECTED AND ALLUSERS = 1 AND NOT Privileged AND NOT Installed]]></Custom>
     </InstallExecuteSequence>
     <InstallUISequence>
       <FindRelatedProducts After="RestoreEveryoneAllUsers" />

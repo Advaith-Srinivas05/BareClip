@@ -1,6 +1,7 @@
 # Checks installing for everyone on this PC: the shared folders and registry, upgrading in place
-# and uninstalling. Run scripts/build-msi.ps1 first, on an administrator account. Each step shows
-# the installer's progress bar and asks for permission, unless Windows is set not to.
+# and uninstalling. Run scripts/build-msi.ps1 first, on an administrator account but not from an
+# elevated window. Each step shows the installer's progress bar and asks for permission, unless
+# Windows is set not to.
 $ErrorActionPreference = 'Stop'
 
 $Root = Split-Path -Parent $PSScriptRoot
@@ -51,6 +52,17 @@ try {
     Assert-That (Test-Path $Desktop) 'the shared desktop shortcut exists'
     Assert-That (Test-Path 'HKLM:\Software\BareClip') 'its choices are in the machine registry'
     Assert-That (-not (Test-Path 'HKCU:\Software\BareClip')) 'and not in this user''s'
+
+    # An unattended upgrade that isn't told it's for everyone gets no administrator permission,
+    # so it has to stop before it removes the copy that is there. Silent, as a progress bar would
+    # wait on the message for someone to press OK.
+    $ExitCode = Invoke-Msi @('/i', "`"$New`"", '/qn', '/l*v', "`"$Log`"")
+    Assert-That ($ExitCode -eq 1603) "an upgrade not told it is for everyone was refused (exit $ExitCode)"
+    $Logged = Get-Content $Log -Encoding Unicode -Raw
+    Assert-That ($Logged -match 'updating it needs administrator permission') 'and it says why'
+    $Installed = @(Get-Installed)
+    Assert-That ($Installed.Count -eq 1 -and $Installed[0].Version -like '0.1.0*') 'the older version is still installed'
+    Assert-That (Test-Path (Join-Path $InstallDir 'bareclip.exe')) 'and still in Program Files'
 
     # With no pages to work it out on, an unattended upgrade has to be told it's for everyone.
     $ExitCode = Invoke-Msi @('/i', "`"$New`"", '/qb', '/l*v', "`"$Log`"", 'MSIINSTALLPERUSER=""')
