@@ -198,6 +198,56 @@ impl From<bareclip_capture::CameraMode> for CameraModeChoice {
     }
 }
 
+/// The fewest and most seconds the player's arrow keys can jump.
+pub const SEEK_SECONDS_RANGE: std::ops::RangeInclusive<u32> = 1..=60;
+
+/// The player's choices.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ViewerSettings {
+    /// Where the player was when it last closed, apart from the editor's window.
+    pub window: Option<WindowPlace>,
+    /// Where mini view was last left.
+    pub mini_window: Option<WindowPlace>,
+    /// How loud the player plays, out of 100.
+    pub volume: u32,
+    pub muted: bool,
+    /// How far Left and Right jump, in seconds.
+    pub seek_seconds: u32,
+    /// Whether a file picks up where it was last stopped.
+    pub resume: bool,
+}
+
+impl Default for ViewerSettings {
+    fn default() -> Self {
+        Self {
+            window: None,
+            mini_window: None,
+            volume: 100,
+            muted: false,
+            seek_seconds: 5,
+            resume: true,
+        }
+    }
+}
+
+impl ViewerSettings {
+    /// The seek step, kept within what Settings offers, whatever the file says.
+    pub fn seek_step(&self) -> u32 {
+        self.seek_seconds
+            .clamp(*SEEK_SECONDS_RANGE.start(), *SEEK_SECONDS_RANGE.end())
+    }
+
+    /// The volume as a share of full, kept to at most full.
+    pub fn loudness(&self) -> f32 {
+        if self.muted {
+            0.0
+        } else {
+            self.volume.min(100) as f32 / 100.0
+        }
+    }
+}
+
 /// The user's choices. Anything missing from the file takes its default, so settings written
 /// by another version still load.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,6 +296,9 @@ pub struct Settings {
     pub microphone_key: Shortcut,
     /// Where the window was when it last closed. `None` opens it in the middle of the screen.
     pub window: Option<WindowPlace>,
+    /// The player's own choices, kept apart so that the player and an editor open at the same
+    /// time each save only their own.
+    pub viewer: ViewerSettings,
 }
 
 impl Default for Settings {
@@ -275,6 +328,7 @@ impl Default for Settings {
             pause_key: Shortcut::PAUSE,
             microphone_key: Shortcut::MICROPHONE,
             window: None,
+            viewer: ViewerSettings::default(),
         }
     }
 }
@@ -307,6 +361,26 @@ impl Settings {
         fs::create_dir_all(folder)?;
         let text = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
         write_atomic(&folder.join(SETTINGS_FILE), text.as_bytes())
+    }
+
+    /// Saves the editor's choices, keeping the player's as the file has them, because a player
+    /// open at the same time may have changed them since this copy was read.
+    pub fn save_from_editor(&mut self, folder: &Path) -> io::Result<()> {
+        self.viewer = Settings::load(folder).viewer;
+        self.save(folder)
+    }
+
+    /// Saves the player's choices and the theme, which the two share, into the file as it is,
+    /// leaving the editor's alone.
+    pub fn save_from_viewer(
+        folder: &Path,
+        viewer: &ViewerSettings,
+        theme: ThemeSetting,
+    ) -> io::Result<()> {
+        let mut settings = Settings::load(folder);
+        settings.viewer = viewer.clone();
+        settings.theme = theme;
+        settings.save(folder)
     }
 }
 
@@ -573,6 +647,78 @@ mod tests {
     }
 
     #[test]
+    fn the_player_and_an_editor_each_save_only_their_own_choices() {
+        let folder = temporary_folder("settings-shared");
+        let mut editor = Settings::load(&folder);
+        let place = WindowPlace {
+            left: 10,
+            top: 20,
+            right: 1290,
+            bottom: 740,
+            maximized: false,
+        };
+        let viewer = ViewerSettings {
+            window: Some(place),
+            volume: 40,
+            muted: true,
+            seek_seconds: 12,
+            ..ViewerSettings::default()
+        };
+        Settings::save_from_viewer(&folder, &viewer, ThemeSetting::Dark).unwrap();
+
+        // The editor read the file before the player saved, and saves afterwards.
+        editor.auto_save = true;
+        editor.save_from_editor(&folder).unwrap();
+
+        let saved = Settings::load(&folder);
+        assert!(saved.auto_save, "the editor's change is kept");
+        assert_eq!(saved.viewer, viewer, "the player's changes are kept");
+        assert_eq!(editor.viewer, viewer, "the editor's copy catches up");
+
+        Settings::save_from_viewer(&folder, &ViewerSettings::default(), ThemeSetting::Light)
+            .unwrap();
+        let saved = Settings::load(&folder);
+        assert!(
+            saved.auto_save,
+            "the player leaves the editor's choices alone"
+        );
+        assert_eq!(saved.theme, ThemeSetting::Light, "the theme is shared");
+    }
+
+    #[test]
+    fn the_seek_step_and_volume_stay_within_what_settings_offer() {
+        let mut viewer = ViewerSettings::default();
+        assert_eq!(viewer.seek_step(), 5);
+        assert_eq!(viewer.loudness(), 1.0);
+        viewer.seek_seconds = 0;
+        assert_eq!(viewer.seek_step(), 1);
+        viewer.seek_seconds = 600;
+        assert_eq!(viewer.seek_step(), 60);
+        viewer.volume = 250;
+        assert_eq!(viewer.loudness(), 1.0);
+        viewer.volume = 30;
+        assert!((viewer.loudness() - 0.3).abs() < 1e-6);
+        viewer.muted = true;
+        assert_eq!(viewer.loudness(), 0.0);
+
+        let folder = temporary_folder("settings-viewer-old");
+        fs::write(folder.join(SETTINGS_FILE), r#"{"auto_save": true}"#).unwrap();
+        assert_eq!(
+            Settings::load(&folder).viewer,
+            ViewerSettings::default(),
+            "a file from before the player gets the player's defaults"
+        );
+        fs::write(
+            folder.join(SETTINGS_FILE),
+            r#"{"viewer": {"seek_seconds": 9}}"#,
+        )
+        .unwrap();
+        let viewer = Settings::load(&folder).viewer;
+        assert_eq!(viewer.seek_step(), 9);
+        assert_eq!(viewer.volume, 100, "what's missing takes its default");
+    }
+
+    #[test]
     fn settings_start_at_their_defaults_when_there_is_no_file() {
         let folder = temporary_folder("settings-none");
 
@@ -635,6 +781,13 @@ mod tests {
                 bottom: 840,
                 maximized: true,
             }),
+            viewer: ViewerSettings {
+                volume: 35,
+                muted: true,
+                seek_seconds: 10,
+                resume: false,
+                ..ViewerSettings::default()
+            },
         };
 
         settings.save(&folder).expect("they can be saved");

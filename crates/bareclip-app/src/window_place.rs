@@ -12,8 +12,8 @@ use windows_sys::Win32::{
     },
     UI::WindowsAndMessaging::{
         GetWindowPlacement, GetWindowRect, SW_HIDE, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED,
-        SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPlacement, SetWindowPos, WINDOWPLACEMENT,
-        WPF_RESTORETOMAXIMIZED,
+        SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPlacement, SetWindowPos,
+        WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED,
     },
 };
 
@@ -184,6 +184,32 @@ pub fn restore(window: HWND, saved: Option<WindowPlace>) -> bool {
         move_to(window, centered(now.width(), now.height(), screen));
     }
     saved.is_some_and(|saved| saved.maximized)
+}
+
+/// Moves a window that is already showing to a saved place, normal or maximised as saved, if
+/// that place can still be reached on a screen. Says whether it moved.
+pub fn put_back(window: HWND, saved: WindowPlace) -> bool {
+    let Some(before) = placement(window) else {
+        return false;
+    };
+    let on_screen = saved_on_screen(window, &before, saved);
+    if !on_screen.is_some_and(|area| reachable(area, &screens())) {
+        return false;
+    }
+    let mut wanted = before;
+    wanted.flags = 0;
+    wanted.showCmd = if saved.maximized {
+        SW_SHOWMAXIMIZED as u32
+    } else {
+        SW_SHOWNORMAL as u32
+    };
+    wanted.rcNormalPosition = RECT {
+        left: saved.left,
+        top: saved.top,
+        right: saved.right,
+        bottom: saved.bottom,
+    };
+    unsafe { SetWindowPlacement(window, &wanted) != 0 }
 }
 
 /// Where the saved spot is on the desktop. Windows saves it measured from the edge of the

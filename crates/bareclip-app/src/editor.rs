@@ -68,7 +68,7 @@ use crate::{
 const TRANSITIONS_REASON: &str = "Transitions show two clips at once, so the video is drawn again.";
 const LOOKS_REASON: &str =
     "Filters, colours and picture fades change the picture, so the video is drawn again.";
-const LOGO_DARK: &[u8] = include_bytes!("../../../assets/brand/png/mark-dark-256.png");
+pub(crate) const LOGO_DARK: &[u8] = include_bytes!("../../../assets/brand/png/mark-dark-256.png");
 const LOGO_LIGHT: &[u8] = include_bytes!("../../../assets/brand/png/mark-light-256.png");
 // The brand rules call for the simplified mark at this size.
 const SMALL_LOGO_DARK: &[u8] = include_bytes!("../../../assets/brand/png/mark-small-dark-256.png");
@@ -527,6 +527,20 @@ const NEW_SOUND_REASON: &str =
 /// Why video that can't be cut exactly is redrawn when its sound changes.
 const EXACT_CUTS_REASON: &str =
     "The sound has changed, and this video can't be cut exactly to stay in time with it.";
+/// Kinds of video the fast route can't copy, found by exporting one of each, so they are redrawn
+/// into an MP4 instead. FFmpeg's FLV writer refuses copied packets, and a transport stream's
+/// clock starts partway, often 1.4 s in, which the copy route counts from zero, so it kept
+/// only the last 18 of 60 frames.
+const KINDS_REDRAWN: [&str; 4] = ["flv", "ts", "mts", "m2ts"];
+
+/// The kind of a video, in capitals, if it has to be redrawn rather than copied.
+fn kind_that_cant_be_copied(path: &Path) -> Option<String> {
+    let extension = path.extension()?.to_string_lossy().to_ascii_lowercase();
+    KINDS_REDRAWN
+        .contains(&extension.as_str())
+        .then(|| extension.to_uppercase())
+}
+
 /// The kinds of file known to take the sound a mix makes alongside a copied picture.
 const CONTAINERS_FOR_NEW_SOUND: [&str; 4] = ["mp4", "m4v", "mov", "mkv"];
 
@@ -770,7 +784,7 @@ pub struct Editor {
     /// Restart now was pressed in Settings this frame.
     restart_asked: bool,
     /// Files from "Edit with BareClip", waiting for any dialog that decides what the project is.
-    waiting_edits: Vec<PathBuf>,
+    waiting_edits: Vec<crate::handoff::Handed>,
     /// Videos ticked in the panel, in the order they were ticked.
     selected_media: Vec<MediaId>,
     media_panel_open: bool,
@@ -904,35 +918,7 @@ struct CardState {
 /// Moves a file to the Recycle Bin. Tests swap it for one that never reaches the real one.
 type TrashFile = fn(&Path) -> Result<(), String>;
 
-/// Moves a file to the Recycle Bin, quietly, so it can be brought back from there.
-fn move_to_recycle_bin(path: &Path) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::UI::Shell::{
-        FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, SHFILEOPSTRUCTW,
-        SHFileOperationW,
-    };
-    let absolute = std::path::absolute(path).map_err(|error| error.to_string())?;
-    if !absolute.exists() {
-        return Err("The file isn't there any more.".to_owned());
-    }
-    // The list of files ends in two zeros.
-    let from: Vec<u16> = absolute.as_os_str().encode_wide().chain([0, 0]).collect();
-    let mut operation = SHFILEOPSTRUCTW {
-        wFunc: FO_DELETE,
-        pFrom: from.as_ptr(),
-        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI) as u16,
-        ..Default::default()
-    };
-    // SAFETY: the structure and the list it points to live until the call returns.
-    let result = unsafe { SHFileOperationW(&mut operation) };
-    if result != 0 || operation.fAnyOperationsAborted != 0 {
-        return Err(format!("Windows gave error {result}."));
-    }
-    if absolute.exists() {
-        return Err("It is still in use.".to_owned());
-    }
-    Ok(())
-}
+use crate::file_ops::move_to_recycle_bin;
 
 /// What was pressed on the media cards this frame.
 #[derive(Default)]
@@ -1138,7 +1124,7 @@ impl Editor {
 
     fn save_settings(&mut self) {
         if let Some(folder) = &self.app_folder
-            && let Err(error) = self.settings.save(folder)
+            && let Err(error) = self.settings.save_from_editor(folder)
         {
             self.notice = Some(format!("Your settings could not be saved. {error}"));
         }
@@ -1770,7 +1756,26 @@ impl Editor {
     /// timeline. They wait while a dialog is still deciding what the project is, so restoring
     /// lost work or opening another project can't throw them away.
     pub fn edit_files(&mut self, paths: &[PathBuf]) {
-        self.waiting_edits.extend(paths.iter().cloned());
+        self.waiting_edits
+            .extend(paths.iter().cloned().map(crate::handoff::Handed::whole));
+    }
+
+    /// Takes files sent from other windows. A clip sent from the player says which stretch of
+    /// its file to use, and goes on the top row of its kind.
+    pub fn edit_clips(&mut self, clips: &[crate::handoff::Handed]) {
+        self.waiting_edits.extend(clips.iter().cloned());
+    }
+
+    /// Every clip on every row, and the stretch of its footage it plays, for tests outside.
+    #[cfg(test)]
+    pub fn clip_sources(&self) -> Vec<TimeRange> {
+        self.project
+            .tracks
+            .tracks()
+            .iter()
+            .flat_map(Timeline::clips)
+            .map(|clip| clip.source)
+            .collect()
     }
 
     fn take_waiting_edits(&mut self, ctx: &egui::Context) {
@@ -1785,7 +1790,7 @@ impl Editor {
             return;
         }
         let mut chosen = Vec::new();
-        for path in std::mem::take(&mut self.waiting_edits) {
+        for crate::handoff::Handed { path, range } in std::mem::take(&mut self.waiting_edits) {
             let is_media = path.extension().is_some_and(|extension| {
                 extension != project::EXTENSION
                     && !extension.eq_ignore_ascii_case(text::CAPTIONS_EXTENSION)
@@ -1799,12 +1804,12 @@ impl Editor {
                 .visible_media()
                 .find(|entry| same_file(&entry.info.path, &path))
             {
-                chosen.push(entry.id);
+                chosen.push((entry.id, range));
                 continue;
             }
             match self.load(ctx, &path) {
                 Ok(entry) => {
-                    chosen.push(entry.id);
+                    chosen.push((entry.id, range));
                     self.media.push(entry);
                 }
                 Err(error) => {
@@ -1821,7 +1826,41 @@ impl Editor {
         }
         self.media_panel_open = true;
         self.left_panel = LeftPanel::Media;
-        self.add_to_end(chosen);
+        self.add_sent_to_end(chosen);
+    }
+
+    /// Adds files sent from other windows, as one step to undo. Whole files go after every
+    /// picture, as + does. A clip from the player goes after the last clip on the top row of
+    /// pictures, or the first row of sound, keeping the rest of its file to drag back out.
+    fn add_sent_to_end(&mut self, chosen: Vec<(MediaId, Option<TimeRange>)>) {
+        if chosen.iter().all(|(_, range)| range.is_none()) {
+            self.add_to_end(chosen.into_iter().map(|(id, _)| id).collect());
+            return;
+        }
+        self.record();
+        for (id, range) in chosen {
+            let Some(whole) = self.full_range(id) else {
+                continue;
+            };
+            self.selected = Some(match range {
+                Some(range) => {
+                    let kept = TimeRange {
+                        start: range.start.clamp(whole.start, whole.end),
+                        end: range.end.clamp(whole.start, whole.end),
+                    };
+                    let kept = if kept.end > kept.start { kept } else { whole };
+                    if self.is_sound_only(id) {
+                        self.project.tracks.push_sound(id, kept)
+                    } else {
+                        self.project.tracks.push_on_top_row(id, kept)
+                    }
+                }
+                None => self.push_clip(id, whole),
+            });
+            self.settle_canvas();
+            self.settle_canvas();
+        }
+        self.after_clip_added();
     }
 
     fn load(&mut self, ctx: &egui::Context, path: &Path) -> Result<MediaEntry, MediaError> {
@@ -2902,6 +2941,14 @@ impl Editor {
         let route = route_for(videos, !tracks.picture_gaps().is_empty());
         if route != Route::Fast {
             return route;
+        }
+        if let Some(kind) = videos
+            .iter()
+            .find_map(|video| kind_that_cant_be_copied(&video.path))
+        {
+            return Route::Full(format!(
+                "{kind} files can't be cut by copying, so the video is drawn again into an MP4."
+            ));
         }
         if !self.sound_is_plain() {
             if !self.first_video_can_hold_new_sound() {
@@ -6392,7 +6439,7 @@ fn dialog_scroll<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> 
         .inner
 }
 
-fn dialog_frame(ctx: &egui::Context) -> Frame {
+pub(crate) fn dialog_frame(ctx: &egui::Context) -> Frame {
     Frame::popup(&ctx.global_style())
         .inner_margin(Margin::same(20))
         .corner_radius(CornerRadius::same(DIALOG_RADIUS))
@@ -6627,7 +6674,7 @@ fn resize_cursor(direction: egui::ResizeDirection) -> egui::CursorIcon {
 }
 
 /// With no Windows title bar the app resizes its own window from its edges.
-fn window_edges(ctx: &egui::Context) {
+pub(crate) fn window_edges(ctx: &egui::Context) {
     let (maximized, pointer, pressed, busy) = ctx.input(|input| {
         (
             input.viewport().maximized.unwrap_or(false),
@@ -6971,7 +7018,6 @@ mod tests {
     use bareclip_core::placement::{Placement, WHOLE};
     use bareclip_core::speed::Speed;
     use bareclip_core::title::TitleSpot;
-    use eframe::{egui_wgpu, wgpu};
     use std::{process::Command, sync::OnceLock, time::Instant};
 
     fn make_clip(name: &str, size: &str) -> PathBuf {
@@ -7137,67 +7183,9 @@ mod tests {
         output
     }
 
-    thread_local! {
-        /// Texture changes saved for `Camera`, which draws frames some time later.
-        static KEPT_TEXTURES: std::cell::RefCell<Option<Vec<egui::TexturesDelta>>> =
-            const { std::cell::RefCell::new(None) };
-    }
-
-    /// Draws the screen with the real renderer into a picture, with no window involved.
-    struct Camera {
-        device: wgpu::Device,
-        queue: wgpu::Queue,
-        renderer: Arc<egui::mutex::RwLock<egui_wgpu::Renderer>>,
-        folder: PathBuf,
-    }
-
-    const CAMERA_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
-    thread_local! {
-        /// The window's size in tests, which a test can change for its own thread.
-        static SCREEN: std::cell::Cell<[u32; 2]> = const { std::cell::Cell::new([1280, 800]) };
-    }
-
-    fn screen() -> egui::Rect {
-        let [width, height] = SCREEN.get();
-        egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(width as f32, height as f32))
-    }
-
-    fn block_on<F: std::future::Future>(future: F) -> F::Output {
-        let mut future = std::pin::pin!(future);
-        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-        loop {
-            if let std::task::Poll::Ready(value) = future.as_mut().poll(&mut context) {
-                return value;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-    }
+    use crate::screen_camera::{Camera, KEPT_TEXTURES, SCREEN, screen};
 
     impl Camera {
-        fn new(folder: PathBuf) -> Self {
-            std::fs::create_dir_all(&folder).expect("the folder can be created");
-            let instance = wgpu::Instance::default();
-            let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                ..Default::default()
-            }))
-            .expect("a GPU is available");
-            let (device, queue) = block_on(adapter.request_device(&Default::default()))
-                .expect("the GPU can be opened");
-            let renderer = Arc::new(egui::mutex::RwLock::new(egui_wgpu::Renderer::new(
-                &device,
-                CAMERA_FORMAT,
-                Default::default(),
-            )));
-            KEPT_TEXTURES.with_borrow_mut(|kept| *kept = Some(Vec::new()));
-            Self {
-                device,
-                queue,
-                renderer,
-                folder,
-            }
-        }
-
         /// Runs one frame with these events and saves it as a PPM picture.
         fn shoot(
             &mut self,
@@ -7208,116 +7196,6 @@ mod tests {
         ) {
             let output = run_frame(ctx, editor, events);
             self.save(ctx, output, name);
-        }
-
-        /// Draws a frame that has already run, wherever it came from, and saves it.
-        fn save(&mut self, ctx: &egui::Context, output: egui::FullOutput, name: &str) {
-            let mut textures = KEPT_TEXTURES
-                .with_borrow_mut(|kept| std::mem::take(kept.as_mut().expect("the camera is on")));
-            for delta in &textures {
-                for (id, images) in &delta.set {
-                    for image in images {
-                        self.renderer
-                            .write()
-                            .update_texture(&self.device, &self.queue, *id, image);
-                    }
-                }
-            }
-            let jobs = ctx.tessellate(output.shapes, output.pixels_per_point);
-            let screen = egui_wgpu::ScreenDescriptor {
-                size_in_pixels: SCREEN.get(),
-                pixels_per_point: output.pixels_per_point,
-            };
-            let size = wgpu::Extent3d {
-                width: SCREEN.get()[0],
-                height: SCREEN.get()[1],
-                depth_or_array_layers: 1,
-            };
-            let target = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: None,
-                size,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: CAMERA_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
-            let view = target.create_view(&Default::default());
-            let row_bytes =
-                (SCREEN.get()[0] * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-            let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: None,
-                size: u64::from(row_bytes * SCREEN.get()[1]),
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-
-            let mut encoder = self.device.create_command_encoder(&Default::default());
-            let extra = self.renderer.write().update_buffers(
-                &self.device,
-                &self.queue,
-                &mut encoder,
-                &jobs,
-                &screen,
-            );
-            {
-                let mut pass = encoder
-                    .begin_render_pass(&wgpu::RenderPassDescriptor {
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &view,
-                            depth_slice: None,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        ..Default::default()
-                    })
-                    .forget_lifetime();
-                self.renderer.read().render(&mut pass, &jobs, &screen);
-            }
-            encoder.copy_texture_to_buffer(
-                target.as_image_copy(),
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &readback,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(row_bytes),
-                        rows_per_image: None,
-                    },
-                },
-                size,
-            );
-            self.queue
-                .submit(extra.into_iter().chain([encoder.finish()]));
-            readback.map_async(wgpu::MapMode::Read, .., |result| {
-                result.expect("the picture can be read back");
-            });
-            self.device
-                .poll(wgpu::PollType::wait_indefinitely())
-                .expect("the GPU finishes");
-
-            let data = readback
-                .get_mapped_range(..)
-                .expect("the picture was mapped");
-            let mut picture =
-                format!("P6 {} {} 255\n", SCREEN.get()[0], SCREEN.get()[1]).into_bytes();
-            for row in data.chunks(row_bytes as usize) {
-                for pixel in row[..SCREEN.get()[0] as usize * 4].chunks(4) {
-                    picture.extend_from_slice(&pixel[..3]);
-                }
-            }
-            std::fs::write(self.folder.join(format!("{name}.ppm")), picture)
-                .expect("the picture can be saved");
-            drop(data);
-            for delta in &mut textures {
-                for id in &delta.free {
-                    self.renderer.write().free_texture(id);
-                }
-                delta.clear();
-            }
         }
     }
 
@@ -23436,5 +23314,352 @@ mod tests {
             }
             *kept = None;
         });
+    }
+
+    /// A file made by FFmpeg from these arguments, for the new kinds of file.
+    fn made_with_ffmpeg(name: &str, arguments: &[&str]) -> PathBuf {
+        let folder = std::env::temp_dir().join("bareclip-app-tests");
+        std::fs::create_dir_all(&folder).expect("the folder can be created");
+        let path = folder.join(format!("{}-{name}", std::process::id()));
+        let status = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(arguments)
+            .arg(&path)
+            .status()
+            .expect("ffmpeg is on PATH");
+        assert!(status.success(), "ffmpeg made {name}");
+        path
+    }
+
+    fn a_song() -> PathBuf {
+        made_with_ffmpeg(
+            "song.mp3",
+            &["-f", "lavfi", "-i", "sine=f=440:d=6", "-c:a", "libmp3lame"],
+        )
+    }
+
+    fn from_player(path: &Path, start: f64, end: f64) -> crate::handoff::Handed {
+        crate::handoff::Handed {
+            path: path.to_owned(),
+            range: Some(TimeRange {
+                start: Ticks::from_seconds(start),
+                end: Ticks::from_seconds(end),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_clip_from_the_player_lands_after_the_top_rows_last_clip_keeping_its_cut_parts() {
+        let ctx = context();
+        let long = clip_with_sound();
+        let mut editor = in_panel_only(&ctx, &[test_clip(), &long]);
+        let (first, below) = (editor.media[0].id, editor.media[1].id);
+        editor.add_to_timeline(first);
+        let whole_below = editor.full_range(below).unwrap();
+        editor
+            .project
+            .tracks
+            .place(below, whole_below, Ticks(0), TrackTarget::New(1));
+        let top_end = editor.project.tracks.picture_tracks()[0].duration();
+        let all_clips = |editor: &Editor| {
+            editor
+                .project
+                .tracks
+                .tracks()
+                .iter()
+                .map(|row| row.clips().len())
+                .sum::<usize>()
+        };
+        let before = all_clips(&editor);
+
+        editor.edit_clips(&[from_player(test_clip(), 1.0, 3.0)]);
+        run_frame(&ctx, &mut editor, vec![]);
+
+        assert_eq!(
+            editor.visible_media().count(),
+            2,
+            "the video isn't listed twice"
+        );
+        let sent = editor
+            .selected
+            .and_then(|id| editor.project.tracks.clip(id))
+            .expect("the new clip is selected");
+        assert_eq!(
+            editor.project.tracks.track_of(sent.id),
+            Some(0),
+            "on the top row"
+        );
+        assert_eq!(
+            sent.start, top_end,
+            "after the top row's last clip, over the longer row"
+        );
+        assert_eq!(
+            sent.source,
+            TimeRange {
+                start: Ticks::from_seconds(1.0),
+                end: Ticks::from_seconds(3.0),
+            }
+        );
+        let whole = editor.full_range(first).unwrap();
+        assert!(
+            whole.start < sent.source.start && sent.source.end < whole.end,
+            "the cut parts are still there to drag back out"
+        );
+        editor.undo();
+        assert!(editor.project.tracks.clip(sent.id).is_none());
+        assert_eq!(all_clips(&editor), before, "one step undoes it all");
+    }
+
+    #[test]
+    fn sound_from_the_player_lands_on_the_first_sound_row_making_one_if_need_be() {
+        let ctx = context();
+        let song = a_song();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        assert!(editor.project.tracks.audio_tracks().is_empty());
+
+        editor.edit_clips(&[from_player(&song, 1.0, 4.0)]);
+        run_frame(&ctx, &mut editor, vec![]);
+        let first = editor.selected.expect("the sound is selected");
+        let row = editor.project.tracks.track_of(first).unwrap();
+        assert!(
+            editor.project.tracks.is_sound_row(row),
+            "a sound row was made"
+        );
+        assert_eq!(editor.project.tracks.clip(first).unwrap().start, Ticks(0));
+
+        editor.edit_clips(&[from_player(&song, 0.0, 2.0)]);
+        run_frame(&ctx, &mut editor, vec![]);
+        let second = editor.selected.unwrap();
+        assert_eq!(
+            editor.project.tracks.track_of(second),
+            Some(row),
+            "the same row"
+        );
+        assert_eq!(
+            editor.project.tracks.clip(second).unwrap().start,
+            Ticks::from_seconds(3.0),
+            "after the last clip on it"
+        );
+    }
+
+    #[test]
+    fn an_editor_busy_with_the_export_window_holds_a_clip_until_it_closes() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        editor.open_export();
+        editor.edit_clips(&[from_player(test_clip(), 0.5, 1.5)]);
+        for _ in 0..3 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        assert_eq!(clip_count(&editor), 1, "nothing lands while it is open");
+        editor.export_state = ExportState::Closed;
+        run_frame(&ctx, &mut editor, vec![]);
+        assert_eq!(clip_count(&editor), 2);
+    }
+
+    #[test]
+    fn opening_without_a_missing_video_leaves_gaps_where_its_clips_were() {
+        let ctx = context();
+        let folder = project_folder("gaps");
+        let videos = folder.join("videos");
+        std::fs::create_dir_all(&videos).unwrap();
+        let (gone, kept) = (videos.join("gone.mp4"), videos.join("kept.mp4"));
+        std::fs::copy(test_clip(), &gone).unwrap();
+        std::fs::copy(clip_with_sound(), &kept).unwrap();
+        let mut editor = in_panel_only(&ctx, &[&gone, &kept]);
+        let (a, b) = (editor.media[0].id, editor.media[1].id);
+        editor.add_to_end(vec![a, b, a]);
+        let starts: Vec<Ticks> = editor
+            .project
+            .tracks
+            .tracks()
+            .iter()
+            .flat_map(Timeline::clips)
+            .filter(|clip| clip.media == b)
+            .map(|clip| clip.start)
+            .collect();
+        let project = folder.join("gaps.bareclip");
+        assert!(editor.save_to(&project));
+        drop(editor);
+        once_free(|| std::fs::remove_file(&gone));
+
+        let mut back = Editor::new(&ctx, false);
+        back.open_project(&ctx, &project);
+        let_dialog_open(&ctx, &mut back);
+        click_named(&ctx, &mut back, "Open without them");
+        let left: Vec<Ticks> = back
+            .project
+            .tracks
+            .tracks()
+            .iter()
+            .flat_map(Timeline::clips)
+            .map(|clip| clip.start)
+            .collect();
+        assert_eq!(left, starts, "the other clip stays where it was");
+        assert!(left[0] > Ticks(0), "a gap is left where the first clip was");
+        assert!(!back.project.tracks.gaps().is_empty());
+    }
+
+    #[test]
+    fn a_video_renamed_in_the_player_is_found_again_with_every_clip_in_place() {
+        let ctx = context();
+        let (project, video) = project_with_movable_video(&ctx, "renamed");
+        let mut renamed = None;
+        once_free(|| {
+            renamed = Some(
+                crate::file_ops::rename(&video, "renamed in the player")
+                    .map_err(std::io::Error::other)?,
+            );
+            Ok(())
+        });
+        let renamed = renamed.unwrap();
+
+        let mut back = Editor::new(&ctx, false);
+        back.open_project(&ctx, &project);
+        assert!(
+            back.missing_videos.is_some(),
+            "it says the video is missing"
+        );
+        back.point_video_at(&ctx, 0, renamed.clone());
+        settle(&ctx, &mut back);
+        assert!(back.missing_videos.is_none());
+        assert_eq!(back.project.tracks.played().clips().len(), 1);
+        assert_eq!(back.media[0].info.path, renamed);
+    }
+
+    /// The kinds of file added alongside the player: each is added, played and exported once.
+    #[test]
+    fn every_new_kind_of_file_is_added_played_and_exported() {
+        let ctx = context();
+        let video = |name: &str, codecs: &[&str]| {
+            let mut arguments = vec![
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=320x180:r=30:d=2",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=f=440:d=2",
+                "-shortest",
+            ];
+            arguments.extend_from_slice(codecs);
+            made_with_ffmpeg(name, &arguments)
+        };
+        let sound = |name: &str, codec: &str| {
+            made_with_ffmpeg(
+                name,
+                &["-f", "lavfi", "-i", "sine=f=440:d=2", "-c:a", codec],
+            )
+        };
+        let files = [
+            video("a.m4v", &["-c:v", "libopenh264", "-c:a", "aac"]),
+            video("a.wmv", &["-c:v", "wmv2", "-c:a", "wmav2"]),
+            video(
+                "a.flv",
+                &["-c:v", "flv1", "-c:a", "libmp3lame", "-ar", "44100"],
+            ),
+            video(
+                "a.3gp",
+                &[
+                    "-c:v",
+                    "libopenh264",
+                    "-c:a",
+                    "aac",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "16000",
+                ],
+            ),
+            video(
+                "a.ts",
+                &["-c:v", "libopenh264", "-c:a", "aac", "-f", "mpegts"],
+            ),
+            video(
+                "a.mts",
+                &["-c:v", "libopenh264", "-c:a", "aac", "-f", "mpegts"],
+            ),
+            video(
+                "a.m2ts",
+                &["-c:v", "libopenh264", "-c:a", "aac", "-f", "mpegts"],
+            ),
+            sound("a.wma", "wmav2"),
+            sound("a.aiff", "pcm_s16be"),
+            sound("a.mka", "libopus"),
+        ];
+        for file in &files {
+            let name = file.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(
+                text::MEDIA_EXTENSIONS
+                    .iter()
+                    .any(|extension| name.ends_with(extension))
+            );
+            let mut editor = with_videos(&ctx, &[file]);
+            assert_eq!(
+                clip_count(&editor) + editor.project.tracks.audio_tracks().len(),
+                1,
+                "{name}"
+            );
+            editor.toggle_playback();
+            let started = Instant::now();
+            while editor.position() < Ticks::from_seconds(0.2) {
+                assert!(started.elapsed() < Duration::from_secs(10), "{name} plays");
+                run_frame(&ctx, &mut editor, vec![]);
+                thread::sleep(Duration::from_millis(10));
+            }
+            editor.toggle_playback();
+            editor.project_name = format!("exported {name}");
+            editor.sound_only = editor.media[0].info.is_sound_only();
+            // Where the export window would suggest, as a person would take it.
+            let output = editor
+                .suggested_output()
+                .expect("there is something to export");
+            editor.start_export_to(&ctx, output.clone());
+            wait_for_export(&ctx, &mut editor);
+            if let ExportState::Failed(problem) = &editor.export_state {
+                panic!("{name} didn't export: {problem}");
+            }
+            assert!(
+                matches!(editor.export_state, ExportState::Done { .. }),
+                "{name} exports"
+            );
+            let saved = probe(&output).expect("the export can be read");
+            assert!(
+                (saved.duration.as_seconds() - 2.0).abs() < 0.3,
+                "{name}: {}",
+                saved.duration.as_seconds()
+            );
+        }
+    }
+
+    /// Pictures of a clip from the player arriving, and of a missing video, in the folder named
+    /// by `BARECLIP_SCREENS`. Run with
+    /// `$env:BARECLIP_SCREENS = '<folder>'; ./scripts/cargo.ps1 test -p bareclip-app draw_the_sent_clip_screens '--' --ignored`
+    #[test]
+    #[ignore = "draws pictures to look at"]
+    fn draw_the_sent_clip_screens() {
+        let folder = std::env::var_os("BARECLIP_SCREENS").map_or_else(
+            || std::env::temp_dir().join("bareclip-screens"),
+            PathBuf::from,
+        );
+        let ctx = context();
+        let mut camera = Camera::new(folder);
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        editor.edit_clips(&[from_player(test_clip(), 1.0, 3.0)]);
+        for _ in 0..12 {
+            run_frame(&ctx, &mut editor, vec![]);
+        }
+        camera.shoot(&ctx, &mut editor, vec![], "sent-01-clip-arrived");
+
+        let (project, video) = project_with_movable_video(&ctx, "screens-missing");
+        once_free(|| std::fs::remove_file(&video));
+        let mut back = Editor::new(&ctx, false);
+        back.open_project(&ctx, &project);
+        for _ in 0..12 {
+            run_frame(&ctx, &mut back, vec![]);
+        }
+        camera.shoot(&ctx, &mut back, vec![], "sent-02-missing-video");
+        KEPT_TEXTURES.with_borrow_mut(|kept| *kept = None);
     }
 }

@@ -1,5 +1,6 @@
 //! The only crate that calls FFmpeg.
 
+mod details;
 mod encoders;
 mod error;
 mod export;
@@ -7,15 +8,20 @@ mod full;
 mod gif;
 mod media_foundation;
 mod nal;
+mod picture_file;
 mod preview;
 mod probe;
 mod remux;
 mod resample;
 mod screen;
+mod sound_cut;
 mod still;
 mod strip;
 mod turn;
 
+pub use details::{
+    MediaDetails, StreamDetails, TagChanges, TagSupport, read_details, tag_support, write_with_tags,
+};
 pub use encoders::{ChipMaker, SKIP_VARIABLE as SKIP_ENCODERS_VARIABLE, follow_chip};
 pub use error::MediaError;
 pub use export::{
@@ -28,6 +34,7 @@ pub use full::{
 };
 pub use gif::GifWriter;
 pub use media_foundation::take_turn as media_foundation_turn;
+pub use picture_file::{FullPicture, picture_at, write_png};
 pub use preview::{
     AudioChunk, AudioPreview, AudioStep, DecodeStep, PreviewFrame, PreviewPlanes, VideoPreview,
     fit_preview_size,
@@ -36,7 +43,8 @@ pub use probe::{AudioInfo, MediaInfo, VideoInfo, join_problem, probe, scan_frame
 pub use remux::{SoundFile, join_picture_and_sound};
 pub use resample::RateChange;
 pub use screen::{BgraConverter, ScreenPicture};
-pub use still::read_still;
+pub use sound_cut::{SoundCut, cut_sound};
+pub use still::{read_cover, read_still};
 pub use strip::{SoundShape, StripPicture, picture_spacing, read_sound_shape, read_strip_pictures};
 pub use turn::Orientation;
 

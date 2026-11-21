@@ -1830,9 +1830,142 @@ pub fn progress_bar(ui: &mut Ui, palette: &Palette, fraction: f32) {
     }
 }
 
+/// A date and time to the second, with no time zone, as typed into or shown in a date field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DateTime {
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+}
+
+fn days_in_month(year: u16, month: u8) -> u8 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400) => {
+            29
+        }
+        2 => 28,
+        _ => 0,
+    }
+}
+
+impl DateTime {
+    /// Reads a date and time typed as `2025-09-14 01:35` or `2025-09-14 01:35:20`, or a date
+    /// alone, which means midnight. Slashes and dots work between the date's parts too.
+    pub fn parse(text: &str) -> Option<Self> {
+        let text = text.trim();
+        let (date, time) = text
+            .split_once(|c: char| c.is_whitespace() || c == 'T')
+            .map_or((text, ""), |(date, time)| (date, time.trim()));
+        let mut date_parts = date.split(['-', '/', '.']);
+        let year: u16 = date_parts.next()?.trim().parse().ok()?;
+        let month: u8 = date_parts.next()?.trim().parse().ok()?;
+        let day: u8 = date_parts.next()?.trim().parse().ok()?;
+        if date_parts.next().is_some() {
+            return None;
+        }
+        let (mut hour, mut minute, mut second) = (0_u8, 0_u8, 0_u8);
+        if !time.is_empty() {
+            let mut time_parts = time.split(':');
+            hour = time_parts.next()?.trim().parse().ok()?;
+            minute = time_parts.next()?.trim().parse().ok()?;
+            if let Some(seconds) = time_parts.next() {
+                second = seconds.trim().parse().ok()?;
+            }
+            if time_parts.next().is_some() {
+                return None;
+            }
+        }
+        let valid = (1601..=9999).contains(&year)
+            && (1..=12).contains(&month)
+            && day >= 1
+            && day <= days_in_month(year, month)
+            && hour < 24
+            && minute < 60
+            && second < 60;
+        valid.then_some(Self {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+        })
+    }
+
+    /// The form a date field is typed in, which `parse` reads back.
+    pub fn to_typed(self) -> String {
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            self.year, self.month, self.day, self.hour, self.minute, self.second
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_date_and_time_is_read_as_typed_and_shown_back() {
+        let parsed = DateTime::parse("2025-09-14 01:35").unwrap();
+        assert_eq!(
+            parsed,
+            DateTime {
+                year: 2025,
+                month: 9,
+                day: 14,
+                hour: 1,
+                minute: 35,
+                second: 0
+            }
+        );
+        assert_eq!(parsed.to_typed(), "2025-09-14 01:35:00");
+        assert_eq!(DateTime::parse(&parsed.to_typed()), Some(parsed));
+        assert_eq!(
+            DateTime::parse(" 2024/2/29 23:59:59 ").map(DateTime::to_typed),
+            Some("2024-02-29 23:59:59".to_owned()),
+            "a leap day, with slashes"
+        );
+        assert_eq!(
+            DateTime::parse("2024.12.31").map(DateTime::to_typed),
+            Some("2024-12-31 00:00:00".to_owned()),
+            "a date alone is midnight"
+        );
+        assert_eq!(
+            DateTime::parse("2025-09-14T01:35:20").map(DateTime::to_typed),
+            Some("2025-09-14 01:35:20".to_owned())
+        );
+    }
+
+    #[test]
+    fn impossible_dates_and_times_are_refused() {
+        for text in [
+            "",
+            "yesterday",
+            "2023-02-29",
+            "2025-04-31",
+            "2025-13-01",
+            "2025-00-10",
+            "2025-01-01 24:00",
+            "2025-01-01 10:60",
+            "2025-01-01 10:00:60",
+            "1500-01-01",
+            "2025-01-01-01",
+            "2025-01-01 10:00:00:00",
+        ] {
+            assert_eq!(DateTime::parse(text), None, "{text}");
+        }
+        assert!(
+            DateTime::parse("2000-02-29").is_some(),
+            "2000 was a leap year"
+        );
+        assert!(DateTime::parse("1900-02-29").is_none(), "1900 wasn't");
+    }
     use crate::theme::{
         DARK, LIGHT,
         tests::{contrast, over},

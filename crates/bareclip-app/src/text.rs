@@ -13,13 +13,81 @@ use bareclip_core::{
 use bareclip_export::{FullPlan, FullReport, ProjectReport};
 use bareclip_media::{AudioInfo, ExportReport, MediaInfo, Quality, VideoFormat};
 
-pub const VIDEO_EXTENSIONS: [&str; 6] = ["mp4", "mkv", "mov", "webm", "avi", "ts"];
+pub const VIDEO_EXTENSIONS: [&str; 12] = [
+    "mp4", "mkv", "mov", "webm", "avi", "ts", "m4v", "wmv", "flv", "3gp", "mts", "m2ts",
+];
 /// Sound with no picture.
-pub const AUDIO_EXTENSIONS: [&str; 7] = ["mp3", "wav", "flac", "m4a", "aac", "ogg", "opus"];
+pub const AUDIO_EXTENSIONS: [&str; 10] = [
+    "mp3", "wav", "flac", "m4a", "aac", "ogg", "opus", "wma", "aiff", "mka",
+];
+/// Videos the player opens on a double-click. Not `ts`, which TypeScript uses too.
+pub const PLAYER_VIDEO_EXTENSIONS: [&str; 11] = [
+    "mp4", "mkv", "mov", "webm", "avi", "m4v", "wmv", "flv", "3gp", "mts", "m2ts",
+];
+/// Sound the player opens on a double-click.
+pub const PLAYER_AUDIO_EXTENSIONS: [&str; 10] = [
+    "mp3", "wav", "flac", "m4a", "aac", "ogg", "opus", "wma", "aiff", "mka",
+];
+
+/// Whether the player opens this kind of file, going by its extension in any case.
+pub fn is_playable(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            let extension = extension.to_ascii_lowercase();
+            PLAYER_VIDEO_EXTENSIONS
+                .iter()
+                .chain(&PLAYER_AUDIO_EXTENSIONS)
+                .any(|known| *known == extension)
+        })
+}
+
+/// Where the player saves the picture at a moment: beside the video, named after it and the
+/// time, such as `Clip 0-13.70.png`, with a number added if that is taken. Windows doesn't
+/// allow colons in names, so the time uses dashes.
+pub fn picture_file_name(video: &Path, time: Ticks) -> PathBuf {
+    let folder = video.parent().unwrap_or(Path::new(""));
+    let stem = video.file_stem().map_or_else(
+        || "Picture".to_owned(),
+        |stem| stem.to_string_lossy().into_owned(),
+    );
+    let base = format!("{stem} {}", format_timecode(time).replace(':', "-"));
+    let mut path = folder.join(format!("{base}.png"));
+    let mut number = 2;
+    while path.exists() {
+        path = folder.join(format!("{base} ({number}).png"));
+        number += 1;
+    }
+    path
+}
+
+/// Why the player can't play a file, in plain words.
+pub fn unplayable_reason(error: &bareclip_media::MediaError) -> String {
+    use bareclip_media::MediaError;
+    match error {
+        MediaError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            "It isn't there any more. It may have been moved or deleted.".to_owned()
+        }
+        MediaError::Io(error) => format!("Windows won't let BareClip read it. {error}"),
+        MediaError::Ffmpeg(ffmpeg_error) => {
+            let said = ffmpeg_error.to_string();
+            if said.contains("Invalid data") {
+                "It is damaged, or isn't a kind of video or sound BareClip can read.".to_owned()
+            } else if said.contains("not found") || said.contains("Decoder") {
+                "BareClip can't read the way its picture or sound was made.".to_owned()
+            } else {
+                error.to_string()
+            }
+        }
+        other => other.to_string(),
+    }
+}
+
 /// Everything that can be added to a project: videos, sound on its own, and images.
-pub const MEDIA_EXTENSIONS: [&str; 19] = [
-    "mp4", "mkv", "mov", "webm", "avi", "ts", "mp3", "wav", "flac", "m4a", "aac", "ogg", "opus",
-    "jpg", "jpeg", "png", "webp", "bmp", "gif",
+pub const MEDIA_EXTENSIONS: [&str; 28] = [
+    "mp4", "mkv", "mov", "webm", "avi", "ts", "m4v", "wmv", "flv", "3gp", "mts", "m2ts", "mp3",
+    "wav", "flac", "m4a", "aac", "ogg", "opus", "wma", "aiff", "mka", "jpg", "jpeg", "png", "webp",
+    "bmp", "gif",
 ];
 
 /// What Noise suppression's hint says.
@@ -706,6 +774,38 @@ mod tests {
                 .contains(r#"Property="WixShellExecTarget" Value="[INSTALLFOLDER]bareclip.exe""#)
         );
         assert!(installer.contains("WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed"));
+    }
+
+    #[test]
+    fn the_player_opens_21_kinds_of_file_and_never_ts_or_images() {
+        let all: Vec<&str> = PLAYER_VIDEO_EXTENSIONS
+            .iter()
+            .chain(&PLAYER_AUDIO_EXTENSIONS)
+            .copied()
+            .collect();
+        assert_eq!(all.len(), 21);
+        let mut unique = all.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 21, "no type is listed twice");
+        for extension in VIDEO_EXTENSIONS.iter().chain(&AUDIO_EXTENSIONS) {
+            assert_eq!(
+                all.contains(extension),
+                *extension != "ts",
+                "the player takes what Edit with BareClip takes: .{extension}"
+            );
+        }
+        assert!(is_playable(Path::new(r"C:\clips\Match 2.MP4")));
+        assert!(is_playable(Path::new("song.aiff")));
+        for name in [
+            "code.ts",
+            "photo.png",
+            "project.bareclip",
+            "notes",
+            "clip.mp4.txt",
+        ] {
+            assert!(!is_playable(Path::new(name)), "{name}");
+        }
     }
 
     /// The installer's "Edit with BareClip" goes on every video and sound type the app takes,

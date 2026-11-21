@@ -52,6 +52,14 @@ pub struct DecodedPicture {
 }
 
 impl DecodedPicture {
+    pub(crate) fn frame(&self) -> &frame::Video {
+        &self.frame
+    }
+
+    pub(crate) fn color(&self) -> ColorFormat {
+        self.color
+    }
+
     /// When this picture appears in its video.
     pub fn time(&self) -> Ticks {
         self.time

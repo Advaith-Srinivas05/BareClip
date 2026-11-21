@@ -39,11 +39,29 @@ pub(crate) fn seek_to_seconds(
     seconds: f64,
 ) -> Result<(), ffmpeg::Error> {
     let target = (seconds * f64::from(ffi::AV_TIME_BASE)) as i64;
-    if target <= 0 {
+    let tried = if target <= 0 {
         input.seek(0, ..0)
     } else {
         input.seek(target, ..target)
+    };
+    let Err(error) = tried else {
+        return Ok(());
+    };
+    // Some files, such as an FLV with no index, can't seek by time that way. Asking for the
+    // frame before the moment may still work, and otherwise reading starts again from the
+    // beginning of the file, which every caller can read on from, because each skips what
+    // comes before the moment it wants.
+    // SAFETY: the context is live, and these only move where it reads next.
+    unsafe {
+        let context = input.as_mut_ptr();
+        if ffi::av_seek_frame(context, -1, target.max(0), ffi::AVSEEK_FLAG_BACKWARD) >= 0 {
+            return Ok(());
+        }
+        if ffi::av_seek_frame(context, -1, 0, ffi::AVSEEK_FLAG_BYTE) >= 0 {
+            return Ok(());
+        }
     }
+    Err(error)
 }
 
 /// The largest size that fits within the limits, keeping the shape of the picture.

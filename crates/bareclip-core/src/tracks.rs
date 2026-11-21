@@ -330,6 +330,23 @@ impl Tracks {
         self.place(media, source, end, TrackTarget::Existing(0))
     }
 
+    /// Adds a clip after the last clip on the top row of pictures, which is how a clip sent from
+    /// the player lands. Rows below that run longer carry on under it.
+    pub fn push_on_top_row(&mut self, media: MediaId, source: TimeRange) -> ClipId {
+        let row = (0..self.picture_rows).find(|row| !self.is_text_row(*row));
+        let end = row
+            .and_then(|row| {
+                self.tracks[row]
+                    .clips()
+                    .iter()
+                    .filter(|clip| !clip.is_title())
+                    .map(|clip| clip.end())
+                    .max()
+            })
+            .unwrap_or(Ticks(0));
+        self.place(media, source, end, TrackTarget::Existing(row.unwrap_or(0)))
+    }
+
     /// Adds a clip as close as it can get to a moment on a target.
     pub fn place(
         &mut self,
@@ -1715,6 +1732,44 @@ mod tests {
 
     fn a_title() -> MediaId {
         MediaId::for_title(1)
+    }
+
+    #[test]
+    fn a_clip_sent_from_the_player_goes_after_the_top_rows_own_last_clip() {
+        let mut tracks = Tracks::default();
+        tracks.push(VIDEO, seconds(0, 10));
+        // A longer clip on a row below the top one.
+        tracks.place(OTHER, seconds(0, 30), Ticks(0), TrackTarget::New(1));
+        assert_eq!(tracks.picture_rows(), 2);
+
+        let sent = tracks.push_on_top_row(VIDEO, seconds(2, 7));
+        let clip = tracks.clip(sent).unwrap();
+        assert_eq!(tracks.track_of(sent), Some(0), "on the top row");
+        assert_eq!(
+            clip.start,
+            seconds(10, 10).start,
+            "after its last clip, over the row below"
+        );
+        assert_eq!(
+            clip.source,
+            seconds(2, 7),
+            "keeping the range it was sent with"
+        );
+
+        // Titles above don't count as the top row of pictures.
+        let title = tracks.place_title(a_title(), seconds(0, 5), Ticks(0));
+        let title_row = tracks.track_of(title).unwrap();
+        let again = tracks.push_on_top_row(OTHER, seconds(0, 3));
+        assert_ne!(tracks.track_of(again), Some(title_row));
+        assert_eq!(
+            tracks.clip(again).unwrap().start,
+            seconds(15, 15).start,
+            "after the clip sent before"
+        );
+
+        let mut empty = Tracks::default();
+        let first = empty.push_on_top_row(VIDEO, seconds(1, 4));
+        assert_eq!(empty.clip(first).unwrap().start, Ticks(0));
     }
 
     #[test]

@@ -48,12 +48,21 @@ fn premultiply(rgba: &mut [u8]) {
 /// Decodes the first picture in a file.
 fn first_picture(path: &Path) -> Result<frame::Video, MediaError> {
     crate::init()?;
-    let mut input = ffmpeg::format::input(path)?;
+    let input = ffmpeg::format::input(path)?;
     let stream = input
         .streams()
         .best(Type::Video)
         .ok_or(MediaError::NoVideoStream)?;
     let index = stream.index();
+    first_picture_in(input, index)
+}
+
+/// Decodes the first picture of one stream.
+fn first_picture_in(
+    mut input: ffmpeg::format::context::Input,
+    index: usize,
+) -> Result<frame::Video, MediaError> {
+    let stream = input.stream(index).ok_or(MediaError::NoVideoStream)?;
     let mut decoder = ffmpeg::codec::context::Context::from_parameters(stream.parameters())?
         .decoder()
         .video()?;
@@ -85,8 +94,27 @@ pub(crate) fn upright_size(path: &Path) -> Result<(u32, u32), MediaError> {
 /// Reads an image, the right way up. For a file with several pictures in it, such as an animated
 /// GIF, this is the first one.
 pub fn read_still(path: &Path) -> Result<StillPicture, MediaError> {
-    let decoded = first_picture(path)?;
+    to_still(&first_picture(path)?)
+}
 
+/// Reads a sound file's cover art, such as an MP3's album picture, or `None` if it has none.
+pub fn read_cover(path: &Path) -> Result<Option<StillPicture>, MediaError> {
+    crate::init()?;
+    let input = ffmpeg::format::input(path)?;
+    let cover = input.streams().find(|stream| {
+        stream.parameters().medium() == Type::Video
+            && stream
+                .disposition()
+                .contains(ffmpeg::format::stream::Disposition::ATTACHED_PIC)
+    });
+    let Some(index) = cover.map(|stream| stream.index()) else {
+        return Ok(None);
+    };
+    to_still(&first_picture_in(input, index)?).map(Some)
+}
+
+/// A decoded picture as RGBA, the right way up and no larger than is kept.
+fn to_still(decoded: &frame::Video) -> Result<StillPicture, MediaError> {
     let (width, height) = size_to_keep(decoded.width(), decoded.height());
     let mut scaler = Scaler::get(
         decoded.format(),
@@ -98,7 +126,7 @@ pub fn read_still(path: &Path) -> Result<StillPicture, MediaError> {
         Flags::BICUBIC,
     )?;
     let mut converted = frame::Video::empty();
-    scaler.run(&decoded, &mut converted)?;
+    scaler.run(decoded, &mut converted)?;
 
     let row = width as usize * 4;
     let stride = converted.stride(0);
@@ -108,7 +136,7 @@ pub fn read_still(path: &Path) -> Result<StillPicture, MediaError> {
     }
     premultiply(&mut rgba);
 
-    let orientation = Orientation::of(&decoded);
+    let orientation = Orientation::of(decoded);
     let rgba = orientation.turn(rgba, width, height);
     let (width, height) = orientation.turned_size(width, height);
     Ok(StillPicture::new(width, height, rgba))
@@ -117,6 +145,41 @@ pub fn read_still(path: &Path) -> Result<StillPicture, MediaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An MP3 of a second's tone, with a red 64x48 cover if asked.
+    fn song(name: &str, with_cover: bool) -> std::path::PathBuf {
+        let folder = std::env::temp_dir().join("bareclip-cover-tests");
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join(format!("{name}-{}.mp3", std::process::id()));
+        let mut command = std::process::Command::new("ffmpeg");
+        command.args(["-hide_banner", "-loglevel", "error", "-y"]);
+        command.args(["-f", "lavfi", "-i", "sine=frequency=440:duration=1"]);
+        if with_cover {
+            command.args(["-f", "lavfi", "-i", "color=c=red:s=64x48:r=1:d=1"]);
+            command.args(["-map", "0:a", "-map", "1:v"]);
+            command.args(["-c:v", "png", "-disposition:v", "attached_pic"]);
+            command.args(["-id3v2_version", "3"]);
+        }
+        command.args(["-c:a", "libmp3lame"]).arg(&path);
+        assert!(command.status().expect("ffmpeg is on PATH").success());
+        path
+    }
+
+    #[test]
+    fn a_songs_cover_is_read_and_a_song_without_one_has_none() {
+        let cover = read_cover(&song("with-cover", true))
+            .unwrap()
+            .expect("the cover is found");
+        assert_eq!((cover.width, cover.height), (64, 48));
+        let middle = ((24 * 64 + 32) * 4) as usize;
+        let pixel = &cover.rgba[middle..middle + 4];
+        assert!(
+            pixel[0] > 200 && pixel[1] < 40 && pixel[2] < 40,
+            "{pixel:?}"
+        );
+
+        assert!(read_cover(&song("without-cover", false)).unwrap().is_none());
+    }
 
     #[test]
     fn a_picture_that_fits_keeps_its_size() {

@@ -11,6 +11,7 @@ use std::{path::Path, sync::atomic::AtomicBool, time::Duration};
 
 use bareclip_media::{ExportReport, ExportRequest, MediaError, MediaInfo, export, probe};
 
+pub use full::export_full;
 pub use layered::{
     ExportJoin, LayeredClip, LayeredRequest, LayeredStretch, export_layered, export_layered_as,
 };
