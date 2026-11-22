@@ -332,6 +332,43 @@ pub fn free_space(folder: &Path) -> Option<u64> {
         .then_some(free)
 }
 
+/// The page of Windows' Default apps for BareClip, where one press makes it the player for
+/// every type. It is listed for everyone when installed for everyone, and otherwise for the
+/// person who installed it.
+pub fn default_apps_link() -> &'static str {
+    use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
+    let key: Vec<u16> = r"Software\RegisteredApplications"
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    let name: Vec<u16> = "BareClip".encode_utf16().chain([0]).collect();
+    let mut size = 0_u32;
+    // SAFETY: the names are nul-terminated, and asking for the size only reads no data.
+    let for_everyone = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    } == 0;
+    if for_everyone {
+        "ms-settings:defaultapps?registeredAppMachine=BareClip"
+    } else {
+        "ms-settings:defaultapps?registeredAppUser=BareClip"
+    }
+}
+
+/// Opens Windows' Default apps page at BareClip.
+pub fn open_default_apps() {
+    let _ = std::process::Command::new("explorer.exe")
+        .arg(default_apps_link())
+        .spawn();
+}
+
 /// Where a rewritten copy of a file goes while it is made: beside it, so swapping it in is
 /// instant, with its own kind's extension so it is written the same way.
 pub fn copy_path_for(path: &Path) -> PathBuf {

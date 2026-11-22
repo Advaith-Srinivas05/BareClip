@@ -52,6 +52,18 @@ try {
     Assert-That (Test-Path $Desktop) 'the shared desktop shortcut exists'
     Assert-That (Test-Path 'HKLM:\Software\BareClip') 'its choices are in the machine registry'
     Assert-That (-not (Test-Path 'HKCU:\Software\BareClip')) 'and not in this user''s'
+    # The player is registered in the machine's registry, for every type, without taking one over.
+    $Classes = 'HKLM:\Software\Classes'
+    $Exe = Join-Path $InstallDir 'bareclip.exe'
+    Assert-That ((Get-Item "$Classes\BareClip.Video\shell\open\command").GetValue('') -eq "`"$Exe`" --play `"%1`"") 'videos open with the player for everyone'
+    Assert-That ((Get-ItemProperty 'HKLM:\Software\RegisteredApplications').BareClip -eq 'Software\BareClip\Capabilities') 'BareClip is registered for everyone'
+    foreach ($Type in 'mp4', 'mkv', 'mov', 'webm', 'avi', 'm4v', 'wmv', 'flv', '3gp', 'mts', 'm2ts') {
+        Assert-That ((Get-Item "$Classes\.$Type\OpenWithProgids").GetValueNames() -contains 'BareClip.Video') "  .$Type lists it"
+    }
+    foreach ($Type in 'mp3', 'wav', 'flac', 'm4a', 'aac', 'ogg', 'opus', 'wma', 'aiff', 'mka') {
+        Assert-That ((Get-Item "$Classes\.$Type\OpenWithProgids").GetValueNames() -contains 'BareClip.Audio') "  .$Type lists it"
+    }
+    Assert-That (-not (Test-Path 'HKCU:\Software\Classes\BareClip.Video')) '  and none of it is in this user''s registry'
 
     # An unattended upgrade that isn't told it's for everyone gets no administrator permission,
     # so it has to stop before it removes the copy that is there. Silent, as a progress bar would
@@ -84,4 +96,6 @@ Assert-That (-not (Test-Path $InstallDir)) 'the folder in Program Files is gone'
 Assert-That (-not (Test-Path $StartMenu)) 'the shared Start menu shortcut is gone'
 Assert-That (-not (Test-Path $Desktop)) 'the shared desktop shortcut is gone'
 Assert-That (-not (Test-Path 'HKLM:\Software\BareClip')) 'the registry entries are gone'
+Assert-That (-not (Test-Path 'HKLM:\Software\Classes\BareClip.Video')) 'the player''s types are gone'
+Assert-That (-not ((Get-ItemProperty 'HKLM:\Software\RegisteredApplications' -ErrorAction SilentlyContinue).BareClip)) '  and so is its registration'
 Write-Host 'The install for everyone passed.'

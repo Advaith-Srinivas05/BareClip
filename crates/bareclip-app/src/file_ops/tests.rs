@@ -176,3 +176,13 @@ fn a_deleted_file_goes_to_the_recycle_bin_and_can_come_back() {
     assert_eq!(std::fs::read(&clip).unwrap(), b"keep me");
     assert!(move_to_recycle_bin(&folder.join("gone.mp4")).is_err());
 }
+
+#[test]
+fn the_default_apps_link_names_bareclips_own_page() {
+    let link = default_apps_link();
+    assert!(
+        link.starts_with("ms-settings:defaultapps?registeredApp"),
+        "{link}"
+    );
+    assert!(link.ends_with("=BareClip"));
+}

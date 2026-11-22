@@ -3,60 +3,6 @@
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Product Id="*"
            Name="BareClip"
-        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.m4v\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
-          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
-          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
-          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
-          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
-        </RegistryKey>
-        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.wmv\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
-          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
-          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
-          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
-          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
-        </RegistryKey>
-        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.flv\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
-          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
-          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
-          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
-          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
-        </RegistryKey>
-        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.3gp\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
-          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
-          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
-          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
-          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
-        </RegistryKey>
-        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.mts\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
-          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
-          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
-          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
-          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
-        </RegistryKey>
-        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.m2ts\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
-          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
-          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
-          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
-          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
-        </RegistryKey>
-        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.wma\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
-          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
-          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
-          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
-          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
-        </RegistryKey>
-        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.aiff\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
-          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
-          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
-          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
-          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
-        </RegistryKey>
-        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.mka\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
-          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
-          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
-          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
-          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
-        </RegistryKey>
            Language="1033"
            Version="$(var.Version)"
            Manufacturer="Advaith Srinivas"
@@ -95,6 +41,14 @@
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
     <CustomAction Id="NeedsAdminToUpdate" Error="BareClip is installed for everyone on this PC, so updating it needs administrator permission. Open the installer by double-clicking it, or add MSIINSTALLPERUSER=&quot;&quot; to the command line so Windows asks for permission." />
     <CustomAction Id="LaunchBareClip" BinaryKey="WixCA" DllEntry="WixShellExec" Impersonate="yes" Return="ignore" />
+    <!-- The second box on the last page, ticked, and what it opens. -->
+    <Property Id="MAKE_DEFAULT_PLAYER" Value="1" />
+    <CustomAction Id="OpenDefaultApps" BinaryKey="WixCA" DllEntry="WixShellExec" Impersonate="yes" Return="ignore" />
+    <!-- Tells Explorer that file types changed, so icons and Open with update without a restart.
+         Windows Installer has no step for it, so the app does it and leaves, with no window. It
+         runs as the person installing, before the app is removed on an uninstall. -->
+    <CustomAction Id="RefreshFileTypes" FileKey="BareClipExe" ExeCommand="--refresh-file-types" Execute="deferred" Impersonate="yes" Return="ignore" />
+    <CustomAction Id="RefreshFileTypesGone" FileKey="BareClipExe" ExeCommand="--refresh-file-types" Execute="deferred" Impersonate="yes" Return="ignore" />
 
     <!-- An upgrade keeps the earlier choices, and stays in the same place so there is only
          ever one copy. Windows only finds an earlier copy installed the same way. -->
@@ -149,6 +103,8 @@
            earlier copy was for everyone, so an unattended upgrade not told so would remove that
            copy and then fail to install. It stops here instead, before anything is removed. -->
       <Custom Action="NeedsAdminToUpdate" After="FindRelatedProducts"><![CDATA[WIX_UPGRADE_DETECTED AND ALLUSERS = 1 AND NOT Privileged AND NOT Installed]]></Custom>
+      <Custom Action="RefreshFileTypes" After="WriteRegistryValues">NOT REMOVE~="ALL"</Custom>
+      <Custom Action="RefreshFileTypesGone" After="RemoveRegistryValues">REMOVE~="ALL"</Custom>
     </InstallExecuteSequence>
     <InstallUISequence>
       <FindRelatedProducts After="RestoreEveryoneAllUsers" />
@@ -322,14 +278,42 @@
       <Publish Dialog="BrowseDlg" Control="OK" Event="SetTargetPath" Value="INSTALLFOLDER" Order="4">1</Publish>
 
       <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="PrepareDlg">1</Publish>
-      <Publish Dialog="ExitDialog" Control="Finish" Property="WixShellExecTarget" Value="[INSTALLFOLDER]bareclip.exe" Order="997">WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed</Publish>
-      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchBareClip" Order="998">WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed</Publish>
-      <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999">1</Publish>
+      <Publish Dialog="DoneDlg" Control="Finish" Property="WixShellExecTarget" Value="[INSTALLFOLDER]bareclip.exe" Order="990">WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed</Publish>
+      <Publish Dialog="DoneDlg" Control="Finish" Event="DoAction" Value="LaunchBareClip" Order="991">WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed</Publish>
+      <Publish Dialog="DoneDlg" Control="Finish" Property="WixShellExecTarget" Value="ms-settings:defaultapps?registeredAppUser=BareClip" Order="992">MAKE_DEFAULT_PLAYER = 1 AND NOT Installed AND NOT ALLUSERS = 1</Publish>
+      <Publish Dialog="DoneDlg" Control="Finish" Property="WixShellExecTarget" Value="ms-settings:defaultapps?registeredAppMachine=BareClip" Order="993">MAKE_DEFAULT_PLAYER = 1 AND NOT Installed AND ALLUSERS = 1</Publish>
+      <Publish Dialog="DoneDlg" Control="Finish" Event="DoAction" Value="OpenDefaultApps" Order="994">MAKE_DEFAULT_PLAYER = 1 AND NOT Installed AND NOT WIX_UPGRADE_DETECTED</Publish>
+      <Publish Dialog="DoneDlg" Control="Finish" Event="EndDialog" Value="Return" Order="999">1</Publish>
       <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg">1</Publish>
       <Publish Dialog="MaintenanceWelcomeDlg" Control="Next" Event="NewDialog" Value="MaintenanceTypeDlg">1</Publish>
       <Publish Dialog="MaintenanceTypeDlg" Control="RepairButton" Event="NewDialog" Value="VerifyReadyDlg">1</Publish>
       <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="VerifyReadyDlg">1</Publish>
       <Publish Dialog="MaintenanceTypeDlg" Control="Back" Event="NewDialog" Value="MaintenanceWelcomeDlg">1</Publish>
+      <!-- WiX's own last page, with a second box that opens Windows' Default apps page at
+           BareClip, where one press makes it the player for every type. Windows lets nothing
+           make itself the default, so this is as far as an installer can go. The box only shows
+           on a first install. -->
+      <Dialog Id="DoneDlg" Width="370" Height="270" Title="!(loc.ExitDialog_Title)">
+        <Control Id="Finish" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Cancel="yes" Text="!(loc.WixUIFinish)" />
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Disabled="yes" Text="!(loc.WixUICancel)" />
+        <Control Id="Bitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="234" TabSkip="no" Text="!(loc.ExitDialogBitmap)" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Disabled="yes" Text="!(loc.WixUIBack)" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Description" Type="Text" X="135" Y="70" Width="220" Height="40" Transparent="yes" NoPrefix="yes" Text="!(loc.ExitDialogDescription)" />
+        <Control Id="Title" Type="Text" X="135" Y="20" Width="220" Height="60" Transparent="yes" NoPrefix="yes" Text="!(loc.ExitDialogTitle)" />
+        <Control Id="LaunchBox" Type="CheckBox" X="135" Y="170" Width="220" Height="17" Hidden="yes" Property="WIXUI_EXITDIALOGOPTIONALCHECKBOX" CheckBoxValue="1" Text="[WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT]">
+          <Condition Action="show">NOT Installed</Condition>
+        </Control>
+        <Control Id="DefaultBox" Type="CheckBox" X="135" Y="192" Width="220" Height="17" Hidden="yes" Property="MAKE_DEFAULT_PLAYER" CheckBoxValue="1" Text="Make BareClip your default player">
+          <Condition Action="show">NOT Installed AND NOT WIX_UPGRADE_DETECTED</Condition>
+        </Control>
+      </Dialog>
+      <InstallUISequence>
+        <Show Dialog="DoneDlg" OnExit="success" />
+      </InstallUISequence>
+      <AdminUISequence>
+        <Show Dialog="DoneDlg" OnExit="success" />
+      </AdminUISequence>
     </UI>
     <UIRef Id="WixUI_Common" />
 
@@ -453,6 +437,126 @@
           <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
           <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
         </RegistryKey>
+        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.m4v\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
+          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
+          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
+          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
+        </RegistryKey>
+        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.wmv\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
+          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
+          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
+          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
+        </RegistryKey>
+        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.flv\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
+          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
+          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
+          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
+        </RegistryKey>
+        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.3gp\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
+          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
+          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
+          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
+        </RegistryKey>
+        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.mts\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
+          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
+          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
+          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
+        </RegistryKey>
+        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.m2ts\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
+          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
+          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
+          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
+        </RegistryKey>
+        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.wma\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
+          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
+          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
+          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
+        </RegistryKey>
+        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.aiff\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
+          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
+          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
+          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
+        </RegistryKey>
+        <RegistryKey Root="HKMU" Key="Software\Classes\SystemFileAssociations\.mka\shell\BareClip.Edit" ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="MUIVerb" Type="string" Value="Edit with BareClip" />
+          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
+          <RegistryValue Name="MultiSelectModel" Type="string" Value="Player" />
+          <RegistryValue Key="command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --edit &quot;%1&quot;" />
+        </RegistryKey>
+      </Component>
+      <!-- BareClip as a player for every video and sound it plays: a file type of its own for
+           each, listed under Default apps and in each type's Open with list. Nothing changes
+           which program a type opens with, which Windows leaves to the person. -->
+      <Component Id="PlayerTypes" Guid="3E7A51C9-8D24-4F06-B1E3-6C92A0D4F7B8">
+        <RegistryValue Root="HKMU" Key="Software\BareClip" Name="PlayerTypes" Type="integer" Value="1" KeyPath="yes" />
+        <RegistryKey Root="HKMU" Key="Software\Classes\BareClip.Video" ForceDeleteOnUninstall="yes">
+          <RegistryValue Type="string" Value="BareClip video" />
+          <RegistryValue Name="FriendlyTypeName" Type="string" Value="BareClip video" />
+          <RegistryValue Key="DefaultIcon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
+          <RegistryValue Key="shell\open\command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --play &quot;%1&quot;" />
+        </RegistryKey>
+        <RegistryKey Root="HKMU" Key="Software\Classes\BareClip.Audio" ForceDeleteOnUninstall="yes">
+          <RegistryValue Type="string" Value="BareClip audio" />
+          <RegistryValue Name="FriendlyTypeName" Type="string" Value="BareClip audio" />
+          <RegistryValue Key="DefaultIcon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
+          <RegistryValue Key="shell\open\command" Type="string" Value="&quot;[INSTALLFOLDER]bareclip.exe&quot; --play &quot;%1&quot;" />
+        </RegistryKey>
+        <RegistryKey Root="HKMU" Key="Software\BareClip\Capabilities" ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="ApplicationName" Type="string" Value="BareClip" />
+          <RegistryValue Name="ApplicationDescription" Type="string" Value="Plays, trims and edits videos and sound." />
+          <RegistryValue Name="ApplicationIcon" Type="string" Value="[INSTALLFOLDER]bareclip.exe,0" />
+          <RegistryValue Key="FileAssociations" Name=".mp4" Type="string" Value="BareClip.Video" />
+          <RegistryValue Key="FileAssociations" Name=".mkv" Type="string" Value="BareClip.Video" />
+          <RegistryValue Key="FileAssociations" Name=".mov" Type="string" Value="BareClip.Video" />
+          <RegistryValue Key="FileAssociations" Name=".webm" Type="string" Value="BareClip.Video" />
+          <RegistryValue Key="FileAssociations" Name=".avi" Type="string" Value="BareClip.Video" />
+          <RegistryValue Key="FileAssociations" Name=".m4v" Type="string" Value="BareClip.Video" />
+          <RegistryValue Key="FileAssociations" Name=".wmv" Type="string" Value="BareClip.Video" />
+          <RegistryValue Key="FileAssociations" Name=".flv" Type="string" Value="BareClip.Video" />
+          <RegistryValue Key="FileAssociations" Name=".3gp" Type="string" Value="BareClip.Video" />
+          <RegistryValue Key="FileAssociations" Name=".mts" Type="string" Value="BareClip.Video" />
+          <RegistryValue Key="FileAssociations" Name=".m2ts" Type="string" Value="BareClip.Video" />
+          <RegistryValue Key="FileAssociations" Name=".mp3" Type="string" Value="BareClip.Audio" />
+          <RegistryValue Key="FileAssociations" Name=".wav" Type="string" Value="BareClip.Audio" />
+          <RegistryValue Key="FileAssociations" Name=".flac" Type="string" Value="BareClip.Audio" />
+          <RegistryValue Key="FileAssociations" Name=".m4a" Type="string" Value="BareClip.Audio" />
+          <RegistryValue Key="FileAssociations" Name=".aac" Type="string" Value="BareClip.Audio" />
+          <RegistryValue Key="FileAssociations" Name=".ogg" Type="string" Value="BareClip.Audio" />
+          <RegistryValue Key="FileAssociations" Name=".opus" Type="string" Value="BareClip.Audio" />
+          <RegistryValue Key="FileAssociations" Name=".wma" Type="string" Value="BareClip.Audio" />
+          <RegistryValue Key="FileAssociations" Name=".aiff" Type="string" Value="BareClip.Audio" />
+          <RegistryValue Key="FileAssociations" Name=".mka" Type="string" Value="BareClip.Audio" />
+        </RegistryKey>
+        <RegistryValue Root="HKMU" Key="Software\RegisteredApplications" Name="BareClip" Type="string" Value="Software\BareClip\Capabilities" />
+        <RegistryValue Root="HKMU" Key="Software\Classes\.mp4\OpenWithProgids" Name="BareClip.Video" Type="string" Value="" />
+        <RegistryValue Root="HKMU" Key="Software\Classes\.mkv\OpenWithProgids" Name="BareClip.Video" Type="string" Value="" />
+        <RegistryValue Root="HKMU" Key="Software\Classes\.mov\OpenWithProgids" Name="BareClip.Video" Type="string" Value="" />
+        <RegistryValue Root="HKMU" Key="Software\Classes\.webm\OpenWithProgids" Name="BareClip.Video" Type="string" Value="" />
+        <RegistryValue Root="HKMU" Key="Software\Classes\.avi\OpenWithProgids" Name="BareClip.Video" Type="string" Value="" />
+        <RegistryValue Root="HKMU" Key="Software\Classes\.m4v\OpenWithProgids" Name="BareClip.Video" Type="string" Value="" />
+        <RegistryValue Root="HKMU" Key="Software\Classes\.wmv\OpenWithProgids" Name="BareClip.Video" Type="string" Value="" />
+        <RegistryValue Root="HKMU" Key="Software\Classes\.flv\OpenWithProgids" Name="BareClip.Video" Type="string" Value="" />
+        <RegistryValue Root="HKMU" Key="Software\Classes\.3gp\OpenWithProgids" Name="BareClip.Video" Type="string" Value="" />
+        <RegistryValue Root="HKMU" Key="Software\Classes\.mts\OpenWithProgids" Name="BareClip.Video" Type="string" Value="" />
+        <RegistryValue Root="HKMU" Key="Software\Classes\.m2ts\OpenWithProgids" Name="BareClip.Video" Type="string" Value="" />
+        <RegistryValue Root="HKMU" Key="Software\Classes\.mp3\OpenWithProgids" Name="BareClip.Audio" Type="string" Value="" />
+        <RegistryValue Root="HKMU" Key="Software\Classes\.wav\OpenWithProgids" Name="BareClip.Audio" Type="string" Value="" />
+        <RegistryValue Root="HKMU" Key="Software\Classes\.flac\OpenWithProgids" Name="BareClip.Audio" Type="string" Value="" />
+        <RegistryValue Root="HKMU" Key="Software\Classes\.m4a\OpenWithProgids" Name="BareClip.Audio" Type="string" Value="" />
+        <RegistryValue Root="HKMU" Key="Software\Classes\.aac\OpenWithProgids" Name="BareClip.Audio" Type="string" Value="" />
+        <RegistryValue Root="HKMU" Key="Software\Classes\.ogg\OpenWithProgids" Name="BareClip.Audio" Type="string" Value="" />
+        <RegistryValue Root="HKMU" Key="Software\Classes\.opus\OpenWithProgids" Name="BareClip.Audio" Type="string" Value="" />
+        <RegistryValue Root="HKMU" Key="Software\Classes\.wma\OpenWithProgids" Name="BareClip.Audio" Type="string" Value="" />
+        <RegistryValue Root="HKMU" Key="Software\Classes\.aiff\OpenWithProgids" Name="BareClip.Audio" Type="string" Value="" />
+        <RegistryValue Root="HKMU" Key="Software\Classes\.mka\OpenWithProgids" Name="BareClip.Audio" Type="string" Value="" />
       </Component>
       <!-- Projects open in a new window on double-click. -->
       <Component Id="ProjectFiles" Guid="9C3A61F4-7E28-4D05-A1B9-E6D420F7C83A">
@@ -518,6 +622,7 @@
       <ComponentRef Id="DesktopChosen" />
       <ComponentRef Id="DesktopDeclined" />
       <ComponentRef Id="EditWith" />
+      <ComponentRef Id="PlayerTypes" />
       <ComponentRef Id="ProjectFiles" />
       <ComponentRef Id="Licenses" />
       <ComponentRef Id="StartMenuShortcut" />

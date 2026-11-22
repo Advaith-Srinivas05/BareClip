@@ -1756,6 +1756,30 @@ impl Viewer {
                     });
                 });
                 ui.add_space(8.0);
+                components::settings_group(ui, palette, "Default player", |ui| {
+                    components::settings_row(
+                        ui,
+                        palette,
+                        (
+                            "Open videos and sound in BareClip",
+                            Some("Windows asks you to choose it once, on its Default apps page"),
+                        ),
+                        150.0,
+                        |ui| {
+                            if ui
+                                .add(
+                                    ActionButton::new(palette, Kind::Secondary, "Make default")
+                                        .small(),
+                                )
+                                .on_hover_text("Make BareClip your default player")
+                                .clicked()
+                            {
+                                crate::file_ops::open_default_apps();
+                            }
+                        },
+                    );
+                });
+                ui.add_space(8.0);
                 components::settings_group(ui, palette, "Keys", |ui| {
                     for (keys, what) in KEY_LIST {
                         components::compact_settings_row(ui, palette, what, 130.0, |ui| {

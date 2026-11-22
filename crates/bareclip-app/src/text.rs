@@ -808,6 +808,89 @@ mod tests {
         }
     }
 
+    /// The text of one component of the installer, so a test checks what is inside it.
+    fn installer_component(id: &str) -> &'static str {
+        let installer = include_str!("../../../installer/bareclip.wxs");
+        let start = installer
+            .find(&format!(r#"<Component Id="{id}""#))
+            .unwrap_or_else(|| panic!("the installer has {id}"));
+        let end = start + installer[start..].find("</Component>").unwrap();
+        &installer[start..end]
+    }
+
+    #[test]
+    fn every_edit_with_bareclip_entry_is_inside_its_component() {
+        let edit_with = installer_component("EditWith");
+        for extension in VIDEO_EXTENSIONS.iter().chain(&AUDIO_EXTENSIONS) {
+            assert_eq!(
+                edit_with.contains(&format!(r"\.{extension}\shell\BareClip.Edit")),
+                *extension != "ts",
+                ".{extension}"
+            );
+        }
+        let installer = include_str!("../../../installer/bareclip.wxs");
+        let product = &installer[..installer.find("<Package").unwrap()];
+        assert!(
+            !product.contains("RegistryKey"),
+            "nothing sits inside the Product's own tag"
+        );
+    }
+
+    #[test]
+    fn the_installer_registers_the_player_for_all_21_kinds_without_taking_any_over() {
+        let player = installer_component("PlayerTypes");
+        let command = format!(
+            "&quot;[INSTALLFOLDER]bareclip.exe&quot; {} &quot;%1&quot;",
+            crate::handoff::PLAY_FLAG
+        );
+        assert_eq!(
+            player.matches(&command).count(),
+            2,
+            "video and audio open with --play"
+        );
+        for (kinds, type_name) in [
+            (&PLAYER_VIDEO_EXTENSIONS[..], "BareClip.Video"),
+            (&PLAYER_AUDIO_EXTENSIONS[..], "BareClip.Audio"),
+        ] {
+            for extension in kinds {
+                assert!(
+                    player.contains(&format!(
+                        r#"Key="FileAssociations" Name=".{extension}" Type="string" Value="{type_name}""#
+                    )),
+                    "Default apps lists .{extension}"
+                );
+                assert!(
+                    player.contains(&format!(
+                        r#"Key="Software\Classes\.{extension}\OpenWithProgids" Name="{type_name}""#
+                    )),
+                    ".{extension} has BareClip in Open with"
+                );
+            }
+        }
+        assert_eq!(player.matches("FileAssociations").count(), 21);
+        assert!(player.contains(r#"Key="Software\RegisteredApplications" Name="BareClip""#));
+        assert!(!player.contains(r"Software\Classes\.ts"), "never .ts");
+        // Taking a type over would set the default value of its own key, which isn't done.
+        assert!(!player.contains(r#"Key="Software\Classes\.mp4" "#));
+        let installer = include_str!("../../../installer/bareclip.wxs");
+        assert!(installer.contains(r#"<ComponentRef Id="PlayerTypes" />"#));
+    }
+
+    #[test]
+    fn the_last_page_offers_the_default_player_on_a_first_install_and_explorer_is_told() {
+        let installer = include_str!("../../../installer/bareclip.wxs");
+        assert!(installer.contains(r#"Property="MAKE_DEFAULT_PLAYER" CheckBoxValue="1" Text="Make BareClip your default player""#));
+        assert!(
+            installer.contains(r#"<Property Id="MAKE_DEFAULT_PLAYER" Value="1" />"#),
+            "ticked"
+        );
+        assert!(installer.contains("NOT Installed AND NOT WIX_UPGRADE_DETECTED</Condition>"));
+        assert!(installer.contains("ms-settings:defaultapps?registeredAppUser=BareClip"));
+        assert!(installer.contains("ms-settings:defaultapps?registeredAppMachine=BareClip"));
+        assert!(installer.contains(&format!(r#"ExeCommand="{}""#, crate::handoff::REFRESH_FLAG)));
+        assert!(installer.contains(r#"After="WriteRegistryValues">NOT REMOVE~="ALL""#));
+        assert!(installer.contains(r#"After="RemoveRegistryValues">REMOVE~="ALL""#));
+    }
     /// The installer's "Edit with BareClip" goes on every video and sound type the app takes,
     /// apart from .ts, which TypeScript uses too, and never on images or projects.
     #[test]

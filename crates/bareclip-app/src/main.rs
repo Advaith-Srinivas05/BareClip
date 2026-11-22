@@ -34,9 +34,13 @@ const GPU_VARIABLE: &str = "BARECLIP_GPU";
 
 fn main() -> eframe::Result {
     let launch = handoff::read_launch(std::env::args_os().skip(1));
+    if launch.kind == handoff::LaunchKind::RefreshFileTypes {
+        tell_explorer_file_types_changed();
+        return Ok(());
+    }
     let prefix = match launch.kind {
         handoff::LaunchKind::Play => handoff::PLAYER_PIPE_PREFIX,
-        handoff::LaunchKind::Editor | handoff::LaunchKind::Edit => handoff::PIPE_PREFIX,
+        _ => handoff::PIPE_PREFIX,
     };
     // "Edit with BareClip" goes to an editor already open, and a file to watch to a player
     // already open, if there is one.
@@ -66,6 +70,21 @@ fn main() -> eframe::Result {
         return open_window(None, waiting);
     }
     result
+}
+
+/// Tells Explorer that which programs open which files changed, so icons and Open with show it
+/// straight away.
+fn tell_explorer_file_types_changed() {
+    use windows_sys::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
+    // SAFETY: this notice takes no items, so both are null.
+    unsafe {
+        SHChangeNotify(
+            SHCNE_ASSOCCHANGED as i32,
+            SHCNF_IDLIST,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
 }
 
 /// What opens the app with, which the first window to open takes.
@@ -164,7 +183,7 @@ fn open_window(wanted: Option<GpuId>, waiting: WaitingLaunch) -> eframe::Result 
                     viewer.open_launch(ctx, &launch.paths);
                     (Face::Viewer(Box::new(viewer)), maximize)
                 }
-                handoff::LaunchKind::Editor | handoff::LaunchKind::Edit => {
+                _ => {
                     let mut editor = build_editor(ctx, gpu.as_ref(), storage::app_folder(), true);
                     let maximize = window
                         .is_some_and(|window| window_place::restore(window, editor.saved_window()));

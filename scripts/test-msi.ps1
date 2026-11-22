@@ -16,7 +16,10 @@ $Shortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\BareCl
 $Desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'BareClip.lnk'
 $Log = Join-Path $env:TEMP 'bareclip-msi-test.log'
 # The installer's right-click entry, which a test in text.rs holds to what the app takes.
-$EditTypes = 'mp4', 'mkv', 'mov', 'webm', 'avi', 'mp3', 'wav', 'flac', 'm4a', 'aac', 'ogg', 'opus'
+$EditTypes = 'mp4', 'mkv', 'mov', 'webm', 'avi', 'm4v', 'wmv', 'flv', '3gp', 'mts', 'm2ts', 'mp3', 'wav', 'flac', 'm4a', 'aac', 'ogg', 'opus', 'wma', 'aiff', 'mka'
+# What the player opens, which a test in text.rs holds to the installer.
+$PlayerVideo = 'mp4', 'mkv', 'mov', 'webm', 'avi', 'm4v', 'wmv', 'flv', '3gp', 'mts', 'm2ts'
+$PlayerAudio = 'mp3', 'wav', 'flac', 'm4a', 'aac', 'ogg', 'opus', 'wma', 'aiff', 'mka'
 
 if (Test-Path $InstallDir) { throw "$InstallDir already exists, so this test will not touch it." }
 if (Test-Path $Desktop) { throw "$Desktop already exists, so this test will not touch it." }
@@ -117,6 +120,65 @@ try {
     Assert-That ((Get-Item "$Classes\BareClip.Project\shell\open\command").GetValue('') -eq "`"$Exe`" `"%1`"") '  and open in it'
     Assert-That ((Get-Item "$Classes\BareClip.Project\DefaultIcon").GetValue('') -eq "$Exe,0") '  with its icon'
 
+    # The player: a file type of its own for video and sound, listed under Default apps and in
+    # each type's Open with list, with no type's default changed.
+    $PlayCommand = "`"$Exe`" --play `"%1`""
+    foreach ($Type in 'BareClip.Video', 'BareClip.Audio') {
+        Assert-That ((Get-Item "$Classes\$Type\shell\open\command").GetValue('') -eq $PlayCommand) "$Type opens with $PlayCommand"
+        Assert-That ((Get-Item "$Classes\$Type\DefaultIcon").GetValue('') -eq "$Exe,0") '  with the app''s icon'
+    }
+    Assert-That ((Get-ItemProperty 'HKCU:\Software\RegisteredApplications').BareClip -eq 'Software\BareClip\Capabilities') 'BareClip is a registered application'
+    Assert-That ((Get-ItemProperty 'HKCU:\Software\BareClip\Capabilities').ApplicationName -eq 'BareClip') '  with its name for Default apps'
+    $Associations = Get-ItemProperty 'HKCU:\Software\BareClip\Capabilities\FileAssociations'
+    foreach ($Kind in @(@{ Types = $PlayerVideo; Name = 'BareClip.Video' }, @{ Types = $PlayerAudio; Name = 'BareClip.Audio' })) {
+        foreach ($Type in $Kind.Types) {
+            Assert-That ($Associations.".$Type" -eq $Kind.Name) "Default apps offers BareClip for .$Type"
+            Assert-That ((Get-Item "$Classes\.$Type\OpenWithProgids").GetValueNames() -contains $Kind.Name) "  and Open with lists it"
+            Assert-That (-not ((Get-Item "$Classes\.$Type" -ErrorAction SilentlyContinue).GetValue('') -like 'BareClip*')) '  without taking the type over'
+        }
+    }
+    # Other programs may list themselves for .ts, which is TypeScript's too.
+    $TsList = Get-Item "$Classes\.ts\OpenWithProgids" -ErrorAction SilentlyContinue
+    Assert-That (-not ($TsList -and ($TsList.GetValueNames() | Where-Object { $_ -like 'BareClip.*' }))) '.ts is left alone'
+
+    # A real launch through the registered command, as a double-click on a BareClip-owned type does.
+    $Watch = Join-Path $env:TEMP "bareclip play test $PID"
+    $WatchAppData = Join-Path $env:TEMP "bareclip play appdata $PID"
+    New-Item -ItemType Directory -Force $Watch, $WatchAppData | Out-Null
+    & (Join-Path $Root 'vendor\ffmpeg\bin\ffmpeg.exe') -hide_banner -loglevel error -y -f lavfi -i 'testsrc=size=320x180:rate=30:duration=2' -pix_fmt yuv420p (Join-Path $Watch 'watch me.mp4')
+    $Registered = (Get-Item "$Classes\BareClip.Video\shell\open\command").GetValue('')
+    $Arguments = $Registered.Substring($Registered.IndexOf('" ') + 2).Replace('%1', (Join-Path $Watch 'watch me.mp4'))
+    $SavedPath = $env:PATH
+    $SavedAppData = $env:LOCALAPPDATA
+    $Player = $null
+    try {
+        $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+        $env:LOCALAPPDATA = $WatchAppData
+        $Player = Start-Process $Exe -ArgumentList $Arguments -PassThru
+        $Clock = [Diagnostics.Stopwatch]::StartNew()
+        $Window = [IntPtr]::Zero
+        while ($Clock.Elapsed.TotalSeconds -lt 20 -and -not $Player.HasExited -and $Window -eq [IntPtr]::Zero) {
+            $Window = [BareClipTest.Windows]::Find($Player.Id, 'BareClip')
+            Start-Sleep -Milliseconds 20
+        }
+        Assert-That ($Window -ne [IntPtr]::Zero) "the registered command opens the player after $($Clock.ElapsedMilliseconds) ms"
+        $Second = Start-Process $Exe -ArgumentList $Arguments -PassThru
+        $null = $Second.Handle
+        Assert-That ($Second.WaitForExit(10000)) '  and a second file goes to the same window'
+        [void][BareClipTest.Windows]::PostMessage($Window, $WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
+        Assert-That ($Player.WaitForExit(6000)) '  which closes cleanly'
+        $Refresh = Start-Process $Exe -ArgumentList '--refresh-file-types' -PassThru
+        $null = $Refresh.Handle
+        Assert-That ($Refresh.WaitForExit(5000) -and $Refresh.ExitCode -eq 0) 'telling Explorer about file types leaves straight away'
+    }
+    finally {
+        $env:PATH = $SavedPath
+        $env:LOCALAPPDATA = $SavedAppData
+        if ($Player -and -not $Player.HasExited) { Stop-Process -Id $Player.Id -Force }
+        Start-Sleep -Milliseconds 300
+        Remove-Item -Recurse -Force $Watch, $WatchAppData -ErrorAction SilentlyContinue
+    }
+
     $Media = Join-Path $env:TEMP "bareclip edit test $PID"
     $AppData = Join-Path $env:TEMP "bareclip edit appdata $PID"
     New-Item -ItemType Directory -Force $Media, $AppData | Out-Null
@@ -208,6 +270,13 @@ foreach ($Type in $EditTypes) {
 }
 Assert-That (-not (Test-Path 'HKCU:\Software\Classes\.bareclip')) '.bareclip is no longer registered'
 Assert-That (-not (Test-Path 'HKCU:\Software\Classes\BareClip.Project')) '  and neither is the project type'
+Assert-That (-not (Test-Path 'HKCU:\Software\Classes\BareClip.Video')) 'the player''s video type is gone'
+Assert-That (-not (Test-Path 'HKCU:\Software\Classes\BareClip.Audio')) '  and its audio type'
+Assert-That (-not ((Get-ItemProperty 'HKCU:\Software\RegisteredApplications' -ErrorAction SilentlyContinue).BareClip)) '  and it is no longer a registered application'
+foreach ($Type in $PlayerVideo + $PlayerAudio) {
+    $Listed = (Get-Item "HKCU:\Software\Classes\.$Type\OpenWithProgids" -ErrorAction SilentlyContinue)
+    Assert-That (-not ($Listed -and ($Listed.GetValueNames() | Where-Object { $_ -like 'BareClip.*' }))) "  and .$Type no longer lists it"
+}
 
 # A chosen folder holds a BareClip folder, and unticked shortcuts are left out. The space
 # in the name is on purpose.

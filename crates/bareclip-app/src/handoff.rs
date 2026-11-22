@@ -61,6 +61,10 @@ pub const PLAY_FLAG: &str = "--play";
 /// file opened to watch never lands in a project, and one sent to edit never lands in a player.
 pub const PLAYER_PIPE_PREFIX: &str = "BareClipPlayer";
 
+/// What the installer runs the app with after changing file types, to tell Explorer so. The app
+/// does that and leaves, with no window.
+pub const REFRESH_FLAG: &str = "--refresh-file-types";
+
 /// More than any list of paths Explorer would send, so a stray writer can't fill memory.
 const LARGEST_MESSAGE: u64 = 4 << 20;
 
@@ -73,6 +77,8 @@ pub enum LaunchKind {
     Edit,
     /// A double-click on a video or sound, which opens the player.
     Play,
+    /// The installer, telling Explorer that file types changed.
+    RefreshFileTypes,
 }
 
 /// What the app was started with.
@@ -99,6 +105,8 @@ pub fn read_launch(args: impl IntoIterator<Item = OsString>) -> Launch {
             kind.get_or_insert(LaunchKind::Edit);
         } else if arg == PLAY_FLAG {
             kind.get_or_insert(LaunchKind::Play);
+        } else if arg == REFRESH_FLAG {
+            kind.get_or_insert(LaunchKind::RefreshFileTypes);
         } else {
             paths.push(PathBuf::from(arg));
         }
@@ -582,6 +590,13 @@ mod tests {
         assert!(launch.paths.is_empty());
     }
 
+    #[test]
+    fn the_installers_refresh_is_told_apart_and_takes_no_files() {
+        let launch = read_launch(["--refresh-file-types"].map(OsString::from));
+        assert_eq!(launch.kind, LaunchKind::RefreshFileTypes);
+        assert!(launch.paths.is_empty());
+        assert!(!launch.edit());
+    }
     #[test]
     fn the_first_flag_decides_and_later_flags_are_not_taken_for_files() {
         let launch = read_launch(["--play", r"C:\a.mp4", "--edit"].map(OsString::from));
