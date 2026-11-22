@@ -38,6 +38,7 @@ impl Viewer {
         if self.mini.is_some() {
             return;
         }
+        self.flyout.close();
         if self.full_screen {
             self.set_full_screen(ctx, false);
         }
@@ -155,7 +156,7 @@ impl Viewer {
                 }
                 let room = (ui.available_width() - 40.0).max(40.0);
                 let (position, duration) = (self.position(), self.duration());
-                if let Some(time) = crate::timeline::seek_bar(
+                if let Some(time) = super::bars::seek_line(
                     ui,
                     palette,
                     room,

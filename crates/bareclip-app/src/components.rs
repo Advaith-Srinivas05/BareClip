@@ -324,6 +324,10 @@ impl Widget for ActionButton<'_> {
     }
 }
 
+/// How much of its height a jump button's Undo or Redo arrow is drawn, so it arches low over
+/// the number of seconds under it.
+pub const SKIP_ARCH: f32 = 0.7;
+
 /// A button that is only a symbol. Its name is read out by screen readers, so hover text
 /// should repeat it along with any shortcut.
 pub struct IconButton<'a> {
@@ -334,10 +338,14 @@ pub struct IconButton<'a> {
     size: f32,
     icon_size: f32,
     icon_raise: f32,
+    /// How much of its height the symbol is drawn, squashing it.
+    icon_height: f32,
     round: bool,
     solid: bool,
     hidden: bool,
     tint: Option<Color32>,
+    /// Draws BareClip's mark in place of the symbol.
+    mark: bool,
 }
 
 impl<'a> IconButton<'a> {
@@ -350,11 +358,27 @@ impl<'a> IconButton<'a> {
             size: BUTTON_HEIGHT,
             icon_size: 16.0,
             icon_raise: 0.0,
+            icon_height: 1.0,
             round: false,
             solid: false,
             hidden: false,
             tint: None,
+            mark: false,
         }
+    }
+
+    /// A button showing BareClip's own mark rather than a symbol, for opening something in
+    /// BareClip. It is drawn in the kind's colour, like the symbols beside it.
+    pub fn mark(palette: &'a Palette, kind: Kind, name: &'a str) -> Self {
+        Self {
+            mark: true,
+            ..Self::new(palette, kind, icons::PLAY, name)
+        }
+    }
+
+    /// How wide and tall a button is unless given a size.
+    pub fn default_size() -> f32 {
+        BUTTON_HEIGHT
     }
 
     pub fn size(mut self, size: f32, icon_size: f32) -> Self {
@@ -366,6 +390,12 @@ impl<'a> IconButton<'a> {
     /// Moves the symbol up from the middle, leaving room for something under it.
     pub fn icon_raised(mut self, by: f32) -> Self {
         self.icon_raise = by;
+        self
+    }
+
+    /// Draws the symbol only `share` of its height, as wide as ever, lowering an arch.
+    pub fn icon_squashed(mut self, share: f32) -> Self {
+        self.icon_height = share;
         self
     }
 
@@ -414,8 +444,13 @@ impl<'a> IconButton<'a> {
             };
             paint_box(ui, rect, radius, &look, &response, self.palette);
             let middle = rect.center() - vec2(0.0, self.icon_raise);
-            let square = icons::square_at(middle, self.icon_size);
-            if self.solid {
+            let square = Rect::from_center_size(
+                middle,
+                vec2(self.icon_size, self.icon_size * self.icon_height),
+            );
+            if self.mark {
+                icons::paint_mark(ui.painter(), square, look.content);
+            } else if self.solid {
                 icons::paint_solid(ui.painter(), square, &self.icon, look.content);
             } else {
                 icons::paint(ui.painter(), square, &self.icon, look.content);
@@ -553,7 +588,11 @@ pub struct MenuItem<'a> {
     detail: &'a str,
     /// Leaves room for a tick before the symbol, and whether it is ticked.
     tick: Option<bool>,
+    /// Leaves a tick's room empty, so an action lines up with ticked choices in its menu.
+    tick_room: bool,
     width: Option<f32>,
+    /// Lets the width go below the usual menu width, for a menu of short choices.
+    short: bool,
 }
 
 impl<'a> MenuItem<'a> {
@@ -567,13 +606,30 @@ impl<'a> MenuItem<'a> {
             shape: None,
             detail: "",
             tick: None,
+            tick_room: false,
             width: None,
+            short: false,
         }
+    }
+
+    /// Leaves the room a tick takes empty, so this line's symbol and words line up with the
+    /// ticked choices in the same menu.
+    pub fn tick_room(mut self) -> Self {
+        self.tick_room = true;
+        self
     }
 
     /// Takes this width rather than the usual one, such as a dropdown's, from [`menu_width`].
     pub fn width(mut self, width: f32) -> Self {
         self.width = Some(width);
+        self
+    }
+
+    /// Takes this width even below the usual menu width, for a menu of short choices such as
+    /// speeds, which would otherwise be much wider than the button it opens from.
+    pub fn short(mut self, width: f32) -> Self {
+        self.width = Some(width);
+        self.short = true;
         self
     }
 
@@ -605,7 +661,9 @@ impl<'a> MenuItem<'a> {
             shape: None,
             detail: "",
             tick: None,
+            tick_room: false,
             width: None,
+            short: false,
         }
     }
 
@@ -672,7 +730,10 @@ fn menu_words(
 impl Widget for MenuItem<'_> {
     fn ui(self, ui: &mut Ui) -> Response {
         let palette = self.palette;
-        let width = self.width.unwrap_or(MENU_WIDTH).max(MENU_WIDTH);
+        let width = match self.width {
+            Some(width) if self.short => width,
+            width => width.unwrap_or(MENU_WIDTH).max(MENU_WIDTH),
+        };
         let enabled = ui.is_enabled();
         let shortcut_colour = if enabled {
             palette.text_muted
@@ -695,7 +756,7 @@ impl Widget for MenuItem<'_> {
         } else {
             0.0
         };
-        let text_left = menu_text_left(self.tick.is_some(), self.shape.is_some());
+        let text_left = menu_text_left(self.tick.is_some() || self.tick_room, self.shape.is_some());
         let room = (width - text_left - MENU_ITEM_PADDING - shortcut_room - arrow_room).max(24.0);
         let words = menu_words(ui, (self.label, self.detail), shortcut_colour, room);
         let height = MENU_ITEM_HEIGHT.max(words.size().y + MENU_ITEM_PADDING * 1.5);
@@ -730,6 +791,8 @@ impl Widget for MenuItem<'_> {
                         look.content,
                     );
                 }
+                left += icon_size + ICON_GAP;
+            } else if self.tick_room {
                 left += icon_size + ICON_GAP;
             }
             if let Some(icon) = &self.icon {
@@ -1717,6 +1780,64 @@ pub fn dialog_buttons(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     });
 }
 
+/// How wide a Settings dialog is, the editor's and the player's alike.
+pub const SETTINGS_WIDTH: f32 = 626.0;
+/// How wide a Settings dialog's tabs are.
+const SETTINGS_TABS_WIDTH: f32 = 124.0;
+/// The room either side of the line between a Settings dialog's tabs and its page.
+const SETTINGS_TABS_GAP: f32 = 14.0;
+
+/// A Settings dialog's middle: its tabs down the left, each a symbol, a label and a name for
+/// screen readers, a line, and the open tab's page beside them. It is `height` tall, as tall as
+/// the tallest page, so the dialog keeps its size when tabs are switched. A click on a tab
+/// opens it.
+pub fn settings_tabs<T: Copy + PartialEq>(
+    ui: &mut Ui,
+    palette: &Palette,
+    tabs: &[(T, Icon, &str, &str)],
+    open: &mut T,
+    height: f32,
+    page: impl FnOnce(&mut Ui, T),
+) {
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.allocate_ui_with_layout(
+            vec2(SETTINGS_TABS_WIDTH, height),
+            Layout::top_down(Align::Min),
+            |ui| {
+                ui.set_width(SETTINGS_TABS_WIDTH);
+                ui.spacing_mut().item_spacing.y = 2.0;
+                for &(tab, icon, label, name) in tabs {
+                    let side_tab = SideTab::new(palette, icon, (label, name), *open == tab);
+                    if ui.add(side_tab).clicked() {
+                        *open = tab;
+                    }
+                }
+            },
+        );
+        // A line down between the tabs and the page, so they read as apart.
+        ui.add_space(SETTINGS_TABS_GAP);
+        let (line, _) = ui.allocate_exact_size(vec2(1.0, height), Sense::hover());
+        ui.painter().vline(
+            line.center().x,
+            line.y_range(),
+            Stroke::new(1.0, palette.border),
+        );
+        ui.add_space(SETTINGS_TABS_GAP);
+        let page_width = ui.available_width();
+        let tab = *open;
+        ui.allocate_ui_with_layout(
+            vec2(page_width, height),
+            Layout::top_down(Align::Min),
+            |ui| {
+                ui.set_width(page_width);
+                ui.set_min_height(height);
+                page(ui, tab);
+            },
+        );
+    });
+}
+
 /// A dialog's bottom row: quieter words on the left and its buttons on the right, both centred
 /// on the same line.
 pub fn dialog_footer(ui: &mut Ui, palette: &Palette, note: &str, add: impl FnOnce(&mut Ui)) {
@@ -2099,6 +2220,44 @@ mod tests {
             "Split",
             "S"
         ))));
+    }
+
+    #[test]
+    fn an_action_with_tick_room_lines_up_with_ticked_choices_without_claiming_a_tick() {
+        let ctx = context();
+        ctx.enable_accesskit();
+        let output = run_ui(&ctx, egui::RawInput::default(), |ui| {
+            ui.add(MenuItem::new(&DARK, icons::ROTATE_CCW, "Reset", "").tick_room());
+            ui.add(MenuItem::ticked(&DARK, icons::REPEAT, "Loop", false));
+            ui.add(MenuItem::new(&DARK, icons::SCISSORS, "Split", ""));
+        });
+        let left_of = |words: &str| {
+            output
+                .shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::epaint::Shape::Text(shape) if shape.galley.text() == words => {
+                        Some(shape.pos.x)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{words} is drawn"))
+        };
+        assert_eq!(left_of("Reset"), left_of("Loop"), "the words line up");
+        assert!(
+            left_of("Split") < left_of("Reset"),
+            "the room is only kept when asked"
+        );
+        let update = output
+            .platform_output
+            .accesskit_update
+            .expect("the tree is reported");
+        let reset = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Reset"))
+            .expect("the action is named");
+        assert_eq!(reset.1.toggled(), None, "an action isn't on or off");
     }
 
     #[test]

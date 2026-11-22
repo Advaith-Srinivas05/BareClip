@@ -1,5 +1,7 @@
-//! The quick trimmer: two handles over a strip of the whole file, which keep one stretch, and
-//! saving that stretch as a new file beside the original or wherever the Save window says.
+//! The quick trimmer: two handles on a line along the whole file, which keep one stretch, and
+//! saving that stretch as a new file beside the original. It is laid out like the Photos app's:
+//! "Trim" and the save buttons along the top, and a pill along the bottom with play, the volume,
+//! the line between the start and end times, and "…" with the trimmer's tools.
 //! Videos are cut the editor's frame-exact way, copying all but the stretches around the cuts,
 //! and sound is cut by `cut_sound`.
 
@@ -15,31 +17,61 @@ use std::{
 
 use bareclip_core::{
     splice::{CutMode, FrameIndex},
-    time::{Ticks, format_timecode},
+    time::Ticks,
     timeline::TimeRange,
 };
-use bareclip_media::{ExportPart, ExportRequest, SoundShape, StripPicture};
+use bareclip_media::{ExportPart, ExportRequest};
 use eframe::egui::{
-    self, Align, Color32, Layout, Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions,
-    UiBuilder, pos2, vec2,
+    self, Align, Align2, FontId, Layout, Pos2, Rangef, Rect, RichText, Sense, Stroke, UiBuilder,
+    pos2, vec2,
 };
 
-use super::Viewer;
+use super::{
+    Viewer,
+    bars::Flyout,
+    note::{Note, NotePress},
+    pill::{self, PILL_HEIGHT, PILL_RADIUS, raised_card},
+};
 use crate::{
-    components::{self, ActionButton, Kind},
-    icons, text,
+    components::{self, ActionButton, IconButton, Kind, MenuItem},
+    fonts, icons, text,
     theme::Palette,
 };
 
 /// The kinds of video a trim is copied into as they are. Others come out as an MP4, redrawn.
 const COPIED_CONTAINERS: [&str; 4] = ["mp4", "m4v", "mov", "mkv"];
-/// The most pictures along the strip.
-const STRIP_PICTURES: u32 = 48;
-pub const STRIP_HEIGHT: f32 = 46.0;
-const HANDLE_WIDTH: f32 = 10.0;
-/// The trimmer's rows: the strip with its times, then its buttons.
-pub const TRIM_ROW_HEIGHT: f32 = STRIP_HEIGHT + 30.0;
-pub const ACTION_ROW_HEIGHT: f32 = 40.0;
+/// How wide a save's progress is.
+const SAVING_BAR_WIDTH: f32 = 220.0;
+/// The card a save's progress shows in.
+const SAVING_CARD_WIDTH: f32 = 440.0;
+/// The room between Save as copy and Cancel and the window's buttons.
+const TITLE_BUTTON_GAP: f32 = 16.0;
+/// "Trim" in the top bar: its symbol, the room after it, and the mark under the word.
+const TRIM_ICON_SIZE: f32 = 16.0;
+const TRIM_ICON_GAP: f32 = 8.0;
+const TRIM_MARK_WIDTH: f32 = 22.0;
+/// The room under the pill, so it doesn't sit tight on the window's edge.
+const PILL_BOTTOM_ROOM: f32 = 12.0;
+/// The bubble with the playhead's time, over the pill.
+const BUBBLE_WIDTH: f32 = 104.0;
+const BUBBLE_HEIGHT: f32 = 32.0;
+const BUBBLE_GAP: f32 = 10.0;
+/// Room over the bubble, and how tall the bottom is while trimming.
+const TRIM_BAR_TOP: f32 = 16.0;
+pub const TRIM_BAR_HEIGHT: f32 =
+    TRIM_BAR_TOP + BUBBLE_HEIGHT + 8.0 + BUBBLE_GAP + PILL_HEIGHT + PILL_BOTTOM_ROOM;
+/// The line: how thick it is, its handles, and the playhead's thumb on it, which is the seek
+/// line's: a light dot ringed in the accent that grows under the mouse.
+const LINE_THICKNESS: f32 = 4.0;
+const HANDLE_WIDTH: f32 = 8.0;
+const HANDLE_HEIGHT: f32 = 24.0;
+const GRIP_LENGTH: f32 = 10.0;
+const THUMB: f32 = 6.0;
+const THUMB_HOVER: f32 = 8.0;
+/// How tall the stretch is that a click or drag seeks along.
+const SEEK_REACH: f32 = 32.0;
+/// How long the thumb takes to grow and settle.
+const SWELL_TIME: f32 = 0.12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Handle {
@@ -60,24 +92,14 @@ pub struct Trimmer {
     pub start: Ticks,
     pub end: Ticks,
     held: Option<Handle>,
-    pictures: Vec<(Ticks, TextureHandle)>,
-    pub(super) arriving: Option<Receiver<StripPicture>>,
-    shape: Option<SoundShape>,
-    pub(super) shape_arriving: Option<Receiver<Option<SoundShape>>>,
-    /// Stops the strip's readers when the trimmer closes.
-    cancel: Arc<AtomicBool>,
     saving: Option<Saving>,
     /// The file last saved, and what the save did.
     pub saved: Option<(PathBuf, Vec<String>)>,
     pub problem: Option<String>,
-    /// Save… is waiting for an answer about becoming an MP4.
-    asking_mp4: bool,
-}
-
-impl Drop for Trimmer {
-    fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
-    }
+    /// Playing goes round the kept stretch rather than stopping at its end.
+    pub looping: bool,
+    /// The saved trim leaves the sound behind.
+    pub without_sound: bool,
 }
 
 /// Whether a trim of this file is saved as the same kind of file.
@@ -125,62 +147,22 @@ impl Viewer {
         self.trim.is_some()
     }
 
-    /// Opens the trimmer, keeping the whole file, and starts reading its strip.
-    pub fn open_trimmer(&mut self, ctx: &egui::Context) {
+    /// Opens the trimmer, keeping the whole file.
+    pub fn open_trimmer(&mut self, _ctx: &egui::Context) {
         let Some(file) = &self.file else {
             return;
         };
-        let cancel = Arc::new(AtomicBool::new(false));
-        let path = file.info.path.clone();
-        let duration = file.info.duration;
-        let mut trimmer = Trimmer {
+        self.flyout.close();
+        self.trim = Some(Trimmer {
             start: Ticks(0),
-            end: duration,
+            end: file.info.duration,
             held: None,
-            pictures: Vec::new(),
-            arriving: None,
-            shape: None,
-            shape_arriving: None,
-            cancel: cancel.clone(),
             saving: None,
             saved: None,
             problem: None,
-            asking_mp4: false,
-        };
-        let repaint = ctx.clone();
-        if file.is_sound() {
-            let (sender, receiver) = mpsc::channel();
-            thread::spawn(move || {
-                let shape = bareclip_media::read_sound_shape(&path, &cancel, |_| {})
-                    .ok()
-                    .flatten();
-                let _ = sender.send(shape);
-                repaint.request_repaint();
-            });
-            trimmer.shape_arriving = Some(receiver);
-        } else {
-            let (sender, receiver) = mpsc::channel();
-            let spacing = bareclip_media::picture_spacing(
-                duration,
-                Ticks::from_seconds(0.25),
-                STRIP_PICTURES,
-            );
-            thread::spawn(move || {
-                let _ = bareclip_media::read_strip_pictures(
-                    &path,
-                    duration,
-                    spacing,
-                    (160, 90),
-                    &cancel,
-                    |picture| {
-                        let _ = sender.send(picture);
-                        repaint.request_repaint();
-                    },
-                );
-            });
-            trimmer.arriving = Some(receiver);
-        }
-        self.trim = Some(trimmer);
+            looping: false,
+            without_sound: false,
+        });
     }
 
     /// Leaves the trimmer and forgets the handles.
@@ -268,14 +250,29 @@ impl Viewer {
         })
     }
 
-    /// While trimming, play runs between the handles and stops at the end one.
+    /// While trimming, play runs between the handles and stops at the end one, or goes round
+    /// to the start one with Loop the kept part on.
     pub(super) fn keep_within_trim(&mut self) {
         let Some(range) = self.trim_range() else {
             return;
         };
+        let looping = self.trim.as_ref().is_some_and(|trimmer| trimmer.looping);
         if self.is_playing() && self.position() >= range.end {
-            self.pause();
-            self.seek(self.last_kept_frame(range.end));
+            if looping {
+                self.seek(range.start);
+            } else {
+                self.pause();
+                self.seek(self.last_kept_frame(range.end));
+            }
+        }
+    }
+
+    /// Both handles back at the file's ends.
+    pub fn reset_trim(&mut self) {
+        let duration = self.duration();
+        if let Some(trimmer) = &mut self.trim {
+            trimmer.start = Ticks(0);
+            trimmer.end = duration;
         }
     }
 
@@ -308,6 +305,11 @@ impl Viewer {
             }
             return;
         }
+        let keep_sound = sound
+            || !self
+                .trim
+                .as_ref()
+                .is_some_and(|trimmer| trimmer.without_sound);
         let frames = file.frames.clone();
         if !sound && frames.is_none() {
             if let Some(trimmer) = &mut self.trim {
@@ -348,16 +350,19 @@ impl Viewer {
                     }],
                     mode: CutMode::FrameExact,
                 };
-                let exported = if keeps_its_kind(&source, false) {
+                let exported = if !keeps_its_kind(&source, false) {
+                    let mut plan = bareclip_export::FullPlan::for_videos(&[info]);
+                    if !keep_sound {
+                        plan.settings.sound_tracks.clear();
+                    }
+                    bareclip_export::export_full(&request, &plan, &stop, &report)
+                        .map(bareclip_export::ProjectReport::Full)
+                } else if keep_sound {
                     bareclip_export::export_project(&request, &stop, &report)
                 } else {
-                    bareclip_export::export_full(
-                        &request,
-                        &bareclip_export::FullPlan::for_videos(&[info]),
-                        &stop,
-                        &report,
-                    )
-                    .map(bareclip_export::ProjectReport::Full)
+                    // One file is always copied the fast way, so the sound is simply left out.
+                    bareclip_media::export_picture_only(&request, &stop, &report)
+                        .map(bareclip_export::ProjectReport::Fast)
                 };
                 exported.map(|report| text::export_summary(&report))
             };
@@ -380,65 +385,11 @@ impl Viewer {
         }
     }
 
-    /// Save…: Windows' Save window in the file's folder, saying first if it becomes an MP4.
-    pub fn save_trim_as(&mut self, ctx: &egui::Context) {
-        let Some(file) = &self.file else {
-            return;
-        };
-        let sound = file.is_sound();
-        if !keeps_its_kind(&file.info.path, sound)
-            && let Some(trimmer) = &mut self.trim
-            && !trimmer.asking_mp4
-        {
-            trimmer.asking_mp4 = true;
-            return;
-        }
-        if let Some(trimmer) = &mut self.trim {
-            trimmer.asking_mp4 = false;
-        }
-        let suggested = copy_name(&file.info.path, sound);
-        let extension = suggested
-            .extension()
-            .map(|extension| extension.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let mut dialog = rfd::FileDialog::new()
-            .set_title("Save the trimmed clip")
-            .set_file_name(
-                suggested
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-            )
-            .add_filter(extension.to_uppercase(), &[extension.as_str()]);
-        if let Some(folder) = file.info.path.parent() {
-            dialog = dialog.set_directory(folder);
-        }
-        if let Some(target) = dialog.save_file() {
-            self.save_trim(ctx, Some(target));
-        }
-    }
-
-    /// Takes in what the strip readers and a save have sent.
-    pub(super) fn poll_trimmer(&mut self, ctx: &egui::Context) {
+    /// Takes in what a save has sent.
+    pub(super) fn poll_trimmer(&mut self, _ctx: &egui::Context) {
         let Some(trimmer) = &mut self.trim else {
             return;
         };
-        if let Some(arriving) = &trimmer.arriving {
-            for picture in arriving.try_iter().take(8) {
-                let image = egui::ColorImage::from_rgba_unmultiplied(
-                    [picture.width as usize, picture.height as usize],
-                    &picture.rgba,
-                );
-                let texture = ctx.load_texture("trim-strip", image, TextureOptions::LINEAR);
-                trimmer.pictures.push((picture.time, texture));
-            }
-        }
-        if let Some(arriving) = &trimmer.shape_arriving
-            && let Ok(shape) = arriving.try_recv()
-        {
-            trimmer.shape = shape;
-            trimmer.shape_arriving = None;
-        }
         let finished = trimmer
             .saving
             .as_ref()
@@ -482,118 +433,408 @@ impl Viewer {
         }
     }
 
-    #[cfg(test)]
+    /// Whether a trim is being saved, while the save buttons wait.
     pub fn is_saving_trim(&self) -> bool {
         self.trim
             .as_ref()
             .is_some_and(|trimmer| trimmer.saving.is_some())
     }
 
-    /// The strip with its handles, and the start, end and kept length under it.
-    pub(super) fn trim_row(&mut self, ui: &mut egui::Ui, palette: &Palette, row: Rect) {
+    /// The top bar while trimming, as Photos lays it out: the file's name on the left, "Trim"
+    /// in the middle, and Save as copy and Cancel before the window's buttons on the right.
+    /// The save buttons wait while a save is under way.
+    pub(super) fn trim_title(&mut self, ui: &mut egui::Ui, palette: &Palette, rect: Rect) {
+        let ctx = ui.ctx().clone();
+        let inner = rect.shrink2(vec2(8.0, 0.0));
+        let idle = !self.is_saving_trim();
+        let mut pressed = (false, false);
+        let right = ui
+            .scope_builder(
+                UiBuilder::new()
+                    .max_rect(inner)
+                    .layout(Layout::right_to_left(Align::Center)),
+                |ui| {
+                    self.window_buttons(ui, palette);
+                    ui.add_space(TITLE_BUTTON_GAP);
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    pressed.1 = ui
+                        .add(ActionButton::new(palette, Kind::Secondary, "Cancel").small())
+                        .on_hover_text("Leave the trimmer (Escape)")
+                        .clicked();
+                    pressed.0 = ui
+                        .add_enabled(
+                            idle,
+                            ActionButton::new(palette, Kind::Primary, "Save as copy").small(),
+                        )
+                        .on_hover_text("Save the trimmed clip beside the original")
+                        .clicked();
+                },
+            )
+            .response
+            .rect;
+
+        // "Trim" in the middle of the window, marked as the mode the player is in.
+        let font = FontId::proportional(14.0);
+        let word = ui
+            .painter()
+            .layout_no_wrap("Trim".to_owned(), font, palette.text);
+        let width = TRIM_ICON_SIZE + TRIM_ICON_GAP + word.size().x;
+        let left = rect.center().x - width / 2.0;
+        let icon = icons::square_at(
+            pos2(left + TRIM_ICON_SIZE / 2.0, rect.center().y),
+            TRIM_ICON_SIZE,
+        );
+        icons::paint(ui.painter(), icon, &icons::SCISSORS, palette.text);
+        let text_at = pos2(
+            left + TRIM_ICON_SIZE + TRIM_ICON_GAP,
+            rect.center().y - word.size().y / 2.0,
+        );
+        let underline_y = text_at.y + word.size().y + 4.0;
+        let underline_middle = text_at.x + word.size().x / 2.0;
+        ui.painter().galley(text_at, word, palette.text);
+        ui.painter().line_segment(
+            [
+                pos2(underline_middle - TRIM_MARK_WIDTH / 2.0, underline_y),
+                pos2(underline_middle + TRIM_MARK_WIDTH / 2.0, underline_y),
+            ],
+            Stroke::new(3.0, palette.accent),
+        );
+
+        // The name on the left, as far as the middle allows.
+        let name_room = Rect::from_min_max(
+            pos2(inner.left() + 8.0, rect.top()),
+            pos2((left - 16.0).min(right.left() - 16.0), rect.bottom()),
+        );
+        if name_room.width() > 24.0 {
+            ui.scope_builder(
+                UiBuilder::new()
+                    .max_rect(name_room)
+                    .layout(Layout::left_to_right(Align::Center)),
+                |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(self.name())
+                                .font(FontId::proportional(components::NAME_BAR_TEXT - 1.0))
+                                .color(palette.text),
+                        )
+                        .truncate()
+                        .selectable(false),
+                    );
+                },
+            );
+        }
+        if pressed.0 {
+            self.save_trim(&ctx, None);
+        }
+        if pressed.1 {
+            self.close_trimmer();
+        }
+    }
+
+    /// The bottom while trimming: the time at the playhead in a bubble, or a save's progress,
+    /// over a pill holding play, the volume, the start time, the line with its handles, the
+    /// end time and "…". The pill is as wide as the player's, for the picture's width `across`,
+    /// and centred under the picture.
+    pub(super) fn trim_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        palette: &Palette,
+        rect: Rect,
+        across: Rangef,
+    ) {
+        let Some(range) = self.trim_range() else {
+            return;
+        };
+        let pill = Rect::from_center_size(
+            pos2(
+                across.center(),
+                rect.bottom() - PILL_BOTTOM_ROOM - PILL_HEIGHT / 2.0,
+            ),
+            vec2(pill::pill_width(across.span()), PILL_HEIGHT),
+        );
+        let bubble_middle = pos2(
+            pill.center().x,
+            pill.top() - BUBBLE_GAP - BUBBLE_HEIGHT / 2.0,
+        );
+        let saving = self
+            .trim
+            .as_ref()
+            .and_then(|trimmer| trimmer.saving.as_ref())
+            .map(|saving| saving.progress.load(Ordering::Relaxed) as f32 / 1000.0);
+        if let Some(share) = saving {
+            self.save_progress(ui, palette, bubble_middle, share);
+        } else {
+            raised_card(
+                ui,
+                palette,
+                Rect::from_center_size(bubble_middle, vec2(BUBBLE_WIDTH, BUBBLE_HEIGHT)),
+                BUBBLE_HEIGHT / 2.0,
+            );
+            ui.painter().text(
+                bubble_middle,
+                Align2::CENTER_CENTER,
+                self.clock(self.position()),
+                fonts::strong(14.0),
+                palette.text,
+            );
+        }
+
+        raised_card(ui, palette, pill, PILL_RADIUS);
+        let content = pill.shrink2(vec2(8.0, 0.0));
+        let duration = self.duration();
+        let times = [self.clock(range.start), self.clock(range.end)];
+        let time_box = pill::time_width(ui, &self.clock(duration)) + 4.0;
+        let mut line = Rect::NOTHING;
+        ui.scope_builder(
+            UiBuilder::new()
+                .max_rect(content)
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let (icon, name) = if self.is_playing() {
+                    (icons::PAUSE, "Pause")
+                } else {
+                    (icons::PLAY, "Play")
+                };
+                if ui
+                    .add(IconButton::new(palette, Kind::Ghost, icon, name).solid())
+                    .on_hover_text("Play or pause (Space)")
+                    .clicked()
+                {
+                    self.toggle_playback();
+                }
+                self.volume_button(ui, palette);
+                ui.add_space(pill::TIME_SIDE_GAP);
+                trim_time(ui, palette, &times[0], time_box, Align::Max);
+                // The line takes what the end time and More leave.
+                let room = ui.available_width()
+                    - time_box
+                    - pill::TIME_SIDE_GAP
+                    - IconButton::default_size()
+                    - ui.spacing().item_spacing.x * 3.0;
+                let (rect, _) =
+                    ui.allocate_exact_size(vec2(room.max(40.0), PILL_HEIGHT), Sense::hover());
+                line = rect;
+                trim_time(ui, palette, &times[1], time_box, Align::Min);
+                ui.add_space(pill::TIME_SIDE_GAP);
+                self.more_button(ui, palette);
+            },
+        );
+        self.trim_line(ui, palette, line);
+    }
+
+    /// A save's progress, with a way to stop it, where the time's bubble goes.
+    fn save_progress(&mut self, ui: &mut egui::Ui, palette: &Palette, middle: Pos2, share: f32) {
+        let card = Rect::from_center_size(middle, vec2(SAVING_CARD_WIDTH, BUBBLE_HEIGHT + 8.0));
+        raised_card(ui, palette, card, (BUBBLE_HEIGHT + 8.0) / 2.0);
+        let mut cancel_save = false;
+        ui.scope_builder(
+            UiBuilder::new()
+                .max_rect(card.shrink2(vec2(12.0, 0.0)))
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                ui.add(
+                    egui::Label::new(
+                        RichText::new("Saving the trim")
+                            .size(12.5)
+                            .color(palette.text),
+                    )
+                    .selectable(false),
+                );
+                ui.allocate_ui(vec2(SAVING_BAR_WIDTH, 24.0), |ui| {
+                    components::progress_bar(ui, palette, share);
+                });
+                cancel_save = ui
+                    .add(ActionButton::new(palette, Kind::Ghost, "Cancel saving").small())
+                    .clicked();
+            },
+        );
+        if cancel_save
+            && let Some(saving) = self
+                .trim
+                .as_ref()
+                .and_then(|trimmer| trimmer.saving.as_ref())
+        {
+            saving.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// The pill's "…": the start or end at the playhead, back to the whole file, looping the
+    /// kept stretch, and saving it without its sound.
+    fn more_button(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        let kind = super::bars::flyout_kind(self.flyout.open, Flyout::More);
+        let response = ui
+            .add(IconButton::new(
+                palette,
+                kind,
+                icons::ELLIPSIS,
+                "More options",
+            ))
+            .on_hover_text("More options");
+        let sound = self.file.as_ref().is_some_and(super::OpenFile::is_sound);
+        let (looping, without_sound) = self.trim.as_ref().map_or((false, false), |trimmer| {
+            (trimmer.looping, trimmer.without_sound)
+        });
+        let idle = !self.is_saving_trim();
+        let chosen = super::bars::flyout(&response, &mut self.flyout, Flyout::More, true, |ui| {
+            let start = ui
+                .add(
+                    MenuItem::new(
+                        palette,
+                        icons::ALIGN_START_VERTICAL,
+                        "Start at playhead",
+                        "[",
+                    )
+                    .tick_room(),
+                )
+                .on_hover_text("Keep from the frame showing")
+                .clicked();
+            let end = ui
+                .add(
+                    MenuItem::new(palette, icons::ALIGN_END_VERTICAL, "End at playhead", "]")
+                        .tick_room(),
+                )
+                .on_hover_text("Keep up to the frame showing")
+                .clicked();
+            let reset = ui
+                .add(
+                    MenuItem::new(palette, icons::ROTATE_CCW, "Reset to whole clip", "")
+                        .tick_room(),
+                )
+                .clicked();
+            ui.separator();
+            let looping = ui
+                .add(MenuItem::ticked(
+                    palette,
+                    icons::REPEAT,
+                    "Loop the kept part",
+                    looping,
+                ))
+                .on_hover_text("Play the kept part over and over")
+                .clicked();
+            let without_sound = !sound
+                && ui
+                    .add_enabled(
+                        idle,
+                        MenuItem::ticked(
+                            palette,
+                            icons::VOLUME_X,
+                            "Save without sound",
+                            without_sound,
+                        ),
+                    )
+                    .on_hover_text("The saved clip has no sound")
+                    .clicked();
+            TrimMore {
+                start,
+                end,
+                reset,
+                looping,
+                without_sound,
+            }
+        });
+        let pressed = chosen.unwrap_or_default();
+        if pressed.start {
+            self.set_trim_start(self.position());
+        }
+        if pressed.end {
+            self.set_trim_end(self.position());
+        }
+        if pressed.reset {
+            self.reset_trim();
+        }
+        if let Some(trimmer) = &mut self.trim {
+            trimmer.looping ^= pressed.looping;
+            trimmer.without_sound ^= pressed.without_sound;
+        }
+    }
+
+    /// The line along the whole file: the kept stretch in the accent between its two handles,
+    /// and the playhead as a pin standing over it. A click or drag on the line moves the
+    /// playhead; the handles drag, landing on frames.
+    fn trim_line(&mut self, ui: &mut egui::Ui, palette: &Palette, rect: Rect) {
         let Some(trimmer) = &self.trim else {
             return;
         };
         let duration = self.duration();
-        let strip = Rect::from_min_size(
-            row.min + vec2(16.0, 6.0),
-            vec2(row.width() - 32.0, STRIP_HEIGHT),
+        let track = Rect::from_center_size(
+            rect.center(),
+            vec2(rect.width() - HANDLE_WIDTH, LINE_THICKNESS),
         );
         let x_of = |time: Ticks| {
-            strip.left() + strip.width() * (time.0 as f64 / duration.0.max(1) as f64) as f32
+            track.left() + track.width() * (time.0 as f64 / duration.0.max(1) as f64) as f32
         };
         let time_at = |x: f32| {
             Ticks(
-                (((x - strip.left()) / strip.width()).clamp(0.0, 1.0) as f64 * duration.0 as f64)
+                (((x - track.left()) / track.width()).clamp(0.0, 1.0) as f64 * duration.0 as f64)
                     as i64,
             )
         };
-        let painter = ui.painter_at(strip.expand(HANDLE_WIDTH));
-        painter.rect_filled(strip, 4.0, palette.stage);
-        if let Some(shape) = &trimmer.shape {
-            let bars = (strip.width() / 3.0) as usize;
-            for bar in 0..bars {
-                let from = Ticks(duration.0 * bar as i64 / bars.max(1) as i64);
-                let to = Ticks(duration.0 * (bar as i64 + 1) / bars.max(1) as i64);
-                let peak = shape.peak_between(from, to).max(0.04);
-                let x = strip.left() + bar as f32 * 3.0 + 1.0;
-                let height = (strip.height() - 8.0) * peak;
-                painter.rect_filled(
-                    Rect::from_center_size(pos2(x, strip.center().y), vec2(2.0, height)),
-                    1.0,
-                    palette.clip_audio,
-                );
-            }
-        } else if !trimmer.pictures.is_empty() {
-            let size = trimmer.pictures[0].1.size_vec2();
-            let width = (STRIP_HEIGHT * size.x / size.y.max(1.0)).max(8.0);
-            let slots = (strip.width() / width).ceil() as usize;
-            for slot in 0..slots {
-                let left = strip.left() + slot as f32 * width;
-                let at = time_at(left);
-                let picture = trimmer
-                    .pictures
-                    .iter()
-                    .rev()
-                    .find(|(time, _)| *time <= at)
-                    .unwrap_or(&trimmer.pictures[0]);
-                painter.image(
-                    picture.1.id(),
-                    Rect::from_min_size(pos2(left, strip.top()), vec2(width, STRIP_HEIGHT)),
-                    Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                    Color32::WHITE,
-                );
-            }
-        }
-        // What is cut away is dimmed.
         let (start_x, end_x) = (x_of(trimmer.start), x_of(trimmer.end));
-        let shade = Color32::from_black_alpha(170);
+        let painter = ui.painter();
+        painter.rect_filled(track, LINE_THICKNESS / 2.0, palette.border_strong);
         painter.rect_filled(
-            Rect::from_min_max(strip.min, pos2(start_x, strip.bottom())),
+            Rect::from_min_max(pos2(start_x, track.top()), pos2(end_x, track.bottom())),
             0.0,
-            shade,
-        );
-        painter.rect_filled(
-            Rect::from_min_max(pos2(end_x, strip.top()), strip.max),
-            0.0,
-            shade,
-        );
-        painter.rect_stroke(
-            Rect::from_min_max(pos2(start_x, strip.top()), pos2(end_x, strip.bottom())),
-            2.0,
-            Stroke::new(2.0, palette.accent),
-            egui::StrokeKind::Inside,
-        );
-        let playhead = x_of(self.position());
-        painter.vline(
-            playhead,
-            (strip.top() - 3.0)..=(strip.bottom() + 3.0),
-            Stroke::new(2.0, palette.playhead),
+            palette.accent,
         );
 
-        // A click on the strip moves the playhead, and the handles drag.
-        let strip_response = ui.interact(strip, egui::Id::unique("trim_strip"), Sense::click());
-        if strip_response.clicked()
-            && let Some(pointer) = strip_response.interact_pointer_pos()
+        // A click or drag along the line, or on the thumb, moves the playhead.
+        let seek_area = Rect::from_center_size(
+            rect.center(),
+            vec2(track.width() + THUMB_HOVER * 2.0, SEEK_REACH),
+        );
+        let line_response = ui.interact(
+            seek_area,
+            egui::Id::unique("trim_line"),
+            Sense::click_and_drag(),
+        );
+        line_response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Slider, true, "Seek"));
+        if (line_response.clicked() || line_response.dragged())
+            && let Some(pointer) = line_response.interact_pointer_pos()
         {
             self.seek(time_at(pointer.x));
         }
+
+        // The playhead, drawn as the seek line's thumb under the handles, so a handle at the
+        // same spot still shows and is what a drag there takes.
+        let active = line_response.hovered() || line_response.dragged();
+        let swell =
+            ui.ctx()
+                .animate_bool_with_time(line_response.id.with("swell"), active, SWELL_TIME);
+        let middle = pos2(x_of(self.position()), track.center().y);
+        let thumb = egui::lerp(THUMB..=THUMB_HOVER, swell);
+        ui.painter()
+            .circle_filled(middle, thumb, crate::theme::DARK.text);
+        ui.painter()
+            .circle_stroke(middle, thumb, Stroke::new(2.0, palette.accent));
+
         for (handle, x, name) in [
             (Handle::Start, start_x, "Trim start"),
             (Handle::End, end_x, "Trim end"),
         ] {
-            let rect = Rect::from_center_size(
-                pos2(x, strip.center().y),
-                vec2(HANDLE_WIDTH, STRIP_HEIGHT + 8.0),
+            let grip = Rect::from_center_size(
+                pos2(x, track.center().y),
+                vec2(HANDLE_WIDTH, HANDLE_HEIGHT),
             );
-            let response = ui.interact(rect, egui::Id::unique(name), Sense::drag());
+            let response = ui.interact(
+                grip.expand2(vec2(4.0, 2.0)),
+                egui::Id::unique(name),
+                Sense::drag(),
+            );
             response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Slider, true, name));
             let fill = if response.hovered() || response.dragged() {
                 palette.accent_hover
             } else {
                 palette.accent
             };
-            ui.painter().rect_filled(rect, 3.0, fill);
+            ui.painter().rect_filled(grip, HANDLE_WIDTH / 2.0, fill);
+            ui.painter().vline(
+                grip.center().x,
+                (grip.center().y - GRIP_LENGTH / 2.0)..=(grip.center().y + GRIP_LENGTH / 2.0),
+                Stroke::new(1.5, palette.accent_text),
+            );
             if response.hovered() || response.dragged() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
             }
@@ -627,211 +868,73 @@ impl Viewer {
                 trimmer.held = None;
             }
         }
-
-        let Some(range) = self.trim_range() else {
-            return;
-        };
-        let labels = Rect::from_min_max(
-            pos2(strip.left(), strip.bottom() + 4.0),
-            pos2(strip.right(), row.bottom()),
-        );
-        ui.scope_builder(
-            UiBuilder::new()
-                .max_rect(labels)
-                .layout(Layout::left_to_right(Align::Center)),
-            |ui| {
-                ui.spacing_mut().item_spacing.x = 18.0;
-                for line in [
-                    format!("Start {}", format_timecode(range.start)),
-                    format!("End {}", format_timecode(range.end)),
-                    format!("Kept {}", text::clip_length(range.duration())),
-                ] {
-                    ui.add(
-                        egui::Label::new(RichText::new(line).size(12.0).color(palette.text_muted))
-                            .selectable(false),
-                    );
-                }
-            },
-        );
     }
 
-    /// Cancel, Save as copy, Save… and Edit in BareClip, or the save's progress, or what it did.
-    pub(super) fn trim_actions(&mut self, ui: &mut egui::Ui, palette: &Palette, row: Rect) {
+    /// What the last save did, as a note over the picture: the file saved, with Play and Show
+    /// in folder, or why it couldn't be. Each stays until closed, or the trimmer closes.
+    pub(super) fn trim_notes(
+        &mut self,
+        ui: &mut egui::Ui,
+        palette: &Palette,
+        area: Rect,
+        top: &mut f32,
+    ) {
         let ctx = ui.ctx().clone();
         let Some(trimmer) = &self.trim else {
             return;
         };
-        let saving = trimmer
-            .saving
-            .as_ref()
-            .map(|saving| saving.progress.load(Ordering::Relaxed) as f32 / 1000.0);
         let saved = trimmer.saved.clone();
         let problem = trimmer.problem.clone();
-        let inner = row.shrink2(vec2(16.0, 4.0));
-        let mut cancel_save = false;
-        let mut leave = false;
-        let mut copy = false;
-        let mut save_as = false;
-        let mut play_saved = None;
-        let mut edit = false;
-        // What happened, on the left.
-        ui.scope_builder(
-            UiBuilder::new()
-                .max_rect(inner)
-                .layout(Layout::left_to_right(Align::Center)),
-            |ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                if let Some(share) = saving {
-                    ui.allocate_ui(
-                        vec2((inner.width() - 120.0).clamp(80.0, 360.0), 24.0),
-                        |ui| {
-                            components::progress_bar(ui, palette, share);
-                        },
-                    );
-                    cancel_save = ui
-                        .add(ActionButton::new(palette, Kind::Secondary, "Cancel saving").small())
-                        .clicked();
-                } else if let Some((path, summary)) = &saved {
-                    components::symbol(ui, &icons::CIRCLE_CHECK, 16.0, palette.success);
-                    let name = path
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(format!("Saved {name}"))
-                                .size(12.5)
-                                .color(palette.text),
-                        )
-                        .truncate()
-                        .selectable(false),
-                    )
-                    .on_hover_text(summary.join("\n"));
-                    if ui
-                        .add(ActionButton::new(palette, Kind::Secondary, "Play").small())
-                        .clicked()
-                    {
-                        play_saved = Some(path.clone());
-                    }
-                    if ui
-                        .add(ActionButton::new(palette, Kind::Secondary, "Show in folder").small())
-                        .clicked()
-                    {
-                        super::show_in_folder(path);
-                    }
-                } else if let Some(problem) = &problem {
-                    ui.add(
-                        egui::Label::new(RichText::new(problem).size(12.5).color(palette.danger))
-                            .truncate(),
-                    );
+        if let Some((path, summary)) = saved {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let words = format!("Saved {name}");
+            let summary = summary.join("\n");
+            match Note::new(&icons::CIRCLE_CHECK, palette.success, &words)
+                .hover(&summary)
+                .actions(&["Play it", "Show in folder"])
+                .closable()
+                .show(ui, palette, area, top)
+            {
+                NotePress::Action(0) => {
+                    self.close_trimmer();
+                    self.open(&ctx, &path);
+                    return;
                 }
-            },
-        );
-        if saving.is_none() {
-            ui.scope_builder(
-                UiBuilder::new()
-                    .max_rect(inner)
-                    .layout(Layout::right_to_left(Align::Center)),
-                |ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    edit = ui
-                        .add(
-                            ActionButton::new(palette, Kind::Secondary, "Edit in BareClip")
-                                .icon(icons::CLAPPERBOARD)
-                                .small(),
-                        )
-                        .on_hover_text("Send the clip as trimmed to the editor")
-                        .clicked();
-                    save_as = ui
-                        .add(ActionButton::new(palette, Kind::Secondary, "Save…").small())
-                        .on_hover_text("Choose where to save the trimmed clip")
-                        .clicked();
-                    copy = ui
-                        .add(ActionButton::new(palette, Kind::Primary, "Save as copy").small())
-                        .on_hover_text("Save the trimmed clip beside the original")
-                        .clicked();
-                    leave = ui
-                        .add(ActionButton::new(palette, Kind::Secondary, "Cancel").small())
-                        .on_hover_text("Leave the trimmer (Escape)")
-                        .clicked();
-                },
-            );
-        }
-        if cancel_save
-            && let Some(saving) = self
-                .trim
-                .as_ref()
-                .and_then(|trimmer| trimmer.saving.as_ref())
-        {
-            saving.cancel.store(true, Ordering::Relaxed);
-        }
-        if leave {
-            self.close_trimmer();
-        }
-        if copy {
-            self.save_trim(&ctx, None);
-        }
-        if save_as {
-            self.save_trim_as(&ctx);
-        }
-        if edit {
-            self.edit_in_bareclip();
-        }
-        if let Some(path) = play_saved {
-            self.close_trimmer();
-            self.open(&ctx, &path);
-        }
-    }
-
-    /// Asks before Save… makes an MP4 of a kind of video that can't be kept.
-    pub(super) fn mp4_question(&mut self, ctx: &egui::Context, palette: &Palette) {
-        if !self.trim.as_ref().is_some_and(|trimmer| trimmer.asking_mp4) {
-            return;
-        }
-        let mut go_on = false;
-        let mut cancel = false;
-        egui::Modal::new(egui::Id::unique("viewer_mp4_question"))
-            .frame(crate::editor::dialog_frame(ctx))
-            .show(ctx, |ui| {
-                ui.set_width(440.0);
-                components::dialog_title(ui, &icons::INFO, palette.accent, "This will be an MP4");
-                ui.add_space(10.0);
-                ui.colored_label(
-                    palette.text_muted,
-                    "This kind of video can't be cut by copying, so the trimmed clip is drawn \
-                     again into an MP4.",
-                );
-                ui.add_space(18.0);
-                components::dialog_buttons(ui, |ui| {
-                    go_on = ui
-                        .add(ActionButton::new(palette, Kind::Primary, "Choose where"))
-                        .clicked();
-                    cancel = ui
-                        .add(ActionButton::new(palette, Kind::Secondary, "Cancel"))
-                        .clicked();
-                });
-            });
-        if cancel {
-            if let Some(trimmer) = &mut self.trim {
-                trimmer.asking_mp4 = false;
+                NotePress::Action(_) => super::show_in_folder(&path),
+                NotePress::Close => {
+                    if let Some(trimmer) = &mut self.trim {
+                        trimmer.saved = None;
+                    }
+                }
+                NotePress::Nothing => {}
             }
-        } else if go_on {
-            self.save_trim_as(ctx);
+        }
+        if let Some(problem) = problem
+            && Note::new(&icons::CIRCLE_ALERT, palette.danger, &problem)
+                .closable()
+                .show(ui, palette, area, top)
+                == NotePress::Close
+            && let Some(trimmer) = &mut self.trim
+        {
+            trimmer.problem = None;
         }
     }
 }
 
 impl Viewer {
-    /// Edit in BareClip: sends the whole file, or the clip as trimmed, to the editor used last,
-    /// and pauses. With no editor open, this window becomes the editor.
+    /// Edit in BareClip: sends the whole file to the editor used last, and pauses. With no
+    /// editor open, this window becomes the editor.
     pub fn edit_in_bareclip(&mut self) {
         let Some(file) = &self.file else {
             return;
         };
-        let range = self.trim_range().unwrap_or(TimeRange {
+        let range = TimeRange {
             start: Ticks(0),
             end: file.info.duration,
-        });
+        };
         let clip = crate::handoff::Handed {
             path: file.info.path.clone(),
             range: Some(range),
@@ -846,4 +949,26 @@ impl Viewer {
     pub fn take_become_editor(&mut self) -> Option<crate::handoff::Handed> {
         self.become_editor.take()
     }
+}
+
+/// A start or end time in the pill, in a box of one width so the line beside it never moves.
+fn trim_time(ui: &mut egui::Ui, palette: &Palette, time: &str, width: f32, align: Align) {
+    let (rect, _) = ui.allocate_exact_size(vec2(width, PILL_HEIGHT), Sense::hover());
+    let (anchor, at) = if align == Align::Max {
+        (Align2::RIGHT_CENTER, rect.right_center())
+    } else {
+        (Align2::LEFT_CENTER, rect.left_center())
+    };
+    ui.painter()
+        .text(at, anchor, time, FontId::proportional(13.0), palette.text);
+}
+
+/// What was chosen in the trimmer's "…".
+#[derive(Clone, Copy, Debug, Default)]
+struct TrimMore {
+    start: bool,
+    end: bool,
+    reset: bool,
+    looping: bool,
+    without_sound: bool,
 }

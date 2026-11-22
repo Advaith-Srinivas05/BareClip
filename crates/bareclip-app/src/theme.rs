@@ -110,6 +110,19 @@ const THEME_CHOICES: [(ThemePreference, Icon, &str); 3] = [
 
 /// How long panels take to slide and menus to fade, kept short so nothing feels slow.
 const ANIMATION_SECONDS: f32 = 0.15;
+/// How long something takes to come into view, such as the player's bars or a flyout, long
+/// enough to be seen moving rather than jumping.
+pub const ENTER_SECONDS: f32 = 0.26;
+/// How long it takes to go, as long as coming, so its way out can be seen too.
+pub const EXIT_SECONDS: f32 = 0.26;
+
+/// How far along something is in coming into view, from 0 (gone) to 1 (fully there). It eases
+/// out on the way in and goes a little quicker. Like Windows' Media Player, it moves whatever
+/// Windows' Animation effects setting says.
+pub fn appear(ctx: &egui::Context, id: egui::Id, shown: bool) -> f32 {
+    let time = if shown { ENTER_SECONDS } else { EXIT_SECONDS };
+    ctx.animate_bool_with_time_and_easing(id, shown, time, egui::emath::easing::cubic_out)
+}
 
 /// The colours of the theme currently showing.
 pub fn palette(ctx: &egui::Context) -> &'static Palette {

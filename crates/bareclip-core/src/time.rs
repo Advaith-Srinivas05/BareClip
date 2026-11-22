@@ -57,6 +57,26 @@ pub fn format_timecode(time: Ticks) -> String {
     }
 }
 
+/// Shows a time as a player's clock does: minutes and seconds, such as `01:24`, or with hours
+/// in front, such as `1:02:03`, when `with_hours`, which [`clock_needs_hours`] says for a
+/// file's length so every time in it is written alike. Rounds down, as [`format_timecode`]
+/// does.
+pub fn format_clock(time: Ticks, with_hours: bool) -> String {
+    let sign = if time.0 < 0 { "-" } else { "" };
+    let seconds = i128::from(time.0).abs() / i128::from(TICKS_PER_SECOND);
+    let (hours, minutes, rest) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    if with_hours {
+        format!("{sign}{hours}:{minutes:02}:{rest:02}")
+    } else {
+        format!("{sign}{:02}:{rest:02}", seconds / 60)
+    }
+}
+
+/// Whether a clock needs hours for a file this long: one an hour or longer.
+pub fn clock_needs_hours(length: Ticks) -> bool {
+    length.0 >= TICKS_PER_SECOND * 3600
+}
+
 fn round_div(numerator: i128, denominator: i128) -> i128 {
     let half = denominator / 2;
     if numerator >= 0 {
@@ -85,6 +105,19 @@ mod tests {
         assert_eq!(format_timecode(Ticks(0)), "0:00.00");
         assert_eq!(format_timecode(Ticks::from_seconds(84.18)), "1:24.18");
         assert_eq!(format_timecode(Ticks::from_seconds(3723.5)), "1:02:03.50");
+    }
+
+    #[test]
+    fn clocks_show_minutes_and_seconds_and_hours_only_when_asked() {
+        assert_eq!(format_clock(Ticks(0), false), "00:00");
+        assert_eq!(format_clock(Ticks::from_seconds(17.9), false), "00:17");
+        assert_eq!(format_clock(Ticks::from_seconds(84.18), false), "01:24");
+        assert_eq!(format_clock(Ticks::from_seconds(3599.99), false), "59:59");
+        assert_eq!(format_clock(Ticks::from_seconds(17.0), true), "0:00:17");
+        assert_eq!(format_clock(Ticks::from_seconds(3723.5), true), "1:02:03");
+        assert_eq!(format_clock(Ticks::from_seconds(-1.5), false), "-00:01");
+        assert!(!clock_needs_hours(Ticks::from_seconds(3599.99)));
+        assert!(clock_needs_hours(Ticks::from_seconds(3600.0)));
     }
 
     #[test]

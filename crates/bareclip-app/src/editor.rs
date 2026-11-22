@@ -133,14 +133,9 @@ const PROJECT_NAME_WIDTH: f32 = 220.0;
 const SETTINGS_ROW_GAP: f32 = 14.0;
 /// The buttons that skip 5 seconds: an arrow arching over the number, each with room to be read.
 const SKIP_ARROW_SIZE: f32 = 22.0;
-const SKIP_ARROW_RAISE: f32 = 6.0;
+const SKIP_ARROW_RAISE: f32 = 5.0;
 const SKIP_NUMBER_SIZE: f32 = 12.0;
 const SKIP_NUMBER_DROP: f32 = 7.0;
-/// The whole Settings dialog: its tabs down the left, a line, and the open tab's page beside them.
-const SETTINGS_WIDTH: f32 = 626.0;
-const SETTINGS_TABS_WIDTH: f32 = 124.0;
-/// The room either side of the line between the tabs and the page.
-const SETTINGS_TABS_GAP: f32 = 14.0;
 /// As tall as the tallest tab's page, so the dialog keeps its size when tabs are switched.
 const SETTINGS_PAGE_HEIGHT: f32 = 450.0;
 const SETTINGS_CHOICE_WIDTH: f32 = 96.0;
@@ -3776,65 +3771,29 @@ impl Editor {
             .show(ctx, |ui| {
                 let room = dialog_room(ctx);
                 dialog_scroll(ui, |ui| {
-                    ui.set_width(SETTINGS_WIDTH.min(room.x));
+                    ui.set_width(components::SETTINGS_WIDTH.min(room.x));
                     components::dialog_title(ui, &icons::SETTINGS, palette.accent, "Settings");
                     ui.add_space(SETTINGS_ROW_GAP);
-                    ui.horizontal_top(|ui| {
-                        ui.spacing_mut().item_spacing.x = 0.0;
-                        ui.allocate_ui_with_layout(
-                            vec2(SETTINGS_TABS_WIDTH, SETTINGS_PAGE_HEIGHT),
-                            Layout::top_down(Align::Min),
-                            |ui| {
-                                ui.set_width(SETTINGS_TABS_WIDTH);
-                                ui.spacing_mut().item_spacing.y = 2.0;
-                                for (tab, icon, label, name) in SettingsTab::ALL {
-                                    let chosen = self.settings_tab == tab;
-                                    let side_tab = components::SideTab::new(
-                                        palette,
-                                        icon,
-                                        (label, name),
-                                        chosen,
-                                    );
-                                    if ui.add(side_tab).clicked() {
-                                        self.settings_tab = tab;
-                                    }
-                                }
-                            },
-                        );
-                        // A line down between the tabs and the page, so they read as apart.
-                        ui.add_space(SETTINGS_TABS_GAP);
-                        let (line, _) = ui.allocate_exact_size(
-                            vec2(1.0, SETTINGS_PAGE_HEIGHT),
-                            egui::Sense::hover(),
-                        );
-                        ui.painter().vline(
-                            line.center().x,
-                            line.y_range(),
-                            egui::Stroke::new(1.0, palette.border),
-                        );
-                        ui.add_space(SETTINGS_TABS_GAP);
-                        let page_width = ui.available_width();
-                        ui.allocate_ui_with_layout(
-                            vec2(page_width, SETTINGS_PAGE_HEIGHT),
-                            Layout::top_down(Align::Min),
-                            |ui| {
-                                ui.set_width(page_width);
-                                ui.set_min_height(SETTINGS_PAGE_HEIGHT);
-                                match self.settings_tab {
-                                    SettingsTab::General => {
-                                        let (page_changed, page_strip) =
-                                            self.general_settings(ui, palette);
-                                        changed |= page_changed;
-                                        strip_changed |= page_strip;
-                                    }
-                                    SettingsTab::Recording => {
-                                        changed |= self.recording_settings(ui, palette);
-                                    }
-                                    SettingsTab::Keybinds => self.keybind_settings(ui, palette),
-                                }
-                            },
-                        );
-                    });
+                    let mut open = self.settings_tab;
+                    components::settings_tabs(
+                        ui,
+                        palette,
+                        &SettingsTab::ALL,
+                        &mut open,
+                        SETTINGS_PAGE_HEIGHT,
+                        |ui, tab| match tab {
+                            SettingsTab::General => {
+                                let (page_changed, page_strip) = self.general_settings(ui, palette);
+                                changed |= page_changed;
+                                strip_changed |= page_strip;
+                            }
+                            SettingsTab::Recording => {
+                                changed |= self.recording_settings(ui, palette);
+                            }
+                            SettingsTab::Keybinds => self.keybind_settings(ui, palette),
+                        },
+                    );
+                    self.settings_tab = open;
                     ui.add_space(12.0);
                     // The version sits at the bottom left whichever tab is open, level with Done.
                     components::dialog_footer(ui, palette, &text::version_line(), |ui| {
@@ -6422,14 +6381,14 @@ fn panel_card(fill: Color32, inner: Margin) -> Frame {
 
 /// How much of the window a dialog's contents can take, leaving its frame and a margin clear,
 /// so a long one scrolls in a small window instead of running off it.
-fn dialog_room(ctx: &egui::Context) -> egui::Vec2 {
+pub(crate) fn dialog_room(ctx: &egui::Context) -> egui::Vec2 {
     let around = 2.0 * (20.0 + DIALOG_WINDOW_MARGIN);
     (ctx.content_rect().size() - vec2(around, around)).max(vec2(200.0, 120.0))
 }
 
 /// Lets a dialog's contents scroll when the window is too short for them. Its height comes from
 /// the window, not from where the dialog sat last frame, so a dialog never shrinks itself.
-fn dialog_scroll<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+pub(crate) fn dialog_scroll<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let room = dialog_room(ui.ctx());
     egui::ScrollArea::vertical()
         .max_height(room.y)
@@ -6446,7 +6405,7 @@ pub(crate) fn dialog_frame(ctx: &egui::Context) -> Frame {
 }
 
 /// The ordinary, secondary button of a dialog.
-fn dialog_button<'a>(palette: &'a Palette, label: &'a str) -> ActionButton<'a> {
+pub(crate) fn dialog_button<'a>(palette: &'a Palette, label: &'a str) -> ActionButton<'a> {
     ActionButton::new(palette, Kind::Secondary, label).width(DIALOG_BUTTON_WIDTH)
 }
 
@@ -6557,7 +6516,8 @@ fn skip_button(
 ) -> egui::Response {
     let arrow = IconButton::new(palette, Kind::Ghost, icon, name)
         .size(32.0, SKIP_ARROW_SIZE)
-        .icon_raised(SKIP_ARROW_RAISE);
+        .icon_raised(SKIP_ARROW_RAISE)
+        .icon_squashed(components::SKIP_ARCH);
     let button = ui.add_enabled(enabled, arrow).on_hover_text(hint);
     let color = if enabled {
         palette.text
@@ -6675,15 +6635,17 @@ fn resize_cursor(direction: egui::ResizeDirection) -> egui::CursorIcon {
 
 /// With no Windows title bar the app resizes its own window from its edges.
 pub(crate) fn window_edges(ctx: &egui::Context) {
-    let (maximized, pointer, pressed, busy) = ctx.input(|input| {
+    // A maximised or full-screen window has no edges to pull.
+    let (filling, pointer, pressed, busy) = ctx.input(|input| {
         (
-            input.viewport().maximized.unwrap_or(false),
+            input.viewport().maximized.unwrap_or(false)
+                || input.viewport().fullscreen.unwrap_or(false),
             input.pointer.latest_pos(),
             input.pointer.primary_pressed(),
             input.pointer.any_down(),
         )
     });
-    let Some(pointer) = pointer.filter(|_| !maximized) else {
+    let Some(pointer) = pointer.filter(|_| !filling) else {
         return;
     };
     let Some(direction) = resize_direction(ctx.content_rect(), pointer) else {

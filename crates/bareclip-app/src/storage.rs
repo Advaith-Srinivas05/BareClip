@@ -198,12 +198,22 @@ impl From<bareclip_capture::CameraMode> for CameraModeChoice {
     }
 }
 
-/// The fewest and most seconds the player's arrow keys can jump.
-pub const SEEK_SECONDS_RANGE: std::ops::RangeInclusive<u32> = 1..=60;
+/// How far, in seconds, the player's jumps can be set to go.
+pub const JUMP_CHOICES: [u32; 5] = [5, 10, 15, 20, 30];
+/// How far each jump goes until it is set.
+const DEFAULT_JUMP: u32 = 5;
+
+/// The jump choice nearest to `seconds`, the shorter of two as near.
+pub fn nearest_jump(seconds: u32) -> u32 {
+    JUMP_CHOICES
+        .into_iter()
+        .min_by_key(|choice| choice.abs_diff(seconds))
+        .unwrap_or(DEFAULT_JUMP)
+}
 
 /// The player's choices.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(from = "StoredViewer")]
 pub struct ViewerSettings {
     /// Where the player was when it last closed, apart from the editor's window.
     pub window: Option<WindowPlace>,
@@ -212,10 +222,63 @@ pub struct ViewerSettings {
     /// How loud the player plays, out of 100.
     pub volume: u32,
     pub muted: bool,
-    /// How far Left and Right jump, in seconds.
-    pub seek_seconds: u32,
+    /// How far Jump back and Left go, and Jump forward and Right, in seconds: one of
+    /// [`JUMP_CHOICES`].
+    pub jump_back: u32,
+    pub jump_forward: u32,
     /// Whether a file picks up where it was last stopped.
     pub resume: bool,
+}
+
+/// The player's choices as a file has them. Before the two jumps were set apart, one
+/// `seek_seconds` of 1 to 60 set both, so a file with only that gets both from it, at the
+/// nearest choice. Anything else not on offer goes to the nearest choice too.
+#[derive(Deserialize)]
+#[serde(default)]
+struct StoredViewer {
+    window: Option<WindowPlace>,
+    mini_window: Option<WindowPlace>,
+    volume: u32,
+    muted: bool,
+    seek_seconds: Option<u32>,
+    jump_back: Option<u32>,
+    jump_forward: Option<u32>,
+    resume: bool,
+}
+
+impl Default for StoredViewer {
+    fn default() -> Self {
+        let viewer = ViewerSettings::default();
+        Self {
+            window: viewer.window,
+            mini_window: viewer.mini_window,
+            volume: viewer.volume,
+            muted: viewer.muted,
+            seek_seconds: None,
+            jump_back: None,
+            jump_forward: None,
+            resume: viewer.resume,
+        }
+    }
+}
+
+impl From<StoredViewer> for ViewerSettings {
+    fn from(stored: StoredViewer) -> Self {
+        let jump = |chosen: Option<u32>| {
+            chosen
+                .or(stored.seek_seconds)
+                .map_or(DEFAULT_JUMP, nearest_jump)
+        };
+        Self {
+            window: stored.window,
+            mini_window: stored.mini_window,
+            volume: stored.volume,
+            muted: stored.muted,
+            jump_back: jump(stored.jump_back),
+            jump_forward: jump(stored.jump_forward),
+            resume: stored.resume,
+        }
+    }
 }
 
 impl Default for ViewerSettings {
@@ -225,17 +288,21 @@ impl Default for ViewerSettings {
             mini_window: None,
             volume: 100,
             muted: false,
-            seek_seconds: 5,
+            jump_back: DEFAULT_JUMP,
+            jump_forward: DEFAULT_JUMP,
             resume: true,
         }
     }
 }
 
 impl ViewerSettings {
-    /// The seek step, kept within what Settings offers, whatever the file says.
-    pub fn seek_step(&self) -> u32 {
-        self.seek_seconds
-            .clamp(*SEEK_SECONDS_RANGE.start(), *SEEK_SECONDS_RANGE.end())
+    /// How far a jump back or forward goes, in seconds.
+    pub fn jump(&self, forward: bool) -> u32 {
+        if forward {
+            self.jump_forward
+        } else {
+            self.jump_back
+        }
     }
 
     /// The volume as a share of full, kept to at most full.
@@ -661,7 +728,8 @@ mod tests {
             window: Some(place),
             volume: 40,
             muted: true,
-            seek_seconds: 12,
+            jump_back: 10,
+            jump_forward: 30,
             ..ViewerSettings::default()
         };
         Settings::save_from_viewer(&folder, &viewer, ThemeSetting::Dark).unwrap();
@@ -686,14 +754,10 @@ mod tests {
     }
 
     #[test]
-    fn the_seek_step_and_volume_stay_within_what_settings_offer() {
+    fn the_jumps_and_volume_stay_within_what_settings_offer() {
         let mut viewer = ViewerSettings::default();
-        assert_eq!(viewer.seek_step(), 5);
+        assert_eq!((viewer.jump(false), viewer.jump(true)), (5, 5));
         assert_eq!(viewer.loudness(), 1.0);
-        viewer.seek_seconds = 0;
-        assert_eq!(viewer.seek_step(), 1);
-        viewer.seek_seconds = 600;
-        assert_eq!(viewer.seek_step(), 60);
         viewer.volume = 250;
         assert_eq!(viewer.loudness(), 1.0);
         viewer.volume = 30;
@@ -714,8 +778,43 @@ mod tests {
         )
         .unwrap();
         let viewer = Settings::load(&folder).viewer;
-        assert_eq!(viewer.seek_step(), 9);
+        assert_eq!(
+            (viewer.jump(false), viewer.jump(true)),
+            (10, 10),
+            "the one jump of before sets both, at the nearest choice"
+        );
         assert_eq!(viewer.volume, 100, "what's missing takes its default");
+        fs::write(
+            folder.join(SETTINGS_FILE),
+            r#"{"viewer": {"seek_seconds": 9, "jump_back": 60, "jump_forward": 12}}"#,
+        )
+        .unwrap();
+        let viewer = Settings::load(&folder).viewer;
+        assert_eq!(
+            (viewer.jump(false), viewer.jump(true)),
+            (30, 10),
+            "set jumps win, and go to the nearest choice"
+        );
+    }
+
+    #[test]
+    fn a_jump_goes_to_the_nearest_choice_the_shorter_of_two_as_near() {
+        for (seconds, nearest) in [
+            (0, 5),
+            (1, 5),
+            (7, 5),
+            (8, 10),
+            (12, 10),
+            (13, 15),
+            (25, 20),
+            (26, 30),
+            (600, 30),
+        ] {
+            assert_eq!(nearest_jump(seconds), nearest, "{seconds}");
+        }
+        for choice in JUMP_CHOICES {
+            assert_eq!(nearest_jump(choice), choice);
+        }
     }
 
     #[test]
@@ -784,7 +883,8 @@ mod tests {
             viewer: ViewerSettings {
                 volume: 35,
                 muted: true,
-                seek_seconds: 10,
+                jump_back: 15,
+                jump_forward: 20,
                 resume: false,
                 ..ViewerSettings::default()
             },

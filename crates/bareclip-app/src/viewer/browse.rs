@@ -8,12 +8,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bareclip_core::time::{Ticks, format_timecode};
-use eframe::egui::{self, Align, Layout, Rect, RichText, UiBuilder, pos2, vec2};
+use bareclip_core::time::Ticks;
+use eframe::egui::{self, Rect, pos2, vec2};
 
-use super::Viewer;
+use super::{
+    Viewer,
+    note::{Note, NotePress},
+};
 use crate::{
-    components::{ActionButton, IconButton, Kind},
+    components::{IconButton, Kind},
     folder_files, icons,
     theme::Palette,
 };
@@ -179,7 +182,13 @@ impl Viewer {
     }
 
     /// Says where a file picked up, with Start over, for a few seconds.
-    pub(super) fn start_over_note(&mut self, ui: &mut egui::Ui, palette: &Palette, area: Rect) {
+    pub(super) fn start_over_note(
+        &mut self,
+        ui: &mut egui::Ui,
+        palette: &Palette,
+        area: Rect,
+        top: &mut f32,
+    ) {
         let Some((at, since)) = self.resumed else {
             return;
         };
@@ -189,33 +198,11 @@ impl Viewer {
         }
         ui.ctx()
             .request_repaint_after(START_OVER_FOR - since.elapsed());
-        let rect = Rect::from_min_size(
-            pos2(area.left() + 16.0, area.bottom() - 16.0 - 40.0),
-            vec2(260.0, 40.0),
-        );
-        ui.painter().rect_filled(rect, 8.0, palette.raised);
-        let mut start_over = false;
-        ui.scope_builder(
-            UiBuilder::new()
-                .max_rect(rect.shrink2(vec2(12.0, 0.0)))
-                .layout(Layout::left_to_right(Align::Center)),
-            |ui| {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(format!("Picked up at {}", format_timecode(at)))
-                            .size(13.0)
-                            .color(palette.text),
-                    )
-                    .selectable(false),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    start_over = ui
-                        .add(ActionButton::new(palette, Kind::Secondary, "Start over").small())
-                        .clicked();
-                });
-            },
-        );
-        if start_over {
+        let words = format!("Picked up at {}", self.clock(at));
+        if let NotePress::Action(_) = Note::new(&icons::CLOCK, palette.text_muted, &words)
+            .actions(&["Start over"])
+            .show(ui, palette, area, top)
+        {
             self.start_over();
         }
     }

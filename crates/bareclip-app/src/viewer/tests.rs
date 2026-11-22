@@ -128,6 +128,18 @@ fn click_named(ctx: &egui::Context, viewer: &mut Viewer, name: &str) {
     click_at(ctx, viewer, rect.center());
 }
 
+/// Somewhere on the picture, away from the bars, the pill and their flyouts.
+const ON_THE_PICTURE: egui::Pos2 = egui::pos2(300.0, 300.0);
+
+/// Brings the mouse from the picture to rest on a button long enough for its flyout to open.
+fn rest_on(ctx: &egui::Context, viewer: &mut Viewer, name: &str) {
+    let rect = named_rect(ctx, viewer, name);
+    frame(ctx, viewer, vec![egui::Event::PointerMoved(ON_THE_PICTURE)]);
+    frame(ctx, viewer, vec![egui::Event::PointerMoved(rect.center())]);
+    viewer.flyout.rest_is_up();
+    frame(ctx, viewer, vec![]);
+}
+
 fn seconds(value: f64) -> Ticks {
     Ticks::from_seconds(value)
 }
@@ -158,7 +170,7 @@ fn a_video_opens_playing_and_shows_its_name_and_details() {
     );
     let details = file_details(viewer.file.as_ref().unwrap());
     assert_eq!(details[0], "MP4");
-    assert_eq!(details[1], "320 x 180");
+    assert_eq!(details[1], "320 \u{d7} 180");
     wait_for(&ctx, &mut viewer, "a picture", |viewer| {
         viewer.picture.is_some()
     });
@@ -213,19 +225,21 @@ fn space_k_and_a_click_on_the_picture_play_and_pause() {
 }
 
 #[test]
-fn the_arrows_jump_by_the_seek_step_and_home_and_end_go_to_the_ends() {
+fn the_arrows_jump_back_and_forward_each_by_its_own_amount_and_home_and_end_go_to_the_ends() {
     let ctx = context();
-    let mut viewer = opened(&ctx, video());
-    viewer.set_seek_step(1);
+    let mut viewer = opened(&ctx, long_video());
+    viewer.set_jump(false, 5);
+    viewer.set_jump(true, 10);
 
     frame(&ctx, &mut viewer, press(Key::ArrowRight));
-    assert!(near(viewer.position(), seconds(1.0), 0.01));
+    assert!(near(viewer.position(), seconds(10.0), 0.01));
     frame(&ctx, &mut viewer, press(Key::ArrowRight));
-    assert!(near(viewer.position(), seconds(2.0), 0.01));
+    assert!(near(viewer.position(), seconds(20.0), 0.01));
     frame(&ctx, &mut viewer, press(Key::ArrowLeft));
-    assert!(near(viewer.position(), seconds(1.0), 0.01));
-    frame(&ctx, &mut viewer, press(Key::ArrowLeft));
-    frame(&ctx, &mut viewer, press(Key::ArrowLeft));
+    assert!(near(viewer.position(), seconds(15.0), 0.01), "back goes 5");
+    for _ in 0..4 {
+        frame(&ctx, &mut viewer, press(Key::ArrowLeft));
+    }
     assert_eq!(viewer.position(), Ticks(0), "it stops at the start");
 
     frame(&ctx, &mut viewer, press(Key::End));
@@ -237,13 +251,6 @@ fn the_arrows_jump_by_the_seek_step_and_home_and_end_go_to_the_ends() {
     );
     frame(&ctx, &mut viewer, press(Key::Home));
     assert_eq!(viewer.position(), Ticks(0));
-
-    viewer.set_seek_step(5);
-    frame(&ctx, &mut viewer, press(Key::ArrowRight));
-    assert!(
-        near(viewer.position(), viewer.duration(), 0.001),
-        "5 s is past 4"
-    );
 }
 
 #[test]
@@ -344,20 +351,25 @@ fn every_speed_sets_the_clip_and_the_playhead_keeps_to_it() {
 }
 
 #[test]
-fn the_speed_menu_shows_the_speed_on_its_button_and_is_never_saved() {
+fn the_speed_menu_closes_on_a_choice_and_the_speed_is_never_saved() {
     let ctx = context();
     let folder = temporary_folder("speed");
     let mut viewer = Viewer::new(&ctx, false);
     viewer.use_storage(&ctx, folder.clone());
     viewer.open(&ctx, video());
 
-    click_named(&ctx, &mut viewer, "1x");
+    rest_on(&ctx, &mut viewer, "Watching speed");
+    assert_eq!(viewer.flyout.open, Some(bars::Flyout::Speed));
+    settle(&ctx, &mut viewer);
     click_named(&ctx, &mut viewer, "1.5x");
     assert_eq!(viewer.speed(), 1.5);
+    assert_eq!(viewer.flyout.open, None, "choosing a speed closes the menu");
+    settle(&ctx, &mut viewer);
     assert!(
-        named(&ctx, &mut viewer)
+        !named(&ctx, &mut viewer)
             .iter()
-            .any(|(label, ..)| label == "1.5x")
+            .any(|(label, ..)| label == "1.5x"),
+        "and it fades away"
     );
 
     viewer.closing(None);
@@ -399,51 +411,151 @@ fn loop_starts_again_at_the_end_and_without_it_playback_rests_on_the_last_pictur
     assert!(went_round, "it started again from the start");
 }
 
+/// Says the mouse last moved this long ago, and a little more.
+fn rest_for(viewer: &mut Viewer, linger: Duration) {
+    viewer.last_pointer_move = Instant::now() - linger - Duration::from_millis(10);
+}
+
 #[test]
-fn f_and_escape_go_in_and_out_of_full_screen_where_the_bars_hide_when_the_mouse_rests() {
+fn the_pill_goes_when_the_mouse_rests_a_little_later_while_paused_and_moving_brings_it_back() {
     let ctx = context();
     let mut viewer = opened(&ctx, video());
-    frame(&ctx, &mut viewer, press(Key::F));
-    assert!(viewer.is_full_screen());
-    assert!(viewer.bars_shown(&ctx), "the bars show at first");
-    viewer.last_pointer_move = Instant::now() - BARS_LINGER - Duration::from_millis(10);
-    assert!(!viewer.bars_shown(&ctx), "and hide once the mouse rests");
+    rest_for(&mut viewer, PILL_LINGER);
+    assert!(viewer.pill_shown(&ctx), "paused, it waits a little longer");
+    rest_for(&mut viewer, PILL_LINGER_PAUSED);
+    assert!(!viewer.pill_shown(&ctx), "but goes in the end");
     frame(
         &ctx,
         &mut viewer,
         vec![egui::Event::PointerMoved(pos2(300.0, 300.0))],
     );
-    assert!(viewer.bars_shown(&ctx), "moving it brings them back");
+    assert!(viewer.pill_shown(&ctx), "any movement brings it back");
 
-    frame(&ctx, &mut viewer, press(Key::Escape));
-    assert!(!viewer.is_full_screen());
-    viewer.last_pointer_move = Instant::now() - BARS_LINGER - Duration::from_millis(10);
-    assert!(viewer.bars_shown(&ctx), "in a window they always show");
+    viewer.play();
+    rest_for(&mut viewer, PILL_LINGER);
+    assert!(!viewer.pill_shown(&ctx), "playing, it goes sooner");
+    settle(&ctx, &mut viewer);
+    let shown = named(&ctx, &mut viewer);
+    assert!(
+        !shown.iter().any(|(label, ..)| label == "Pause"),
+        "a hidden pill holds no buttons"
+    );
+    assert!(
+        shown.iter().any(|(label, ..)| label == "Mini view"),
+        "the bars stay in a window"
+    );
 }
 
 #[test]
-fn the_seek_step_is_saved_kept_within_1_to_60_and_used_by_the_arrows() {
+fn the_pill_stays_while_held_or_under_the_mouse() {
     let ctx = context();
-    let folder = temporary_folder("seek-step");
+    let mut viewer = opened(&ctx, video());
+    viewer.play();
+    viewer.last_pointer_move = Instant::now();
+    let on_pill = named_rect(&ctx, &mut viewer, "Loop");
+    frame(
+        &ctx,
+        &mut viewer,
+        vec![egui::Event::PointerMoved(on_pill.center())],
+    );
+    rest_for(&mut viewer, PILL_LINGER);
+    assert!(viewer.pill_shown(&ctx), "the mouse resting on it keeps it");
+    let middle = viewer.view.center();
+    frame(&ctx, &mut viewer, vec![egui::Event::PointerMoved(middle)]);
+    rest_for(&mut viewer, PILL_LINGER);
+    assert!(
+        !viewer.pill_shown(&ctx),
+        "resting on the picture lets it go"
+    );
+    viewer.seek_bar_held = true;
+    assert!(viewer.pill_shown(&ctx), "a held seek line keeps it");
+    viewer.seek_bar_held = false;
+    viewer.settings_open = true;
+    assert!(viewer.pill_shown(&ctx), "so does Settings");
+}
+
+#[test]
+fn in_full_screen_the_bars_come_over_the_picture_only_while_the_mouse_is_over_them() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    let screen = screen_camera::screen();
+    let shown = |ctx: &egui::Context, viewer: &mut Viewer, name: &str| {
+        named(ctx, viewer).iter().any(|(label, ..)| label == name)
+    };
+    settle(&ctx, &mut viewer);
+    assert_eq!(
+        viewer.view.top(),
+        bars::TITLE_HEIGHT,
+        "in a window, under the top bar"
+    );
+    assert_eq!(viewer.view.bottom(), screen.bottom() - bars::BOTTOM_HEIGHT);
+
+    frame(&ctx, &mut viewer, press(Key::F));
+    let middle = screen.center();
+    frame(&ctx, &mut viewer, vec![egui::Event::PointerMoved(middle)]);
+    settle(&ctx, &mut viewer);
+    assert_eq!(viewer.view, screen, "the picture fills the screen");
+    assert!(!shown(&ctx, &mut viewer, "Settings"), "the top bar is away");
+    assert!(!shown(&ctx, &mut viewer, "Mini view"), "and the bottom one");
+
+    frame(
+        &ctx,
+        &mut viewer,
+        vec![egui::Event::PointerMoved(pos2(300.0, 10.0))],
+    );
+    settle(&ctx, &mut viewer);
+    assert!(shown(&ctx, &mut viewer, "Settings"), "the top bar comes in");
+    assert_eq!(viewer.view, screen, "over the picture, not pushing it");
+    frame(&ctx, &mut viewer, vec![egui::Event::PointerMoved(middle)]);
+    settle(&ctx, &mut viewer);
+    assert!(
+        !shown(&ctx, &mut viewer, "Settings"),
+        "and goes once the mouse leaves it"
+    );
+
+    let low = pos2(300.0, screen.bottom() - 10.0);
+    frame(&ctx, &mut viewer, vec![egui::Event::PointerMoved(low)]);
+    settle(&ctx, &mut viewer);
+    let nodes = named(&ctx, &mut viewer);
+    assert!(nodes.iter().any(|(label, ..)| label == "Mini view"));
+    assert!(
+        rect_of(&nodes, "Play").bottom() <= screen.bottom() - bars::BOTTOM_HEIGHT,
+        "the pill rises above the bottom bar"
+    );
+
+    frame(&ctx, &mut viewer, press(Key::Escape));
+    assert!(!viewer.is_full_screen());
+}
+
+#[test]
+fn the_jumps_start_at_5_s_are_saved_kept_to_the_choices_and_used_by_the_arrows() {
+    let ctx = context();
+    let folder = temporary_folder("jumps");
     let mut viewer = Viewer::new(&ctx, false);
     viewer.use_storage(&ctx, folder.clone());
-    assert_eq!(viewer.seek_step(), 5);
+    assert_eq!((viewer.jump(false), viewer.jump(true)), (5, 5));
 
-    viewer.set_seek_step(0);
-    assert_eq!(viewer.seek_step(), 1);
-    viewer.set_seek_step(90);
-    assert_eq!(viewer.seek_step(), 60);
-    viewer.set_seek_step(2);
-    assert_eq!(Settings::load(&folder).viewer.seek_seconds, 2);
+    viewer.set_jump(false, 0);
+    assert_eq!(viewer.jump(false), 5);
+    viewer.set_jump(true, 90);
+    assert_eq!(viewer.jump(true), 30);
+    viewer.set_jump(false, 12);
+    assert_eq!(
+        viewer.jump(false),
+        10,
+        "between choices it takes the nearest"
+    );
+    let saved = Settings::load(&folder).viewer;
+    assert_eq!((saved.jump_back, saved.jump_forward), (10, 30));
 
     let mut again = Viewer::new(&ctx, false);
     again.use_storage(&ctx, folder);
-    assert_eq!(again.seek_step(), 2);
-    again.open(&ctx, video());
+    assert_eq!((again.jump(false), again.jump(true)), (10, 30));
+    again.open(&ctx, long_video());
     again.pause();
-    again.seek(Ticks(0));
-    frame(&ctx, &mut again, press(Key::ArrowRight));
-    assert!(near(again.position(), seconds(2.0), 0.01));
+    again.seek(seconds(25.0));
+    frame(&ctx, &mut again, press(Key::ArrowLeft));
+    assert!(near(again.position(), seconds(15.0), 0.01));
 }
 
 #[test]
@@ -644,7 +756,8 @@ fn the_wheel_zooms_toward_the_pointer_and_a_double_click_or_0_fits() {
     frame(&ctx, &mut viewer, vec![]);
     let fit = viewer.zoom_percent(&ctx);
     let view = viewer.view;
-    let corner = view.min + vec2(40.0, 40.0);
+    // On the picture, clear of the bars that float over its edges.
+    let corner = view.center() - vec2(200.0, 120.0);
 
     frame(&ctx, &mut viewer, wheel(corner, 1.0));
     assert!(
@@ -785,12 +898,613 @@ fn a_song_has_no_save_picture_or_zoom() {
     let ctx = context();
     let mut viewer = opened(&ctx, &make_song("no-zoom", false));
     let nodes = named(&ctx, &mut viewer);
-    for name in ["Save picture", "Zoom in", "Zoom out", "Fit"] {
+    for name in ["Save picture", "Zoom"] {
         assert!(
             !nodes.iter().any(|(label, _, off)| label == name && !off),
             "{name} is hidden"
         );
     }
+}
+
+/// The rectangle of the control with this name.
+fn rect_of(nodes: &[(String, Rect, bool)], name: &str) -> Rect {
+    nodes
+        .iter()
+        .find(|(label, ..)| label == name)
+        .unwrap_or_else(|| panic!("nothing is named {name}"))
+        .1
+}
+
+#[test]
+fn the_pill_is_56_percent_of_the_pictures_width_and_sits_just_above_the_status_bar() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    settle(&ctx, &mut viewer);
+    let check = |viewer: &Viewer| {
+        let (pill, view) = (viewer.pill_at, viewer.view);
+        assert!(
+            (pill.width() - view.width() * pill::PILL_SHARE).abs() < 1.0,
+            "{} wide for a picture {} wide",
+            pill.width(),
+            view.width()
+        );
+        assert!((pill.center().x - view.center().x).abs() < 1.0, "centred");
+        assert_eq!(pill.height(), pill::PILL_HEIGHT);
+        assert!((view.bottom() - pill.bottom() - pill::PILL_GAP).abs() < 0.5);
+    };
+    check(&viewer);
+
+    // Nothing in it moves when the speed changes.
+    let before = named(&ctx, &mut viewer);
+    viewer.set_speed(0);
+    let after = named(&ctx, &mut viewer);
+    for name in [
+        "Play",
+        "Jump back",
+        "Jump forward",
+        "Volume",
+        "Seek",
+        "Loop",
+    ] {
+        assert_eq!(
+            rect_of(&before, name),
+            rect_of(&after, name),
+            "{name} stayed put at 0.25x"
+        );
+    }
+
+    // With Info open it takes the same share of the narrower picture.
+    viewer.toggle_info();
+    settle(&ctx, &mut viewer);
+    check(&viewer);
+}
+
+#[test]
+fn the_pill_reads_play_back_forward_volume_seek_loop_save_picture_and_the_bar_the_rest() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    let nodes = named(&ctx, &mut viewer);
+    let left_of = |name: &str| rect_of(&nodes, name).left();
+    let in_order = |names: &[&str]| {
+        names
+            .windows(2)
+            .all(|pair| left_of(pair[0]) < left_of(pair[1]))
+    };
+    let pill = viewer.pill_at;
+    let on_pill = [
+        "Play",
+        "Jump back",
+        "Jump forward",
+        "Volume",
+        "Seek",
+        "Loop",
+        "Save picture",
+    ];
+    assert!(in_order(&on_pill), "the pill runs in order");
+    for name in on_pill {
+        assert!(
+            pill.contains(rect_of(&nodes, name).center()),
+            "{name} is on it"
+        );
+    }
+    let bar_top = screen_camera::screen().bottom() - bars::BOTTOM_HEIGHT;
+    let in_bar = ["Zoom", "Watching speed", "Mini view", "Full screen"];
+    assert!(
+        in_order(&in_bar),
+        "the status bar runs zoom, speed, mini view, full screen"
+    );
+    for name in in_bar {
+        assert!(
+            rect_of(&nodes, name).top() >= bar_top,
+            "{name} is in the status bar"
+        );
+    }
+    for gone in ["Go to start", "Go to end", "More options"] {
+        assert!(!nodes.iter().any(|(label, ..)| label == gone), "no {gone}");
+    }
+}
+
+#[test]
+fn a_song_has_no_save_picture_so_loop_ends_its_pill() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, &make_song("pill-end", false));
+    let nodes = named(&ctx, &mut viewer);
+    assert!(!nodes.iter().any(|(label, ..)| label == "Save picture"));
+    let rightmost = nodes
+        .iter()
+        .filter(|(_, rect, _)| viewer.pill_at.contains(rect.center()))
+        .max_by(|a, b| a.1.right().total_cmp(&b.1.right()))
+        .map(|(label, ..)| label.clone());
+    assert_eq!(rightmost.as_deref(), Some("Loop"));
+}
+
+#[test]
+fn a_narrow_pill_puts_the_jumps_loop_and_save_picture_into_more() {
+    screen_camera::SCREEN.set([640, 400]);
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    let nodes = named(&ctx, &mut viewer);
+    let left_of = |name: &str| rect_of(&nodes, name).left();
+    assert!(left_of("Play") < left_of("Volume"));
+    assert!(left_of("Volume") < left_of("Seek"));
+    assert!(left_of("Seek") < left_of("More options"));
+    for put_away in ["Jump back", "Jump forward", "Loop", "Save picture"] {
+        assert!(
+            !nodes.iter().any(|(label, ..)| label == put_away),
+            "{put_away} is put away"
+        );
+    }
+    click_named(&ctx, &mut viewer, "More options");
+    settle(&ctx, &mut viewer);
+    let nodes = named(&ctx, &mut viewer);
+    for name in ["Jump back", "Jump forward", "Loop", "Save picture"] {
+        assert!(
+            nodes.iter().any(|(label, ..)| label == name),
+            "{name} under More"
+        );
+    }
+    click_named(&ctx, &mut viewer, "Loop");
+    assert!(viewer.is_looping(), "Loop works from there");
+    assert!(!viewer.flyout.is_open(), "and the menu closes");
+}
+
+#[test]
+fn notes_stack_without_covering_each_other_and_a_problem_closes() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    viewer.notice =
+        Some("Something went wrong in a way that takes a long sentence to say.".to_owned());
+    viewer.resumed = Some((seconds(83.0), Instant::now()));
+    let nodes = named(&ctx, &mut viewer);
+    let close = rect_of(&nodes, "Close note");
+    let start_over = rect_of(&nodes, "Start over");
+    assert!(
+        start_over.top() > close.bottom() + note::NOTE_GAP,
+        "the second note is below the first"
+    );
+    assert!(
+        close.top() > viewer.view.top(),
+        "notes are over the picture"
+    );
+
+    click_named(&ctx, &mut viewer, "Close note");
+    assert!(viewer.notice.is_none());
+    let start_over_now = named_rect(&ctx, &mut viewer, "Start over");
+    assert!(
+        start_over_now.top() < start_over.top(),
+        "the note left moves up into the room"
+    );
+}
+
+#[test]
+fn a_saved_trim_says_so_over_the_picture_until_closed() {
+    let ctx = context();
+    let folder = folder_of_videos("trim-note", &["Match.mp4"]);
+    let mut viewer = trimmer_on(&ctx, &folder.join("Match.mp4"));
+    let saving = viewer.pretend_saving(0.5);
+    let nodes = named(&ctx, &mut viewer);
+    assert!(
+        nodes.iter().any(|(label, ..)| label == "Cancel saving"),
+        "its progress shows under the strip"
+    );
+    assert!(
+        nodes
+            .iter()
+            .any(|(label, _, off)| label == "Save as copy" && *off),
+        "the save buttons wait while one is under way"
+    );
+    let _ = saving.send(Ok((
+        folder.join("Match (trimmed).mp4"),
+        vec!["Copied it all.".to_owned()],
+    )));
+    frame(&ctx, &mut viewer, vec![]);
+    let nodes = named(&ctx, &mut viewer);
+    let note = rect_of(&nodes, "Play it");
+    assert!(
+        note.bottom() < viewer.view.center().y,
+        "the note is at the top"
+    );
+    assert!(nodes.iter().any(|(label, ..)| label == "Save as copy"));
+
+    click_named(&ctx, &mut viewer, "Close note");
+    assert!(viewer.trim.as_ref().unwrap().saved.is_none());
+    assert!(
+        viewer.is_trimming(),
+        "closing the note leaves the trimmer open"
+    );
+}
+
+#[test]
+fn the_volume_button_mutes_on_a_click_and_opens_its_slider_while_the_mouse_rests_on_it() {
+    assert_eq!(bars::volume_icon(0), icons::VOLUME_X);
+    assert_eq!(bars::volume_icon(20), icons::VOLUME);
+    assert_eq!(bars::volume_icon(50), icons::VOLUME_1);
+    assert_eq!(bars::volume_icon(100), icons::VOLUME_2);
+
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    viewer.set_volume(60);
+    click_named(&ctx, &mut viewer, "Volume");
+    assert!(viewer.is_muted(), "a click mutes");
+    assert_eq!(viewer.flyout.open, None, "and opens nothing");
+    click_named(&ctx, &mut viewer, "Volume");
+    assert!(!viewer.is_muted());
+    assert_eq!(
+        viewer.volume(),
+        60,
+        "a second click brings it back as it was"
+    );
+
+    let closed = named(&ctx, &mut viewer);
+    assert!(!closed.iter().any(|(label, ..)| label == "Volume level"));
+    rest_on(&ctx, &mut viewer, "Volume");
+    assert_eq!(viewer.flyout.open, Some(bars::Flyout::Volume));
+    settle(&ctx, &mut viewer);
+    let open = named(&ctx, &mut viewer);
+    let slider = rect_of(&open, "Volume level");
+    assert!(
+        slider.bottom() < rect_of(&open, "Volume").top(),
+        "the flyout opens above the bar"
+    );
+    click_at(
+        &ctx,
+        &mut viewer,
+        slider.left_center() + vec2(slider.width() * 0.25, 0.0),
+    );
+    assert!(
+        (15..=35).contains(&viewer.volume()),
+        "a click a quarter along sets about a quarter: {}",
+        viewer.volume()
+    );
+    click_named(&ctx, &mut viewer, "Mute");
+    assert!(viewer.is_muted());
+    click_named(&ctx, &mut viewer, "Volume");
+    assert!(!viewer.is_muted(), "the button unmutes with it open");
+    assert_eq!(
+        viewer.flyout.open,
+        Some(bars::Flyout::Volume),
+        "and leaves it open"
+    );
+
+    // Escape closes the flyout, and only the flyout, even in full screen.
+    viewer.full_screen = true;
+    frame(&ctx, &mut viewer, press(Key::Escape));
+    settle(&ctx, &mut viewer);
+    assert!(
+        !named(&ctx, &mut viewer)
+            .iter()
+            .any(|(label, ..)| label == "Volume level")
+    );
+    assert!(
+        viewer.is_full_screen(),
+        "the first Escape only closed the flyout"
+    );
+    viewer.full_screen = false;
+    settle(&ctx, &mut viewer);
+
+    // The wheel over the button turns it up.
+    let before = viewer.volume();
+    let button = named_rect(&ctx, &mut viewer, "Volume");
+    frame(&ctx, &mut viewer, wheel(button.center(), 2.0));
+    assert_eq!(viewer.volume(), (before + 2 * VOLUME_STEP).min(100));
+}
+
+#[test]
+fn the_zoom_flyout_has_a_slider_over_minus_percentage_plus_and_reset() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    frame(&ctx, &mut viewer, vec![]);
+    let fit = viewer.zoom_percent(&ctx);
+    rest_on(&ctx, &mut viewer, "Zoom");
+    settle(&ctx, &mut viewer);
+    let nodes = named(&ctx, &mut viewer);
+    let (slider, minus, plus, reset) = (
+        rect_of(&nodes, "Zoom level"),
+        rect_of(&nodes, "Zoom out"),
+        rect_of(&nodes, "Zoom in"),
+        rect_of(&nodes, "Reset zoom"),
+    );
+    assert!(slider.bottom() <= minus.top(), "the slider is on top");
+    assert!(minus.right() < plus.left() && plus.right() < reset.left());
+    assert!(
+        (slider.left() - minus.left()).abs() <= 1.0
+            && (slider.right() - reset.right()).abs() <= 1.0,
+        "the slider is as long as the row under it: {slider:?}, {minus:?} to {reset:?}"
+    );
+    assert!(reset.left() - plus.right() >= 10.0, "reset is set apart");
+
+    // − and + go by tens, past fit both ways, stopping at fit on the way through.
+    click_named(&ctx, &mut viewer, "Zoom in");
+    let once = viewer.zoom_percent(&ctx);
+    assert!(
+        (once - ((fit / 10.0).floor() + 1.0) * 10.0).abs() < 0.5,
+        "{fit} went to {once}"
+    );
+    click_named(&ctx, &mut viewer, "Zoom out");
+    assert!(viewer.zoom.is_fit(), "back down, it stops at fit");
+    click_named(&ctx, &mut viewer, "Zoom out");
+    let below = viewer.zoom_percent(&ctx);
+    assert!(below < fit, "and goes on below it: {below} under {fit}");
+
+    // The slider's middle is fit, its left end a quarter of fit.
+    let slider = named_rect(&ctx, &mut viewer, "Zoom level");
+    click_at(&ctx, &mut viewer, slider.center());
+    assert!(viewer.zoom.is_fit(), "the middle is fit");
+    click_at(&ctx, &mut viewer, slider.left_center());
+    assert!(
+        (viewer.zoom_percent(&ctx) - fit * zoom::LEAST_OF_FIT).abs() < 0.5,
+        "the left end is a quarter of fit"
+    );
+    let picture = viewer
+        .zoom
+        .picture_rect(viewer.view, viewer.video_size().unwrap());
+    assert!(
+        picture.width() < viewer.view.width(),
+        "the picture is smaller"
+    );
+    click_at(&ctx, &mut viewer, slider.right_center());
+    assert!(
+        viewer.zoom_percent(&ctx) > 700.0,
+        "the right end is the closest zoom"
+    );
+
+    click_named(&ctx, &mut viewer, "Reset zoom");
+    assert!(viewer.zoom.is_fit(), "reset goes back to fit");
+}
+
+#[test]
+fn zoom_steps_land_on_tens_and_100_means_real_pixels() {
+    let ctx = context();
+    // A video bigger than the window, so fit is below 100%.
+    let big = temporary_folder("zoom-tens").join("big.mp4");
+    let status = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi"])
+        .args(["-i", "testsrc2=size=2560x1440:rate=30:duration=1"])
+        .args(["-pix_fmt", "yuv420p"])
+        .arg(&big)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let mut viewer = opened(&ctx, &big);
+    frame(&ctx, &mut viewer, vec![]);
+    let fit = viewer.zoom_percent(&ctx);
+    assert!(fit < 100.0, "fit is {fit}");
+    viewer.zoom_to(&ctx, 100.0);
+    frame(&ctx, &mut viewer, vec![]);
+    assert!((viewer.zoom_percent(&ctx) - 100.0).abs() < 0.5);
+    viewer.zoom_step(&ctx, true);
+    frame(&ctx, &mut viewer, vec![]);
+    assert!((viewer.zoom_percent(&ctx) - 110.0).abs() < 0.5);
+    viewer.zoom_step(&ctx, false);
+    viewer.zoom_step(&ctx, false);
+    frame(&ctx, &mut viewer, vec![]);
+    assert!((viewer.zoom_percent(&ctx) - 90.0).abs() < 0.5);
+}
+
+#[test]
+fn the_jump_buttons_each_move_by_their_own_amount_and_show_it() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, long_video());
+    viewer.set_jump(false, 10);
+    viewer.set_jump(true, 15);
+    let output = frame(&ctx, &mut viewer, vec![]);
+    let (back, forward) = (
+        named_rect(&ctx, &mut viewer, "Jump back"),
+        named_rect(&ctx, &mut viewer, "Jump forward"),
+    );
+    assert!(back.contains(text_rect(&output, "10").center()));
+    assert!(forward.contains(text_rect(&output, "15").center()));
+    click_named(&ctx, &mut viewer, "Jump forward");
+    assert!(near(viewer.position(), seconds(15.0), 0.05));
+    click_named(&ctx, &mut viewer, "Jump back");
+    assert!(near(viewer.position(), seconds(5.0), 0.05));
+}
+
+#[test]
+fn the_jump_arrows_arch_lower_than_they_are_wide() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    let button = named_rect(&ctx, &mut viewer, "Jump back");
+    let output = frame(&ctx, &mut viewer, vec![]);
+    // The arrow's lines, which are the only lines in the button above its number.
+    let mut arrow = Rect::NOTHING;
+    for clipped in &output.shapes {
+        if let egui::epaint::Shape::Path(path) = &clipped.shape {
+            for point in &path.points {
+                if button.contains(*point) && point.y < button.center().y + 2.0 {
+                    arrow.extend_with(*point);
+                }
+            }
+        }
+    }
+    assert!(arrow.is_positive(), "the arrow is drawn");
+    assert!(
+        arrow.height() < arrow.width() * 0.6,
+        "a low arch: {} tall and {} wide",
+        arrow.height(),
+        arrow.width()
+    );
+}
+
+#[test]
+fn while_trimming_the_top_bar_has_save_as_copy_and_cancel_and_the_pill_has_the_rest() {
+    let ctx = context();
+    let mut viewer = trimmer_on(&ctx, video());
+    let nodes = named(&ctx, &mut viewer);
+    let (copy, cancel) = (rect_of(&nodes, "Save as copy"), rect_of(&nodes, "Cancel"));
+    for rect in [copy, cancel] {
+        assert!(rect.bottom() <= bars::TITLE_HEIGHT, "in the top bar");
+    }
+    assert!(copy.right() < cancel.left(), "Save as copy, then Cancel");
+    assert!(
+        cancel.right() < rect_of(&nodes, "Minimise window").left(),
+        "before the window's buttons"
+    );
+    for gone in [
+        "Info",
+        "Trim",
+        "Delete",
+        "Edit in BareClip",
+        "Settings",
+        "Loop",
+    ] {
+        assert!(
+            !nodes.iter().any(|(label, ..)| label == gone),
+            "{gone} is put away while trimming"
+        );
+    }
+    // The pill along the bottom: play, volume, the line with its handles and More, in order.
+    let left_of = |name: &str| rect_of(&nodes, name).left();
+    assert!(left_of("Play") < left_of("Volume"));
+    assert!(left_of("Volume") < left_of("Trim start"));
+    assert!(left_of("Trim start") < left_of("Trim end"));
+    assert!(left_of("Trim end") < left_of("More options"));
+    let pill_middle = (left_of("Play") + rect_of(&nodes, "More options").right()) / 2.0;
+    assert!(
+        (pill_middle - screen_camera::screen().center().x).abs() <= 12.0,
+        "the pill sits in the middle"
+    );
+    // From its first button to its last, inside the room the pill keeps at its ends.
+    let pill_width = rect_of(&nodes, "More options").right() - left_of("Play") + 16.0;
+    assert!(
+        (pill_width - viewer.view.width() * pill::PILL_SHARE).abs() <= 8.0,
+        "as wide as the player's pill: {pill_width}"
+    );
+
+    // The trimmer's tools are under More, and Save… and Edit in BareClip are gone.
+    click_named(&ctx, &mut viewer, "More options");
+    settle(&ctx, &mut viewer);
+    let nodes = named(&ctx, &mut viewer);
+    for name in [
+        "Start at playhead",
+        "End at playhead",
+        "Reset to whole clip",
+        "Loop the kept part",
+        "Save without sound",
+    ] {
+        assert!(
+            nodes.iter().any(|(label, ..)| label == name),
+            "{name} under More"
+        );
+    }
+    for gone in ["Save…", "Edit in BareClip"] {
+        assert!(!nodes.iter().any(|(label, ..)| label == gone), "no {gone}");
+    }
+    frame(&ctx, &mut viewer, press(Key::Escape));
+    settle(&ctx, &mut viewer);
+    assert!(viewer.is_trimming(), "Escape closed only the menu");
+
+    click_named(&ctx, &mut viewer, "Cancel");
+    assert!(!viewer.is_trimming());
+    let nodes = named(&ctx, &mut viewer);
+    assert!(!nodes.iter().any(|(label, ..)| label == "Save as copy"));
+}
+
+#[test]
+fn the_name_is_centred_on_the_window_unless_the_buttons_crowd_it() {
+    let bar = Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 48.0));
+    let left = Rect::from_min_size(pos2(8.0, 8.0), vec2(120.0, 32.0));
+    let right = Rect::from_min_size(pos2(1000.0, 8.0), vec2(272.0, 32.0));
+    let room = bars::name_room(bar, left, right);
+    assert!((room.center().x - 640.0).abs() < 0.01, "centred: {room:?}");
+    assert!(room.right() <= right.left(), "clear of the buttons");
+
+    let crowded = Rect::from_min_size(pos2(8.0, 8.0), vec2(560.0, 32.0));
+    let room = bars::name_room(bar, crowded, right);
+    assert!(
+        room.left() >= crowded.right(),
+        "it moves over into the room left"
+    );
+}
+
+#[test]
+fn settings_has_general_and_keys_tabs_and_the_version_like_the_editors() {
+    screen_camera::SCREEN.set([1280, 720]);
+    let ctx = context();
+    let folder = temporary_folder("settings-tabs");
+    let mut viewer = Viewer::new(&ctx, false);
+    viewer.use_storage(&ctx, folder.clone());
+    viewer.open(&ctx, video());
+    viewer.settings_open = true;
+    settle(&ctx, &mut viewer);
+    let output = frame(&ctx, &mut viewer, vec![]);
+    assert!(text_rect(&output, &text::version_line()).is_positive());
+    let nodes = named(&ctx, &mut viewer);
+    for name in [
+        "General settings",
+        "Keys settings",
+        "Jump back: 5 s",
+        "Jump forward: 5 s",
+        "Pick up where I stopped",
+        "Make default",
+        "Done",
+    ] {
+        assert!(
+            nodes.iter().any(|(label, ..)| label == name),
+            "{name} is on the General tab"
+        );
+    }
+    let done = rect_of(&nodes, "Done");
+
+    click_named(&ctx, &mut viewer, "Jump forward: 5 s");
+    settle(&ctx, &mut viewer);
+    let mut choices: Vec<(String, Rect)> = named(&ctx, &mut viewer)
+        .into_iter()
+        .filter(|(label, ..)| label.ends_with(" s") && !label.contains(':'))
+        .map(|(label, rect, ..)| (label, rect))
+        .collect();
+    choices.sort_by(|a, b| a.1.top().total_cmp(&b.1.top()));
+    let choices: Vec<String> = choices.into_iter().map(|(label, _)| label).collect();
+    assert_eq!(choices, ["5 s", "10 s", "15 s", "20 s", "30 s"]);
+    click_named(&ctx, &mut viewer, "30 s");
+    settle(&ctx, &mut viewer);
+    assert_eq!(viewer.jump(true), 30);
+    assert_eq!(viewer.jump(false), 5, "the other jump is its own");
+    assert_eq!(
+        Settings::load(&folder).viewer.jump_forward,
+        30,
+        "and it's saved"
+    );
+
+    click_named(&ctx, &mut viewer, "Keys settings");
+    settle(&ctx, &mut viewer);
+    let output = frame(&ctx, &mut viewer, vec![]);
+    for (_, what) in KEY_LIST {
+        assert!(text_rect(&output, what).is_positive(), "{what} is listed");
+    }
+    let nodes = named(&ctx, &mut viewer);
+    assert!(!nodes.iter().any(|(label, ..)| label == "Make default"));
+    assert_eq!(rect_of(&nodes, "Done"), done, "it keeps its size");
+}
+
+#[test]
+fn settings_fit_a_720_high_window_and_scroll_in_a_shorter_one() {
+    screen_camera::SCREEN.set([1280, 720]);
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    viewer.settings_open = true;
+    for _ in 0..12 {
+        frame(&ctx, &mut viewer, vec![]);
+    }
+    let nodes = named(&ctx, &mut viewer);
+    let done = rect_of(&nodes, "Done");
+    let height = screen_camera::SCREEN.get()[1] as f32;
+    assert!(done.bottom() <= height, "Done is on screen at {done:?}");
+    assert!(
+        nodes.iter().any(|(label, ..)| label == "Make default"),
+        "every row shows"
+    );
+
+    screen_camera::SCREEN.set([960, 400]);
+    for _ in 0..12 {
+        frame(&ctx, &mut viewer, vec![]);
+    }
+    let done = named_rect(&ctx, &mut viewer, "Done");
+    screen_camera::SCREEN.set([1280, 720]);
+    assert!(
+        done.bottom() <= 400.0,
+        "Done is still on screen at {done:?}"
+    );
 }
 
 #[test]
@@ -1065,10 +1779,12 @@ fn type_text(ctx: &egui::Context, viewer: &mut Viewer, field: &str, typed: &str)
     frame(ctx, viewer, vec![]);
 }
 
+/// Waits for the info panel's details, and for the card to finish sliding in.
 fn wait_for_details(ctx: &egui::Context, viewer: &mut Viewer) {
     wait_for(ctx, viewer, "the details", |viewer| {
         viewer.info.as_ref().is_some_and(|info| info.has_details())
     });
+    settle(ctx, viewer);
 }
 
 #[test]
@@ -1257,7 +1973,7 @@ fn the_artist_and_creation_time_are_written_into_the_file_keeping_its_dates() {
     // The file is read again after it changes, and the boxes come back once it has been.
     frame(&ctx, &mut viewer, vec![]);
     wait_for_details(&ctx, &mut viewer);
-    type_text(&ctx, &mut viewer, "Made", "2019-05-06 07:08:09");
+    type_text(&ctx, &mut viewer, info::MADE_LABEL, "2019-05-06 07:08:09");
     wait_for(&ctx, &mut viewer, "the second rewrite", |viewer| {
         !viewer.is_rewriting()
     });
@@ -1322,7 +2038,7 @@ fn a_kind_of_file_whose_tags_cant_be_written_shows_them_read_only() {
         "it can still be renamed"
     );
     assert!(!nodes.iter().any(|(label, ..)| label == "Artist"));
-    assert!(!nodes.iter().any(|(label, ..)| label == "Made"));
+    assert!(!nodes.iter().any(|(label, ..)| label == info::MADE_LABEL));
 }
 
 /// Which frame of `video()` each frame of a file is, read from the binary pattern across it.
@@ -1466,7 +2182,7 @@ fn a_trim_is_saved_frame_exact_beside_the_original() {
         wait_for_save(&ctx, &mut viewer),
         folder.join("numbers (trimmed 2).mp4")
     );
-    click_named(&ctx, &mut viewer, "Play");
+    click_named(&ctx, &mut viewer, "Play it");
     assert_eq!(
         viewer.current_path(),
         Some(folder.join("numbers (trimmed 2).mp4").as_path()),
@@ -1633,32 +2349,6 @@ fn copies_are_named_trimmed_then_numbered() {
 }
 
 #[test]
-fn edit_in_bareclip_sends_the_clip_as_trimmed_to_an_open_editor_and_pauses() {
-    let ctx = context();
-    let prefix = format!("ViewerEditTest{}", std::process::id());
-    let editor = crate::handoff::starting_editor(&prefix);
-    let mut viewer = trimmer_on(&ctx, video());
-    viewer.editor_prefix = prefix;
-    viewer.set_trim_start(during_frame(15));
-    viewer.set_trim_end(during_frame(74));
-    viewer.play();
-    click_named(&ctx, &mut viewer, "Edit in BareClip");
-
-    let started = Instant::now();
-    let mut arrived = Vec::new();
-    while arrived.is_empty() && started.elapsed() < Duration::from_secs(10) {
-        arrived = editor.take();
-        thread::sleep(Duration::from_millis(5));
-    }
-    let range = viewer.trim_range();
-    assert_eq!(arrived.len(), 1);
-    assert_eq!(arrived[0].path, video());
-    assert_eq!(arrived[0].range, range, "exactly as trimmed, saved or not");
-    assert!(!viewer.is_playing(), "the player pauses and stays");
-    assert!(viewer.take_become_editor().is_none());
-}
-
-#[test]
 fn with_no_editor_open_the_player_asks_to_become_one_with_the_whole_file() {
     let ctx = context();
     let mut viewer = opened(&ctx, video());
@@ -1672,7 +2362,7 @@ fn with_no_editor_open_the_player_asks_to_become_one_with_the_whole_file() {
             start: Ticks(0),
             end: viewer.duration()
         }),
-        "outside the trimmer, the whole file"
+        "the whole file"
     );
     assert!(viewer.take_become_editor().is_none(), "only once");
 }
@@ -1682,19 +2372,29 @@ fn with_no_editor_open_the_player_asks_to_become_one_with_the_whole_file() {
 #[test]
 #[ignore = "draws pictures to look at"]
 fn draw_the_player_screens() {
+    draw_player_screens_in(egui::Theme::Dark, "");
+    draw_player_screens_in(egui::Theme::Light, "-light");
+}
+
+/// Every picture of the player in one theme, with `suffix` after each name.
+fn draw_player_screens_in(theme: egui::Theme, suffix: &str) {
     let folder = std::env::var_os("BARECLIP_SCREENS").map_or_else(
         || std::env::temp_dir().join("bareclip-screens"),
         PathBuf::from,
     );
     screen_camera::SCREEN.set([1280, 720]);
     let ctx = context();
+    ctx.set_theme(theme);
     let mut camera = Camera::new(folder.clone());
+    // How many frames run before a picture, so menus have measured themselves; none to catch
+    // something partway through moving.
+    let settling = std::cell::Cell::new(12);
     let mut shoot = |viewer: &mut Viewer, events: Vec<egui::Event>, name: &str| {
-        for _ in 0..12 {
+        for _ in 0..settling.get() {
             frame(&ctx, viewer, vec![]);
         }
         let output = frame(&ctx, viewer, events);
-        camera.save(&ctx, output, name);
+        camera.save(&ctx, output, &format!("{name}{suffix}"));
     };
 
     let mut empty = Viewer::new(&ctx, false);
@@ -1714,13 +2414,83 @@ fn draw_the_player_screens() {
     shoot(&mut viewer, vec![], "player-04-half-speed");
     viewer.full_screen = true;
     viewer.last_pointer_move = Instant::now();
-    shoot(&mut viewer, vec![], "player-05-full-screen-bars");
-    viewer.last_pointer_move = Instant::now() - BARS_LINGER - Duration::from_millis(10);
+    shoot(
+        &mut viewer,
+        vec![egui::Event::PointerMoved(pos2(300.0, 10.0))],
+        "player-05-full-screen-top-bar",
+    );
+    shoot(
+        &mut viewer,
+        vec![egui::Event::PointerMoved(pos2(300.0, 712.0))],
+        "player-05b-full-screen-bottom-bar",
+    );
+    frame(
+        &ctx,
+        &mut viewer,
+        vec![egui::Event::PointerMoved(pos2(640.0, 300.0))],
+    );
+    viewer.last_pointer_move = Instant::now() - PILL_LINGER_PAUSED - Duration::from_millis(10);
     shoot(&mut viewer, vec![], "player-06-full-screen-bare");
     viewer.full_screen = false;
     viewer.settings_open = true;
     shoot(&mut viewer, vec![], "player-07-settings");
+    viewer.settings_tab = SettingsTab::Keys;
+    shoot(&mut viewer, vec![], "player-07b-settings-keys");
+    viewer.settings_tab = SettingsTab::General;
     viewer.settings_open = false;
+    frame(&ctx, &mut viewer, vec![]);
+    viewer.set_speed(NORMAL_SPEED);
+    rest_on(&ctx, &mut viewer, "Volume");
+    shoot(&mut viewer, vec![], "player-26-volume-flyout");
+    frame(&ctx, &mut viewer, press(Key::Escape));
+    rest_on(&ctx, &mut viewer, "Zoom");
+    shoot(&mut viewer, vec![], "player-27-zoom-flyout");
+    frame(&ctx, &mut viewer, press(Key::Escape));
+    viewer.zoom_to(&ctx, 40.0);
+    shoot(&mut viewer, vec![], "player-32-zoomed-out");
+    viewer.fit();
+    rest_on(&ctx, &mut viewer, "Watching speed");
+    shoot(&mut viewer, vec![], "player-31-speed-flyout");
+    frame(&ctx, &mut viewer, press(Key::Escape));
+    // Partway: a flyout growing out of its button, and the bars sliding away.
+    for _ in 0..12 {
+        frame(&ctx, &mut viewer, vec![]);
+    }
+    rest_on(&ctx, &mut viewer, "Volume");
+    settling.set(0);
+    shoot(&mut viewer, vec![], "player-33-flyout-growing");
+    settling.set(12);
+    frame(&ctx, &mut viewer, press(Key::Escape));
+    for _ in 0..12 {
+        frame(&ctx, &mut viewer, vec![]);
+    }
+    viewer.play();
+    viewer.last_pointer_move = Instant::now() - PILL_LINGER - Duration::from_millis(10);
+    frame(&ctx, &mut viewer, vec![]);
+    settling.set(0);
+    shoot(&mut viewer, vec![], "player-34-pill-going");
+    settling.set(12);
+    viewer.pause();
+    viewer.last_pointer_move = Instant::now();
+    let seek = named_rect(&ctx, &mut viewer, "Seek");
+    shoot(
+        &mut viewer,
+        vec![egui::Event::PointerMoved(
+            seek.left_center() + vec2(seek.width() * 0.6, 0.0),
+        )],
+        "player-28-seek-hover",
+    );
+    viewer.play();
+    frame(
+        &ctx,
+        &mut viewer,
+        vec![egui::Event::PointerMoved(pos2(640.0, 300.0))],
+    );
+    viewer.last_pointer_move = Instant::now() - PILL_LINGER - Duration::from_millis(10);
+    shoot(&mut viewer, vec![], "player-29-playing-pill-hidden");
+    viewer.last_pointer_move = Instant::now();
+    shoot(&mut viewer, vec![], "player-30-playing-pill-over-picture");
+    viewer.pause();
 
     let broken = temporary_folder("screens").join("broken.mkv");
     std::fs::write(&broken, b"not a video").unwrap();
@@ -1788,10 +2558,26 @@ fn draw_the_player_screens() {
     viewer.toggle_info();
     wait_for_details(&ctx, &mut viewer);
     shoot(&mut viewer, vec![], "player-16-info-video");
+    let created = named_rect(&ctx, &mut viewer, "Created");
+    shoot(
+        &mut viewer,
+        vec![egui::Event::PointerMoved(created.center())],
+        "player-16b-info-row-hovered",
+    );
     click_named(&ctx, &mut viewer, "File name");
     frame(&ctx, &mut viewer, vec![egui::Event::Text(" 2".to_owned())]);
     shoot(&mut viewer, vec![], "player-17-info-renaming");
     frame(&ctx, &mut viewer, press(Key::Escape));
+    frame(&ctx, &mut viewer, vec![]);
+    viewer.toggle_info();
+    for _ in 0..6 {
+        frame(&ctx, &mut viewer, vec![]);
+    }
+    settling.set(0);
+    shoot(&mut viewer, vec![], "player-17b-info-sliding-away");
+    settling.set(12);
+    viewer.toggle_info();
+    wait_for_details(&ctx, &mut viewer);
     viewer.ask_to_delete();
     shoot(&mut viewer, vec![], "player-18-delete-question");
     viewer.confirm_delete = false;
@@ -1802,20 +2588,13 @@ fn draw_the_player_screens() {
 
     let folder = folder_of_videos("screens-trim", &["Match.mp4"]);
     let mut viewer = trimmer_on(&ctx, &folder.join("Match.mp4"));
-    wait_for(&ctx, &mut viewer, "the strip", |viewer| {
-        viewer
-            .trim
-            .as_ref()
-            .is_some_and(|trimmer| trimmer.arriving.is_some())
-    });
-    for _ in 0..40 {
-        frame(&ctx, &mut viewer, vec![]);
-        thread::sleep(Duration::from_millis(10));
-    }
     viewer.set_trim_start(seconds(0.8));
     viewer.set_trim_end(seconds(3.1));
     viewer.seek(seconds(1.6));
     shoot(&mut viewer, vec![], "player-20-trimmer");
+    click_named(&ctx, &mut viewer, "More options");
+    shoot(&mut viewer, vec![], "player-20b-trimmer-more");
+    frame(&ctx, &mut viewer, press(Key::Escape));
     let saving = viewer.pretend_saving(0.42);
     shoot(&mut viewer, vec![], "player-21-trimmer-saving");
     let _ = saving.send(Ok((
@@ -1824,15 +2603,30 @@ fn draw_the_player_screens() {
     )));
     shoot(&mut viewer, vec![], "player-22-trimmer-saved");
     let mut viewer = trimmer_on(&ctx, &make_song("screens-trim-song", true));
-    wait_for(&ctx, &mut viewer, "the sound's shape", |viewer| {
-        viewer
-            .trim
-            .as_ref()
-            .is_some_and(|trimmer| trimmer.shape_arriving.is_none())
-    });
     viewer.set_trim_start(seconds(0.5));
     viewer.set_trim_end(seconds(2.2));
     shoot(&mut viewer, vec![], "player-23-trimmer-song");
+
+    let mut viewer = opened(&ctx, video());
+    viewer.notice = Some(
+        "Your settings could not be saved. The folder they live in can't be written to, so \
+         nothing changed here will be kept after the player closes."
+            .to_owned(),
+    );
+    viewer.resumed = Some((seconds(83.0), Instant::now()));
+    shoot(&mut viewer, vec![], "player-24-notes-stacked");
+    viewer.notice = None;
+    viewer.resumed = None;
+    screen_camera::SCREEN.set([640, 400]);
+    shoot(
+        &mut viewer,
+        vec![egui::Event::PointerMoved(pos2(320.0, 200.0))],
+        "player-35-narrow-pill",
+    );
+    screen_camera::SCREEN.set([960, 540]);
+    viewer.settings_open = true;
+    shoot(&mut viewer, vec![], "player-25-settings-short-window");
+    screen_camera::SCREEN.set([1280, 720]);
 
     KEPT_TEXTURES.with_borrow_mut(|kept| *kept = None);
 }
@@ -1878,4 +2672,986 @@ fn first_picture_time() {
 
 fn handoff_flag() -> &'static str {
     crate::handoff::PLAY_FLAG
+}
+
+/// Runs frames until whatever is fading in or out has finished.
+fn settle(ctx: &egui::Context, viewer: &mut Viewer) {
+    for _ in 0..30 {
+        frame(ctx, viewer, vec![]);
+    }
+}
+
+/// One frame with the window said to be maximised or full screen.
+fn frame_in_window(
+    ctx: &egui::Context,
+    viewer: &mut Viewer,
+    maximized: bool,
+    fullscreen: bool,
+    events: Vec<egui::Event>,
+) -> egui::FullOutput {
+    let mut input = egui::RawInput {
+        screen_rect: Some(screen_camera::screen()),
+        events,
+        ..Default::default()
+    };
+    input.viewports.insert(
+        egui::ViewportId::ROOT,
+        egui::ViewportInfo {
+            maximized: Some(maximized),
+            fullscreen: Some(fullscreen),
+            ..Default::default()
+        },
+    );
+    let mut output = ctx.run_ui(input, |ui| viewer.show(ui));
+    output.textures_delta.clear();
+    output
+}
+
+/// Where a piece of text was drawn in a frame.
+fn text_rect(output: &egui::FullOutput, text: &str) -> Rect {
+    output
+        .shapes
+        .iter()
+        .find_map(|clipped| match &clipped.shape {
+            egui::epaint::Shape::Text(shape) if shape.galley.text() == text => {
+                Some(shape.galley.rect.translate(shape.pos.to_vec2()))
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("nothing says {text}"))
+}
+
+/// Where the open flyout is: the one area in front of the window's own.
+fn flyout_rect(ctx: &egui::Context) -> Rect {
+    ctx.memory(|memory| {
+        let areas = memory.areas();
+        let mut flyouts = areas
+            .visible_layer_ids()
+            .into_iter()
+            .filter(|layer| layer.order == egui::Order::Foreground)
+            .filter_map(|layer| memory.area_rect(layer.id));
+        let rect = flyouts.next().expect("a flyout is open");
+        assert!(flyouts.next().is_none(), "only one flyout is open");
+        rect
+    })
+}
+
+#[test]
+fn the_top_bar_reads_info_trim_edit_in_bareclip_delete() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    let nodes = named(&ctx, &mut viewer);
+    let left_of = |name| rect_of(&nodes, name).left();
+    assert!(left_of("Info") < left_of("Trim"));
+    assert!(left_of("Trim") < left_of("Edit in BareClip"));
+    assert!(left_of("Edit in BareClip") < left_of("Delete"));
+    assert_eq!(
+        rect_of(&nodes, "Edit in BareClip").size(),
+        rect_of(&nodes, "Trim").size()
+    );
+}
+
+#[test]
+fn volume_zoom_speed_mini_view_and_full_screen_are_one_size() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    let nodes = named(&ctx, &mut viewer);
+    let size = rect_of(&nodes, "Full screen").size();
+    for name in ["Volume", "Zoom", "Watching speed", "Mini view"] {
+        assert_eq!(rect_of(&nodes, name).size(), size, "{name}");
+    }
+    assert_eq!(
+        rect_of(&nodes, "Jump back").size(),
+        rect_of(&nodes, "Jump forward").size()
+    );
+}
+
+#[test]
+fn home_carries_on_from_the_start_and_end_pauses_on_the_last_frame() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    viewer.seek(seconds(2.0));
+    viewer.play();
+    frame(&ctx, &mut viewer, press(Key::Home));
+    assert_eq!(viewer.position(), Ticks(0));
+    assert!(viewer.is_playing(), "going to the start keeps playing");
+    frame(&ctx, &mut viewer, press(Key::End));
+    assert!(!viewer.is_playing(), "the end is shown paused");
+    assert!(near(viewer.position(), viewer.duration(), 0.001));
+}
+
+#[test]
+fn each_flyout_opens_with_its_middle_over_its_button_which_shows_it_is_open() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    let middle_x = |rect: Rect| rect.center().x;
+
+    rest_on(&ctx, &mut viewer, "Volume");
+    assert_eq!(viewer.flyout.open, Some(bars::Flyout::Volume));
+    assert_eq!(
+        bars::flyout_kind(viewer.flyout.open, bars::Flyout::Volume),
+        Kind::Chosen,
+        "its button shows as held in"
+    );
+    assert_eq!(
+        bars::flyout_kind(viewer.flyout.open, bars::Flyout::Zoom),
+        Kind::Ghost
+    );
+    settle(&ctx, &mut viewer);
+    let nodes = named(&ctx, &mut viewer);
+    let row = flyout_rect(&ctx);
+    let button = rect_of(&nodes, "Volume");
+    assert!(
+        (middle_x(row) - middle_x(button)).abs() <= 1.0,
+        "the volume's flyout is centred on it: {} and {}",
+        middle_x(row),
+        middle_x(button)
+    );
+
+    // Opening another closes the first.
+    rest_on(&ctx, &mut viewer, "Watching speed");
+    assert_eq!(viewer.flyout.open, Some(bars::Flyout::Speed));
+    settle(&ctx, &mut viewer);
+    let nodes = named(&ctx, &mut viewer);
+    assert!(!nodes.iter().any(|(label, ..)| label == "Volume level"));
+    assert!(
+        (middle_x(flyout_rect(&ctx)) - middle_x(rect_of(&nodes, "Watching speed"))).abs() <= 1.0,
+        "the speed menu is centred on its button: {:?} and {:?}",
+        flyout_rect(&ctx),
+        rect_of(&nodes, "Watching speed")
+    );
+
+    rest_on(&ctx, &mut viewer, "Zoom");
+    assert_eq!(viewer.flyout.open, Some(bars::Flyout::Zoom));
+    settle(&ctx, &mut viewer);
+    let nodes = named(&ctx, &mut viewer);
+    let reset = rect_of(&nodes, "Reset zoom");
+    let row = flyout_rect(&ctx);
+    assert!(
+        (middle_x(row) - middle_x(rect_of(&nodes, "Zoom"))).abs() <= 1.0,
+        "the zoom's flyout is centred on it"
+    );
+    assert!(reset.bottom() < rect_of(&nodes, "Zoom").top());
+
+    // A click elsewhere closes it.
+    click_at(&ctx, &mut viewer, ON_THE_PICTURE);
+    assert_eq!(viewer.flyout.open, None);
+}
+
+#[test]
+fn a_flyout_waits_for_the_mouse_to_rest_and_goes_a_moment_after_it_leaves() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    let volume = named_rect(&ctx, &mut viewer, "Volume");
+    frame(
+        &ctx,
+        &mut viewer,
+        vec![egui::Event::PointerMoved(volume.center())],
+    );
+    frame(&ctx, &mut viewer, vec![]);
+    assert_eq!(viewer.flyout.open, None, "passing over opens nothing");
+    frame(
+        &ctx,
+        &mut viewer,
+        vec![egui::Event::PointerMoved(ON_THE_PICTURE)],
+    );
+    viewer.flyout.rest_is_up();
+    frame(&ctx, &mut viewer, vec![]);
+    assert_eq!(
+        viewer.flyout.open, None,
+        "nor does a rest that ended before it was up"
+    );
+
+    rest_on(&ctx, &mut viewer, "Volume");
+    assert_eq!(viewer.flyout.open, Some(bars::Flyout::Volume));
+    settle(&ctx, &mut viewer);
+    let on_it = flyout_rect(&ctx).center();
+    frame(&ctx, &mut viewer, vec![egui::Event::PointerMoved(on_it)]);
+    assert!(!viewer.flyout.is_closing(), "the mouse on it keeps it");
+
+    frame(
+        &ctx,
+        &mut viewer,
+        vec![egui::Event::PointerMoved(ON_THE_PICTURE)],
+    );
+    assert!(viewer.flyout.is_closing(), "the mouse away starts it going");
+    frame(
+        &ctx,
+        &mut viewer,
+        vec![egui::Event::PointerMoved(volume.center())],
+    );
+    assert!(
+        !viewer.flyout.is_closing(),
+        "and coming back in time keeps it"
+    );
+    frame(
+        &ctx,
+        &mut viewer,
+        vec![egui::Event::PointerMoved(ON_THE_PICTURE)],
+    );
+    viewer.flyout.away_is_up();
+    frame(&ctx, &mut viewer, vec![]);
+    assert_eq!(viewer.flyout.open, None, "a moment away and it goes");
+
+    // Closed while the mouse rests on its button, it waits for the mouse to come back.
+    rest_on(&ctx, &mut viewer, "Volume");
+    frame(&ctx, &mut viewer, press(Key::Escape));
+    viewer.flyout.rest_is_up();
+    frame(&ctx, &mut viewer, vec![]);
+    assert_eq!(viewer.flyout.open, None, "Escape keeps it shut");
+    rest_on(&ctx, &mut viewer, "Volume");
+    assert_eq!(viewer.flyout.open, Some(bars::Flyout::Volume));
+
+    // A held mouse button keeps it, as while dragging the slider past its edge.
+    settle(&ctx, &mut viewer);
+    let slider = named_rect(&ctx, &mut viewer, "Volume level");
+    let button = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    };
+    frame(
+        &ctx,
+        &mut viewer,
+        vec![egui::Event::PointerMoved(slider.center())],
+    );
+    frame(&ctx, &mut viewer, vec![button(slider.center(), true)]);
+    frame(
+        &ctx,
+        &mut viewer,
+        vec![egui::Event::PointerMoved(ON_THE_PICTURE)],
+    );
+    assert!(!viewer.flyout.is_closing(), "held, it stays");
+    frame(&ctx, &mut viewer, vec![button(ON_THE_PICTURE, false)]);
+    frame(&ctx, &mut viewer, vec![]);
+    assert!(
+        viewer.flyout.is_closing(),
+        "let go away from it, it starts going"
+    );
+}
+
+#[test]
+fn a_click_on_speed_or_zoom_puts_it_back_to_normal() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    frame(&ctx, &mut viewer, vec![]);
+    let fit = viewer.zoom_percent(&ctx);
+    viewer.set_speed(5);
+    viewer.zoom_to(&ctx, 250.0);
+    frame(&ctx, &mut viewer, vec![]);
+    click_named(&ctx, &mut viewer, "Watching speed");
+    assert_eq!(viewer.speed(), 1.0, "back to 1x");
+    click_named(&ctx, &mut viewer, "Zoom");
+    assert!(
+        (viewer.zoom_percent(&ctx) - fit).abs() < 0.5,
+        "back to fit: {}",
+        viewer.zoom_percent(&ctx)
+    );
+    assert_eq!(viewer.flyout.open, None, "a quick click opens nothing");
+}
+
+/// How much the open flyout is scaled as it grows out of its button, if it is.
+fn flyout_scaling(ctx: &egui::Context) -> Option<f32> {
+    let layers = ctx.memory(|memory| memory.areas().visible_layer_ids());
+    layers
+        .into_iter()
+        .filter(|layer| layer.order == egui::Order::Foreground)
+        .find_map(|layer| ctx.layer_transform_to_global(layer))
+        .map(|transform| transform.scaling)
+}
+
+#[test]
+fn a_flyout_grows_out_of_its_button_as_it_opens() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    rest_on(&ctx, &mut viewer, "Volume");
+    frame(&ctx, &mut viewer, vec![]);
+    let early = flyout_scaling(&ctx).expect("it starts smaller");
+    assert!(early < 1.0, "{early}");
+    settle(&ctx, &mut viewer);
+    assert_eq!(flyout_scaling(&ctx), None, "and ends at its full size");
+}
+
+#[test]
+fn the_pill_sinks_away_when_the_mouse_rests_and_comes_back_when_it_moves() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    let play = named_rect(&ctx, &mut viewer, "Play");
+    viewer.play();
+    frame(&ctx, &mut viewer, vec![]);
+    rest_for(&mut viewer, PILL_LINGER);
+    frame(&ctx, &mut viewer, vec![]);
+    let going = named_rect(&ctx, &mut viewer, "Pause");
+    assert!(going.top() > play.top(), "it sinks as it goes");
+    assert_eq!(going.left(), play.left(), "straight down");
+    settle(&ctx, &mut viewer);
+    assert!(
+        !named(&ctx, &mut viewer)
+            .iter()
+            .any(|(label, ..)| label == "Pause"),
+        "gone once out of sight"
+    );
+    frame(
+        &ctx,
+        &mut viewer,
+        vec![egui::Event::PointerMoved(pos2(300.0, 300.0))],
+    );
+    settle(&ctx, &mut viewer);
+    assert_eq!(
+        named_rect(&ctx, &mut viewer, "Pause"),
+        play,
+        "back in place once the mouse moves"
+    );
+}
+
+#[test]
+fn the_seek_line_has_the_same_gap_to_each_time() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    let output = frame(&ctx, &mut viewer, vec![]);
+    let start = text_rect(&output, &viewer.clock(Ticks(0)));
+    let end = text_rect(&output, &viewer.clock(viewer.duration()));
+    let pill = viewer.pill_at;
+    assert!(
+        pill.contains(start.center()) && pill.contains(end.center()),
+        "on the pill"
+    );
+    let seek = named_rect(&ctx, &mut viewer, "Seek");
+    let (before, after) = (seek.left() - start.right(), end.left() - seek.right());
+    assert!(
+        (before - after).abs() <= 1.0,
+        "{before} before the line, {after} after it"
+    );
+}
+
+#[test]
+fn the_wheel_shows_its_flyout_until_the_mouse_has_been_away_a_moment() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    frame(&ctx, &mut viewer, vec![]);
+    let middle = viewer.view.center();
+    frame(&ctx, &mut viewer, wheel(middle, 1.0));
+    assert_eq!(
+        viewer.flyout.open,
+        Some(bars::Flyout::Zoom),
+        "zooming shows the zoom"
+    );
+    frame(&ctx, &mut viewer, vec![]);
+    assert!(viewer.flyout.is_closing(), "the mouse is on the picture");
+    viewer.flyout.away_is_up();
+    frame(&ctx, &mut viewer, vec![]);
+    assert_eq!(viewer.flyout.open, None, "it goes by itself");
+
+    // Moving onto it keeps it.
+    frame(&ctx, &mut viewer, wheel(middle, -1.0));
+    settle(&ctx, &mut viewer);
+    let on_it = flyout_rect(&ctx).center();
+    frame(&ctx, &mut viewer, vec![egui::Event::PointerMoved(on_it)]);
+    assert!(!viewer.flyout.is_closing());
+    assert_eq!(viewer.flyout.open, Some(bars::Flyout::Zoom), "it stays");
+    frame(&ctx, &mut viewer, press(Key::Escape));
+
+    // The wheel over the volume shows the volume's slider, which stays while the mouse does.
+    let volume = named_rect(&ctx, &mut viewer, "Volume");
+    let zoom_before = viewer.zoom;
+    frame(&ctx, &mut viewer, wheel(volume.center(), -1.0));
+    assert_eq!(
+        viewer.zoom, zoom_before,
+        "the wheel over a bar doesn't zoom the picture under it"
+    );
+    assert_eq!(viewer.flyout.open, Some(bars::Flyout::Volume));
+    frame(&ctx, &mut viewer, vec![]);
+    assert!(!viewer.flyout.is_closing());
+    frame(
+        &ctx,
+        &mut viewer,
+        vec![egui::Event::PointerMoved(ON_THE_PICTURE)],
+    );
+    viewer.flyout.away_is_up();
+    frame(&ctx, &mut viewer, vec![]);
+    assert_eq!(viewer.flyout.open, None);
+}
+
+#[test]
+fn playing_pausing_or_moving_through_closes_a_flyout() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    for key in [Key::Space, Key::K, Key::ArrowRight, Key::Home, Key::Period] {
+        rest_on(&ctx, &mut viewer, "Watching speed");
+        assert!(viewer.flyout.is_open());
+        frame(&ctx, &mut viewer, press(key));
+        assert!(!viewer.flyout.is_open(), "{key:?} closes it");
+    }
+    rest_on(&ctx, &mut viewer, "Volume");
+    frame(&ctx, &mut viewer, press(Key::ArrowUp));
+    assert_eq!(
+        viewer.flyout.open,
+        Some(bars::Flyout::Volume),
+        "turning the volume up leaves its slider open"
+    );
+}
+
+#[test]
+fn the_status_bar_is_one_row_along_the_bottom() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    let full = named_rect(&ctx, &mut viewer, "Full screen");
+    let bottom = screen_camera::screen().bottom();
+    assert_eq!(full.center().y, bottom - bars::BOTTOM_HEIGHT / 2.0);
+}
+
+#[test]
+fn full_screen_from_maximised_unmaximises_first_and_maximises_again_after() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    let sent = commands(&frame_in_window(
+        &ctx,
+        &mut viewer,
+        true,
+        false,
+        press(Key::F),
+    ));
+    assert!(viewer.is_full_screen());
+    let at = |wanted: &egui::ViewportCommand| sent.iter().position(|command| command == wanted);
+    let unmaximise = at(&egui::ViewportCommand::Maximized(false)).expect("it unmaximises");
+    let full = at(&egui::ViewportCommand::Fullscreen(true)).expect("it goes full screen");
+    assert!(
+        unmaximise < full,
+        "a maximised window would stop at the taskbar"
+    );
+
+    let sent = commands(&frame_in_window(
+        &ctx,
+        &mut viewer,
+        false,
+        true,
+        press(Key::Escape),
+    ));
+    let at = |wanted: &egui::ViewportCommand| sent.iter().position(|command| command == wanted);
+    let leave = at(&egui::ViewportCommand::Fullscreen(false)).expect("it leaves full screen");
+    let maximise = at(&egui::ViewportCommand::Maximized(true)).expect("and is maximised again");
+    assert!(leave < maximise);
+
+    // From a window that wasn't maximised, nothing is maximised on the way out.
+    frame_in_window(&ctx, &mut viewer, false, false, press(Key::F));
+    let sent = commands(&frame_in_window(
+        &ctx,
+        &mut viewer,
+        false,
+        true,
+        press(Key::Escape),
+    ));
+    assert!(!sent.contains(&egui::ViewportCommand::Maximized(true)));
+}
+
+#[test]
+fn maximise_in_full_screen_leaves_full_screen_instead() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    frame(&ctx, &mut viewer, press(Key::F));
+    frame(
+        &ctx,
+        &mut viewer,
+        vec![egui::Event::PointerMoved(pos2(300.0, 10.0))],
+    );
+    settle(&ctx, &mut viewer);
+    let sent = click_named_for_commands(&ctx, &mut viewer, "Maximise window");
+    assert!(!viewer.is_full_screen());
+    assert!(!sent.contains(&egui::ViewportCommand::Maximized(true)));
+}
+
+#[test]
+fn closing_in_full_screen_keeps_the_window_place_from_before() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    let before = WindowPlace {
+        left: 100,
+        top: 100,
+        right: 900,
+        bottom: 600,
+        maximized: false,
+    };
+    let whole_screen = WindowPlace {
+        left: 0,
+        top: 0,
+        right: 1920,
+        bottom: 1080,
+        maximized: false,
+    };
+    viewer.full_screen = true;
+    viewer.before_full_screen = Some((false, Some(before)));
+    viewer.closing(Some(whole_screen));
+    assert_eq!(viewer.saved_window(), Some(before));
+}
+
+#[test]
+fn the_window_edges_resize_only_in_a_plain_window() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    let edge = pos2(1.0, 400.0);
+    let press_edge = || {
+        vec![
+            egui::Event::PointerMoved(edge),
+            egui::Event::PointerButton {
+                pos: edge,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ]
+    };
+    let resizes = |sent: Vec<egui::ViewportCommand>| {
+        sent.iter()
+            .any(|command| matches!(command, egui::ViewportCommand::BeginResize(_)))
+    };
+    let release = || {
+        vec![egui::Event::PointerButton {
+            pos: edge,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]
+    };
+    assert!(resizes(commands(&frame_in_window(
+        &ctx,
+        &mut viewer,
+        false,
+        false,
+        press_edge()
+    ))));
+    frame_in_window(&ctx, &mut viewer, false, false, release());
+    for (maximized, fullscreen) in [(true, false), (false, true)] {
+        assert!(
+            !resizes(commands(&frame_in_window(
+                &ctx,
+                &mut viewer,
+                maximized,
+                fullscreen,
+                press_edge()
+            ))),
+            "maximised {maximized}, full screen {fullscreen}"
+        );
+        frame_in_window(&ctx, &mut viewer, maximized, fullscreen, release());
+    }
+}
+
+#[test]
+fn the_trim_line_and_its_times_stay_put_as_the_cut_moves() {
+    let ctx = context();
+    let mut viewer = trimmer_on(&ctx, video());
+    let line = named_rect(&ctx, &mut viewer, "Seek");
+    let start_text = |viewer: &mut Viewer| {
+        let output = frame(&ctx, viewer, vec![]);
+        let start = viewer.clock(viewer.trim_range().unwrap().start);
+        // The lowest, which is the one in the pill rather than the bubble over it.
+        output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::epaint::Shape::Text(shape) if shape.galley.text() == start => {
+                    Some(shape.galley.rect.translate(shape.pos.to_vec2()))
+                }
+                _ => None,
+            })
+            .max_by(|a, b| a.top().total_cmp(&b.top()))
+            .expect("the start time shows")
+    };
+    let before = start_text(&mut viewer);
+    viewer.set_trim_start(seconds(1.23));
+    viewer.set_trim_end(seconds(2.5));
+    assert_eq!(
+        named_rect(&ctx, &mut viewer, "Seek"),
+        line,
+        "the line doesn't move"
+    );
+    let after = start_text(&mut viewer);
+    assert!(
+        (after.right() - before.right()).abs() <= 0.5,
+        "the start time keeps its place: {before:?} then {after:?}"
+    );
+}
+
+#[test]
+fn f11_also_toggles_full_screen_which_hides_the_shadows_gap_and_doesnt_drag() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    let sent = commands(&frame(&ctx, &mut viewer, press(Key::F11)));
+    assert!(viewer.is_full_screen(), "F11 goes into full screen");
+    let at = |sent: &[egui::ViewportCommand], wanted: &egui::ViewportCommand| {
+        sent.iter().position(|command| command == wanted)
+    };
+    let full = at(&sent, &egui::ViewportCommand::Fullscreen(true)).expect("full screen");
+    let shadow = at(&sent, &egui::ViewportCommand::Decorations(false))
+        .expect("the window's shadow, and the pixel it moves things by, are turned off");
+    assert!(full < shadow, "after going full screen");
+
+    // The top bar doesn't move or maximise the window in full screen.
+    let title = pos2(300.0, bars::TITLE_HEIGHT / 2.0);
+    let press_at = |pressed| egui::Event::PointerButton {
+        pos: title,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    };
+    let mut dragged = Vec::new();
+    for events in [
+        vec![egui::Event::PointerMoved(title)],
+        vec![press_at(true)],
+        vec![egui::Event::PointerMoved(title + vec2(40.0, 10.0))],
+        vec![press_at(false)],
+    ] {
+        dragged.extend(commands(&frame(&ctx, &mut viewer, events)));
+    }
+    assert!(
+        !dragged.contains(&egui::ViewportCommand::StartDrag),
+        "no dragging in full screen"
+    );
+
+    let sent = commands(&frame(&ctx, &mut viewer, press(Key::F11)));
+    assert!(!viewer.is_full_screen(), "F11 leaves it");
+    let leave = at(&sent, &egui::ViewportCommand::Fullscreen(false)).expect("leaves");
+    let shadow = at(&sent, &egui::ViewportCommand::Decorations(false)).expect("shadow back");
+    assert!(leave < shadow);
+}
+
+#[test]
+fn the_info_card_slides_in_from_the_right_narrowing_the_picture_and_slides_back_out() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    settle(&ctx, &mut viewer);
+    let whole = viewer.view;
+    click_named(&ctx, &mut viewer, "Info");
+    assert!(viewer.is_info_open());
+    let partway = viewer.view;
+    let open_right = whole.right() - info::CARD_WIDTH - info::CARD_MARGIN * 2.0;
+    assert!(
+        partway.right() < whole.right() && partway.right() > open_right,
+        "the picture narrows as the card comes: {partway:?}"
+    );
+    settle(&ctx, &mut viewer);
+    assert!((viewer.view.right() - open_right).abs() < 0.5);
+    assert_eq!(
+        viewer.view.top(),
+        whole.top(),
+        "the card sits between the bars"
+    );
+    assert_eq!(viewer.view.bottom(), whole.bottom());
+
+    // Copy path, Open location and × are symbols on the heading's line, at its right.
+    let output = frame(&ctx, &mut viewer, vec![]);
+    let heading = text_rect(&output, "Info");
+    let nodes = named(&ctx, &mut viewer);
+    let (copy, open, close) = (
+        rect_of(&nodes, "Copy path"),
+        rect_of(&nodes, "Open location"),
+        rect_of(&nodes, "Close info"),
+    );
+    for button in [copy, open, close] {
+        assert!(
+            (button.center().y - heading.center().y).abs() <= 2.0,
+            "on the heading's line"
+        );
+        assert_eq!(button.width(), button.height(), "a symbol, not words");
+    }
+    assert!(heading.right() < copy.left() && copy.right() < open.left());
+    assert!(open.right() < close.left());
+    assert!(
+        close.right() <= whole.right() - info::CARD_MARGIN,
+        "inside the card"
+    );
+
+    click_named(&ctx, &mut viewer, "Close info");
+    assert!(!viewer.is_info_open());
+    assert!(viewer.info.is_some(), "it is still sliding away");
+    assert!(viewer.view.right() < whole.right());
+    settle(&ctx, &mut viewer);
+    assert!(viewer.info.is_none(), "and goes once out of sight");
+    assert_eq!(viewer.view, whole);
+}
+
+#[test]
+fn changeable_facts_are_one_line_like_the_others_and_turn_into_a_box_in_place() {
+    let ctx = context();
+    let folder = folder_of_videos("info-rows", &["clip.mp4"]);
+    let mut viewer = opened(&ctx, &folder.join("clip.mp4"));
+    viewer.toggle_info();
+    wait_for_details(&ctx, &mut viewer);
+    settle(&ctx, &mut viewer);
+    let output = frame(&ctx, &mut viewer, vec![]);
+    let name_text = text_rect(&output, "clip.mp4");
+    let size_name = text_rect(&output, "Size");
+    let nodes = named(&ctx, &mut viewer);
+    for name in [
+        "File name",
+        "Created",
+        "Modified",
+        info::MADE_LABEL,
+        "Artist",
+    ] {
+        let row = rect_of(&nodes, name);
+        assert!(row.height() <= 20.0, "{name} is one line: {row:?}");
+    }
+    let row = rect_of(&nodes, "File name");
+    assert!(
+        row.contains(name_text.center()),
+        "the name shows with its extension, on its line"
+    );
+    assert!(
+        (row.left() - size_name.left()).abs() <= 1.0,
+        "it lines up with the facts that can't change"
+    );
+    assert!(
+        name_text.left() - row.left() >= 100.0,
+        "and its value sits in the values' column"
+    );
+
+    click_named(&ctx, &mut viewer, "File name");
+    let output = frame(&ctx, &mut viewer, vec![]);
+    let typing = named_rect(&ctx, &mut viewer, "File name");
+    assert!(
+        (typing.center().y - row.center().y).abs() <= 3.0,
+        "the box is on the same line"
+    );
+    assert!(viewer.info.as_ref().unwrap().is_typing());
+    let extension = text_rect(&output, ".mp4");
+    assert!(
+        extension.left() >= typing.right(),
+        "the extension stays after the box"
+    );
+    assert_eq!(
+        text_rect(&output, "Size").top(),
+        size_name.top(),
+        "nothing below moves when the box opens"
+    );
+    frame(&ctx, &mut viewer, press(Key::Escape));
+    frame(&ctx, &mut viewer, vec![]);
+    assert!(
+        !viewer.info.as_ref().unwrap().is_typing(),
+        "Escape puts it back"
+    );
+}
+
+#[test]
+fn closing_the_panel_or_going_full_screen_partway_through_a_change_still_opens_the_file_again() {
+    let ctx = context();
+    for full_screen in [false, true] {
+        let folder = folder_of_videos(&format!("info-close-{full_screen}"), &["clip.mp4"]);
+        let path = folder.join("clip.mp4");
+        let mut viewer = opened(&ctx, &path);
+        viewer.toggle_info();
+        wait_for_details(&ctx, &mut viewer);
+        viewer.change_tags(
+            &ctx,
+            bareclip_media::TagChanges {
+                artist: Some("Somebody".to_owned()),
+                creation_time: None,
+            },
+        );
+        if full_screen {
+            frame(&ctx, &mut viewer, press(Key::F));
+        } else {
+            viewer.toggle_info();
+        }
+        wait_for(&ctx, &mut viewer, "the file to come back", |viewer| {
+            viewer.file.is_some() && !viewer.is_rewriting()
+        });
+        let details = bareclip_media::read_details(&path).unwrap();
+        assert_eq!(
+            details.tag("artist"),
+            Some("Somebody"),
+            "full screen {full_screen}"
+        );
+        if !full_screen {
+            settle(&ctx, &mut viewer);
+            assert!(viewer.info.is_none(), "the closed panel goes after");
+        }
+    }
+}
+
+#[test]
+fn the_trimmers_more_sets_the_ends_at_the_playhead_and_resets_them() {
+    let ctx = context();
+    let mut viewer = trimmer_on(&ctx, video());
+    let one = 1.0 / 30.0;
+    let choose = |viewer: &mut Viewer, name: &str| {
+        click_named(&ctx, viewer, "More options");
+        settle(&ctx, viewer);
+        click_named(&ctx, viewer, name);
+        settle(&ctx, viewer);
+    };
+    viewer.seek(during_frame(30));
+    choose(&mut viewer, "Start at playhead");
+    viewer.seek(during_frame(60));
+    choose(&mut viewer, "End at playhead");
+    let range = viewer.trim_range().unwrap();
+    assert!(
+        near(range.start, seconds(30.0 * one), 0.0005),
+        "start at the playhead"
+    );
+    assert!(
+        near(range.end, seconds(61.0 * one), 0.0005),
+        "end after its frame"
+    );
+    choose(&mut viewer, "Reset to whole clip");
+    let range = viewer.trim_range().unwrap();
+    assert_eq!((range.start, range.end), (Ticks(0), viewer.duration()));
+}
+
+#[test]
+fn loop_the_kept_part_goes_round_between_the_handles() {
+    let ctx = context();
+    let mut viewer = trimmer_on(&ctx, video());
+    viewer.set_trim_start(seconds(1.0));
+    viewer.set_trim_end(seconds(1.4));
+    click_named(&ctx, &mut viewer, "More options");
+    settle(&ctx, &mut viewer);
+    click_named(&ctx, &mut viewer, "Loop the kept part");
+    assert!(viewer.trim.as_ref().unwrap().looping);
+    viewer.seek(seconds(1.0));
+    viewer.toggle_playback();
+    let started = Instant::now();
+    let mut went_round = false;
+    let mut furthest = Ticks(0);
+    while started.elapsed() < Duration::from_secs(5) {
+        frame(&ctx, &mut viewer, vec![]);
+        let at = viewer.position();
+        if furthest > seconds(1.3) && at < seconds(1.15) {
+            went_round = true;
+            break;
+        }
+        furthest = furthest.max(at);
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(went_round, "it went back to the start handle");
+    assert!(viewer.is_playing(), "and carries on playing");
+}
+
+#[test]
+fn save_without_sound_leaves_the_sound_behind_copied_or_redrawn() {
+    let ctx = context();
+    let folder = temporary_folder("trim-silent");
+    for (name, codecs) in [
+        ("clip.mp4", &["-c:v", "libopenh264", "-c:a", "aac"][..]),
+        ("clip.wmv", &["-c:v", "wmv2", "-c:a", "wmav2"][..]),
+    ] {
+        let path = folder.join(name);
+        let status = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "testsrc2=s=160x90:r=30:d=2"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=330:duration=2"])
+            .args(codecs)
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let mut viewer = trimmer_on(&ctx, &path);
+        assert!(
+            !viewer.file.as_ref().unwrap().info.audio.is_empty(),
+            "{name} has sound"
+        );
+        viewer.set_trim_start(seconds(0.5));
+        viewer.set_trim_end(seconds(1.5));
+        click_named(&ctx, &mut viewer, "More options");
+        settle(&ctx, &mut viewer);
+        click_named(&ctx, &mut viewer, "Save without sound");
+        assert!(viewer.trim.as_ref().unwrap().without_sound);
+        viewer.save_trim(&ctx, None);
+        let saved = wait_for_save(&ctx, &mut viewer);
+        let info = bareclip_media::probe(&saved).unwrap();
+        assert!(
+            info.audio.is_empty(),
+            "{name}: no sound in {}",
+            saved.display()
+        );
+        assert_eq!((info.video.width, info.video.height), (160, 90), "{name}");
+        assert!(
+            (info.duration.as_seconds() - 1.0).abs() < 0.15,
+            "{name}: {}",
+            info.duration.as_seconds()
+        );
+    }
+
+    // A song has nothing to leave behind but its sound.
+    let mut viewer = trimmer_on(&ctx, &make_song("trim-silent-song", false));
+    click_named(&ctx, &mut viewer, "More options");
+    settle(&ctx, &mut viewer);
+    assert!(
+        !named(&ctx, &mut viewer)
+            .iter()
+            .any(|(label, ..)| label == "Save without sound")
+    );
+}
+
+#[test]
+fn the_trimmers_playhead_is_a_thumb_on_the_line_that_drags() {
+    let ctx = context();
+    let mut viewer = trimmer_on(&ctx, video());
+    viewer.set_trim_start(seconds(1.0));
+    viewer.set_trim_end(seconds(3.0));
+    viewer.seek(seconds(2.0));
+    let seek = named_rect(&ctx, &mut viewer, "Seek");
+    let duration = viewer.duration().as_seconds() as f32;
+    // The seeking stretch is the track with the thumb's widest added at each end.
+    let x_at = |time: f32| {
+        let left = seek.left() + 8.0;
+        let width = seek.width() - 16.0;
+        left + width * time / duration
+    };
+    let thumb = pos2(x_at(2.0), seek.center().y);
+    let target = pos2(x_at(1.5), seek.center().y);
+    let button = |at, pressed| egui::Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    };
+    for events in [
+        vec![egui::Event::PointerMoved(thumb)],
+        vec![button(thumb, true)],
+        vec![egui::Event::PointerMoved(thumb + vec2(-10.0, 0.0))],
+        vec![egui::Event::PointerMoved(target)],
+        vec![button(target, false)],
+    ] {
+        frame(&ctx, &mut viewer, events);
+    }
+    assert!(
+        near(viewer.position(), seconds(1.5), 0.1),
+        "dragged to {}",
+        viewer.position().as_seconds()
+    );
+    let range = viewer.trim_range().unwrap();
+    assert!(
+        near(range.start, seconds(1.0), 0.04) && near(range.end, seconds(3.0), 0.04),
+        "the handles stay"
+    );
+}
+
+#[test]
+fn edit_in_bareclip_sends_the_whole_file_to_an_open_editor_and_pauses() {
+    let ctx = context();
+    let prefix = format!("ViewerEditTest{}", std::process::id());
+    let editor = crate::handoff::starting_editor(&prefix);
+    let mut viewer = opened(&ctx, video());
+    viewer.editor_prefix = prefix;
+    viewer.play();
+    click_named(&ctx, &mut viewer, "Edit in BareClip");
+
+    let started = Instant::now();
+    let mut arrived = Vec::new();
+    while arrived.is_empty() && started.elapsed() < Duration::from_secs(10) {
+        arrived = editor.take();
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(arrived.len(), 1);
+    assert_eq!(arrived[0].path, video());
+    assert_eq!(
+        arrived[0].range,
+        Some(TimeRange {
+            start: Ticks(0),
+            end: viewer.duration()
+        })
+    );
+    assert!(!viewer.is_playing(), "the player pauses and stays");
+    assert!(viewer.take_become_editor().is_none());
 }

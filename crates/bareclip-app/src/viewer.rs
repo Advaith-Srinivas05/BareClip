@@ -1,5 +1,6 @@
-//! The player: what a double-click on a video or sound opens. It is a window of its own, with
-//! the editor's title strip, the picture in the middle and a bar of controls along the bottom.
+//! The player: what a double-click on a video or sound opens. It is a window of its own, laid
+//! out as the Photos app's: a title strip, the picture, a status bar along the bottom, and a
+//! pill of playing controls floating over the bottom of the picture.
 //!
 //! It plays through the same `Preview` as the editor, on a private timeline holding one clip,
 //! the whole file, so sound is the clock and seeking, frame steps and sound at other speeds all
@@ -22,26 +23,28 @@ use bareclip_core::{
     sound::{ClipSound, FULL_VOLUME},
     speed::Speed,
     splice::FrameIndex,
-    time::{Ticks, format_timecode},
+    time::{Ticks, clock_needs_hours, format_clock},
     timeline::{Clip, ClipId, MediaId, TimeRange},
     tracks::Tracks,
 };
 use bareclip_media::{MediaInfo, probe};
 use eframe::egui::{
-    self, Align, Align2, Color32, FontId, Key, Layout, Modifiers, Rect, RichText, Sense, Stroke,
-    TextureHandle, TextureOptions, UiBuilder, pos2, vec2,
+    self, Align2, Color32, FontId, Key, Modifiers, Rect, Sense, Stroke, TextureHandle,
+    TextureOptions, pos2, vec2,
 };
 
+use note::{Note, NotePress};
 use windows_sys::Win32::Foundation::HWND;
 use zoom::Zoom;
 
 use crate::{
-    components::{self, ActionButton, IconButton, Kind, MenuItem},
+    components::{self, ActionButton, Kind, MenuItem},
     fonts, icons,
     preview::Preview,
     storage::{self, Settings, ThemeSetting, ViewerSettings, WindowPlace},
     text, theme,
     theme::Palette,
+    window_place,
 };
 
 /// The smallest the player's window goes, which leaves room for mini view.
@@ -50,23 +53,42 @@ pub const SMALLEST_WINDOW: [f32; 2] = [320.0, 180.0];
 pub const SPEEDS: [f64; 7] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
 /// Where 1x is in `SPEEDS`.
 const NORMAL_SPEED: usize = 3;
-/// How long the bars stay in full screen once the mouse stops moving.
-const BARS_LINGER: Duration = Duration::from_secs(2);
+/// How long the pill stays once the mouse stops moving while playing, and while paused.
+const PILL_LINGER: Duration = Duration::from_secs(2);
+const PILL_LINGER_PAUSED: Duration = Duration::from_secs(5);
+/// Keys that play, pause or move through the video, which close an open flyout.
+const PLAYBACK_KEYS: [Key; 10] = [
+    Key::Space,
+    Key::K,
+    Key::ArrowLeft,
+    Key::ArrowRight,
+    Key::Comma,
+    Key::Period,
+    Key::Home,
+    Key::End,
+    Key::PageUp,
+    Key::PageDown,
+];
 /// How much Up and Down change the volume, out of 100.
 const VOLUME_STEP: u32 = 5;
 /// A step forward or back when the frame table isn't read yet, or there's no picture.
 const FALLBACK_STEP_SECONDS: f64 = 1.0 / 30.0;
 
-const TITLE_HEIGHT: f32 = 48.0;
-const SEEK_ROW_HEIGHT: f32 = 26.0;
-const CONTROL_ROW_HEIGHT: f32 = 44.0;
-const BOTTOM_HEIGHT: f32 = SEEK_ROW_HEIGHT + CONTROL_ROW_HEIGHT;
-const WINDOW_BUTTON_SIZE: f32 = 40.0;
-const CONTROL_SPACING: f32 = 4.0;
-const VOLUME_BAR_WIDTH: f32 = 80.0;
-const TIME_WIDTH: f32 = 72.0;
-/// How wide the controls in the middle of the bottom bar are.
-const MIDDLE_WIDTH: f32 = 470.0;
+/// As tall as the taller of Settings' pages, so it keeps its size when tabs are switched.
+const SETTINGS_PAGE_HEIGHT: f32 = 380.0;
+/// The room between Settings' title, groups and page.
+const SETTINGS_GAP: f32 = 14.0;
+/// The room Settings leaves for its title, its Done button and the window's edges, so its
+/// page scrolls rather than running off a short window.
+const SETTINGS_FRAME_ROOM: f32 = 170.0;
+/// How tall a line of Settings' key list is.
+const KEY_ROW_HEIGHT: f32 = 34.0;
+/// Room for the Make default button, which the row's words stop short of.
+const MAKE_DEFAULT_WIDTH: f32 = 104.0;
+/// The jumps' dropdowns, wide enough for "30 s" and the arrow.
+const JUMP_DROPDOWN_WIDTH: f32 = 84.0;
+/// The symbol over the message shown when nothing can play.
+const STAGE_SYMBOL: f32 = 32.0;
 /// How large the BareClip mark shows for a sound file with no cover.
 const MARK_SIDE: f32 = 160.0;
 /// How far one notch of a mouse wheel scrolls, in points.
@@ -145,12 +167,20 @@ pub struct Viewer {
     speed: usize,
     looping: bool,
     full_screen: bool,
+    /// Whether the window was maximised, and where it was, before full screen, so leaving full
+    /// screen puts it back and closing in full screen saves that rather than the whole screen.
+    before_full_screen: Option<(bool, Option<WindowPlace>)>,
+    /// The bottom bar's flyout that is open, if any.
+    flyout: bars::Flyouts,
     last_pointer_move: Instant,
     last_pointer: Option<egui::Pos2>,
     seek_bar_held: bool,
+    /// Where the pill was last drawn, so resting the mouse on it keeps it shown.
+    pill_at: Rect,
     resume_after_scrub: bool,
     volume_held: bool,
     settings_open: bool,
+    settings_tab: SettingsTab,
     /// Something to tell the user, shown over the bottom of the picture.
     notice: Option<String>,
     /// Was playing last frame, to notice playback reaching the end.
@@ -206,12 +236,16 @@ impl Viewer {
             speed: NORMAL_SPEED,
             looping: false,
             full_screen: false,
+            before_full_screen: None,
+            flyout: bars::Flyouts::default(),
             last_pointer_move: Instant::now(),
             last_pointer: None,
             seek_bar_held: false,
+            pill_at: Rect::NOTHING,
             resume_after_scrub: false,
             volume_held: false,
             settings_open: false,
+            settings_tab: SettingsTab::General,
             notice: None,
             was_playing: false,
             zoom: Zoom::fit(),
@@ -257,6 +291,10 @@ impl Viewer {
 
     /// Keeps where the window is as it closes, for the next run.
     pub fn closing(&mut self, place: Option<WindowPlace>) {
+        let place = match self.before_full_screen {
+            Some((_, before)) if self.full_screen => before,
+            _ => place,
+        };
         if let Some(place) = place {
             self.settings.window = Some(place);
         }
@@ -512,9 +550,20 @@ impl Viewer {
         );
     }
 
-    /// Jumps by the seek step from Settings.
+    /// Goes to the start, carrying on as it was, or to the last frame, where it pauses so the
+    /// end can be seen rather than looping or finishing.
+    pub fn go_to_end(&mut self, to_end: bool) {
+        if to_end {
+            self.pause();
+            self.seek(self.duration());
+        } else {
+            self.seek(Ticks(0));
+        }
+    }
+
+    /// Jumps back or forward as far as Settings says.
     pub fn skip(&mut self, forward: bool) {
-        let step = Ticks::from_seconds(f64::from(self.settings.seek_step()));
+        let step = Ticks::from_seconds(f64::from(self.jump(forward)));
         let target = if forward {
             Ticks(self.position().0 + step.0)
         } else {
@@ -553,7 +602,14 @@ impl Viewer {
         self.seek(target);
     }
 
+    /// A time as the player writes it: minutes and seconds, with hours in front for a file an
+    /// hour or longer.
+    pub fn clock(&self, time: Ticks) -> String {
+        format_clock(time, clock_needs_hours(self.duration()))
+    }
+
     /// The watching speed, as a factor.
+    #[cfg(test)]
     pub fn speed(&self) -> f64 {
         SPEEDS[self.speed]
     }
@@ -597,13 +653,19 @@ impl Viewer {
         self.sync_sound();
     }
 
-    pub fn seek_step(&self) -> u32 {
-        self.settings.seek_step()
+    /// How far a jump back or forward goes, in seconds.
+    pub fn jump(&self, forward: bool) -> u32 {
+        self.settings.jump(forward)
     }
 
-    pub fn set_seek_step(&mut self, seconds: u32) {
-        self.settings.seek_seconds = seconds;
-        self.settings.seek_seconds = self.settings.seek_step();
+    /// Sets how far a jump back or forward goes, to the nearest choice Settings offers.
+    pub fn set_jump(&mut self, forward: bool, seconds: u32) {
+        let seconds = storage::nearest_jump(seconds);
+        if forward {
+            self.settings.jump_forward = seconds;
+        } else {
+            self.settings.jump_back = seconds;
+        }
         self.save_settings();
     }
 
@@ -617,10 +679,35 @@ impl Viewer {
         self.full_screen
     }
 
-    fn set_full_screen(&mut self, ctx: &egui::Context, full: bool) {
+    /// Goes into or out of full screen. A maximised window without Windows' title bar keeps out of
+    /// the taskbar's way even in full screen, leaving a strip uncovered, so it stops being
+    /// maximised first, and is maximised again on the way out.
+    pub(super) fn set_full_screen(&mut self, ctx: &egui::Context, full: bool) {
         if self.full_screen != full {
             self.full_screen = full;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(full));
+            if full {
+                let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+                self.before_full_screen =
+                    Some((maximized, self.window.and_then(window_place::read)));
+                if maximized {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                // Without Windows' title bar the window has a shadow, which Windows makes by moving
+                // the picture down a pixel; sending this again after full screen turns that off
+                // there, so nothing shows above the top bar, and back on after.
+                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+                if self
+                    .before_full_screen
+                    .take()
+                    .is_some_and(|(maximized, _)| maximized)
+                {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+                }
+            }
             self.last_pointer_move = Instant::now();
         }
     }
@@ -658,54 +745,142 @@ impl Viewer {
             // Mini view is only the picture, with its controls on hover.
             self.video_area(ui, palette, whole);
             self.mini_controls(ui, palette, whole);
-            self.show_notice(ui, palette, whole);
+            let mut top = whole.top() + note::NOTE_GAP;
+            self.show_notice(ui, palette, whole, &mut top);
             return;
         }
-        let bars = self.bars_shown(&ctx);
-        let title = Rect::from_min_size(whole.min, vec2(whole.width(), TITLE_HEIGHT));
-        let bottom_height = if self.trim.is_some() {
-            trim::TRIM_ROW_HEIGHT + trim::ACTION_ROW_HEIGHT + CONTROL_ROW_HEIGHT
+        self.flyout.tick(&ctx);
+        self.finish_rewrite(&ctx);
+        let trimming = self.trim.is_some();
+        // In full screen the bars only come over the picture while the mouse is over their
+        // strip. In a window, and while trimming, they stay, with the picture between them.
+        let overlay = self.full_screen && !trimming;
+        let pointer = ctx.input(|input| input.pointer.hover_pos());
+        let over = |strip: Rect| pointer.is_some_and(|at| strip.contains(at));
+        let title = Rect::from_min_size(whole.min, vec2(whole.width(), bars::TITLE_HEIGHT));
+        let bottom_height = if trimming {
+            trim::TRIM_BAR_HEIGHT
         } else {
-            BOTTOM_HEIGHT
+            bars::BOTTOM_HEIGHT
         };
         let bottom = Rect::from_min_max(
             pos2(whole.left(), whole.bottom() - bottom_height),
             whole.max,
         );
-        let mut video = if self.full_screen {
+        let (top_shown, bottom_shown) = if overlay {
+            // A flyout of the bottom bar's keeps it while the mouse goes up onto the flyout.
+            let bar_flyout = matches!(
+                self.flyout.open,
+                Some(bars::Flyout::Zoom | bars::Flyout::Speed)
+            );
+            let on_pill = pointer.is_some_and(|at| self.pill_at.contains(at));
+            (
+                theme::appear(&ctx, egui::Id::unique("viewer_top_bar"), over(title)),
+                theme::appear(
+                    &ctx,
+                    egui::Id::unique("viewer_bottom_bar"),
+                    (over(bottom) && !on_pill) || bar_flyout,
+                ),
+            )
+        } else {
+            (1.0, 1.0)
+        };
+        let mut video = if overlay {
             whole
         } else {
-            Rect::from_min_max(
-                pos2(whole.left(), title.bottom()),
-                pos2(whole.right(), bottom.top()),
-            )
+            Rect::from_min_max(pos2(whole.left(), title.bottom()), bottom.right_top())
         };
-        // The info panel sits beside the picture, as long as there is room for both.
-        let panel =
-            (self.info.is_some() && !self.full_screen && video.width() > info::PANEL_WIDTH * 2.0)
-                .then(|| {
-                    let panel = Rect::from_min_max(
-                        pos2(video.right() - info::PANEL_WIDTH, video.top()),
-                        video.max,
-                    );
-                    video.max.x = panel.left();
-                    panel
-                });
+
+        // The info card slides in from the right, between the bars, and the picture narrows
+        // beside it as it comes.
+        let info_room = !self.full_screen && whole.width() > info::CARD_WIDTH * 2.0;
+        let info_shown = theme::appear(
+            &ctx,
+            egui::Id::unique("viewer_info_card"),
+            self.is_info_open() && info_room,
+        );
+        if info_shown <= 0.0 {
+            self.forget_closed_info();
+        }
+        let card = (info_shown > 0.0 && self.info.is_some()).then(|| {
+            let left = whole.right() - info_shown * (info::CARD_WIDTH + info::CARD_MARGIN);
+            video.max.x = whole.right() - info_shown * (info::CARD_WIDTH + info::CARD_MARGIN * 2.0);
+            Rect::from_min_max(
+                pos2(left, video.top() + info::CARD_MARGIN),
+                pos2(left + info::CARD_WIDTH, video.bottom() - info::CARD_MARGIN),
+            )
+        });
+
+        // The pill rises above the bottom bar while that shows over the picture.
+        let pill_wanted = !trimming && self.file.is_some() && self.pill_shown(&ctx);
+        let pill_appears = theme::appear(&ctx, egui::Id::unique("viewer_pill"), pill_wanted);
+        let pill_room = video.with_max_y(if overlay {
+            video.bottom() - bottom.height() * bottom_shown
+        } else {
+            video.bottom()
+        });
+        let pill_rect = pill::pill_rect(pill_room);
+        // The trimmer has its own pill, so the player's isn't drawn at all, even fading.
+        let pill_appears = if trimming { 0.0 } else { pill_appears };
+        self.pill_at = if pill_appears > 0.0 {
+            pill_rect
+        } else {
+            Rect::NOTHING
+        };
+        // The arrows to the files either side come and go with the pill, and stay while
+        // trimming, as they always have.
+        let arrows = if trimming { 1.0 } else { pill_appears };
+
         self.video_area(ui, palette, video);
-        self.edge_arrows(ui, palette, video);
-        self.start_over_note(ui, palette, video);
-        if let Some(panel) = panel {
-            self.info_panel(ui, palette, panel);
+        if let Some(card) = card {
+            ui.painter().rect_filled(
+                Rect::from_min_max(video.right_top(), pos2(whole.right(), video.bottom())),
+                0.0,
+                palette.bg_app,
+            );
+            self.info_panel(ui, palette, card);
         }
-        if bars {
-            self.title_strip(ui, palette, title);
-            self.bottom_bar(ui, palette, bottom);
+        if arrows > 0.0 {
+            ui.scope(|ui| {
+                ui.multiply_opacity(arrows);
+                self.edge_arrows(ui, palette, video);
+            });
         }
+        // With the pill away, the pointer goes too while playing, and always in full screen,
+        // as in other players.
+        if !pill_wanted
+            && !trimming
+            && (self.is_playing() || self.full_screen)
+            && pointer.is_some_and(|at| video.contains(at))
+        {
+            ctx.set_cursor_icon(egui::CursorIcon::None);
+        }
+        if pill_appears > 0.0 {
+            let sink = (1.0 - pill_appears) * pill::PILL_SINK;
+            ui.scope(|ui| {
+                ui.multiply_opacity(pill_appears);
+                self.play_pill(ui, palette, pill_rect.translate(vec2(0.0, sink)));
+            });
+        }
+        if top_shown > 0.0 {
+            let title_now = title.translate(vec2(0.0, -title.height() * (1.0 - top_shown)));
+            self.title_strip(ui, palette, title_now, overlay);
+        }
+        if trimming {
+            bars::bar_backdrop(ui, palette, bottom, false, "viewer_bottom_bar");
+            self.trim_bar(ui, palette, bottom, video.x_range());
+        } else if bottom_shown > 0.0 {
+            let bottom_now = bottom.translate(vec2(0.0, bottom.height() * (1.0 - bottom_shown)));
+            self.bottom_bar(ui, palette, bottom_now, overlay);
+        }
+        // Notes stack down from the top of the picture.
+        let mut top = video.top() + note::NOTE_GAP;
+        self.show_notice(ui, palette, video, &mut top);
+        self.trim_notes(ui, palette, video, &mut top);
+        self.saved_picture_note(ui, palette, video, &mut top);
+        self.start_over_note(ui, palette, video, &mut top);
         self.settings_window(&ctx, palette);
         self.delete_dialog(&ctx, palette);
-        self.mp4_question(&ctx, palette);
-        self.show_notice(ui, palette, video);
-        self.saved_picture_note(ui, palette, video);
         crate::editor::window_edges(&ctx);
     }
 
@@ -736,6 +911,62 @@ impl Viewer {
     /// Back to the whole picture.
     pub fn fit(&mut self) {
         self.zoom = Zoom::fit();
+    }
+
+    /// Zooms to the next multiple of 10% up or down, as − and + do, between a quarter of fit
+    /// and the closest zoom, stopping at fit on the way through.
+    pub fn zoom_step(&mut self, ctx: &egui::Context, up: bool) {
+        let Some(video) = self.video_size() else {
+            return;
+        };
+        let step = bars::ZOOM_BUTTON_STEP;
+        let now = self.zoom_percent(ctx);
+        // A hair's allowance, so 90% that is really 89.999% still goes on to 100%.
+        let steps = now / step;
+        let wanted = if up {
+            ((steps + 0.01).floor() + 1.0) * step
+        } else {
+            ((steps - 0.01).ceil() - 1.0) * step
+        };
+        let fit = zoom::fit_percent(self.view, video, ctx.pixels_per_point());
+        let passes_fit = (now - fit) * (wanted - fit) < 0.0 && (now - fit).abs() > 0.5;
+        if passes_fit {
+            self.fit();
+        } else {
+            self.zoom_to(ctx, wanted);
+        }
+    }
+
+    /// Zooms to a percentage of the video's real size, between a quarter of fit and the
+    /// closest zoom, landing on fit when within half a percent of it.
+    pub fn zoom_to(&mut self, ctx: &egui::Context, percent: f32) {
+        let Some(video) = self.video_size() else {
+            return;
+        };
+        let ppp = ctx.pixels_per_point();
+        let fit = zoom::fit_percent(self.view, video, ppp);
+        if (percent - fit).abs() <= 0.5 {
+            self.fit();
+            return;
+        }
+        let most = (zoom::MOST_ZOOM * 100.0).max(fit);
+        let least = fit * zoom::LEAST_OF_FIT;
+        let percent = percent.clamp(least, most);
+        // From the same side of fit it keeps the part being looked at. Across fit it goes from
+        // fit, because zooming through fit stops there.
+        let now = self.zoom.percent(self.view, video, ppp);
+        let base = if (now - fit) * (percent - fit) > 0.0 {
+            self.zoom
+        } else {
+            Zoom::fit()
+        };
+        self.zoom = base.zoom_to_percent(self.view, video, percent, ppp);
+    }
+
+    /// Whether the picture is zoomed in past fit, so a drag pans it rather than a click playing.
+    fn zoomed_in(&self) -> bool {
+        self.video_size()
+            .is_some_and(|video| self.zoom.is_zoomed_in(self.view, video))
     }
 
     /// The zoom as a percentage of the video's real pixels.
@@ -811,19 +1042,31 @@ impl Viewer {
         }
     }
 
-    /// Whether the bars show: always in a window, and in full screen only while the mouse is
-    /// moving.
-    fn bars_shown(&self, ctx: &egui::Context) -> bool {
-        if !self.full_screen {
+    /// Whether the pill shows. Any movement of the mouse brings it, and it goes once the mouse
+    /// has rested for a moment, a little longer while paused, unless the mouse rests on it, a
+    /// flyout or menu is open, a slider is held, or a window is asking something.
+    fn pill_shown(&self, ctx: &egui::Context) -> bool {
+        let on_pill = ctx
+            .input(|input| input.pointer.hover_pos())
+            .is_some_and(|at| self.pill_at.contains(at));
+        let keep = self.seek_bar_held
+            || self.volume_held
+            || self.settings_open
+            || self.confirm_delete
+            || on_pill
+            || self.flyout.is_open()
+            || egui::Popup::is_any_open(ctx);
+        let linger = if self.is_playing() {
+            PILL_LINGER
+        } else {
+            PILL_LINGER_PAUSED
+        };
+        let since = self.last_pointer_move.elapsed();
+        if since < linger {
+            ctx.request_repaint_after(linger - since);
             return true;
         }
-        let since = self.last_pointer_move.elapsed();
-        if since < BARS_LINGER {
-            ctx.request_repaint_after(BARS_LINGER - since);
-            true
-        } else {
-            self.seek_bar_held || self.volume_held || self.settings_open
-        }
+        keep
     }
 
     fn follow_pointer(&mut self, ctx: &egui::Context) {
@@ -903,6 +1146,24 @@ impl Viewer {
         if self.confirm_delete {
             return;
         }
+        // Escape closes an open flyout or menu first, before leaving full screen or the trimmer.
+        if (self.flyout.is_open() || egui::Popup::is_any_open(ctx))
+            && consume(Modifiers::NONE, Key::Escape)
+        {
+            self.flyout.close();
+            egui::Popup::close_all(ctx);
+            return;
+        }
+        // Playing, pausing or moving through the video closes a flyout, so it doesn't sit over
+        // the picture being watched.
+        let moves_playback = ctx.input(|input| {
+            PLAYBACK_KEYS
+                .iter()
+                .any(|&key| input.key_pressed(key) && input.modifiers.is_none())
+        });
+        if moves_playback {
+            self.flyout.close();
+        }
         if self.file.is_some() {
             if consume(Modifiers::NONE, Key::Delete) {
                 self.ask_to_delete();
@@ -923,10 +1184,10 @@ impl Viewer {
                 self.step_frame(true);
             }
             if consume(Modifiers::NONE, Key::Home) {
-                self.seek(Ticks(0));
+                self.go_to_end(false);
             }
             if consume(Modifiers::NONE, Key::End) {
-                self.seek(self.duration());
+                self.go_to_end(true);
             }
         }
         if consume(Modifiers::NONE, Key::ArrowUp) {
@@ -941,7 +1202,9 @@ impl Viewer {
             self.toggle_mute();
             self.save_settings();
         }
-        if consume(Modifiers::NONE, Key::F) && self.mini.is_none() {
+        let full_screen_key =
+            consume(Modifiers::NONE, Key::F) || consume(Modifiers::NONE, Key::F11);
+        if full_screen_key && self.mini.is_none() {
             let full = !self.full_screen;
             self.set_full_screen(ctx, full);
         }
@@ -955,10 +1218,10 @@ impl Viewer {
             self.fit();
         }
         if consume(Modifiers::COMMAND, Key::Equals) || consume(Modifiers::COMMAND, Key::Plus) {
-            self.zoom_by(ctx, zoom::STEP, None);
+            self.zoom_step(ctx, true);
         }
         if consume(Modifiers::COMMAND, Key::Minus) {
-            self.zoom_by(ctx, 1.0 / zoom::STEP, None);
+            self.zoom_step(ctx, false);
         }
         if self.trim.is_some() {
             if consume(Modifiers::NONE, Key::OpenBracket) {
@@ -997,20 +1260,13 @@ impl Viewer {
         );
         self.picture_input(&ctx, &response);
         if let Some(failed) = &self.failed {
-            let painter = ui.painter_at(area);
-            painter.text(
-                area.center() - vec2(0.0, 12.0),
-                Align2::CENTER_CENTER,
+            let reason = failed.reason.clone();
+            stage_message(
+                ui,
+                area,
+                (&icons::CIRCLE_ALERT, theme::DARK.danger),
                 "This file can't be played",
-                fonts::strong(18.0),
-                palette_on_stage(palette),
-            );
-            painter.text(
-                area.center() + vec2(0.0, 16.0),
-                Align2::CENTER_CENTER,
-                &failed.reason,
-                FontId::proportional(13.0),
-                palette_on_stage(palette).gamma_multiply(0.75),
+                &reason,
             );
             return;
         }
@@ -1029,12 +1285,12 @@ impl Viewer {
                 );
                 return;
             }
-            ui.painter().text(
-                area.center(),
-                Align2::CENTER_CENTER,
+            stage_message(
+                ui,
+                area,
+                (&icons::FILM, theme::DARK.text_muted),
+                "Nothing open",
                 "Open a video or sound from File Explorer to play it here.",
-                FontId::proportional(14.0),
-                palette_on_stage(palette).gamma_multiply(0.75),
             );
             return;
         };
@@ -1090,11 +1346,11 @@ impl Viewer {
         }
         if response.double_clicked() {
             self.fit();
-        } else if response.clicked() && self.zoom.is_fit() {
+        } else if response.clicked() && !self.zoomed_in() {
             self.toggle_playback();
         }
         if response.drag_started() {
-            self.panning = !self.zoom.is_fit();
+            self.panning = self.zoomed_in();
         }
         if self.panning
             && response.dragged()
@@ -1115,6 +1371,8 @@ impl Viewer {
             if notches != 0.0 {
                 let pointer = ctx.input(|input| input.pointer.hover_pos());
                 self.zoom_by(ctx, zoom::STEP.powf(notches), pointer);
+                // The zoom's flyout shows the new level for a moment.
+                self.flyout.show_for_a_moment(bars::Flyout::Zoom);
             }
         }
     }
@@ -1130,431 +1388,6 @@ impl Viewer {
             self.mark = Some(ctx.load_texture("viewer-mark", image, TextureOptions::LINEAR));
         }
         self.mark.clone()
-    }
-
-    /// The strip across the top, which replaces the Windows title bar and does its jobs.
-    fn title_strip(&mut self, ui: &mut egui::Ui, palette: &Palette, rect: Rect) {
-        let ctx = ui.ctx().clone();
-        ui.painter().rect_filled(rect, 0.0, palette.bg_app);
-        let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
-        let strip = ui.interact(
-            rect,
-            egui::Id::unique("viewer_title_drag"),
-            Sense::click_and_drag(),
-        );
-        if strip.double_clicked() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
-        } else if strip.drag_started_by(egui::PointerButton::Primary) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-        }
-        let has_file = self.file.is_some();
-        let inner = rect.shrink2(vec2(8.0, 0.0));
-        let left = ui
-            .scope_builder(
-                UiBuilder::new()
-                    .max_rect(inner)
-                    .layout(Layout::left_to_right(Align::Center)),
-                |ui| {
-                    ui.spacing_mut().item_spacing.x = CONTROL_SPACING;
-                    let trimming = self.trim.is_some();
-                    if ui
-                        .add_enabled(
-                            has_file,
-                            ActionButton::new(palette, Kind::Ghost, "Trim")
-                                .icon(icons::SCISSORS)
-                                .selected(trimming),
-                        )
-                        .on_hover_text("Keep one stretch of this file")
-                        .clicked()
-                    {
-                        if trimming {
-                            self.close_trimmer();
-                        } else {
-                            let ctx = ui.ctx().clone();
-                            self.open_trimmer(&ctx);
-                        }
-                    }
-                    if ui
-                        .add_enabled(
-                            has_file,
-                            IconButton::new(palette, Kind::Ghost, icons::TRASH_2, "Delete"),
-                        )
-                        .on_hover_text("Move to the Recycle Bin (Delete)")
-                        .clicked()
-                    {
-                        self.ask_to_delete();
-                    }
-                    if ui
-                        .add_enabled(
-                            has_file,
-                            IconButton::new(
-                                palette,
-                                Kind::Ghost,
-                                icons::CLAPPERBOARD,
-                                "Edit in BareClip",
-                            ),
-                        )
-                        .on_hover_text("Edit in BareClip")
-                        .clicked()
-                    {
-                        self.edit_in_bareclip();
-                    }
-                },
-            )
-            .response
-            .rect;
-        let right = ui
-            .scope_builder(
-                UiBuilder::new()
-                    .max_rect(inner)
-                    .layout(Layout::right_to_left(Align::Center)),
-                |ui| {
-                    ui.spacing_mut().item_spacing.x = CONTROL_SPACING;
-                    let button = |icon, name| {
-                        IconButton::new(palette, Kind::Ghost, icon, name)
-                            .size(WINDOW_BUTTON_SIZE, 16.0)
-                    };
-                    if ui
-                        .add(button(icons::X, "Close window"))
-                        .on_hover_text("Close")
-                        .clicked()
-                    {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                    let (icon, name, hint) = if maximized {
-                        (icons::COPY, "Restore window", "Restore")
-                    } else {
-                        (icons::SQUARE, "Maximise window", "Maximise")
-                    };
-                    if ui.add(button(icon, name)).on_hover_text(hint).clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
-                    }
-                    if ui
-                        .add(button(icons::MINUS, "Minimise window"))
-                        .on_hover_text("Minimise")
-                        .clicked()
-                    {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                    }
-                    ui.add_space(8.0);
-                    if ui
-                        .add(IconButton::new(
-                            palette,
-                            Kind::Ghost,
-                            icons::SETTINGS,
-                            "Settings",
-                        ))
-                        .on_hover_text("Settings")
-                        .clicked()
-                    {
-                        self.settings_open = true;
-                    }
-                    let info_open = self.info.is_some();
-                    if ui
-                        .add_enabled(
-                            has_file || info_open,
-                            IconButton::new(palette, Kind::Ghost, icons::INFO, "Info").tint(
-                                if info_open {
-                                    palette.accent
-                                } else {
-                                    palette.text
-                                },
-                            ),
-                        )
-                        .on_hover_text("Info")
-                        .clicked()
-                    {
-                        self.toggle_info();
-                    }
-                },
-            )
-            .response
-            .rect;
-        // The name sits in the middle of the window, as far as the buttons allow.
-        let room = (right.left() - left.right() - 24.0).max(0.0);
-        let name_rect = Rect::from_center_size(
-            pos2(rect.center().x, rect.center().y),
-            vec2(room.min(rect.width()), TITLE_HEIGHT),
-        );
-        let name_rect = name_rect
-            .translate(vec2((left.right() + 12.0 - name_rect.left()).max(0.0), 0.0))
-            .translate(vec2(
-                (right.left() - 12.0 - name_rect.right()).min(0.0),
-                0.0,
-            ));
-        ui.scope_builder(
-            UiBuilder::new()
-                .max_rect(name_rect)
-                .layout(Layout::centered_and_justified(egui::Direction::LeftToRight)),
-            |ui| {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(self.name())
-                            .font(FontId::proportional(components::NAME_BAR_TEXT - 1.0))
-                            .color(palette.text),
-                    )
-                    .truncate()
-                    .selectable(false),
-                );
-            },
-        );
-    }
-
-    /// The seek line, and under it the file's details, the controls and zoom.
-    fn bottom_bar(&mut self, ui: &mut egui::Ui, palette: &Palette, rect: Rect) {
-        ui.painter().rect_filled(rect, 0.0, palette.bg_app);
-        ui.painter()
-            .hline(rect.x_range(), rect.top(), Stroke::new(1.0, palette.border));
-        let controls = Rect::from_min_max(
-            pos2(rect.left(), rect.bottom() - CONTROL_ROW_HEIGHT),
-            rect.max,
-        );
-        let has_file = self.file.is_some();
-        let duration = self.duration();
-        let position = self.position();
-
-        if self.trim.is_some() {
-            // The trimmer's strip and buttons take the seek line's place.
-            let strip = Rect::from_min_size(rect.min, vec2(rect.width(), trim::TRIM_ROW_HEIGHT));
-            let actions = Rect::from_min_size(
-                pos2(rect.left(), strip.bottom()),
-                vec2(rect.width(), trim::ACTION_ROW_HEIGHT),
-            );
-            self.trim_row(ui, palette, strip);
-            self.trim_actions(ui, palette, actions);
-        } else {
-            let seek_row = Rect::from_min_size(rect.min, vec2(rect.width(), SEEK_ROW_HEIGHT));
-            ui.scope_builder(
-                UiBuilder::new()
-                    .max_rect(seek_row.shrink2(vec2(12.0, 0.0)))
-                    .layout(Layout::left_to_right(Align::Center)),
-                |ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    time_label(ui, palette, &format_timecode(position), Align::Max);
-                    let room = (ui.available_width() - TIME_WIDTH - 8.0).max(40.0);
-                    if let Some(time) = crate::timeline::seek_bar(
-                        ui,
-                        palette,
-                        room,
-                        position,
-                        duration,
-                        &mut self.seek_bar_held,
-                    ) {
-                        self.seek(time);
-                    }
-                    time_label(ui, palette, &format_timecode(duration), Align::Min);
-                },
-            );
-        }
-
-        // The file's details on the left.
-        let details = self.file.as_ref().map(file_details).unwrap_or_default();
-        ui.scope_builder(
-            UiBuilder::new()
-                .max_rect(controls.shrink2(vec2(14.0, 0.0)))
-                .layout(Layout::left_to_right(Align::Center)),
-            |ui| {
-                ui.spacing_mut().item_spacing.x = 14.0;
-                for detail in details {
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(detail).size(12.0).color(palette.text_muted),
-                        )
-                        .selectable(false),
-                    );
-                }
-            },
-        );
-
-        // The controls in the middle.
-        let middle =
-            Rect::from_center_size(controls.center(), vec2(MIDDLE_WIDTH, CONTROL_ROW_HEIGHT));
-        ui.scope_builder(
-            UiBuilder::new()
-                .max_rect(middle)
-                .layout(Layout::left_to_right(Align::Center)),
-            |ui| {
-                ui.spacing_mut().item_spacing.x = CONTROL_SPACING;
-                let (icon, name) = if self.is_playing() {
-                    (icons::PAUSE, "Pause")
-                } else {
-                    (icons::PLAY, "Play")
-                };
-                let play = IconButton::new(palette, Kind::Primary, icon, name)
-                    .size(36.0, 16.0)
-                    .round()
-                    .solid();
-                if ui
-                    .add_enabled(has_file, play)
-                    .on_hover_text("Play or pause (Space)")
-                    .clicked()
-                {
-                    self.toggle_playback();
-                }
-                ui.add_space(6.0);
-                let (icon, name) = if self.is_muted() || self.volume() == 0 {
-                    (icons::VOLUME_X, "Unmute")
-                } else {
-                    (icons::VOLUME_2, "Mute")
-                };
-                if ui
-                    .add(IconButton::new(palette, Kind::Ghost, icon, name))
-                    .on_hover_text("Mute (M)")
-                    .clicked()
-                {
-                    self.toggle_mute();
-                    self.save_settings();
-                }
-                let shown = if self.is_muted() { 0 } else { self.volume() };
-                let mut held = self.volume_held;
-                if let Some(volume) =
-                    level_bar(ui, palette, VOLUME_BAR_WIDTH, shown, &mut held, "Volume")
-                {
-                    self.set_volume(volume);
-                }
-                if self.volume_held && !held {
-                    self.save_settings();
-                }
-                self.volume_held = held;
-                ui.add_space(6.0);
-                self.speed_button(ui, palette);
-                let looping = self.looping;
-                let loop_button = IconButton::new(palette, Kind::Ghost, icons::REPEAT, "Loop")
-                    .tint(if looping {
-                        palette.accent
-                    } else {
-                        palette.text
-                    });
-                if ui
-                    .add_enabled(has_file, loop_button)
-                    .on_hover_text(if looping { "Loop is on" } else { "Loop" })
-                    .clicked()
-                {
-                    self.looping = !looping;
-                }
-                let picture = self.video_size().is_some();
-                let save = IconButton::new(palette, Kind::Ghost, icons::CAMERA, "Save picture")
-                    .hidden(!picture);
-                if ui
-                    .add_enabled(picture && self.saving_picture.is_none(), save)
-                    .on_hover_text("Save this picture beside the video")
-                    .clicked()
-                {
-                    self.save_picture(ui.ctx());
-                }
-                if ui
-                    .add_enabled(
-                        has_file,
-                        IconButton::new(
-                            palette,
-                            Kind::Ghost,
-                            icons::PICTURE_IN_PICTURE_2,
-                            "Mini view",
-                        ),
-                    )
-                    .on_hover_text("Mini view, a small window above the others")
-                    .clicked()
-                {
-                    self.enter_mini_view(ui.ctx());
-                }
-                let (icon, name) = if self.full_screen {
-                    (icons::MINIMIZE, "Leave full screen")
-                } else {
-                    (icons::MAXIMIZE, "Full screen")
-                };
-                if ui
-                    .add(IconButton::new(palette, Kind::Ghost, icon, name))
-                    .on_hover_text(format!("{name} (F)"))
-                    .clicked()
-                {
-                    let full = !self.full_screen;
-                    self.set_full_screen(ui.ctx(), full);
-                }
-            },
-        );
-
-        if self.video_size().is_some() {
-            self.zoom_controls(ui, palette, controls);
-        }
-    }
-
-    /// Zoom out, the zoom's slider, zoom in, the percentage and fit, at the bar's right.
-    fn zoom_controls(&mut self, ui: &mut egui::Ui, palette: &Palette, controls: Rect) {
-        let ctx = ui.ctx().clone();
-        ui.scope_builder(
-            UiBuilder::new()
-                .max_rect(controls.shrink2(vec2(10.0, 0.0)))
-                .layout(Layout::right_to_left(Align::Center)),
-            |ui| {
-                ui.spacing_mut().item_spacing.x = CONTROL_SPACING;
-                if ui
-                    .add(ActionButton::new(palette, Kind::Ghost, "Fit").small())
-                    .on_hover_text("Fit the whole picture (0)")
-                    .clicked()
-                {
-                    self.fit();
-                }
-                let percent = self.zoom_percent(&ctx);
-                ui.allocate_ui_with_layout(
-                    vec2(44.0, CONTROL_ROW_HEIGHT),
-                    Layout::right_to_left(Align::Center),
-                    |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(format!("{percent:.0}%"))
-                                    .size(12.0)
-                                    .color(palette.text_muted),
-                            )
-                            .selectable(false),
-                        );
-                    },
-                );
-                if ui
-                    .add(IconButton::new(
-                        palette,
-                        Kind::Ghost,
-                        icons::ZOOM_IN,
-                        "Zoom in",
-                    ))
-                    .on_hover_text("Zoom in (Ctrl+=)")
-                    .clicked()
-                {
-                    self.zoom_by(&ctx, zoom::STEP, None);
-                }
-                // The slider runs from fit to the closest zoom, evenly in steps of zoom.
-                let fit = self.video_size().map_or(100.0, |video| {
-                    zoom::fit_percent(self.view, video, ctx.pixels_per_point())
-                });
-                let most = (zoom::MOST_ZOOM * 100.0).max(fit);
-                let share = if most > fit {
-                    ((percent / fit).ln() / (most / fit).ln()).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                let mut held = false;
-                let level = (share * 100.0).round() as u32;
-                if let Some(level) = level_bar(ui, palette, 100.0, level, &mut held, "Zoom")
-                    && let Some(video) = self.video_size()
-                {
-                    let wanted = fit * (most / fit).powf(level as f32 / 100.0);
-                    self.zoom =
-                        self.zoom
-                            .zoom_to_percent(self.view, video, wanted, ctx.pixels_per_point());
-                }
-                if ui
-                    .add(IconButton::new(
-                        palette,
-                        Kind::Ghost,
-                        icons::ZOOM_OUT,
-                        "Zoom out",
-                    ))
-                    .on_hover_text("Zoom out (Ctrl+-)")
-                    .clicked()
-                {
-                    self.zoom_by(&ctx, 1.0 / zoom::STEP, None);
-                }
-            },
-        );
     }
 
     /// Saves the picture on screen beside the video, at the video's full size, in the
@@ -1602,7 +1435,13 @@ impl Viewer {
     }
 
     /// Says a picture was saved, with Show in folder, for a few seconds.
-    fn saved_picture_note(&mut self, ui: &mut egui::Ui, palette: &Palette, area: Rect) {
+    fn saved_picture_note(
+        &mut self,
+        ui: &mut egui::Ui,
+        palette: &Palette,
+        area: Rect,
+        top: &mut f32,
+    ) {
         let Some((path, since)) = &self.saved_picture else {
             return;
         };
@@ -1615,194 +1454,77 @@ impl Viewer {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
         let path = path.clone();
-        let rect = Rect::from_center_size(
-            pos2(area.center().x, area.top() + 36.0),
-            vec2(area.width().min(520.0), 40.0),
-        );
-        ui.painter().rect_filled(rect, 8.0, palette.raised);
-        let mut close = false;
-        ui.scope_builder(
-            UiBuilder::new()
-                .max_rect(rect.shrink2(vec2(12.0, 0.0)))
-                .layout(Layout::left_to_right(Align::Center)),
-            |ui| {
-                components::symbol(ui, &icons::CIRCLE_CHECK, 16.0, palette.success);
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(format!("Saved {name}"))
-                            .size(13.0)
-                            .color(palette.text),
-                    )
-                    .truncate()
-                    .selectable(false),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .add(IconButton::new(
-                            palette,
-                            Kind::Ghost,
-                            icons::X,
-                            "Close note",
-                        ))
-                        .clicked()
-                    {
-                        close = true;
-                    }
-                    if ui
-                        .add(ActionButton::new(palette, Kind::Secondary, "Show in folder").small())
-                        .clicked()
-                    {
-                        show_in_folder(&path);
-                    }
-                });
-            },
-        );
-        if close {
-            self.saved_picture = None;
+        let words = format!("Saved {name}");
+        match Note::new(&icons::CIRCLE_CHECK, palette.success, &words)
+            .actions(&["Show in folder"])
+            .closable()
+            .show(ui, palette, area, top)
+        {
+            NotePress::Action(_) => show_in_folder(&path),
+            NotePress::Close => self.saved_picture = None,
+            NotePress::Nothing => {}
         }
     }
 
-    /// The speed's button, which shows the speed when it isn't 1x, and its menu.
-    fn speed_button(&mut self, ui: &mut egui::Ui, palette: &Palette) {
-        let label = if self.speed == NORMAL_SPEED {
-            "1x".to_owned()
-        } else {
-            text::speed_name(self.speed())
-        };
-        let button = ActionButton::new(palette, Kind::Ghost, &label)
-            .icon(icons::GAUGE)
-            .small()
-            .selected(self.speed != NORMAL_SPEED);
-        let response = ui
-            .add_enabled(self.file.is_some(), button)
-            .on_hover_text("Watching speed");
-        let mut chosen = None;
-        egui::Popup::menu(&response).show(|ui| {
-            for (index, speed) in SPEEDS.iter().enumerate().rev() {
-                let name = text::speed_name(*speed);
-                if ui
-                    .add(MenuItem::choice(palette, &name, index == self.speed))
-                    .clicked()
-                {
-                    chosen = Some(index);
-                }
-            }
-        });
-        if let Some(index) = chosen {
-            self.set_speed(index);
-        }
-    }
-
-    /// The player's small Settings window.
+    /// The player's Settings, laid out as the editor's: tabs down the left, the open tab's page
+    /// beside them, and the version and Done along the bottom.
     fn settings_window(&mut self, ctx: &egui::Context, palette: &Palette) {
         if !self.settings_open {
             return;
         }
         let mut close = false;
-        let mut step = self.seek_step();
+        let mut jumps = [self.jump(false), self.jump(true)];
         let mut resume = self.settings.resume;
-        let mut theme = self.theme;
+        let mut tab = self.settings_tab;
         egui::Modal::new(egui::Id::unique("viewer_settings"))
             .frame(crate::editor::dialog_frame(ctx))
             .show(ctx, |ui| {
-                ui.set_width(440.0);
-                components::dialog_title(ui, &icons::SETTINGS, palette.accent, "Player settings");
-                ui.add_space(12.0);
-                components::settings_group(ui, palette, "Playing", |ui| {
-                    components::settings_row(
-                        ui,
-                        palette,
-                        (
-                            "Arrow keys jump",
-                            Some("How far Left and Right jump, from 1 to 60 seconds"),
-                        ),
-                        90.0,
-                        |ui| {
-                            ui.add(
-                                egui::DragValue::new(&mut step)
-                                    .range(storage::SEEK_SECONDS_RANGE)
-                                    .suffix(" s")
-                                    .speed(0.2),
-                            )
-                            .on_hover_text("How far Left and Right jump, from 1 to 60 seconds");
-                        },
-                    );
-                    components::settings_divider(ui, palette);
-                    let row =
-                        components::SwitchRow::new(palette, "Pick up where I stopped", resume);
-                    if ui.add(row).clicked() {
-                        resume = !resume;
-                    }
-                });
-                ui.add_space(8.0);
-                components::settings_group(ui, palette, "Look", |ui| {
-                    components::settings_row(ui, palette, ("Theme", None), 230.0, |ui| {
-                        for (choice, name) in [
-                            (ThemeSetting::System, "System"),
-                            (ThemeSetting::Light, "Light"),
-                            (ThemeSetting::Dark, "Dark"),
-                        ] {
-                            if ui
-                                .add(
-                                    ActionButton::new(palette, Kind::Secondary, name)
-                                        .small()
-                                        .selected(theme == choice),
-                                )
-                                .clicked()
-                            {
-                                theme = choice;
-                            }
-                        }
+                let room = crate::editor::dialog_room(ctx);
+                ui.set_width(components::SETTINGS_WIDTH.min(room.x));
+                components::dialog_title(ui, &icons::SETTINGS, palette.accent, "Settings");
+                ui.add_space(SETTINGS_GAP);
+                // Only the tabs and their page scroll in a short window, so the title and Done
+                // stay in sight.
+                let height = (ctx.content_rect().height() - SETTINGS_FRAME_ROOM).max(120.0);
+                // A scroll bar beside the page rather than over its right edge.
+                ui.spacing_mut().scroll.floating = false;
+                egui::ScrollArea::vertical()
+                    .max_height(height)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        components::settings_tabs(
+                            ui,
+                            palette,
+                            &SETTINGS_TABS,
+                            &mut tab,
+                            SETTINGS_PAGE_HEIGHT,
+                            |ui, tab| match tab {
+                                SettingsTab::General => {
+                                    general_settings(ui, palette, &mut jumps, &mut resume);
+                                }
+                                SettingsTab::Keys => key_settings(ui, palette),
+                            },
+                        );
                     });
-                });
-                ui.add_space(8.0);
-                components::settings_group(ui, palette, "Default player", |ui| {
-                    components::settings_row(
-                        ui,
-                        palette,
-                        (
-                            "Open videos and sound in BareClip",
-                            Some("Windows asks you to choose it once, on its Default apps page"),
-                        ),
-                        150.0,
-                        |ui| {
-                            if ui
-                                .add(
-                                    ActionButton::new(palette, Kind::Secondary, "Make default")
-                                        .small(),
-                                )
-                                .on_hover_text("Make BareClip your default player")
-                                .clicked()
-                            {
-                                crate::file_ops::open_default_apps();
-                            }
-                        },
-                    );
-                });
-                ui.add_space(8.0);
-                components::settings_group(ui, palette, "Keys", |ui| {
-                    for (keys, what) in KEY_LIST {
-                        components::compact_settings_row(ui, palette, what, 130.0, |ui| {
-                            ui.colored_label(palette.text_muted, *keys);
-                        });
-                    }
-                });
-                ui.add_space(14.0);
-                components::dialog_buttons(ui, |ui| {
+                ui.add_space(12.0);
+                components::dialog_footer(ui, palette, &text::version_line(), |ui| {
                     close = ui
-                        .add(ActionButton::new(palette, Kind::Primary, "Done"))
+                        .add(crate::editor::dialog_button(palette, "Done"))
                         .clicked();
                 });
             });
-        if step != self.seek_step() {
-            self.set_seek_step(step);
+        self.settings_tab = tab;
+        for (forward, seconds) in [false, true].into_iter().zip(jumps) {
+            if seconds != self.jump(forward) {
+                self.set_jump(forward, seconds);
+            }
         }
         if resume != self.settings.resume {
             self.set_resume(resume);
         }
+        let theme = ctx.options(|options| options.theme_preference).into();
         if theme != self.theme {
             self.theme = theme;
-            ctx.set_theme(egui::ThemePreference::from(theme));
             self.save_settings();
         }
         if close {
@@ -1810,27 +1532,18 @@ impl Viewer {
         }
     }
 
-    /// A problem, shown over the bottom of the picture.
-    fn show_notice(&mut self, ui: &mut egui::Ui, palette: &Palette, area: Rect) {
-        let Some(notice) = &self.notice else {
+    /// A problem, as the first note over the picture, until it is closed or the file changes.
+    fn show_notice(&mut self, ui: &mut egui::Ui, palette: &Palette, area: Rect, top: &mut f32) {
+        let Some(notice) = self.notice.clone() else {
             return;
         };
-        let galley = ui.painter().layout(
-            notice.clone(),
-            FontId::proportional(13.0),
-            palette.text,
-            (area.width() - 80.0).max(100.0),
-        );
-        let rect = Rect::from_center_size(
-            pos2(
-                area.center().x,
-                area.bottom() - 32.0 - galley.size().y / 2.0,
-            ),
-            galley.size() + vec2(24.0, 14.0),
-        );
-        ui.painter().rect_filled(rect, 8.0, palette.raised);
-        ui.painter()
-            .galley(rect.min + vec2(12.0, 7.0), galley, palette.text);
+        if Note::new(&icons::CIRCLE_ALERT, palette.danger, &notice)
+            .closable()
+            .show(ui, palette, area, top)
+            == NotePress::Close
+        {
+            self.notice = None;
+        }
     }
 }
 
@@ -1910,18 +1623,166 @@ fn since_process_start() -> Option<Duration> {
     ))
 }
 
-/// The keys, as Settings lists them.
-const KEY_LIST: &[(&str, &str)] = &[
-    ("Space, K", "Play or pause"),
-    ("Left, Right", "Jump back or forward"),
-    (", and .", "One frame back or forward"),
-    ("Up, Down", "Volume"),
-    ("M", "Mute"),
-    ("Home, End", "Start or end"),
-    ("Page Up, Page Down", "Previous or next file"),
-    ("0, Ctrl+=, Ctrl+-", "Fit, zoom in or out"),
-    ("F, Escape", "Full screen"),
+/// The tabs of the player's Settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsTab {
+    General,
+    Keys,
+}
+
+/// Each tab's symbol, label and name for screen readers.
+const SETTINGS_TABS: [(SettingsTab, icons::Icon, &str, &str); 2] = [
+    (
+        SettingsTab::General,
+        icons::SLIDERS_HORIZONTAL,
+        "General",
+        "General settings",
+    ),
+    (SettingsTab::Keys, icons::KEYBOARD, "Keys", "Keys settings"),
 ];
+
+/// Settings' General tab: the jumps and picking up where it stopped, the theme, and making
+/// BareClip the default player.
+fn general_settings(ui: &mut egui::Ui, palette: &Palette, jumps: &mut [u32; 2], resume: &mut bool) {
+    components::settings_group(ui, palette, "Playing", |ui| {
+        for (index, (label, detail)) in [
+            ("Jump back", "Jump back and the Left key"),
+            ("Jump forward", "Jump forward and the Right key"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            components::settings_row(
+                ui,
+                palette,
+                (label, Some(detail)),
+                JUMP_DROPDOWN_WIDTH,
+                |ui| {
+                    jump_dropdown(ui, palette, label, &mut jumps[index]);
+                },
+            );
+            components::settings_divider(ui, palette);
+        }
+        let row = components::SwitchRow::new(palette, "Pick up where I stopped", *resume);
+        if ui.add(row).clicked() {
+            *resume = !*resume;
+        }
+    });
+    ui.add_space(SETTINGS_GAP);
+    components::settings_group(ui, palette, "Appearance", |ui| {
+        components::settings_row(
+            ui,
+            palette,
+            ("Theme", None),
+            theme::THEME_PICKER_WIDTH,
+            |ui| theme::theme_picker(ui, palette),
+        );
+    });
+    ui.add_space(SETTINGS_GAP);
+    components::settings_group(ui, palette, "Default player", |ui| {
+        components::settings_row(
+            ui,
+            palette,
+            (
+                "Open videos and sound in BareClip",
+                Some("Windows asks once, on its Default apps page"),
+            ),
+            MAKE_DEFAULT_WIDTH,
+            |ui| {
+                let button = ActionButton::new(palette, Kind::Secondary, "Make default")
+                    .small()
+                    .width(MAKE_DEFAULT_WIDTH);
+                if ui
+                    .add(button)
+                    .on_hover_text("Make BareClip your default player")
+                    .clicked()
+                {
+                    crate::file_ops::open_default_apps();
+                }
+            },
+        );
+    });
+}
+
+/// A jump's choices, from 5 to 30 seconds, in a dropdown.
+fn jump_dropdown(ui: &mut egui::Ui, palette: &Palette, label: &str, seconds: &mut u32) {
+    let shown = format!("{seconds} s");
+    let name = format!("{label}: {shown}");
+    let button = ui.add(components::Dropdown::new(
+        palette,
+        &name,
+        &shown,
+        JUMP_DROPDOWN_WIDTH,
+    ));
+    let width = components::menu_width(&button);
+    egui::Popup::menu(&button).show(|ui| {
+        for choice in storage::JUMP_CHOICES {
+            let label = format!("{choice} s");
+            let item = MenuItem::choice(palette, &label, *seconds == choice).width(width);
+            if ui.add(item).clicked() {
+                *seconds = choice;
+            }
+        }
+    });
+}
+
+/// Settings' Keys tab: what each key does.
+fn key_settings(ui: &mut egui::Ui, palette: &Palette) {
+    components::settings_group(ui, palette, "Keys", |ui| {
+        for (index, (keys, what)) in KEY_LIST.iter().enumerate() {
+            if index > 0 {
+                components::settings_divider(ui, palette);
+            }
+            key_row(ui, palette, keys, what);
+        }
+    });
+}
+
+/// The keys, as Settings lists them.
+const KEY_LIST: &[(&[&str], &str)] = &[
+    (&["Space", "K"], "Play or pause"),
+    (&["Left", "Right"], "Jump back or forward"),
+    (&[",", "."], "Step one frame"),
+    (&["Up", "Down"], "Volume"),
+    (&["M"], "Mute"),
+    (&["Home", "End"], "Start or end"),
+    (&["PgUp", "PgDn"], "Previous or next file"),
+    (&["0", "Ctrl+=", "Ctrl+-"], "Fit or zoom"),
+    (&["F", "Esc"], "Full screen"),
+];
+
+/// A line of the key list: what it does on the left, and its keys as caps on the right.
+fn key_row(ui: &mut egui::Ui, palette: &Palette, keys: &[&str], what: &str) {
+    const PADDING: f32 = 12.0;
+    let (rect, _) =
+        ui.allocate_exact_size(vec2(ui.available_width(), KEY_ROW_HEIGHT), Sense::hover());
+    let painter = ui.painter();
+    painter.text(
+        pos2(rect.left() + PADDING, rect.center().y),
+        Align2::LEFT_CENTER,
+        what,
+        FontId::proportional(13.0),
+        palette.text,
+    );
+    let mut right = rect.right() - PADDING;
+    for key in keys.iter().rev() {
+        let galley =
+            painter.layout_no_wrap((*key).to_owned(), FontId::proportional(11.5), palette.text);
+        let cap = Rect::from_min_max(
+            pos2(right - galley.size().x - 12.0, rect.center().y - 10.0),
+            pos2(right, rect.center().y + 10.0),
+        );
+        painter.rect_filled(cap, 4.0, palette.raised);
+        painter.rect_stroke(
+            cap,
+            4.0,
+            Stroke::new(1.0, palette.border),
+            egui::StrokeKind::Inside,
+        );
+        painter.galley(cap.center() - galley.size() / 2.0, galley, palette.text);
+        right = cap.left() - 4.0;
+    }
+}
 
 /// One of the watching speeds, keeping the voice's pitch.
 fn watching_speed(index: usize) -> Speed {
@@ -1932,10 +1793,38 @@ fn watching_speed(index: usize) -> Speed {
     .with_factor(SPEEDS[index.min(SPEEDS.len() - 1)])
 }
 
-/// Text on the stage, which is dark in both themes.
-fn palette_on_stage(palette: &Palette) -> Color32 {
-    let _ = palette;
-    theme::DARK.text
+/// A symbol, a heading and a line under it, in the middle of the picture's space. The stage is
+/// dark in both themes, so these take the dark theme's colours.
+fn stage_message(
+    ui: &egui::Ui,
+    area: Rect,
+    (icon, tint): (&icons::Icon, Color32),
+    heading: &str,
+    detail: &str,
+) {
+    let painter = ui.painter_at(area);
+    let middle = area.center();
+    icons::paint(
+        &painter,
+        icons::square_at(middle - vec2(0.0, 40.0), STAGE_SYMBOL),
+        icon,
+        tint,
+    );
+    painter.text(
+        middle,
+        Align2::CENTER_CENTER,
+        heading,
+        fonts::strong(18.0),
+        theme::DARK.text,
+    );
+    let detail = painter.layout(
+        detail.to_owned(),
+        FontId::proportional(13.0),
+        theme::DARK.text_muted,
+        (area.width() - 48.0).clamp(80.0, 460.0),
+    );
+    let at = pos2(middle.x - detail.size().x / 2.0, middle.y + 16.0);
+    painter.galley(at, detail, theme::DARK.text_muted);
 }
 
 /// A size shrunk or grown to fit inside a room, keeping its shape.
@@ -1958,7 +1847,7 @@ fn file_details(file: &OpenFile) -> Vec<String> {
     let mut details = vec![format];
     if !file.is_sound() {
         details.push(format!(
-            "{} x {}",
+            "{} \u{d7} {}",
             file.info.video.width, file.info.video.height
         ));
     }
@@ -1966,55 +1855,12 @@ fn file_details(file: &OpenFile) -> Vec<String> {
     details
 }
 
-fn time_label(ui: &mut egui::Ui, palette: &Palette, time: &str, align: Align) {
-    ui.allocate_ui_with_layout(
-        vec2(TIME_WIDTH, SEEK_ROW_HEIGHT),
-        Layout::left_to_right(Align::Center).with_main_align(align),
-        |ui| {
-            ui.add(
-                egui::Label::new(RichText::new(time).size(12.0).color(palette.text_muted))
-                    .selectable(false),
-            );
-        },
-    );
-}
-
-/// A bar for a level out of 100, such as the volume, which a click or drag sets.
-fn level_bar(
-    ui: &mut egui::Ui,
-    palette: &Palette,
-    width: f32,
-    level: u32,
-    held: &mut bool,
-    name: &str,
-) -> Option<u32> {
-    const KNOB: f32 = 6.0;
-    let (rect, response) = ui.allocate_exact_size(vec2(width, 24.0), Sense::click_and_drag());
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Slider, true, name));
-    let left = rect.left() + KNOB;
-    let room = (rect.width() - KNOB * 2.0).max(1.0);
-    let line = Rect::from_center_size(rect.center(), vec2(room, 3.0));
-    ui.painter().rect_filled(line, 1.5, palette.border_strong);
-    let x = left + room * level.min(100) as f32 / 100.0;
-    ui.painter().rect_filled(
-        Rect::from_min_max(line.min, pos2(x, line.bottom())),
-        1.5,
-        palette.accent,
-    );
-    ui.painter()
-        .circle_filled(pos2(x, rect.center().y), KNOB, palette.accent);
-    *held = response.dragged();
-    if !(response.dragged() || response.clicked()) {
-        return None;
-    }
-    let pointer = response.interact_pointer_pos()?;
-    let share = ((pointer.x - left) / room).clamp(0.0, 1.0);
-    Some((share * 100.0).round() as u32)
-}
-
+mod bars;
 mod browse;
 mod info;
 mod mini;
+mod note;
+mod pill;
 mod resume;
 #[cfg(test)]
 mod tests;

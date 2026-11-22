@@ -10,16 +10,16 @@ pub use shadcn_egui_icons_lucide::{
     ALIGN_CENTER_HORIZONTAL, ALIGN_CENTER_VERTICAL, ALIGN_END_HORIZONTAL, ALIGN_END_VERTICAL,
     ALIGN_START_HORIZONTAL, ALIGN_START_VERTICAL, APERTURE, ARROW_DOWN, ARROW_LEFT, ARROW_UP,
     ARROW_UP_DOWN, AUDIO_LINES, BLEND, CAMERA, CAPTIONS, CHECK, CHEVRON_DOWN, CHEVRON_LEFT,
-    CHEVRON_RIGHT, CHEVRONS_DOWN, CHEVRONS_UP, CIRCLE_ALERT, CIRCLE_CHECK, CLAPPERBOARD,
-    CLIPBOARD_PASTE, CLOCK, CONTRAST, COPY, COPY_PLUS, CROP, ELLIPSIS, FILE_PLUS, FILM,
-    FLIP_HORIZONTAL_2, FLIP_VERTICAL_2, FOLD_HORIZONTAL, FOLDER_OPEN, GAUGE, GRIP_VERTICAL, IMAGE,
-    INFO, KEYBOARD, LAYERS, LIBRARY_BIG, LIST_FILTER, MAXIMIZE, MAXIMIZE_2, MIC, MIC_OFF, MINIMIZE,
-    MINUS, MONITOR, MOON, MOVE, MOVE_HORIZONTAL, MUSIC, PAINT_BUCKET, PANEL_BOTTOM_CLOSE,
-    PANEL_BOTTOM_OPEN, PANEL_LEFT_CLOSE, PAUSE, PENCIL, PICTURE_IN_PICTURE_2, PLAY, PLUS, RATIO,
-    REDO, REDO_2, REPEAT, ROTATE_CCW, ROTATE_CW, SAVE, SCALING, SCISSORS, SETTINGS, SHAPES,
-    SKIP_BACK, SKIP_FORWARD, SLIDERS_HORIZONTAL, SPARKLES, SQUARE, SUN, SWATCH_BOOK, TARGET,
-    TRASH_2, TYPE, UNDO, UNDO_2, UNLINK, UPLOAD, VIDEO, VOLUME_2, VOLUME_X, WAND_SPARKLES, WEBCAM,
-    WEBCAM_OFF, X, ZAP, ZOOM_IN, ZOOM_OUT,
+    CHEVRON_RIGHT, CHEVRONS_DOWN, CHEVRONS_UP, CIRCLE_ALERT, CIRCLE_CHECK, CLIPBOARD_PASTE, CLOCK,
+    CONTRAST, COPY, COPY_PLUS, CROP, ELLIPSIS, FILE_PLUS, FILM, FLIP_HORIZONTAL_2, FLIP_VERTICAL_2,
+    FOLD_HORIZONTAL, FOLDER_OPEN, GAUGE, GRIP_VERTICAL, IMAGE, INFO, KEYBOARD, LAYERS, LIBRARY_BIG,
+    LIST_FILTER, MAXIMIZE, MAXIMIZE_2, MIC, MIC_OFF, MINIMIZE, MINUS, MONITOR, MOON, MOVE,
+    MOVE_HORIZONTAL, MUSIC, PAINT_BUCKET, PANEL_BOTTOM_CLOSE, PANEL_BOTTOM_OPEN, PANEL_LEFT_CLOSE,
+    PAUSE, PENCIL, PICTURE_IN_PICTURE_2, PLAY, PLUS, RATIO, REDO, REDO_2, REPEAT, ROTATE_CCW,
+    ROTATE_CW, SAVE, SCALING, SCISSORS, SETTINGS, SHAPES, SKIP_BACK, SKIP_FORWARD,
+    SLIDERS_HORIZONTAL, SPARKLES, SQUARE, SUN, SWATCH_BOOK, TARGET, TRASH_2, TYPE, UNDO, UNDO_2,
+    UNLINK, UPLOAD, VIDEO, VOLUME, VOLUME_1, VOLUME_2, VOLUME_X, WAND_SPARKLES, WEBCAM, WEBCAM_OFF,
+    X, ZAP, ZOOM_IN, ZOOM_OUT,
 };
 
 /// Lucide draws its outlines 2 units wide on a 24 unit square.
@@ -41,10 +41,11 @@ fn push_point(points: &mut Vec<Pos2>, point: Pos2) {
     }
 }
 
-/// Turns a symbol's path commands into lines that fill `rect`.
+/// Turns a symbol's path commands into lines that fill `rect`. A rect shorter than it is wide
+/// squashes the symbol.
 fn lines_of(segments: impl Iterator<Item = Seg>, icon_size: f32, rect: Rect) -> Vec<Line> {
-    let scale = rect.width() / icon_size;
-    let at = |x: f32, y: f32| rect.min + vec2(x, y) * scale;
+    let scale = rect.size() / icon_size;
+    let at = |x: f32, y: f32| rect.min + vec2(x * scale.x, y * scale.y);
     let mut lines = Vec::new();
     let mut points: Vec<Pos2> = Vec::new();
     let mut finish = |points: &mut Vec<Pos2>, closed: bool| {
@@ -127,7 +128,8 @@ fn draw(painter: &Painter, rect: Rect, icon: &Icon, color: Color32, solid: bool)
     }
 }
 
-/// Draws a symbol's outline to fill `rect`, which should be square.
+/// Draws a symbol's outline to fill `rect`, which should be square, or shorter than it is wide
+/// to squash the symbol, as the jump buttons lower Undo's arch. Its lines stay as thick.
 pub fn paint(painter: &Painter, rect: Rect, icon: &Icon, color: Color32) {
     draw(painter, rect, icon, color, false);
 }
@@ -135,6 +137,54 @@ pub fn paint(painter: &Painter, rect: Rect, icon: &Icon, color: Color32) {
 /// Draws a symbol filled in. Only for symbols made of simple closed shapes.
 pub fn paint_solid(painter: &Painter, rect: Rect, icon: &Icon, color: Color32) {
     draw(painter, rect, icon, color, true);
+}
+
+/// BareClip's small mark, a hexagon around a play triangle, in the brand's units. These are
+/// `SMALL_OUTER`, `SMALL_INNER` and `SMALL_PLAY` from `scripts/brand_geometry.py`, without their
+/// slight corner rounding, which can't be seen at a symbol's size.
+const MARK_OUTER: [(f32, f32); 6] = [
+    (405.0, 30.0),
+    (930.0, 328.0),
+    (930.0, 768.0),
+    (405.0, 1072.0),
+    (30.0, 852.0),
+    (30.0, 247.0),
+];
+const MARK_INNER: [(f32, f32); 6] = [
+    (405.0, 172.0),
+    (800.0, 395.0),
+    (800.0, 702.0),
+    (405.0, 930.0),
+    (160.0, 788.0),
+    (160.0, 310.0),
+];
+const MARK_PLAY: [(f32, f32); 3] = [(330.0, 360.0), (690.0, 552.0), (330.0, 742.0)];
+/// How wide the mark's ring is, the room between its outer and inner hexagons.
+const MARK_RING: f32 = 130.0;
+/// The mark's bounds in its units.
+const MARK_SIZE: (f32, f32) = (900.0, 1042.0);
+const MARK_MIDDLE: (f32, f32) = (480.0, 551.0);
+
+/// The points of BareClip's small mark fitted into `rect`: the middle line of its ring, and its
+/// play triangle, with how wide the ring is drawn.
+fn mark_shape(rect: Rect) -> ([Pos2; 6], [Pos2; 3], f32) {
+    let scale = (rect.width() / MARK_SIZE.0).min(rect.height() / MARK_SIZE.1);
+    let middle = pos2(MARK_MIDDLE.0, MARK_MIDDLE.1);
+    let at = |(x, y): (f32, f32)| rect.center() + (pos2(x, y) - middle) * scale;
+    let ring = std::array::from_fn(|index| {
+        let (outer, inner) = (MARK_OUTER[index], MARK_INNER[index]);
+        at(((outer.0 + inner.0) / 2.0, (outer.1 + inner.1) / 2.0))
+    });
+    let play = MARK_PLAY.map(at);
+    (ring, play, MARK_RING * scale)
+}
+
+/// Draws BareClip's small mark in one colour to fill `rect`, for a button that opens something
+/// in BareClip. It is the brand's own shape, not a Lucide symbol.
+pub fn paint_mark(painter: &Painter, rect: Rect, color: Color32) {
+    let (ring, play, width) = mark_shape(rect);
+    painter.add(Shape::closed_line(ring.to_vec(), Stroke::new(width, color)));
+    painter.add(Shape::convex_polygon(play.to_vec(), color, Stroke::NONE));
 }
 
 /// A square of the given size around a point, for drawing a symbol in.
@@ -146,9 +196,8 @@ pub fn square_at(center: Pos2, side: f32) -> Rect {
 mod tests {
     use super::*;
 
-    const USED: [Icon; 99] = [
+    const USED: [Icon; 100] = [
         CAMERA,
-        CLAPPERBOARD,
         MAXIMIZE_2,
         REPEAT,
         MAXIMIZE,
@@ -240,6 +289,8 @@ mod tests {
         FLIP_HORIZONTAL_2,
         FLIP_VERTICAL_2,
         PENCIL,
+        VOLUME,
+        VOLUME_1,
         VOLUME_2,
         VOLUME_X,
         MUSIC,
@@ -367,6 +418,31 @@ mod tests {
         assert_eq!(
             square,
             Rect::from_min_size(pos2(32.0, 32.0), vec2(16.0, 16.0))
+        );
+    }
+
+    #[test]
+    fn the_mark_fits_its_square_with_the_play_inside_the_ring() {
+        let square = Rect::from_min_size(pos2(10.0, 20.0), vec2(16.0, 16.0));
+        let (ring, play, width) = mark_shape(square);
+        // The ring's outer edge, half its width out from its middle line, stays in the square.
+        let outer = Rect::from_points(&ring).expand(width / 2.0);
+        assert!(
+            outer.width() <= 16.01 && outer.height() <= 16.01,
+            "{outer:?}"
+        );
+        assert!((outer.center() - square.center()).length() < 0.5, "centred");
+        assert!((outer.height() - 16.0).abs() < 1.0, "as tall as the square");
+        let inside = Rect::from_points(&ring).shrink(width / 2.0);
+        for point in play {
+            assert!(
+                inside.contains(point),
+                "the play triangle is inside the ring"
+            );
+        }
+        assert!(
+            width > 1.5 && width < 2.5,
+            "about as thick as a symbol's line: {width}"
         );
     }
 }
