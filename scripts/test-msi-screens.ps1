@@ -2,14 +2,15 @@
 # scripts/build-msi.ps1 first, in Windows PowerShell. The installer's windows open on screen
 # for about a minute, so leave them alone. Pass -Pictures to save each page. Pass
 # -InstallForEveryone on an administrator account to press Install on the Everyone path too,
-# which asks for administrator permission unless Windows is set not to.
-param([string]$Pictures, [switch]$InstallForEveryone)
+# which asks for administrator permission unless Windows is set not to. Pass -MsiPath to test
+# another file than dist\BareClip.msi.
+param([string]$Pictures, [switch]$InstallForEveryone, [string]$MsiPath)
 $ErrorActionPreference = 'Stop'
 
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Drawing
 
 $Root = Split-Path -Parent $PSScriptRoot
-$Msi = Join-Path $Root 'dist\BareClip.msi'
+$Msi = if ($MsiPath) { $MsiPath } else { Join-Path $Root 'dist\BareClip.msi' }
 if (-not (Test-Path $Msi)) { throw 'No MSI found. Run scripts/build-msi.ps1 first.' }
 
 $Parent = Join-Path $env:TEMP "bareclip screens $PID"
@@ -27,6 +28,8 @@ Add-Type -Namespace BareClipTest -Name Native -MemberDefinition @'
 [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessageW")] public static extern IntPtr SendText(IntPtr window, uint message, IntPtr w, string text);
 [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessageW")] public static extern IntPtr ReadText(IntPtr window, uint message, IntPtr w, System.Text.StringBuilder text);
 [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr window, IntPtr canvas, uint flags);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string className, string title);
+[DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr window, int id);
 '@
 $BM_GETCHECK = 0xF0
 $BM_CLICK = 0xF5
@@ -128,15 +131,54 @@ function Set-FolderText([string]$Path) {
     Start-Sleep -Milliseconds 200
 }
 
-function Save-Picture([string]$Name, [string]$Inside) {
+# Windows' Browse for Folder window, opened by the installer's helper in another process, which
+# UI Automation doesn't find from the desktop, so it is reached by its handle and control IDs.
+$BROWSE_PATH_BOX = 0x3744
+
+function Wait-Browse {
+    $Clock = [Diagnostics.Stopwatch]::StartNew()
+    while ($Clock.Elapsed.TotalSeconds -lt 30) {
+        $Window = [BareClipTest.Native]::FindWindow('#32770', 'Browse for Folder')
+        if ($Window -ne [IntPtr]::Zero) { Start-Sleep -Milliseconds 500; return $Window }
+        Start-Sleep -Milliseconds 100
+    }
+    throw 'FAILED: the Browse for Folder window never appeared'
+}
+
+function Get-BrowseText {
+    $Box = [BareClipTest.Native]::GetDlgItem((Wait-Browse), $BROWSE_PATH_BOX)
+    $Typed = New-Object Text.StringBuilder 1024
+    [void][BareClipTest.Native]::ReadText($Box, $WM_GETTEXT, [IntPtr]1024, $Typed)
+    $Typed.ToString()
+}
+
+function Set-BrowseText([string]$Path) {
+    $Box = [BareClipTest.Native]::GetDlgItem((Wait-Browse), $BROWSE_PATH_BOX)
+    [void][BareClipTest.Native]::SendText($Box, $WM_SETTEXT, [IntPtr]::Zero, $Path)
+    Start-Sleep -Milliseconds 200
+}
+
+# Presses OK (1) or Cancel (2) and waits for the window to close.
+function Close-Browse([int]$Button) {
+    $Window = Wait-Browse
+    [void][BareClipTest.Native]::PostMessage([BareClipTest.Native]::GetDlgItem($Window, $Button), $BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)
+    $Clock = [Diagnostics.Stopwatch]::StartNew()
+    while ([BareClipTest.Native]::FindWindow('#32770', 'Browse for Folder') -ne [IntPtr]::Zero) {
+        if ($Clock.Elapsed.TotalSeconds -gt 10) { throw 'FAILED: the Browse for Folder window stayed open' }
+        Start-Sleep -Milliseconds 100
+    }
+    Start-Sleep -Milliseconds 300
+}
+
+function Save-Picture([string]$Name, [string]$Inside, [string]$Title = 'BareClip Setup') {
     if (-not $Pictures) { return }
     New-Item -ItemType Directory -Force $Pictures | Out-Null
     Start-Sleep -Milliseconds 300
     # Asks the window to draw itself, so nothing else on the screen ends up in the picture.
-    $Page = Get-Page
+    $Page = Get-Page $Title
     if ($Inside) {
         $Walker = [Windows.Automation.TreeWalker]::RawViewWalker
-        $Page = $Walker.GetParent((Wait-Control $Inside))
+        $Page = $Walker.GetParent((Wait-Control $Inside $Title))
     }
     $Box = $Page.Current.BoundingRectangle
     $Image = New-Object Drawing.Bitmap ([int]$Box.Width), ([int]$Box.Height)
@@ -156,7 +198,7 @@ New-Item -ItemType Directory -Force $Parent | Out-Null
 
 # Everyone needs administrator permission to finish, so this walk normally stops at the last page.
 $EveryoneLog = Join-Path $env:TEMP 'bareclip-msi-everyone-pages.log'
-$Installer = Start-Process msiexec.exe -ArgumentList @('/i', "`"$Msi`"", '/l*v', "`"$EveryoneLog`"") -PassThru
+$Installer = Start-Process msiexec.exe -ArgumentList @('/i', "`"$Msi`"", '/l*v!', "`"$EveryoneLog`"") -PassThru
 try {
     [void](Wait-Control 'I accept the terms in the License Agreement')
     Set-Tick 'I accept the terms in the License Agreement' $true
@@ -201,7 +243,7 @@ try {
             [void](& (Join-Path $PSScriptRoot 'build-msi.ps1') -Version '9.9.9' -OutDir $Work -SkipBuild)
             $Newer = Join-Path $Work 'BareClip-9.9.9.msi'
             $UpgradeLog = Join-Path $env:TEMP 'bareclip-msi-everyone-upgrade.log'
-            $Installer = Start-Process msiexec.exe -ArgumentList @('/i', "`"$Newer`"", '/l*v', "`"$UpgradeLog`"") -PassThru
+            $Installer = Start-Process msiexec.exe -ArgumentList @('/i', "`"$Newer`"", '/l*v!', "`"$UpgradeLog`"") -PassThru
             [void](Wait-Control 'I accept the terms in the License Agreement')
             Set-Tick 'I accept the terms in the License Agreement' $true
             Invoke-Button 'Next'
@@ -261,7 +303,7 @@ finally {
     if (-not $Installer.HasExited) { Stop-Process -Id $Installer.Id -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2 }
 }
 
-$Installer = Start-Process msiexec.exe -ArgumentList @('/i', "`"$Msi`"", '/l*v', "`"$Log`"") -PassThru
+$Installer = Start-Process msiexec.exe -ArgumentList @('/i', "`"$Msi`"", '/l*v!', "`"$Log`"") -PassThru
 try {
     # The agreement.
     [void](Wait-Control 'I accept the terms in the License Agreement')
@@ -303,23 +345,35 @@ try {
     Assert-That ((Get-AllText (Get-Page)) -like '*Only administrators*') 'Program Files explains that it needs Everyone'
     Invoke-Button 'OK'
 
-    # Browsing to a folder puts the app in a BareClip folder inside it.
+    # Browse opens Windows' Browse For Folder window, whose box shows the whole path, BareClip
+    # folder and all, rather than only the folder clicked.
     [void](Wait-Control 'Add to the Start menu')
+    $Before = Get-AllText (Get-Page)
     Invoke-Button 'Browse...'
-    [void](Wait-Control 'OK')
-    Set-FolderText "$Parent\"
-    Invoke-Button 'OK'
+    Assert-That ((Get-BrowseText) -like '*\BareClip') "the box shows the whole path ($(Get-BrowseText))"
+
+    # Cancelling leaves the page as it was.
+    Close-Browse 2
+    [void](Wait-Control 'Add to the Start menu')
+    Assert-That ((Get-AllText (Get-Page)) -eq $Before) 'cancelling changes nothing'
+
+    # Choosing a folder puts the app in a BareClip folder inside it.
+    Invoke-Button 'Browse...'
+    Set-BrowseText "$Parent\"
+    Close-Browse 1
     [void](Wait-Control 'Add to the Start menu')
     Start-Sleep -Milliseconds 500
     $Text = Get-AllText (Get-Page)
     Assert-That ($Text -like "*$InstallDir\*") 'the page shows a BareClip folder inside the chosen one'
-    Save-Picture '5-browsed'
+    Save-Picture '6-browsed'
 
-    # A folder already called BareClip isn't given another one.
+    # The window opens where it was left, showing the same whole path.
     Invoke-Button 'Browse...'
-    [void](Wait-Control 'OK')
-    Set-FolderText "$InstallDir\"
-    Invoke-Button 'OK'
+    Assert-That ((Get-BrowseText) -eq $InstallDir) "it opens on the folder chosen ($(Get-BrowseText))"
+
+    # A folder already called BareClip, which doesn't exist yet, isn't given another one.
+    Set-BrowseText "$InstallDir\"
+    Close-Browse 1
     [void](Wait-Control 'Add to the Start menu')
     Start-Sleep -Milliseconds 500
     $Text = Get-AllText (Get-Page)
@@ -331,14 +385,14 @@ try {
 
     # Ready to go.
     [void](Wait-Control 'Install')
-    Save-Picture '6-ready'
+    Save-Picture '7-ready'
     $Text = Get-AllText (Get-Page)
     Assert-That ($Text -like "*$InstallDir\*") 'the last page names the final folder'
     Assert-That ($Text -like '*available to you only*') 'the last page says it is for you only'
     Invoke-Button 'Install'
 
     [void](Wait-Control 'Finish')
-    Save-Picture '7-finished'
+    Save-Picture '8-finished'
     Assert-That (Get-Tick 'Launch BareClip') 'the launch box starts ticked'
     Invoke-Button 'Finish'
     Assert-That ($Installer.WaitForExit(30000)) 'the installer closes'

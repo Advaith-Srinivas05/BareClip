@@ -8,6 +8,7 @@ members = [
     "crates/bareclip-export",
     "crates/bareclip-media",
     "crates/bareclip-render",
+    "crates/bareclip-setup",
     "crates/bareclip-text",
 ]
 

@@ -50,6 +50,13 @@
     <CustomAction Id="RefreshFileTypes" FileKey="BareClipExe" ExeCommand="--refresh-file-types" Execute="deferred" Impersonate="yes" Return="ignore" />
     <CustomAction Id="RefreshFileTypesGone" FileKey="BareClipExe" ExeCommand="--refresh-file-types" Execute="deferred" Impersonate="yes" Return="ignore" />
 
+    <!-- The Browse button opens Windows' Browse For Folder window, whose box shows the whole
+         path, with BareClip on the end, as each folder is clicked. Windows Installer's own
+         window can only show the folder clicked. The chosen path comes back in BROWSED_FOLDER,
+         empty if it was cancelled. -->
+    <Binary Id="SetupHelper" SourceFile="$(var.SetupDll)" />
+    <CustomAction Id="BrowseForFolder" BinaryKey="SetupHelper" DllEntry="BrowseForFolder" Execute="immediate" Return="ignore" />
+
     <!-- An upgrade keeps the earlier choices, and stays in the same place so there is only
          ever one copy. Windows only finds an earlier copy installed the same way. -->
     <Property Id="SAVED_PARENT_USER" Secure="yes">
@@ -121,7 +128,6 @@
       <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
       <Property Id="WixUI_Mode" Value="InstallDir" />
 
-      <DialogRef Id="BrowseDlg" />
       <DialogRef Id="ErrorDlg" />
       <DialogRef Id="FatalError" />
       <DialogRef Id="FilesInUse" />
@@ -198,8 +204,9 @@
         <Control Id="FolderLabel" Type="Text" X="20" Y="58" Width="330" Height="12" NoPrefix="yes" Text="Install in this folder:" />
         <Control Id="Folder" Type="PathEdit" X="20" Y="73" Width="264" Height="18" Property="WIXUI_INSTALLDIR" Indirect="yes" />
         <Control Id="ChangeFolder" Type="PushButton" X="290" Y="72" Width="60" Height="19" Text="&amp;Browse...">
-          <Publish Property="_BrowseProperty" Value="[WIXUI_INSTALLDIR]" Order="1">1</Publish>
-          <Publish Event="SpawnDialog" Value="BrowseDlg" Order="2">1</Publish>
+          <Publish Event="DoAction" Value="BrowseForFolder" Order="1">1</Publish>
+          <Publish Property="INSTALLFOLDER" Value="[BROWSED_FOLDER]" Order="2">BROWSED_FOLDER</Publish>
+          <Publish Event="SetTargetPath" Value="INSTALLFOLDER" Order="3">BROWSED_FOLDER</Publish>
         </Control>
         <Control Id="ShortcutLabel" Type="Text" X="20" Y="106" Width="330" Height="12" NoPrefix="yes" Text="Shortcuts" />
         <Control Id="StartMenu" Type="CheckBox" X="20" Y="122" Width="330" Height="16" CheckBoxValue="1" Property="ADD_START_MENU" Text="Add to the &amp;Start menu" />
@@ -271,11 +278,6 @@
         <Show Dialog="AgreementDlg" Before="ProgressDlg">NOT Installed</Show>
         <Show Dialog="WelcomeDlg" Before="AgreementDlg">Installed AND PATCH</Show>
       </InstallUISequence>
-
-      <!-- Whatever Browse picked gets a BareClip folder, unless it already is one. WiX's own steps on
-           this button are 1 and 2, and these still run before the window closes. -->
-      <Publish Dialog="BrowseDlg" Control="OK" Property="INSTALLFOLDER" Value="[INSTALLFOLDER]BareClip\" Order="3"><![CDATA[NOT (INSTALLFOLDER ~>> "\BareClip\")]]></Publish>
-      <Publish Dialog="BrowseDlg" Control="OK" Event="SetTargetPath" Value="INSTALLFOLDER" Order="4">1</Publish>
 
       <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="PrepareDlg">1</Publish>
       <Publish Dialog="DoneDlg" Control="Finish" Property="WixShellExecTarget" Value="[INSTALLFOLDER]bareclip.exe" Order="990">WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed</Publish>

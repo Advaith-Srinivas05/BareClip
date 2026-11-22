@@ -13,7 +13,8 @@ $Root = Split-Path -Parent $PSScriptRoot
 & (Join-Path $PSScriptRoot 'setup-wix.ps1')
 
 if (-not $SkipBuild) {
-    & (Join-Path $PSScriptRoot 'cargo.ps1') build --release -p bareclip-app --locked
+    # The app, and the DLL behind the installer's Browse button.
+    & (Join-Path $PSScriptRoot 'cargo.ps1') build --release -p bareclip-app -p bareclip-setup --locked
     if ($LASTEXITCODE -ne 0) { throw 'The release build failed.' }
 }
 $Target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $Root 'target' }
@@ -36,6 +37,7 @@ $Msi = Join-Path $Dist "BareClip-$Version.msi"
     "-dBrandDir=$(Join-Path $Root 'assets\brand')" `
     "-dInstallerDir=$(Join-Path $Root 'installer')" `
     "-dExePath=$(Join-Path $Target 'release\bareclip.exe')" `
+    "-dSetupDll=$(Join-Path $Target 'release\bareclip_setup.dll')" `
     "-dFfmpegDir=$(Join-Path $Root 'vendor\ffmpeg')" `
     "-dFfmpegBin=$(Join-Path $Root 'vendor\ffmpeg\bin')" `
     -out $Object (Join-Path $Root 'installer\bareclip.wxs')

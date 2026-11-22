@@ -1,0 +1,13 @@
+[package]
+name = "bareclip-setup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# A DLL the installer calls for its Browse button, which opens Windows' Browse For Folder window.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_ApplicationInstallationAndServicing", "Win32_UI_Shell_Common"] }
