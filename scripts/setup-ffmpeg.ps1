@@ -1,9 +1,9 @@
 # Downloads the pinned LGPL shared build of FFmpeg into vendor/ffmpeg.
 $ErrorActionPreference = 'Stop'
 
-$Tag = 'autobuild-2026-11-01-12-49'
-$Name = 'ffmpeg-n9.0.2-42-gd7643a0fe3-win64-lgpl-shared-9.0'
-$Sha256 = 'dd3d3791e1d9fe7bca2e62a4c2c916cebe6b46d21cc6b5e3706eb975a1bfe2d4'
+$Tag = 'autobuild-2026-10-31-12-59'
+$Name = 'ffmpeg-n9.0.2-39-g7adfbe40dc-win64-lgpl-shared-9.0'
+$Sha256 = 'e907b01fa4783913151237e37df2a10fa97d99a1598a021bf59d4ae62ffed4c0'
 
 $Root = Split-Path -Parent $PSScriptRoot
 $Vendor = Join-Path $Root 'vendor'
@@ -20,7 +20,7 @@ $Zip = Join-Path $Vendor "$Name.zip"
 $Extracted = Join-Path $Vendor $Name
 
 try {
-    Invoke-WebRequest "https://github.com/BtbN/FFmpeg-Builds/releases/download/$Tag/$Name.zip" -OutFile $Zip
+    Invoke-WebRequest "https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/$Tag/$Name.zip" -OutFile $Zip
 
     $Actual = (Get-FileHash $Zip -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($Actual -ne $Sha256) {

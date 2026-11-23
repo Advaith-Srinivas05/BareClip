@@ -2,7 +2,7 @@
 
     python scripts/ffmpeg-licenses.py
 
-BareClip ships a ready-made LGPL build of FFmpeg from BtbN/FFmpeg-Builds, and that build has
+BareClip ships a ready-made LGPL build of FFmpeg from FFmpeg-Builds/FFmpeg-Builds, and that build has
 dozens of other open-source libraries compiled into it, each under its own licence. This finds
 them the way BtbN's build does: it takes the switches the DLLs report they were built with, finds
 the build script providing each, and follows each script's dependencies, keeping only those its
@@ -25,7 +25,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 OUTPUT = ROOT / "assets" / "licenses" / "FFMPEG-LIBRARIES.txt"
 WORK = ROOT / "target" / "ffmpeg-licenses"
 FFMPEG = ROOT / "vendor" / "ffmpeg" / "bin" / "ffmpeg.exe"
-BUILDS = "https://github.com/BtbN/FFmpeg-Builds.git"
+BUILDS = "https://github.com/FFmpeg-Builds/FFmpeg-Builds.git"
 
 # What BareClip's download is, as BtbN's scripts see it.
 SETTINGS = {"TARGET": "win64", "VARIANT": "lgpl-shared", "ADDINS_STR": "9.0"}
@@ -236,7 +236,7 @@ def main():
         "Libraries built into FFmpeg",
         "===========================",
         "",
-        "BareClip's FFmpeg DLLs are a ready-made LGPL build from BtbN/FFmpeg-Builds, and these",
+        "BareClip's FFmpeg DLLs are a ready-made LGPL build from FFmpeg-Builds/FFmpeg-Builds, and these",
         "open-source libraries are compiled into them. Each is listed with where its source is and",
         "the exact version built, then the licence texts follow, each written once.",
         "",

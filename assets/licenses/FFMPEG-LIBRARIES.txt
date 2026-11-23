@@ -1,12 +1,12 @@
 Libraries built into FFmpeg
 ===========================
 
-BareClip's FFmpeg DLLs are a ready-made LGPL build from BtbN/FFmpeg-Builds, and these
+BareClip's FFmpeg DLLs are a ready-made LGPL build from FFmpeg-Builds/FFmpeg-Builds, and these
 open-source libraries are compiled into them. Each is listed with where its source is and
 the exact version built, then the licence texts follow, each written once.
 
-Build scripts: https://github.com/BtbN/FFmpeg-Builds/tree/autobuild-2026-11-01-12-49
-               commit 5ece62897c650b863c1ddda7b6964845344aef2d
+Build scripts: https://github.com/FFmpeg-Builds/FFmpeg-Builds/tree/autobuild-2026-10-31-12-59
+               commit 5031c6f1082414e53688d39e521849905071070d
 Left out: gnulib, whose pieces built into libiconv come under libiconv's licence.
 
 This file is made by scripts/ffmpeg-licenses.py.
