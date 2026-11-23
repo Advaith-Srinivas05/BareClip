@@ -122,8 +122,50 @@ fn free_space_is_known_for_a_real_drive() {
     assert!(free_space(&std::env::temp_dir()).is_some_and(|free| free > 0));
 }
 
+/// The path with every folder in its long form, as the Recycle Bin records it, so a short
+/// 8.3 name such as `RUNNER~1` in the temp folder still matches. The file itself may be gone.
+fn long_form(path: &Path) -> PathBuf {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return path.to_owned();
+    };
+    let Ok(parent) = std::fs::canonicalize(parent) else {
+        return path.to_owned();
+    };
+    let parent = parent.to_string_lossy();
+    PathBuf::from(parent.strip_prefix(r"\\?\").unwrap_or(&parent)).join(name)
+}
+
+#[test]
+fn long_form_spells_out_short_folder_names() {
+    let folder = folder("long form");
+    let inside = folder.join("a folder with a long name");
+    std::fs::create_dir_all(&inside).unwrap();
+    let short = short_name(&inside);
+    let file = short.join("clip.mp4");
+    assert_eq!(long_form(&file), long_form(&inside.join("clip.mp4")));
+    assert_eq!(
+        long_form(&file).parent().unwrap().file_name().unwrap(),
+        "a folder with a long name"
+    );
+}
+
+/// The folder's 8.3 short name, or the folder itself where the drive keeps none.
+fn short_name(folder: &Path) -> PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+    let wide: Vec<u16> = folder.as_os_str().encode_wide().chain([0]).collect();
+    let mut buffer = vec![0u16; 1024];
+    // SAFETY: both buffers live until the call returns, and the length given is the buffer's.
+    let length = unsafe { GetShortPathNameW(wide.as_ptr(), buffer.as_mut_ptr(), 1024) } as usize;
+    if length == 0 || length > buffer.len() {
+        return folder.to_owned();
+    }
+    PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length]))
+}
+
 /// Where the Recycle Bin keeps a file deleted from this path: its record and the file itself.
 fn find_in_recycle_bin(original: &Path) -> Option<(PathBuf, PathBuf)> {
+    let original = &long_form(original);
     let drive = original.components().next()?;
     let bin = PathBuf::from(format!(
         "{}\\$Recycle.Bin",
@@ -162,8 +204,10 @@ fn find_in_recycle_bin(original: &Path) -> Option<(PathBuf, PathBuf)> {
 
 #[test]
 fn a_deleted_file_goes_to_the_recycle_bin_and_can_come_back() {
-    let folder = folder("recycle");
-    let clip = file_in(&folder, "deleted clip.mp4", b"keep me");
+    let folder = folder("recycle with a long name");
+    // Through the folder's short name, as GitHub's temp folder is, which the Recycle Bin records
+    // in its long form.
+    let clip = file_in(&short_name(&folder), "deleted clip.mp4", b"keep me");
 
     move_to_recycle_bin(&clip).unwrap();
     assert!(!clip.exists());
