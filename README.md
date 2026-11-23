@@ -19,6 +19,16 @@ BareClip runs on 64-bit Windows with an Intel or AMD processor, and has been tes
 
 ## What it does
 
+**Player**
+
+- Double-click a video or song to open it in BareClip's player. The installer can open Windows' Default apps page so you can make BareClip your default player.
+- Play at 0.25x to 2x with voices kept at their pitch, step one frame at a time, loop, and jump back or forward by 5 to 30 seconds
+- Zoom up to 800% with the mouse wheel and drag around, full screen, a mini view that stays on top of other windows, and saving the frame on screen as a picture
+- Go through the other videos and songs in the same folder
+- An info panel showing everything the file says about itself, where you can rename it and change its dates and artist
+- Trim to one stretch, cut to the exact frame, and save it beside the original or wherever you choose, with or without sound
+- Edit in BareClip opens the file in the editor
+
 **Editing**
 
 - Several video and sound rows, with clips you can split, trim, move, copy and duplicate
@@ -72,12 +82,31 @@ BareClip runs on 64-bit Windows with an Intel or AMD processor, and has been tes
 
 | Kind | Formats |
 |---|---|
-| Video | MP4, MKV, MOV, WebM, AVI and TS, including H.264, HEVC and AV1, and recordings with uneven frame timing |
-| Sound | MP3, WAV, FLAC, M4A, AAC, OGG and Opus |
+| Video | MP4, MKV, MOV, WebM, AVI, TS, M4V, WMV, FLV, 3GP, MTS and M2TS, including H.264, HEVC and AV1, and recordings with uneven frame timing |
+| Sound | MP3, WAV, FLAC, M4A, AAC, OGG, Opus, WMA, AIFF and MKA |
 | Images | JPG, PNG, WebP, BMP and GIF |
 | Captions | SRT |
 
 ## Shortcuts
+
+In the player:
+
+| Key | Action |
+|---|---|
+| Space or K | Play or pause |
+| Left and Right | Jump back or forward |
+| Comma and Period | Step one frame back or forward |
+| Up and Down | Volume |
+| M | Mute |
+| Home and End | Go to the start or end |
+| Page Up and Page Down | Previous or next file in the folder |
+| Ctrl + = and Ctrl + - | Zoom in or out |
+| 0 | Fit the picture to the window |
+| F or F11 | Full screen |
+| Escape | Leave full screen |
+| [ and ] | While trimming, set the start or end at the playhead |
+
+In the editor:
 
 | Key | Action |
 |---|---|
