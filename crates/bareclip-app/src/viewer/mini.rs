@@ -150,6 +150,7 @@ impl Viewer {
                 };
                 if ui
                     .add(IconButton::new(palette, Kind::Ghost, icon, name))
+                    .on_hover_text(name)
                     .clicked()
                 {
                     self.toggle_playback();

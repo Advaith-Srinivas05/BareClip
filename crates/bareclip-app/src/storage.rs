@@ -226,8 +226,6 @@ pub struct ViewerSettings {
     /// [`JUMP_CHOICES`].
     pub jump_back: u32,
     pub jump_forward: u32,
-    /// Whether a file picks up where it was last stopped.
-    pub resume: bool,
 }
 
 /// The player's choices as a file has them. Before the two jumps were set apart, one
@@ -243,7 +241,6 @@ struct StoredViewer {
     seek_seconds: Option<u32>,
     jump_back: Option<u32>,
     jump_forward: Option<u32>,
-    resume: bool,
 }
 
 impl Default for StoredViewer {
@@ -257,7 +254,6 @@ impl Default for StoredViewer {
             seek_seconds: None,
             jump_back: None,
             jump_forward: None,
-            resume: viewer.resume,
         }
     }
 }
@@ -276,7 +272,6 @@ impl From<StoredViewer> for ViewerSettings {
             muted: stored.muted,
             jump_back: jump(stored.jump_back),
             jump_forward: jump(stored.jump_forward),
-            resume: stored.resume,
         }
     }
 }
@@ -290,7 +285,6 @@ impl Default for ViewerSettings {
             muted: false,
             jump_back: DEFAULT_JUMP,
             jump_forward: DEFAULT_JUMP,
-            resume: true,
         }
     }
 }
@@ -885,7 +879,6 @@ mod tests {
                 muted: true,
                 jump_back: 15,
                 jump_forward: 20,
-                resume: false,
                 ..ViewerSettings::default()
             },
         };

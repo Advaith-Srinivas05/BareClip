@@ -31,6 +31,8 @@ use crate::{
 type DetailsRead = (Receiver<Result<MediaDetails, String>>, JoinHandle<()>);
 
 /// How wide the card is, and the room it keeps from the bars, the window's edge and the picture.
+/// Why a fact can't be changed while a trim of the file is being saved.
+pub const TRIM_SAVING: &str = "Wait for the trim to finish saving, then try again.";
 pub const CARD_WIDTH: f32 = 340.0;
 pub const CARD_MARGIN: f32 = 8.0;
 const CARD_RADIUS: f32 = 8.0;
@@ -208,8 +210,21 @@ impl Viewer {
         info.reading = Some((receiver, reader));
     }
 
+    /// A trim being saved is still reading the file, so it can't be let go to change it. Says
+    /// so, and gives true, while that lasts.
+    fn waiting_for_a_trim(&mut self) -> bool {
+        let saving = self.is_saving_trim();
+        if saving {
+            self.set_info_problem(TRIM_SAVING.to_owned());
+        }
+        saving
+    }
+
     /// Renames the file, keeping its extension, and carries on playing it under its new name.
     pub fn rename_file(&mut self, ctx: &egui::Context, new_stem: &str) {
+        if self.waiting_for_a_trim() {
+            return;
+        }
         let Some(released) = self.release_file() else {
             return;
         };
@@ -230,6 +245,9 @@ impl Viewer {
         created: Option<SystemTime>,
         modified: Option<SystemTime>,
     ) {
+        if self.waiting_for_a_trim() {
+            return;
+        }
         let Some(released) = self.release_file() else {
             return;
         };
@@ -242,6 +260,9 @@ impl Viewer {
     /// Writes a copy of the file with changed tags in the background, then swaps it in, keeping
     /// Windows' Created and Modified dates.
     pub fn change_tags(&mut self, ctx: &egui::Context, changes: TagChanges) {
+        if self.waiting_for_a_trim() {
+            return;
+        }
         let Some(path) = self.file.as_ref().map(|file| file.info.path.clone()) else {
             return;
         };
@@ -342,7 +363,9 @@ impl Viewer {
 
     /// Asks before moving the file to the Recycle Bin.
     pub fn ask_to_delete(&mut self) {
-        if self.file.is_some() {
+        // Not while trimming, whose bar has no Delete, because deleting moves on to the next
+        // file.
+        if self.file.is_some() && self.trim.is_none() {
             self.confirm_delete = true;
         }
     }
@@ -428,8 +451,14 @@ impl Viewer {
             Stroke::new(1.0, palette.border),
             egui::StrokeKind::Inside,
         );
-        // The card keeps clicks and the wheel off what is under it.
-        let _ = ui.interact(rect, egui::Id::unique("viewer_info_card"), Sense::click());
+        // The card keeps clicks, drags and the wheel off the picture, which it can lie over in
+        // a narrow window. It has to sense drags too, or the picture, which does, still counts
+        // as under the mouse.
+        let _ = ui.interact(
+            rect,
+            egui::Id::unique("viewer_info_card"),
+            Sense::click_and_drag(),
+        );
         let path = self.current_path().map(Path::to_owned);
         let mut pressed = HeaderPress::default();
         ui.scope_builder(
@@ -777,6 +806,7 @@ impl Viewer {
     /// value back.
     fn edit_row(&mut self, ui: &mut egui::Ui, palette: &Palette, row: &EditRow) -> Option<String> {
         let closing = !self.is_info_open();
+        let saving_trim = self.is_saving_trim();
         let info = self.info.as_mut()?;
         let this = std::mem::discriminant(&(row.make)(String::new()));
         let editing = info
@@ -785,8 +815,11 @@ impl Viewer {
             .filter(|editing| std::mem::discriminant(*editing) == this)
             .map(|editing| editing.text().to_owned());
         let Some(mut typed) = editing else {
-            let response = changeable_fact(ui, palette, row.name, row.shown);
-            if response.clicked() && !closing {
+            let mut response = changeable_fact(ui, palette, row.name, row.shown);
+            if saving_trim {
+                response = response.on_hover_text(TRIM_SAVING);
+            }
+            if response.clicked() && !closing && !saving_trim {
                 info.problem = None;
                 info.editing = Some((row.make)(row.starts_as.to_owned()));
                 info.focus_pending = true;

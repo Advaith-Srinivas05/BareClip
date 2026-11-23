@@ -75,12 +75,20 @@ fn opened(ctx: &egui::Context, path: &Path) -> Viewer {
 
 /// Runs frames until something is true, failing after 10 s.
 fn wait_for(ctx: &egui::Context, viewer: &mut Viewer, what: &str, done: impl Fn(&Viewer) -> bool) {
+    wait_up_to(ctx, viewer, Duration::from_secs(10), what, done);
+}
+
+/// Runs frames until something is true, failing after `limit`.
+fn wait_up_to(
+    ctx: &egui::Context,
+    viewer: &mut Viewer,
+    limit: Duration,
+    what: &str,
+    done: impl Fn(&Viewer) -> bool,
+) {
     let started = Instant::now();
     while !done(viewer) {
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "waited too long for {what}"
-        );
+        assert!(started.elapsed() < limit, "waited too long for {what}");
         frame(ctx, viewer, vec![]);
         thread::sleep(Duration::from_millis(5));
     }
@@ -602,7 +610,7 @@ fn the_player_keeps_its_own_window_place_apart_from_the_editors() {
 }
 
 #[test]
-fn a_song_shows_its_cover_and_one_without_shows_the_mark() {
+fn a_song_shows_its_cover_and_one_without_shows_the_logo_and_name() {
     let ctx = context();
     let mut viewer = opened(&ctx, &make_song("cover", true));
     wait_for(&ctx, &mut viewer, "the cover", |viewer| {
@@ -627,8 +635,34 @@ fn a_song_shows_its_cover_and_one_without_shows_the_mark() {
         viewer.file.as_ref().is_some_and(|file| file.cover_read)
     });
     assert!(viewer.file.as_ref().unwrap().cover.is_none());
-    frame(&ctx, &mut viewer, vec![]);
-    assert!(viewer.mark.is_some(), "the mark stands in");
+    // The logo with the name beside it stands in, centred, in the theme's own colours.
+    for (theme, dark) in [(egui::Theme::Dark, true), (egui::Theme::Light, false)] {
+        ctx.set_theme(theme);
+        frame(&ctx, &mut viewer, vec![]);
+        let output = frame(&ctx, &mut viewer, vec![]);
+        let (made_for, texture) = viewer.lockup.clone().expect("the logo and name stand in");
+        assert_eq!(made_for, dark, "{theme:?}");
+        let drawn = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::epaint::Shape::Mesh(mesh) if mesh.texture_id == texture.id() => {
+                    Some(mesh.calc_bounds())
+                }
+                _ => None,
+            })
+            .expect("it is drawn");
+        assert!(
+            drawn.width() > drawn.height() * 3.0,
+            "the name sits beside the logo: {drawn:?}"
+        );
+        assert!(drawn.width() <= LOCKUP_WIDTH + 0.5);
+        assert!(
+            (drawn.center() - viewer.view.center()).length() < 1.0,
+            "centred"
+        );
+    }
+    ctx.set_theme(egui::Theme::Dark);
     assert_eq!(file_details(viewer.file.as_ref().unwrap())[0], "MP3");
     assert_eq!(
         file_details(viewer.file.as_ref().unwrap()).len(),
@@ -862,7 +896,7 @@ fn save_picture_writes_the_picture_beside_the_video_named_for_its_time() {
     viewer.seek(seconds(1.0));
     frame(&ctx, &mut viewer, vec![]);
 
-    click_named(&ctx, &mut viewer, "Save picture");
+    click_named(&ctx, &mut viewer, "Save frame");
     wait_for(&ctx, &mut viewer, "the picture to save", |viewer| {
         viewer.saved_picture.is_some()
     });
@@ -882,7 +916,7 @@ fn save_picture_writes_the_picture_beside_the_video_named_for_its_time() {
 
     click_named(&ctx, &mut viewer, "Close note");
     assert!(viewer.saved_picture.is_none());
-    click_named(&ctx, &mut viewer, "Save picture");
+    click_named(&ctx, &mut viewer, "Save frame");
     wait_for(&ctx, &mut viewer, "the second picture", |viewer| {
         viewer.saved_picture.is_some()
     });
@@ -898,7 +932,7 @@ fn a_song_has_no_save_picture_or_zoom() {
     let ctx = context();
     let mut viewer = opened(&ctx, &make_song("no-zoom", false));
     let nodes = named(&ctx, &mut viewer);
-    for name in ["Save picture", "Zoom"] {
+    for name in ["Save frame", "Zoom"] {
         assert!(
             !nodes.iter().any(|(label, _, off)| label == name && !off),
             "{name} is hidden"
@@ -978,7 +1012,7 @@ fn the_pill_reads_play_back_forward_volume_seek_loop_save_picture_and_the_bar_th
         "Volume",
         "Seek",
         "Loop",
-        "Save picture",
+        "Save frame",
     ];
     assert!(in_order(&on_pill), "the pill runs in order");
     for name in on_pill {
@@ -1009,7 +1043,7 @@ fn a_song_has_no_save_picture_so_loop_ends_its_pill() {
     let ctx = context();
     let mut viewer = opened(&ctx, &make_song("pill-end", false));
     let nodes = named(&ctx, &mut viewer);
-    assert!(!nodes.iter().any(|(label, ..)| label == "Save picture"));
+    assert!(!nodes.iter().any(|(label, ..)| label == "Save frame"));
     let rightmost = nodes
         .iter()
         .filter(|(_, rect, _)| viewer.pill_at.contains(rect.center()))
@@ -1028,7 +1062,7 @@ fn a_narrow_pill_puts_the_jumps_loop_and_save_picture_into_more() {
     assert!(left_of("Play") < left_of("Volume"));
     assert!(left_of("Volume") < left_of("Seek"));
     assert!(left_of("Seek") < left_of("More options"));
-    for put_away in ["Jump back", "Jump forward", "Loop", "Save picture"] {
+    for put_away in ["Jump back", "Jump forward", "Loop", "Save frame"] {
         assert!(
             !nodes.iter().any(|(label, ..)| label == put_away),
             "{put_away} is put away"
@@ -1037,7 +1071,7 @@ fn a_narrow_pill_puts_the_jumps_loop_and_save_picture_into_more() {
     click_named(&ctx, &mut viewer, "More options");
     settle(&ctx, &mut viewer);
     let nodes = named(&ctx, &mut viewer);
-    for name in ["Jump back", "Jump forward", "Loop", "Save picture"] {
+    for name in ["Jump back", "Jump forward", "Loop", "Save frame"] {
         assert!(
             nodes.iter().any(|(label, ..)| label == name),
             "{name} under More"
@@ -1054,12 +1088,18 @@ fn notes_stack_without_covering_each_other_and_a_problem_closes() {
     let mut viewer = opened(&ctx, video());
     viewer.notice =
         Some("Something went wrong in a way that takes a long sentence to say.".to_owned());
-    viewer.resumed = Some((seconds(83.0), Instant::now()));
+    viewer.saved_picture = Some((PathBuf::from("frame.png"), Instant::now()));
     let nodes = named(&ctx, &mut viewer);
-    let close = rect_of(&nodes, "Close note");
-    let start_over = rect_of(&nodes, "Start over");
+    // Both notes can be closed; the problem's is the top one.
+    let close = nodes
+        .iter()
+        .filter(|(label, ..)| label == "Close note")
+        .map(|(_, rect, _)| *rect)
+        .min_by(|a, b| a.top().total_cmp(&b.top()))
+        .expect("the problem's Close");
+    let show = rect_of(&nodes, "Show in folder");
     assert!(
-        start_over.top() > close.bottom() + note::NOTE_GAP,
+        show.top() > close.bottom() + note::NOTE_GAP,
         "the second note is below the first"
     );
     assert!(
@@ -1067,11 +1107,11 @@ fn notes_stack_without_covering_each_other_and_a_problem_closes() {
         "notes are over the picture"
     );
 
-    click_named(&ctx, &mut viewer, "Close note");
+    click_at(&ctx, &mut viewer, close.center());
     assert!(viewer.notice.is_none());
-    let start_over_now = named_rect(&ctx, &mut viewer, "Start over");
+    let show_now = named_rect(&ctx, &mut viewer, "Show in folder");
     assert!(
-        start_over_now.top() < start_over.top(),
+        show_now.top() < show.top(),
         "the note left moves up into the room"
     );
 }
@@ -1090,7 +1130,7 @@ fn a_saved_trim_says_so_over_the_picture_until_closed() {
     assert!(
         nodes
             .iter()
-            .any(|(label, _, off)| label == "Save as copy" && *off),
+            .any(|(label, _, off)| label == trim::SAVE_AS && *off),
         "the save buttons wait while one is under way"
     );
     let _ = saving.send(Ok((
@@ -1104,7 +1144,7 @@ fn a_saved_trim_says_so_over_the_picture_until_closed() {
         note.bottom() < viewer.view.center().y,
         "the note is at the top"
     );
-    assert!(nodes.iter().any(|(label, ..)| label == "Save as copy"));
+    assert!(nodes.iter().any(|(label, ..)| label == trim::SAVE_AS));
 
     click_named(&ctx, &mut viewer, "Close note");
     assert!(viewer.trim.as_ref().unwrap().saved.is_none());
@@ -1327,27 +1367,53 @@ fn the_jump_arrows_arch_lower_than_they_are_wide() {
 }
 
 #[test]
-fn while_trimming_the_top_bar_has_save_as_copy_and_cancel_and_the_pill_has_the_rest() {
+fn while_trimming_save_as_and_cancel_are_at_the_top_left_and_info_beside_trim() {
+    screen_camera::SCREEN.set([1280, 720]);
     let ctx = context();
     let mut viewer = trimmer_on(&ctx, video());
+    let output = frame(&ctx, &mut viewer, vec![]);
     let nodes = named(&ctx, &mut viewer);
-    let (copy, cancel) = (rect_of(&nodes, "Save as copy"), rect_of(&nodes, "Cancel"));
-    for rect in [copy, cancel] {
+    let (save, cancel) = (rect_of(&nodes, trim::SAVE_AS), rect_of(&nodes, "Cancel"));
+    let screen = screen_camera::screen();
+    assert_eq!(save.size(), cancel.size(), "the same size");
+    assert!(save.right() < cancel.left(), "Save as…, then Cancel");
+    assert_eq!(save.center().y, cancel.center().y, "side by side");
+    for rect in [save, cancel] {
         assert!(rect.bottom() <= bars::TITLE_HEIGHT, "in the top bar");
     }
-    assert!(copy.right() < cancel.left(), "Save as copy, then Cancel");
+    assert!(save.left() < 20.0, "at the left: {save:?}");
     assert!(
-        cancel.right() < rect_of(&nodes, "Minimise window").left(),
-        "before the window's buttons"
+        !output.shapes.iter().any(|clipped| matches!(
+            &clipped.shape,
+            egui::epaint::Shape::Text(shape) if shape.galley.text().contains("viewer-")
+        )),
+        "in place of the file's name"
     );
-    for gone in [
-        "Info",
-        "Trim",
-        "Delete",
-        "Edit in BareClip",
-        "Settings",
-        "Loop",
-    ] {
+
+    // "Trim" and Info in the middle, centred together.
+    let word = text_rect(&output, "Trim");
+    let info = rect_of(&nodes, "Info");
+    assert!(word.right() < info.left(), "Info is right of Trim");
+    assert!(info.bottom() <= bars::TITLE_HEIGHT);
+    let group_middle = (word.left() - 24.0 + info.right()) / 2.0;
+    assert!(
+        (group_middle - screen.center().x).abs() <= 2.0,
+        "centred together: {group_middle}"
+    );
+
+    // The pill keeps clear of the window's bottom edge.
+    let play = rect_of(&nodes, "Play");
+    let pill_bottom = play.center().y + pill::PILL_HEIGHT / 2.0;
+    assert!(
+        (screen.bottom() - pill_bottom - trim::PILL_BOTTOM_ROOM).abs() < 1.0,
+        "{} below the pill",
+        screen.bottom() - pill_bottom
+    );
+    assert!(
+        (viewer.view.bottom() - (screen.bottom() - trim::TRIM_BAR_HEIGHT)).abs() < 1.0,
+        "the picture comes down to just over the pill"
+    );
+    for gone in ["Trim", "Delete", "Edit in BareClip", "Settings", "Loop"] {
         assert!(
             !nodes.iter().any(|(label, ..)| label == gone),
             "{gone} is put away while trimming"
@@ -1397,7 +1463,7 @@ fn while_trimming_the_top_bar_has_save_as_copy_and_cancel_and_the_pill_has_the_r
     click_named(&ctx, &mut viewer, "Cancel");
     assert!(!viewer.is_trimming());
     let nodes = named(&ctx, &mut viewer);
-    assert!(!nodes.iter().any(|(label, ..)| label == "Save as copy"));
+    assert!(!nodes.iter().any(|(label, ..)| label == trim::SAVE_AS));
 }
 
 #[test]
@@ -1425,6 +1491,7 @@ fn settings_has_general_and_keys_tabs_and_the_version_like_the_editors() {
     let mut viewer = Viewer::new(&ctx, false);
     viewer.use_storage(&ctx, folder.clone());
     viewer.open(&ctx, video());
+    viewer.is_default_player = || false;
     viewer.settings_open = true;
     settle(&ctx, &mut viewer);
     let output = frame(&ctx, &mut viewer, vec![]);
@@ -1435,7 +1502,6 @@ fn settings_has_general_and_keys_tabs_and_the_version_like_the_editors() {
         "Keys settings",
         "Jump back: 5 s",
         "Jump forward: 5 s",
-        "Pick up where I stopped",
         "Make default",
         "Done",
     ] {
@@ -1482,6 +1548,7 @@ fn settings_fit_a_720_high_window_and_scroll_in_a_shorter_one() {
     screen_camera::SCREEN.set([1280, 720]);
     let ctx = context();
     let mut viewer = opened(&ctx, video());
+    viewer.is_default_player = || false;
     viewer.settings_open = true;
     for _ in 0..12 {
         frame(&ctx, &mut viewer, vec![]);
@@ -1555,7 +1622,7 @@ fn mini_view_shrinks_the_window_above_the_others_and_leaving_puts_it_back() {
     assert!(!viewer.is_mini(), "Escape leaves too");
 }
 
-/// A 30 second video, small and slow so it is quick to make, long enough to resume.
+/// A 30 second video, small and slow so it is quick to make, longer than any jump.
 fn long_video() -> &'static Path {
     static VIDEO: OnceLock<PathBuf> = OnceLock::new();
     VIDEO.get_or_init(|| {
@@ -1674,85 +1741,50 @@ fn a_file_that_cant_be_played_still_moves_on() {
 }
 
 #[test]
-fn a_file_closed_partway_picks_up_there_with_start_over() {
+fn every_file_starts_at_its_beginning() {
+    screen_camera::SCREEN.set([1280, 720]);
     let ctx = context();
-    let storage = temporary_folder("resume-storage");
+    let storage = temporary_folder("starts-at-the-beginning");
+    let folder = folder_of_videos("starts-at-the-beginning", &["a.mp4", "b.mp4", "c.mp4"]);
     let mut viewer = Viewer::new(&ctx, false);
     viewer.use_storage(&ctx, storage.clone());
-    viewer.open(&ctx, long_video());
-    viewer.pause();
-    viewer.seek(seconds(15.0));
+    viewer.open(&ctx, &folder.join("a.mp4"));
+    wait_for(&ctx, &mut viewer, "the folder", |viewer| {
+        viewer.next_file().is_some()
+    });
+    let at_the_start = |viewer: &Viewer| viewer.position() < seconds(0.5);
+
+    // Watched partway, the next file by its arrow starts at its beginning.
+    viewer.seek(seconds(2.0));
+    settle(&ctx, &mut viewer);
+    let middle = viewer.view.center();
+    frame(&ctx, &mut viewer, vec![egui::Event::PointerMoved(middle)]);
+    click_named(&ctx, &mut viewer, "Next file");
+    assert_eq!(viewer.current_path(), Some(folder.join("b.mp4").as_path()));
+    assert!(at_the_start(&viewer), "at {:?}", viewer.position());
+
+    // And by Page Down, and going back to one watched partway.
+    viewer.seek(seconds(2.0));
+    settle(&ctx, &mut viewer);
+    frame(&ctx, &mut viewer, press(Key::PageDown));
+    assert!(at_the_start(&viewer), "at {:?}", viewer.position());
+    viewer.seek(seconds(2.0));
+    settle(&ctx, &mut viewer);
+    frame(&ctx, &mut viewer, press(Key::PageUp));
+    assert_eq!(viewer.current_path(), Some(folder.join("b.mp4").as_path()));
+    assert!(at_the_start(&viewer), "at {:?}", viewer.position());
+
+    // A file sent from Explorer too, and the same file after the app is closed and opened.
+    viewer.seek(seconds(2.0));
+    settle(&ctx, &mut viewer);
+    viewer.open(&ctx, &folder.join("c.mp4"));
+    assert!(at_the_start(&viewer), "at {:?}", viewer.position());
+    viewer.seek(seconds(2.0));
     viewer.closing(None);
-
     let mut again = Viewer::new(&ctx, false);
-    again.use_storage(&ctx, storage.clone());
-    again.open(&ctx, long_video());
-    assert!(near(again.position(), seconds(15.0), 0.01), "it picks up");
-    assert!(again.is_playing());
-    assert!(
-        named(&ctx, &mut again)
-            .iter()
-            .any(|(label, ..)| label == "Start over")
-    );
-    click_named(&ctx, &mut again, "Start over");
-    assert!(again.position() < seconds(1.0));
-    assert!(again.resumed.is_none());
-
-    // Switching files keeps the spot too.
-    again.pause();
-    again.seek(seconds(18.0));
-    again.open(&ctx, video());
-    again.open(&ctx, long_video());
-    assert!(near(again.position(), seconds(18.0), 0.01));
-
-    // Watched near the end, it starts at the beginning next time.
-    again.pause();
-    again.seek(seconds(25.0));
-    again.closing(None);
-    let mut third = Viewer::new(&ctx, false);
-    third.use_storage(&ctx, storage);
-    third.open(&ctx, long_video());
-    assert!(third.position() < seconds(1.0));
-    assert!(third.resumed.is_none());
-}
-
-#[test]
-fn with_resume_off_files_start_from_the_start() {
-    let ctx = context();
-    let storage = temporary_folder("resume-off");
-    let mut viewer = Viewer::new(&ctx, false);
-    viewer.use_storage(&ctx, storage.clone());
-    viewer.set_resume(false);
-    viewer.open(&ctx, long_video());
-    viewer.pause();
-    viewer.seek(seconds(15.0));
-    viewer.closing(None);
-
-    let mut again = Viewer::new(&ctx, false);
-    again.use_storage(&ctx, storage.clone());
-    assert!(
-        !Settings::load(&storage).viewer.resume,
-        "the switch is saved"
-    );
-    again.open(&ctx, long_video());
-    assert!(again.position() < seconds(1.0));
-}
-
-#[test]
-fn a_spot_is_kept_every_few_seconds_while_playing() {
-    let ctx = context();
-    let storage = temporary_folder("resume-playing");
-    let mut viewer = Viewer::new(&ctx, false);
-    viewer.use_storage(&ctx, storage.clone());
-    viewer.open(&ctx, long_video());
-    viewer.seek(seconds(12.0));
-    viewer.play();
-    viewer.spot_kept = Instant::now() - Duration::from_secs(6);
-    frame(&ctx, &mut viewer, vec![]);
-    // Nothing closed, as if the app had crashed.
-    let spots = resume::ResumeSpots::load(&storage);
-    let at = spots.spot_for(long_video()).expect("the spot was written");
-    assert!(near(at, seconds(12.0), 0.5));
+    again.use_storage(&ctx, storage);
+    again.open(&ctx, &folder.join("c.mp4"));
+    assert!(at_the_start(&again), "at {:?}", again.position());
 }
 
 /// Moves a file into a folder of the tests' own, in place of the Recycle Bin.
@@ -2080,7 +2112,11 @@ fn trimmer_on(ctx: &egui::Context, path: &Path) -> Viewer {
 }
 
 fn wait_for_save(ctx: &egui::Context, viewer: &mut Viewer) -> PathBuf {
-    wait_for(ctx, viewer, "the save", |viewer| !viewer.is_saving_trim());
+    // A save is a real encode, which takes far longer while the whole suite runs at once, as
+    // the export tests allow for.
+    wait_up_to(ctx, viewer, Duration::from_secs(60), "the save", |viewer| {
+        !viewer.is_saving_trim()
+    });
     let trimmer = viewer.trim.as_ref().expect("the trimmer stays open");
     assert!(trimmer.problem.is_none(), "{:?}", trimmer.problem);
     trimmer.saved.as_ref().expect("it was saved").0.clone()
@@ -2161,14 +2197,16 @@ fn playing_in_the_trimmer_runs_between_the_handles_and_stops_at_the_end_one() {
 }
 
 #[test]
-fn a_trim_is_saved_frame_exact_beside_the_original() {
+fn a_trim_is_saved_frame_exact_where_the_save_window_says() {
     let ctx = context();
     let folder = folder_of_videos("trim-exact", &["numbers.mp4"]);
     let source = folder.join("numbers.mp4");
     let mut viewer = trimmer_on(&ctx, &source);
+    // As if the Save window were left on the name it suggests.
+    viewer.pick_trim_target = |suggested| Some(suggested.to_owned());
     viewer.set_trim_start(during_frame(17));
     viewer.set_trim_end(during_frame(82));
-    click_named(&ctx, &mut viewer, "Save as copy");
+    click_named(&ctx, &mut viewer, trim::SAVE_AS);
     let saved = wait_for_save(&ctx, &mut viewer);
     assert_eq!(saved, folder.join("numbers (trimmed).mp4"));
     assert_eq!(frame_numbers(&saved), (17..=82).collect::<Vec<u32>>());
@@ -2176,8 +2214,8 @@ fn a_trim_is_saved_frame_exact_beside_the_original() {
     let summary = &viewer.trim.as_ref().unwrap().saved.as_ref().unwrap().1;
     assert!(!summary.is_empty(), "it says how it was saved");
 
-    // A second copy doesn't overwrite the first.
-    click_named(&ctx, &mut viewer, "Save as copy");
+    // The next suggestion doesn't overwrite the first.
+    click_named(&ctx, &mut viewer, trim::SAVE_AS);
     assert_eq!(
         wait_for_save(&ctx, &mut viewer),
         folder.join("numbers (trimmed 2).mp4")
@@ -2190,6 +2228,66 @@ fn a_trim_is_saved_frame_exact_beside_the_original() {
     );
 }
 
+/// What the made-up Save window was offered, and where it says to save.
+static SAVE_WINDOW: std::sync::Mutex<(Option<PathBuf>, Option<PathBuf>)> =
+    std::sync::Mutex::new((None, None));
+
+#[test]
+fn save_as_asks_where_starting_beside_the_original_and_cancelling_saves_nothing() {
+    let ctx = context();
+    let folder = folder_of_videos("trim-save-as", &["clip.mp4"]);
+    let elsewhere = folder.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let mut viewer = trimmer_on(&ctx, &folder.join("clip.mp4"));
+    viewer.pick_trim_target = |suggested| {
+        let mut window = SAVE_WINDOW.lock().unwrap();
+        window.0 = Some(suggested.to_owned());
+        window.1.clone()
+    };
+    viewer.set_trim_end(seconds(1.0));
+
+    // Closing the Save window leaves everything as it was.
+    click_named(&ctx, &mut viewer, trim::SAVE_AS);
+    assert_eq!(
+        SAVE_WINDOW.lock().unwrap().0,
+        Some(folder.join("clip (trimmed).mp4")),
+        "it starts beside the original with the copy's name"
+    );
+    assert!(!viewer.is_saving_trim());
+    assert!(!folder.join("clip (trimmed).mp4").exists());
+
+    // A name typed without its extension gets the kind of file it is.
+    SAVE_WINDOW.lock().unwrap().1 = Some(elsewhere.join("Best bit"));
+    click_named(&ctx, &mut viewer, trim::SAVE_AS);
+    assert_eq!(
+        wait_for_save(&ctx, &mut viewer),
+        elsewhere.join("Best bit.mp4")
+    );
+    assert!(elsewhere.join("Best bit.mp4").exists());
+    assert!(
+        !folder.join("clip (trimmed).mp4").exists(),
+        "nothing beside it"
+    );
+}
+
+#[test]
+fn a_picked_name_ends_in_the_kind_the_trim_is() {
+    let suggested = Path::new(r"C:\v\clip (trimmed).mp4");
+    for (chosen, saved) in [
+        (r"D:\out\best.mp4", r"D:\out\best.mp4"),
+        (r"D:\out\best.MP4", r"D:\out\best.MP4"),
+        (r"D:\out\best", r"D:\out\best.mp4"),
+        (r"D:\out\best.mkv", r"D:\out\best.mkv.mp4"),
+        (r"D:\out\v1.2 final", r"D:\out\v1.2 final.mp4"),
+    ] {
+        assert_eq!(
+            trim::with_extension_of(PathBuf::from(chosen), suggested),
+            PathBuf::from(saved),
+            "{chosen}"
+        );
+    }
+}
+
 /// The same frame-exact save with NVIDIA's and the other graphics encoders out of reach, run
 /// in a process of its own because the setting is for the whole process.
 #[test]
@@ -2200,7 +2298,7 @@ fn a_trim_is_saved_frame_exact_without_a_graphics_encoder_too() {
     let status = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "viewer::tests::a_trim_is_saved_frame_exact_beside_the_original",
+            "viewer::tests::a_trim_is_saved_frame_exact_where_the_save_window_says",
         ])
         .args(["--test-threads", "1"])
         .env(bareclip_media::SKIP_ENCODERS_VARIABLE, "nvenc,amf,qsv")
@@ -2431,9 +2529,20 @@ fn draw_player_screens_in(theme: egui::Theme, suffix: &str) {
     );
     viewer.last_pointer_move = Instant::now() - PILL_LINGER_PAUSED - Duration::from_millis(10);
     shoot(&mut viewer, vec![], "player-06-full-screen-bare");
+    viewer.toggle_info();
+    shoot(&mut viewer, vec![], "player-06b-full-screen-info");
+    viewer.toggle_info();
+    settle(&ctx, &mut viewer);
     viewer.full_screen = false;
+    viewer.is_default_player = || false;
     viewer.settings_open = true;
     shoot(&mut viewer, vec![], "player-07-settings");
+    viewer.settings_open = false;
+    frame(&ctx, &mut viewer, vec![]);
+    viewer.is_default_player = || true;
+    viewer.settings_open = true;
+    shoot(&mut viewer, vec![], "player-07c-settings-default");
+    viewer.is_default_player = || false;
     viewer.settings_tab = SettingsTab::Keys;
     shoot(&mut viewer, vec![], "player-07b-settings-keys");
     viewer.settings_tab = SettingsTab::General;
@@ -2546,11 +2655,10 @@ fn draw_player_screens_in(theme: egui::Theme, suffix: &str) {
     let folder = folder_of_videos("screens-folder", &["a.mp4", "b.mp4", "c.mp4"]);
     let mut viewer = opened(&ctx, &folder.join("b.mp4"));
     wait_for_folder(&ctx, &mut viewer);
-    viewer.resumed = Some((seconds(83.0), Instant::now()));
     shoot(
         &mut viewer,
         vec![egui::Event::PointerMoved(pos2(640.0, 300.0))],
-        "player-15-edge-arrows-and-start-over",
+        "player-15-edge-arrows",
     );
 
     let folder = folder_of_videos("screens-info", &["Holiday clip.mp4"]);
@@ -2606,6 +2714,9 @@ fn draw_player_screens_in(theme: egui::Theme, suffix: &str) {
     viewer.set_trim_start(seconds(0.5));
     viewer.set_trim_end(seconds(2.2));
     shoot(&mut viewer, vec![], "player-23-trimmer-song");
+    screen_camera::SCREEN.set([640, 340]);
+    shoot(&mut viewer, vec![], "player-23b-trimmer-smallest-window");
+    screen_camera::SCREEN.set([1280, 720]);
 
     let mut viewer = opened(&ctx, video());
     viewer.notice = Some(
@@ -2613,16 +2724,20 @@ fn draw_player_screens_in(theme: egui::Theme, suffix: &str) {
          nothing changed here will be kept after the player closes."
             .to_owned(),
     );
-    viewer.resumed = Some((seconds(83.0), Instant::now()));
+    viewer.saved_picture = Some((PathBuf::from("frame.png"), Instant::now()));
     shoot(&mut viewer, vec![], "player-24-notes-stacked");
     viewer.notice = None;
-    viewer.resumed = None;
+    viewer.saved_picture = None;
     screen_camera::SCREEN.set([640, 400]);
     shoot(
         &mut viewer,
         vec![egui::Event::PointerMoved(pos2(320.0, 200.0))],
         "player-35-narrow-pill",
     );
+    viewer.toggle_info();
+    shoot(&mut viewer, vec![], "player-35b-narrow-info");
+    viewer.toggle_info();
+    settle(&ctx, &mut viewer);
     screen_camera::SCREEN.set([960, 540]);
     viewer.settings_open = true;
     shoot(&mut viewer, vec![], "player-25-settings-short-window");
@@ -3654,4 +3769,372 @@ fn edit_in_bareclip_sends_the_whole_file_to_an_open_editor_and_pauses() {
     );
     assert!(!viewer.is_playing(), "the player pauses and stays");
     assert!(viewer.take_become_editor().is_none());
+}
+
+/// Whether resting the mouse on a control shows exactly these words, with no wait.
+fn hint_shows(ctx: &egui::Context, viewer: &mut Viewer, name: &str, hint: &str) -> bool {
+    ctx.all_styles_mut(|style| {
+        style.interaction.tooltip_delay = 0.0;
+        style.interaction.show_tooltips_only_when_still = false;
+    });
+    let at = named_rect(ctx, viewer, name).center();
+    frame(ctx, viewer, vec![egui::Event::PointerMoved(at)]);
+    // Moving straight from one hint to the next takes a frame more to show it.
+    frame(ctx, viewer, vec![]);
+    let output = frame(ctx, viewer, vec![]);
+    output.shapes.iter().any(|clipped| {
+        matches!(&clipped.shape, egui::epaint::Shape::Text(shape) if shape.galley.text() == hint)
+    })
+}
+
+#[test]
+fn the_players_hints_are_short_and_play_says_what_a_click_does() {
+    screen_camera::SCREEN.set([1280, 720]);
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    for (name, hint) in [
+        ("Trim", "Trim"),
+        ("Delete", "Delete"),
+        ("Play", "Play"),
+        ("Jump back", "Back 5s"),
+        ("Jump forward", "Forward 5s"),
+        ("Save frame", "Save frame"),
+        ("Mini view", "Mini view"),
+        ("Full screen", "Fullscreen (F)"),
+    ] {
+        assert!(
+            hint_shows(&ctx, &mut viewer, name, hint),
+            "{name} says {hint}"
+        );
+    }
+    assert!(!hint_shows(
+        &ctx,
+        &mut viewer,
+        "Play",
+        "Play or pause (Space)"
+    ));
+
+    viewer.set_jump(false, 10);
+    viewer.set_jump(true, 30);
+    assert!(hint_shows(&ctx, &mut viewer, "Jump back", "Back 10s"));
+    assert!(hint_shows(&ctx, &mut viewer, "Jump forward", "Forward 30s"));
+
+    viewer.toggle_playback();
+    assert!(viewer.is_playing());
+    assert!(hint_shows(&ctx, &mut viewer, "Pause", "Pause"));
+    viewer.pause();
+
+    // The trimmer's play button says the same.
+    let mut viewer = trimmer_on(&ctx, video());
+    assert!(hint_shows(&ctx, &mut viewer, "Play", "Play"));
+}
+
+#[test]
+fn settings_ticks_the_default_player_and_asks_again_on_coming_back() {
+    screen_camera::SCREEN.set([1280, 720]);
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    viewer.is_default_player = || true;
+    viewer.settings_open = true;
+    settle(&ctx, &mut viewer);
+    let output = frame(&ctx, &mut viewer, vec![]);
+    for words in ["Jump back by", "Jump forward by", DEFAULT_PLAYER_NOTE] {
+        assert!(text_rect(&output, words).is_positive(), "{words}");
+    }
+    let shows_default = |output: &egui::FullOutput| {
+        output.shapes.iter().any(|clipped| {
+            matches!(
+                &clipped.shape,
+                egui::epaint::Shape::Text(shape)
+                    if shape.galley.text() == "Default"
+                        && shape.fallback_color == theme::palette(&ctx).text
+            )
+        })
+    };
+    assert!(
+        shows_default(&output),
+        "a tick and Default in place of the button, in the text's own colour"
+    );
+    let nodes = named(&ctx, &mut viewer);
+    assert!(!nodes.iter().any(|(label, ..)| label == "Make default"));
+    for gone in [
+        "Jump back and the Left key",
+        "Jump forward and the Right key",
+    ] {
+        assert!(
+            !output.shapes.iter().any(|clipped| matches!(
+                &clipped.shape,
+                egui::epaint::Shape::Text(shape) if shape.galley.text() == gone
+            )),
+            "{gone} is gone"
+        );
+    }
+
+    // Changed in Windows while Settings stayed open: nothing is asked until the window is back.
+    viewer.is_default_player = || false;
+    assert!(shows_default(&frame(&ctx, &mut viewer, vec![])));
+    frame(&ctx, &mut viewer, vec![egui::Event::WindowFocused(true)]);
+    let output = frame(&ctx, &mut viewer, vec![]);
+    assert!(text_rect(&output, NOT_DEFAULT_PLAYER_NOTE).is_positive());
+    assert!(!shows_default(&output));
+    let nodes = named(&ctx, &mut viewer);
+    assert!(nodes.iter().any(|(label, ..)| label == "Make default"));
+
+    // Closing Settings forgets the answer, so opening it again asks afresh.
+    viewer.settings_open = false;
+    frame(&ctx, &mut viewer, vec![]);
+    assert_eq!(viewer.default_player, None);
+    viewer.is_default_player = || true;
+    viewer.settings_open = true;
+    settle(&ctx, &mut viewer);
+    assert!(shows_default(&frame(&ctx, &mut viewer, vec![])));
+}
+
+#[test]
+fn in_the_smallest_window_the_trimmers_bars_fit() {
+    let ctx = context();
+    let mut viewer = trimmer_on(&ctx, video());
+    for size in [[640, 340], [900, 600], [1920, 1080]] {
+        screen_camera::SCREEN.set(size);
+        settle(&ctx, &mut viewer);
+        let nodes = named(&ctx, &mut viewer);
+        let screen = screen_camera::screen();
+        let (save, cancel) = (rect_of(&nodes, trim::SAVE_AS), rect_of(&nodes, "Cancel"));
+        let info = rect_of(&nodes, "Info");
+        let minimise = rect_of(&nodes, "Minimise window");
+        assert_eq!(save.size(), cancel.size(), "{size:?}: the same size");
+        assert!(
+            cancel.right() < info.left(),
+            "{size:?}: Cancel clear of Info"
+        );
+        assert!(
+            info.right() < minimise.left(),
+            "{size:?}: Info clear of the window's buttons"
+        );
+        let (play, more) = (rect_of(&nodes, "Play"), rect_of(&nodes, "More options"));
+        assert!(
+            play.left() >= screen.left(),
+            "{size:?}: the pill starts on screen"
+        );
+        assert!(more.right() <= screen.right(), "{size:?}: and ends on it");
+        let line = rect_of(&nodes, "Trim end").left() - rect_of(&nodes, "Trim start").left();
+        assert!(line > 0.0, "{size:?}: the handles have a line between them");
+    }
+    screen_camera::SCREEN.set([1280, 720]);
+}
+
+#[test]
+fn trimming_keeps_to_the_file_on_screen() {
+    screen_camera::SCREEN.set([1280, 720]);
+    let ctx = context();
+    let folder = folder_of_videos("trim-stays", &["a.mp4", "b.mp4", "c.mp4"]);
+    let middle = folder.join("b.mp4");
+    let mut viewer = trimmer_on(&ctx, &middle);
+    wait_for(&ctx, &mut viewer, "the folder", |viewer| {
+        viewer.next_file().is_some() && viewer.previous_file().is_some()
+    });
+    // The mouse over the picture, where the arrows would show.
+    let middle_of_picture = viewer.view.center();
+    frame(
+        &ctx,
+        &mut viewer,
+        vec![egui::Event::PointerMoved(middle_of_picture)],
+    );
+    let nodes = named(&ctx, &mut viewer);
+    for arrow in ["Previous file", "Next file"] {
+        assert!(
+            !nodes.iter().any(|(label, ..)| label == arrow),
+            "no {arrow} while trimming"
+        );
+    }
+    for key in [Key::PageDown, Key::PageUp, Key::Delete] {
+        frame(&ctx, &mut viewer, press(key));
+        frame(&ctx, &mut viewer, vec![]);
+        assert!(viewer.is_trimming(), "{key:?} leaves the trimmer open");
+        assert_eq!(viewer.current_path(), Some(middle.as_path()), "{key:?}");
+        assert!(!viewer.confirm_delete, "{key:?} asks nothing");
+    }
+
+    // Once the trimmer is closed they work again.
+    viewer.close_trimmer();
+    frame(&ctx, &mut viewer, press(Key::PageDown));
+    assert_eq!(viewer.current_path(), Some(folder.join("c.mp4").as_path()));
+}
+
+#[test]
+fn the_space_around_the_picture_is_the_windows_own_colour() {
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    for theme in [egui::Theme::Dark, egui::Theme::Light] {
+        ctx.set_theme(theme);
+        let palette = theme::palette(&ctx);
+        for full_screen in [false, true] {
+            viewer.full_screen = full_screen;
+            frame(&ctx, &mut viewer, vec![]);
+            let output = frame(&ctx, &mut viewer, vec![]);
+            let filled = |colour: Color32| {
+                output.shapes.iter().any(|clipped| {
+                    matches!(
+                        &clipped.shape,
+                        egui::epaint::Shape::Rect(shape)
+                            if shape.fill == colour && shape.rect == viewer.view
+                    )
+                })
+            };
+            assert!(
+                filled(palette.bg_app),
+                "{theme:?}, full screen {full_screen}: the picture's space is the window's colour"
+            );
+            assert!(!filled(palette.stage), "{theme:?}: and not the dark stage");
+        }
+    }
+    viewer.full_screen = false;
+}
+
+#[test]
+fn info_opens_while_trimming_and_the_time_floats_over_the_picture() {
+    screen_camera::SCREEN.set([1280, 720]);
+    let ctx = context();
+    let mut viewer = trimmer_on(&ctx, video());
+    settle(&ctx, &mut viewer);
+    let output = frame(&ctx, &mut viewer, vec![]);
+    let time = text_rect(&output, &viewer.clock(viewer.position()));
+    assert!(
+        time.bottom() < viewer.view.bottom() && time.top() > viewer.view.top(),
+        "the playhead's time is over the bottom of the picture: {time:?}"
+    );
+
+    click_named(&ctx, &mut viewer, "Info");
+    assert!(viewer.is_info_open());
+    assert!(viewer.is_trimming(), "the trim stays");
+    settle(&ctx, &mut viewer);
+    let nodes = named(&ctx, &mut viewer);
+    assert!(
+        nodes.iter().any(|(label, ..)| label == "Copy path"),
+        "the card shows"
+    );
+    assert!(
+        viewer.view.width() < 1000.0,
+        "the picture narrows beside it"
+    );
+    let play = rect_of(&nodes, "Play");
+    assert!(
+        play.left() > viewer.view.left(),
+        "the pill stays under the picture"
+    );
+}
+
+#[test]
+fn renaming_while_trimming_keeps_the_trim_but_waits_for_a_save() {
+    let ctx = context();
+    let folder = folder_of_videos("trim-rename", &["clip.mp4"]);
+    let mut viewer = trimmer_on(&ctx, &folder.join("clip.mp4"));
+    viewer.toggle_info();
+    viewer.set_trim_start(seconds(0.5));
+    viewer.set_trim_end(seconds(2.0));
+    let kept = viewer.trim_range();
+
+    viewer.rename_file(&ctx, "renamed");
+    assert_eq!(
+        viewer.current_path(),
+        Some(folder.join("renamed.mp4").as_path())
+    );
+    assert!(viewer.is_trimming(), "the trimmer stays open");
+    assert_eq!(viewer.trim_range(), kept, "with its handles");
+
+    // A save still reading the file holds changes back, saying why.
+    let _saving = viewer.pretend_saving(0.3);
+    viewer.rename_file(&ctx, "again");
+    assert_eq!(
+        viewer.current_path(),
+        Some(folder.join("renamed.mp4").as_path())
+    );
+    assert_eq!(
+        viewer.info.as_ref().unwrap().problem.as_deref(),
+        Some(info::TRIM_SAVING)
+    );
+    assert!(viewer.is_trimming());
+}
+
+/// Where the info card is, from its Copy path button's line down to the screen readers' view.
+fn info_card_shows(ctx: &egui::Context, viewer: &mut Viewer) -> Option<Rect> {
+    named(ctx, viewer)
+        .into_iter()
+        .find(|(label, ..)| label == "Copy path")
+        .map(|(_, rect, _)| rect)
+}
+
+#[test]
+fn info_shows_in_full_screen_clear_of_the_bars() {
+    screen_camera::SCREEN.set([1280, 720]);
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    viewer.full_screen = true;
+    viewer.toggle_info();
+    settle(&ctx, &mut viewer);
+    let copy = info_card_shows(&ctx, &mut viewer).expect("the card shows in full screen");
+    assert!(
+        copy.top() > bars::TITLE_HEIGHT,
+        "its heading is below where the top bar slides in: {copy:?}"
+    );
+    assert!(
+        viewer.view.right() < 1280.0 - info::CARD_WIDTH,
+        "the picture narrows beside it"
+    );
+    // The bars hide as usual, and the card stays.
+    viewer.last_pointer_move = Instant::now() - Duration::from_secs(10);
+    frame(
+        &ctx,
+        &mut viewer,
+        vec![egui::Event::PointerMoved(pos2(300.0, 360.0))],
+    );
+    settle(&ctx, &mut viewer);
+    assert!(info_card_shows(&ctx, &mut viewer).is_some());
+    viewer.full_screen = false;
+}
+
+#[test]
+fn in_a_narrow_window_info_lies_over_the_picture_and_keeps_the_wheel_off_it() {
+    screen_camera::SCREEN.set([640, 400]);
+    let ctx = context();
+    let mut viewer = opened(&ctx, video());
+    settle(&ctx, &mut viewer);
+    let whole_picture = viewer.view;
+    viewer.toggle_info();
+    settle(&ctx, &mut viewer);
+    let copy = info_card_shows(&ctx, &mut viewer).expect("the card shows in a narrow window");
+    assert_eq!(viewer.view, whole_picture, "the picture keeps its size");
+    assert!(
+        whole_picture.contains(copy.center()),
+        "the card lies over it"
+    );
+    let card = ctx
+        .read_response(egui::Id::unique("viewer_info_card"))
+        .expect("the card is drawn")
+        .rect;
+    frame(
+        &ctx,
+        &mut viewer,
+        vec![egui::Event::PointerMoved(pos2(100.0, 200.0))],
+    );
+    let nodes = named(&ctx, &mut viewer);
+    assert!(
+        rect_of(&nodes, "Play").top() > card.bottom(),
+        "the pill shows below it: {card:?}"
+    );
+    if let Some((_, next, _)) = nodes.iter().find(|(label, ..)| label == "Next file") {
+        assert!(next.right() < card.left(), "the next arrow is left of it");
+    }
+    assert!(
+        card.contains(pos2(copy.center().x, copy.bottom() + 120.0)),
+        "the wheel below goes on the card"
+    );
+
+    // The wheel over the card doesn't zoom the picture under it.
+    let fit = viewer.zoom;
+    let on_card = pos2(copy.center().x, copy.bottom() + 120.0);
+    frame(&ctx, &mut viewer, wheel(on_card, 2.0));
+    settle(&ctx, &mut viewer);
+    assert_eq!(viewer.zoom, fit, "nothing zoomed");
+    screen_camera::SCREEN.set([1280, 720]);
 }

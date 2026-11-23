@@ -68,7 +68,7 @@ use crate::{
 const TRANSITIONS_REASON: &str = "Transitions show two clips at once, so the video is drawn again.";
 const LOOKS_REASON: &str =
     "Filters, colours and picture fades change the picture, so the video is drawn again.";
-pub(crate) const LOGO_DARK: &[u8] = include_bytes!("../../../assets/brand/png/mark-dark-256.png");
+const LOGO_DARK: &[u8] = include_bytes!("../../../assets/brand/png/mark-dark-256.png");
 const LOGO_LIGHT: &[u8] = include_bytes!("../../../assets/brand/png/mark-light-256.png");
 // The brand rules call for the simplified mark at this size.
 const SMALL_LOGO_DARK: &[u8] = include_bytes!("../../../assets/brand/png/mark-small-dark-256.png");
@@ -4924,7 +4924,7 @@ impl Editor {
             .solid();
         if ui
             .add_enabled(has_clips, play)
-            .on_hover_text("Play or pause (Space)")
+            .on_hover_text(name)
             .clicked()
         {
             self.toggle_playback();

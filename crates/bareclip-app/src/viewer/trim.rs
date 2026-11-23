@@ -1,7 +1,8 @@
 //! The quick trimmer: two handles on a line along the whole file, which keep one stretch, and
-//! saving that stretch as a new file beside the original. It is laid out like the Photos app's:
-//! "Trim" and the save buttons along the top, and a pill along the bottom with play, the volume,
-//! the line between the start and end times, and "…" with the trimmer's tools.
+//! saving that stretch as a new file wherever Windows' Save window is told. It is laid out like
+//! the Photos app's: Save as… and Cancel at the top left with "Trim" and Info in the middle, a
+//! pill along the bottom with play, the volume, the line between the start and end times, and
+//! "…" with the trimmer's tools, and the playhead's time floating over the picture above it.
 //! Videos are cut the editor's frame-exact way, copying all but the stretches around the cuts,
 //! and sound is cut by `cut_sound`.
 
@@ -44,22 +45,33 @@ const COPIED_CONTAINERS: [&str; 4] = ["mp4", "m4v", "mov", "mkv"];
 const SAVING_BAR_WIDTH: f32 = 220.0;
 /// The card a save's progress shows in.
 const SAVING_CARD_WIDTH: f32 = 440.0;
-/// The room between Save as copy and Cancel and the window's buttons.
-const TITLE_BUTTON_GAP: f32 = 16.0;
-/// "Trim" in the top bar: its symbol, the room after it, and the mark under the word.
+/// The save button's name. The "…" says a window opens to ask where first.
+pub const SAVE_AS: &str = "Save as…";
+/// Save as… and Cancel at the top left: the room before them, between them, and either side of
+/// each button's word.
+const SAVE_BUTTONS_INSET: f32 = 4.0;
+const SAVE_BUTTONS_GAP: f32 = 8.0;
+const SAVE_BUTTON_SIDE_ROOM: f32 = 14.0;
+/// The trimmer's pill: the room inside its ends and between its controls.
+const TRIM_PILL_PADDING: f32 = 8.0;
+const TRIM_PILL_SPACING: f32 = 6.0;
+/// "Trim" in the top bar: its symbol, the room after it, the mark under the word, and the room
+/// between it and Info.
 const TRIM_ICON_SIZE: f32 = 16.0;
 const TRIM_ICON_GAP: f32 = 8.0;
 const TRIM_MARK_WIDTH: f32 = 22.0;
-/// The room under the pill, so it doesn't sit tight on the window's edge.
-const PILL_BOTTOM_ROOM: f32 = 12.0;
-/// The bubble with the playhead's time, over the pill.
+const INFO_GAP: f32 = 12.0;
+/// The room over and under the pill, so it doesn't sit tight on the window's edge.
+const PILL_TOP_ROOM: f32 = 12.0;
+pub const PILL_BOTTOM_ROOM: f32 = 20.0;
+/// The bubble with the playhead's time, floating over the bottom of the picture, this far up.
 const BUBBLE_WIDTH: f32 = 104.0;
 const BUBBLE_HEIGHT: f32 = 32.0;
-const BUBBLE_GAP: f32 = 10.0;
-/// Room over the bubble, and how tall the bottom is while trimming.
-const TRIM_BAR_TOP: f32 = 16.0;
-pub const TRIM_BAR_HEIGHT: f32 =
-    TRIM_BAR_TOP + BUBBLE_HEIGHT + 8.0 + BUBBLE_GAP + PILL_HEIGHT + PILL_BOTTOM_ROOM;
+pub const BUBBLE_GAP: f32 = 12.0;
+/// How far up the picture the time, or a save's taller progress, reaches, with room above it.
+pub const FLOATING_ROOM: f32 = BUBBLE_GAP + BUBBLE_HEIGHT + 8.0 + 8.0;
+/// How tall the bottom is while trimming: only the pill and the room around it.
+pub const TRIM_BAR_HEIGHT: f32 = PILL_TOP_ROOM + PILL_HEIGHT + PILL_BOTTOM_ROOM;
 /// The line: how thick it is, its handles, and the playhead's thumb on it, which is the seek
 /// line's: a light dot ringed in the accent that grows under the mouse.
 const LINE_THICKNESS: f32 = 4.0;
@@ -141,8 +153,55 @@ pub fn copy_name(path: &Path, sound: bool) -> PathBuf {
     }
 }
 
+/// A name picked in the Save window, with the kind of file the trim really is on the end if it
+/// doesn't already end so, because the saved file is written as that kind whatever it's called.
+pub fn with_extension_of(chosen: PathBuf, suggested: &Path) -> PathBuf {
+    let Some(wanted) = suggested.extension() else {
+        return chosen;
+    };
+    let matches = chosen
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(wanted));
+    if matches {
+        return chosen;
+    }
+    let mut name = chosen.into_os_string();
+    name.push(".");
+    name.push(wanted);
+    PathBuf::from(name)
+}
+
+/// Windows' Save window, starting in the suggested name's folder with that name.
+pub fn ask_where_to_save(suggested: &Path) -> Option<PathBuf> {
+    let extension = suggested
+        .extension()
+        .map(|extension| extension.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut dialog = rfd::FileDialog::new()
+        .set_title("Save the trimmed clip")
+        .add_filter(extension.to_uppercase(), &[extension.as_str()]);
+    if let Some(name) = suggested.file_name() {
+        dialog = dialog.set_file_name(name.to_string_lossy());
+    }
+    if let Some(folder) = suggested.parent() {
+        dialog = dialog.set_directory(folder);
+    }
+    dialog.save_file()
+}
+
+/// How wide Save as… and Cancel each are: wide enough for the longer word, so they match.
+fn save_button_width(ui: &egui::Ui) -> f32 {
+    let words = |text: &str, font: FontId| {
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), font, egui::Color32::PLACEHOLDER)
+            .size()
+            .x
+    };
+    words(SAVE_AS, fonts::strong(12.0)).max(words("Cancel", FontId::proportional(12.0)))
+        + SAVE_BUTTON_SIDE_ROOM * 2.0
+}
+
 impl Viewer {
-    #[cfg(test)]
     pub fn is_trimming(&self) -> bool {
         self.trim.is_some()
     }
@@ -440,46 +499,69 @@ impl Viewer {
             .is_some_and(|trimmer| trimmer.saving.is_some())
     }
 
-    /// The top bar while trimming, as Photos lays it out: the file's name on the left, "Trim"
-    /// in the middle, and Save as copy and Cancel before the window's buttons on the right.
-    /// The save buttons wait while a save is under way.
+    /// The top bar while trimming: Save as… and Cancel on the left, the same size, "Trim" and
+    /// Info together in the middle, and the window's buttons on the right. Save as… waits while
+    /// a save is under way.
     pub(super) fn trim_title(&mut self, ui: &mut egui::Ui, palette: &Palette, rect: Rect) {
         let ctx = ui.ctx().clone();
         let inner = rect.shrink2(vec2(8.0, 0.0));
-        let idle = !self.is_saving_trim();
-        let mut pressed = (false, false);
-        let right = ui
-            .scope_builder(
-                UiBuilder::new()
-                    .max_rect(inner)
-                    .layout(Layout::right_to_left(Align::Center)),
-                |ui| {
-                    self.window_buttons(ui, palette);
-                    ui.add_space(TITLE_BUTTON_GAP);
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    pressed.1 = ui
-                        .add(ActionButton::new(palette, Kind::Secondary, "Cancel").small())
-                        .on_hover_text("Leave the trimmer (Escape)")
-                        .clicked();
-                    pressed.0 = ui
-                        .add_enabled(
-                            idle,
-                            ActionButton::new(palette, Kind::Primary, "Save as copy").small(),
-                        )
-                        .on_hover_text("Save the trimmed clip beside the original")
-                        .clicked();
-                },
-            )
-            .response
-            .rect;
+        ui.scope_builder(
+            UiBuilder::new()
+                .max_rect(inner)
+                .layout(Layout::right_to_left(Align::Center)),
+            |ui| self.window_buttons(ui, palette),
+        );
 
-        // "Trim" in the middle of the window, marked as the mode the player is in.
+        let idle = !self.is_saving_trim();
+        let width = save_button_width(ui);
+        let mut pressed = (false, false);
+        ui.scope_builder(
+            UiBuilder::new()
+                .max_rect(inner.shrink2(vec2(SAVE_BUTTONS_INSET, 0.0)))
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = SAVE_BUTTONS_GAP;
+                pressed.0 = ui
+                    .add_enabled(
+                        idle,
+                        ActionButton::new(palette, Kind::Primary, SAVE_AS)
+                            .small()
+                            .width(width),
+                    )
+                    .on_hover_text("Save the trimmed clip as a new file")
+                    .clicked();
+                pressed.1 = ui
+                    .add(
+                        ActionButton::new(palette, Kind::Secondary, "Cancel")
+                            .small()
+                            .width(width),
+                    )
+                    .on_hover_text("Leave the trimmer (Escape)")
+                    .clicked();
+            },
+        );
+
+        // "Trim", marked as the mode the player is in, and Info beside it, centred together.
         let font = FontId::proportional(14.0);
         let word = ui
             .painter()
             .layout_no_wrap("Trim".to_owned(), font, palette.text);
-        let width = TRIM_ICON_SIZE + TRIM_ICON_GAP + word.size().x;
+        let info_side = IconButton::default_size();
+        let width = TRIM_ICON_SIZE + TRIM_ICON_GAP + word.size().x + INFO_GAP + info_side;
         let left = rect.center().x - width / 2.0;
+        let info_at = Rect::from_center_size(
+            pos2(left + width - info_side / 2.0, rect.center().y),
+            vec2(info_side, info_side),
+        );
+        let info_open = self.is_info_open();
+        let kind = if info_open { Kind::Chosen } else { Kind::Ghost };
+        if ui
+            .put(info_at, IconButton::new(palette, kind, icons::INFO, "Info"))
+            .on_hover_text("Info")
+            .clicked()
+        {
+            self.toggle_info();
+        }
         let icon = icons::square_at(
             pos2(left + TRIM_ICON_SIZE / 2.0, rect.center().y),
             TRIM_ICON_SIZE,
@@ -499,42 +581,30 @@ impl Viewer {
             ],
             Stroke::new(3.0, palette.accent),
         );
-
-        // The name on the left, as far as the middle allows.
-        let name_room = Rect::from_min_max(
-            pos2(inner.left() + 8.0, rect.top()),
-            pos2((left - 16.0).min(right.left() - 16.0), rect.bottom()),
-        );
-        if name_room.width() > 24.0 {
-            ui.scope_builder(
-                UiBuilder::new()
-                    .max_rect(name_room)
-                    .layout(Layout::left_to_right(Align::Center)),
-                |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(self.name())
-                                .font(FontId::proportional(components::NAME_BAR_TEXT - 1.0))
-                                .color(palette.text),
-                        )
-                        .truncate()
-                        .selectable(false),
-                    );
-                },
-            );
-        }
         if pressed.0 {
-            self.save_trim(&ctx, None);
+            self.save_trim_as(&ctx);
         }
         if pressed.1 {
             self.close_trimmer();
         }
     }
 
-    /// The bottom while trimming: the time at the playhead in a bubble, or a save's progress,
-    /// over a pill holding play, the volume, the start time, the line with its handles, the
-    /// end time and "…". The pill is as wide as the player's, for the picture's width `across`,
-    /// and centred under the picture.
+    /// Asks where to save the kept stretch, in Windows' Save window, starting in the file's
+    /// folder with `<name> (trimmed).<ext>`, then saves it there.
+    pub fn save_trim_as(&mut self, ctx: &egui::Context) {
+        let Some(file) = &self.file else {
+            return;
+        };
+        let suggested = copy_name(&file.info.path, file.is_sound());
+        if let Some(chosen) = (self.pick_trim_target)(&suggested) {
+            self.save_trim(ctx, Some(with_extension_of(chosen, &suggested)));
+        }
+    }
+
+    /// The bottom while trimming: a pill holding play, the volume, the start time, the line
+    /// with its handles, the end time and "…", as wide as the player's for the picture's width
+    /// `across` and centred under the picture. Over the bottom of the picture floats the time
+    /// at the playhead in a see-through bubble, or a save's progress.
     pub(super) fn trim_bar(
         &mut self,
         ui: &mut egui::Ui,
@@ -545,6 +615,8 @@ impl Viewer {
         let Some(range) = self.trim_range() else {
             return;
         };
+        let duration = self.duration();
+        let time_box = pill::time_width(ui, &self.clock(duration)) + 4.0;
         let pill = Rect::from_center_size(
             pos2(
                 across.center(),
@@ -554,7 +626,7 @@ impl Viewer {
         );
         let bubble_middle = pos2(
             pill.center().x,
-            pill.top() - BUBBLE_GAP - BUBBLE_HEIGHT / 2.0,
+            rect.top() - BUBBLE_GAP - BUBBLE_HEIGHT / 2.0,
         );
         let saving = self
             .trim
@@ -564,7 +636,7 @@ impl Viewer {
         if let Some(share) = saving {
             self.save_progress(ui, palette, bubble_middle, share);
         } else {
-            raised_card(
+            pill::floating_card(
                 ui,
                 palette,
                 Rect::from_center_size(bubble_middle, vec2(BUBBLE_WIDTH, BUBBLE_HEIGHT)),
@@ -580,17 +652,15 @@ impl Viewer {
         }
 
         raised_card(ui, palette, pill, PILL_RADIUS);
-        let content = pill.shrink2(vec2(8.0, 0.0));
-        let duration = self.duration();
+        let content = pill.shrink2(vec2(TRIM_PILL_PADDING, 0.0));
         let times = [self.clock(range.start), self.clock(range.end)];
-        let time_box = pill::time_width(ui, &self.clock(duration)) + 4.0;
         let mut line = Rect::NOTHING;
         ui.scope_builder(
             UiBuilder::new()
                 .max_rect(content)
                 .layout(Layout::left_to_right(Align::Center)),
             |ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.spacing_mut().item_spacing.x = TRIM_PILL_SPACING;
                 let (icon, name) = if self.is_playing() {
                     (icons::PAUSE, "Pause")
                 } else {
@@ -598,7 +668,7 @@ impl Viewer {
                 };
                 if ui
                     .add(IconButton::new(palette, Kind::Ghost, icon, name).solid())
-                    .on_hover_text("Play or pause (Space)")
+                    .on_hover_text(name)
                     .clicked()
                 {
                     self.toggle_playback();
@@ -626,7 +696,7 @@ impl Viewer {
     /// A save's progress, with a way to stop it, where the time's bubble goes.
     fn save_progress(&mut self, ui: &mut egui::Ui, palette: &Palette, middle: Pos2, share: f32) {
         let card = Rect::from_center_size(middle, vec2(SAVING_CARD_WIDTH, BUBBLE_HEIGHT + 8.0));
-        raised_card(ui, palette, card, (BUBBLE_HEIGHT + 8.0) / 2.0);
+        pill::floating_card(ui, palette, card, (BUBBLE_HEIGHT + 8.0) / 2.0);
         let mut cancel_save = false;
         ui.scope_builder(
             UiBuilder::new()

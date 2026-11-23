@@ -186,3 +186,47 @@ fn the_default_apps_link_names_bareclips_own_page() {
     );
     assert!(link.ends_with("=BareClip"));
 }
+
+#[test]
+fn bareclip_is_the_default_player_only_when_every_type_opens_in_it() {
+    let all_bareclip = |extension: &str| {
+        let kind = if crate::text::PLAYER_VIDEO_EXTENSIONS.contains(&extension) {
+            "BareClip.Video"
+        } else {
+            "BareClip.Audio"
+        };
+        Some(kind.to_owned())
+    };
+    assert!(!every_type_opens_in_bareclip(|_| None), "nothing set");
+    assert!(every_type_opens_in_bareclip(all_bareclip));
+    assert!(
+        every_type_opens_in_bareclip(|extension| if extension == "mkv" {
+            Some(r"Applications\BareClip.exe".to_owned())
+        } else {
+            all_bareclip(extension)
+        }),
+        "bareclip.exe picked by browsing still counts"
+    );
+    for (other, opener) in [("mp4", Some("WMP11.AssocFile.MP4")), ("opus", None)] {
+        assert!(
+            !every_type_opens_in_bareclip(|extension| if extension == other {
+                opener.map(str::to_owned)
+            } else {
+                all_bareclip(extension)
+            }),
+            "one type opening elsewhere is enough: .{other}"
+        );
+    }
+}
+
+#[test]
+fn windows_says_what_opens_a_type() {
+    // Every Windows opens a text file with something, and calls a made-up type Unknown.
+    let text = opens_with("txt").expect("text files open with something");
+    assert!(!text.is_empty() && text != "Unknown", "{text}");
+    let made_up = opens_with("bareclip-made-up-type");
+    assert!(
+        made_up.as_deref().is_none_or(|opener| opener == "Unknown"),
+        "{made_up:?}"
+    );
+}

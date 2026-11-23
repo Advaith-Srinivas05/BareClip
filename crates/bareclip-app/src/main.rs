@@ -45,7 +45,7 @@ fn main() -> eframe::Result {
     // "Edit with BareClip" goes to an editor already open, and a file to watch to a player
     // already open, if there is one.
     let mut claimed = None;
-    if launch.kind != handoff::LaunchKind::Editor {
+    if launch.kind != handoff::LaunchKind::Editor && !launch.new_window {
         // A player is only handed the first file. The rest are what next and previous find.
         let handed = match launch.kind {
             handoff::LaunchKind::Play => &launch.paths[..launch.paths.len().min(1)],
@@ -171,6 +171,9 @@ fn open_window(wanted: Option<GpuId>, waiting: WaitingLaunch) -> eframe::Result 
             }
             // The window is still hidden here, so it never shows anywhere else first.
             let window = window_handle(creation_context);
+            if let Some(window) = window {
+                give_window_the_apps_icon(window);
+            }
             let (face, maximize) = match launch.kind {
                 handoff::LaunchKind::Play => {
                     let mut viewer = viewer::Viewer::new(ctx, true);
@@ -205,6 +208,7 @@ fn open_window(wanted: Option<GpuId>, waiting: WaitingLaunch) -> eframe::Result 
                 app_folder: storage::app_folder(),
                 editor_prefix: handoff::PIPE_PREFIX.to_owned(),
                 use_sound: true,
+                open_elsewhere: open_in_new_player,
             }))
         }),
     )
@@ -265,6 +269,48 @@ fn window_handle(
     }
 }
 
+/// The app's icon in the exe, as the build puts it there.
+const APP_ICON_RESOURCE: u16 = 1;
+
+/// Gives the window the app's icon from the exe, big for the taskbar and Alt+Tab and small for
+/// the title. egui only gives it a small one made from a picture, and without a big one the
+/// taskbar shows Windows' plain application icon.
+fn give_window_the_apps_icon(window: windows_sys::Win32::Foundation::HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, ICON_BIG, ICON_SMALL, SM_CXICON, SM_CXSMICON, SendMessageW, WM_SETICON,
+    };
+    for (kind, metric) in [(ICON_BIG, SM_CXICON), (ICON_SMALL, SM_CXSMICON)] {
+        // SAFETY: asking a size has no inputs that can be wrong.
+        let side = unsafe { GetSystemMetrics(metric) };
+        if let Some(icon) = app_icon(side) {
+            // SAFETY: the window is this app's own, and an icon loaded from the exe stays valid
+            // for as long as the app runs.
+            unsafe { SendMessageW(window, WM_SETICON, kind as usize, icon as isize) };
+        }
+    }
+}
+
+/// The app's icon from its own exe, at a side in pixels, picking the nearest size it holds.
+fn app_icon(side: i32) -> Option<windows_sys::Win32::UI::WindowsAndMessaging::HICON> {
+    use windows_sys::Win32::{
+        System::LibraryLoader::GetModuleHandleW,
+        UI::WindowsAndMessaging::{IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW},
+    };
+    // SAFETY: a null name asks for this process's own exe, and a resource number in place of
+    // a name is how Windows takes one.
+    let icon = unsafe {
+        LoadImageW(
+            GetModuleHandleW(std::ptr::null()),
+            APP_ICON_RESOURCE as usize as *const u16,
+            IMAGE_ICON,
+            side,
+            side,
+            LR_DEFAULTCOLOR,
+        )
+    };
+    (!icon.is_null()).then_some(icon)
+}
+
 /// What the window is showing: the player, or the editor.
 enum Face {
     Viewer(Box<viewer::Viewer>),
@@ -289,6 +335,8 @@ struct Shell {
     editor_prefix: String,
     /// Whether the editor it becomes plays sound. Tests have none.
     use_sound: bool,
+    /// Opens a file in a player window of its own. Tests swap it, so nothing starts.
+    open_elsewhere: fn(&std::path::Path),
 }
 
 impl Shell {
@@ -327,6 +375,35 @@ impl Shell {
     }
 }
 
+/// What a player does with files sent to it: it shows the newest, because one file shows at a
+/// time. While trimming it keeps to its file, so the newest opens in a window of its own.
+fn take_handed(
+    viewer: &mut viewer::Viewer,
+    ctx: &egui::Context,
+    arrived: &[handoff::Handed],
+    open_elsewhere: fn(&std::path::Path),
+) {
+    let Some(handed) = arrived.last() else {
+        return;
+    };
+    if viewer.is_trimming() {
+        open_elsewhere(&handed.path);
+    } else {
+        viewer.open(ctx, &handed.path);
+    }
+}
+
+/// Starts another player window on a file, which opens on its own rather than handing the file
+/// back to this one.
+fn open_in_new_player(path: &std::path::Path) {
+    if let Ok(app) = std::env::current_exe() {
+        let _ = std::process::Command::new(app)
+            .args([handoff::PLAY_FLAG, handoff::NEW_WINDOW_FLAG])
+            .arg(path)
+            .spawn();
+    }
+}
+
 impl eframe::App for Shell {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if std::mem::take(&mut self.maximize) {
@@ -343,10 +420,7 @@ impl eframe::App for Shell {
                 editor.show(ui);
             }
             Face::Viewer(viewer) => {
-                // Only the newest matters, because one file shows at a time.
-                if let Some(handed) = arrived.last() {
-                    viewer.open(ui.ctx(), &handed.path);
-                }
+                take_handed(viewer, ui.ctx(), &arrived, self.open_elsewhere);
                 viewer.show(ui);
                 becoming = viewer.take_become_editor();
             }
@@ -385,6 +459,67 @@ mod tests {
         let icon = eframe::icon_data::from_png_bytes(WINDOW_ICON).unwrap();
 
         assert_eq!((icon.width, icon.height), (64, 64));
+    }
+
+    /// The taskbar's icon comes from the exe, so the exe has to hold it at the sizes asked for.
+    #[test]
+    fn the_exe_holds_the_apps_icon_for_the_taskbar() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::DestroyIcon;
+        for side in [16, 32, 48, 256] {
+            let icon = app_icon(side).unwrap_or_else(|| panic!("a {side} px icon"));
+            unsafe { DestroyIcon(icon) };
+        }
+    }
+
+    /// Files a test's player sent to a window of their own.
+    static SENT_ELSEWHERE: std::sync::Mutex<Vec<std::path::PathBuf>> =
+        std::sync::Mutex::new(Vec::new());
+
+    #[test]
+    fn a_file_sent_while_trimming_opens_in_a_window_of_its_own() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx);
+        theme::install(&ctx);
+        let folder =
+            std::env::temp_dir().join(format!("bareclip-shell-trim-tests-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        let [first, second] = ["first.mp4", "second.mp4"].map(|name| {
+            let video = folder.join(name);
+            let status = std::process::Command::new("ffmpeg")
+                .args(["-hide_banner", "-loglevel", "error", "-y"])
+                .args(["-f", "lavfi", "-i", "testsrc2=s=160x90:r=30:d=2"])
+                .args(["-c:v", "libopenh264"])
+                .arg(&video)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            video
+        });
+        let sent_elsewhere: fn(&std::path::Path) =
+            |path| SENT_ELSEWHERE.lock().unwrap().push(path.to_owned());
+        let handed = |path: &std::path::Path| handoff::Handed::whole(path.to_owned());
+        let mut viewer = viewer::Viewer::new(&ctx, false);
+        viewer.open(&ctx, &first);
+        let first = viewer.current_path().unwrap().to_owned();
+
+        viewer.open_trimmer(&ctx);
+        take_handed(&mut viewer, &ctx, &[handed(&second)], sent_elsewhere);
+        assert!(viewer.is_trimming(), "the trim stays");
+        assert_eq!(viewer.current_path(), Some(first.as_path()));
+        assert_eq!(
+            *SENT_ELSEWHERE.lock().unwrap(),
+            std::slice::from_ref(&second)
+        );
+
+        viewer.close_trimmer();
+        take_handed(&mut viewer, &ctx, &[handed(&second)], sent_elsewhere);
+        assert_eq!(
+            viewer.current_path().and_then(|path| path.file_name()),
+            second.file_name(),
+            "not trimming, the window shows it"
+        );
+        assert_eq!(SENT_ELSEWHERE.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -426,6 +561,7 @@ mod tests {
             app_folder: Some(folder.clone()),
             editor_prefix: editors.clone(),
             use_sound: false,
+            open_elsewhere: |_| {},
         };
         assert!(handoff::window_answers(&players));
         assert!(!handoff::window_answers(&editors));

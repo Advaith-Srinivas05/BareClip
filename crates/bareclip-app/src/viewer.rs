@@ -85,12 +85,24 @@ const SETTINGS_FRAME_ROOM: f32 = 170.0;
 const KEY_ROW_HEIGHT: f32 = 34.0;
 /// Room for the Make default button, which the row's words stop short of.
 const MAKE_DEFAULT_WIDTH: f32 = 104.0;
+/// As tall as the small Make default button it stands in for, so the row keeps its height.
+const DEFAULT_MARK_HEIGHT: f32 = 26.0;
+/// Under Default player, once every type the player plays opens in BareClip.
+const DEFAULT_PLAYER_NOTE: &str = "BareClip is your default player";
+/// Under Default player, while any type opens in another program.
+const NOT_DEFAULT_PLAYER_NOTE: &str = "Some files open in another app";
 /// The jumps' dropdowns, wide enough for "30 s" and the arrow.
 const JUMP_DROPDOWN_WIDTH: f32 = 84.0;
 /// The symbol over the message shown when nothing can play.
 const STAGE_SYMBOL: f32 = 32.0;
-/// How large the BareClip mark shows for a sound file with no cover.
-const MARK_SIDE: f32 = 160.0;
+/// The brand's logo with its name beside it, which stands in for a sound file's missing cover:
+/// gold on the dark theme and bronze on the light one, as the brand has them.
+const LOCKUP_DARK: &[u8] =
+    include_bytes!("../../../assets/brand/png/lockup-horizontal-dark-1600.png");
+const LOCKUP_LIGHT: &[u8] =
+    include_bytes!("../../../assets/brand/png/lockup-horizontal-light-1600.png");
+/// How wide the logo and name show at most.
+const LOCKUP_WIDTH: f32 = 520.0;
 /// How far one notch of a mouse wheel scrolls, in points.
 const WHEEL_NOTCH: f32 = 50.0;
 /// How long the note about a saved picture stays.
@@ -159,7 +171,8 @@ pub struct Viewer {
     failed: Option<Unplayable>,
     /// The picture on screen.
     picture: Option<TextureHandle>,
-    mark: Option<TextureHandle>,
+    /// The logo and name for a sound file with no cover, and whether it is the dark theme's.
+    lockup: Option<(bool, TextureHandle)>,
     settings: ViewerSettings,
     theme: ThemeSetting,
     app_folder: Option<PathBuf>,
@@ -201,18 +214,20 @@ pub struct Viewer {
     /// The playable files in the open file's folder, in name order.
     folder: Vec<PathBuf>,
     folder_reading: Option<Receiver<Vec<PathBuf>>>,
-    /// Where files were last stopped.
-    resume: resume::ResumeSpots,
-    /// When the playing file's spot was last written to disk.
-    spot_kept: Instant,
-    /// Where the open file picked up, and since when, for Start over.
-    resumed: Option<(Ticks, Instant)>,
     /// The info panel, while it is open. It stays open from file to file.
     info: Option<info::InfoPanel>,
     /// Delete is waiting for an answer.
     confirm_delete: bool,
     /// Moves a file to the Recycle Bin. Tests swap it for a folder of their own.
     trash_file: fn(&Path) -> Result<(), String>,
+    /// Whether every type the player plays opens in BareClip. Tests swap it, so they don't
+    /// depend on what this PC opens files with.
+    is_default_player: fn() -> bool,
+    /// Asks where to save a trim, given the suggested file. Tests swap it, so no window opens.
+    pick_trim_target: fn(&Path) -> Option<PathBuf>,
+    /// What it said while Settings is open, asked again when the window comes back to the
+    /// front, as it does after Windows' Default apps page.
+    default_player: Option<bool>,
     /// The quick trimmer, while it is open.
     trim: Option<trim::Trimmer>,
     /// Where Edit in BareClip looks for editors. Tests use names of their own.
@@ -229,7 +244,7 @@ impl Viewer {
             file: None,
             failed: None,
             picture: None,
-            mark: None,
+            lockup: None,
             settings: ViewerSettings::default(),
             theme: ThemeSetting::System,
             app_folder: None,
@@ -257,12 +272,12 @@ impl Viewer {
             saved_picture: None,
             folder: Vec::new(),
             folder_reading: None,
-            resume: resume::ResumeSpots::default(),
-            spot_kept: Instant::now(),
-            resumed: None,
             info: None,
             confirm_delete: false,
             trash_file: crate::file_ops::move_to_recycle_bin,
+            is_default_player: crate::file_ops::is_default_player,
+            pick_trim_target: trim::ask_where_to_save,
+            default_player: None,
             trim: None,
             editor_prefix: crate::handoff::PIPE_PREFIX.to_owned(),
             become_editor: None,
@@ -280,7 +295,6 @@ impl Viewer {
         self.settings = settings.viewer;
         self.theme = settings.theme;
         ctx.set_theme(egui::ThemePreference::from(self.theme));
-        self.resume = resume::ResumeSpots::load(&folder);
         self.app_folder = Some(folder);
     }
 
@@ -299,8 +313,6 @@ impl Viewer {
             self.settings.window = Some(place);
         }
         self.save_settings();
-        self.remember_spot();
-        self.save_spots();
     }
 
     fn save_settings(&mut self) {
@@ -330,7 +342,9 @@ impl Viewer {
                 let file = self.start_file(ctx, info);
                 self.file = Some(file);
                 self.sync_sound();
-                self.resume_if_stopped_partway();
+                // The player carries one clock from file to file, so a new file starts at its
+                // beginning only if told to.
+                self.seek(Ticks(0));
                 self.play();
             }
             Ok(_) => {
@@ -396,11 +410,6 @@ impl Viewer {
 
     /// Lets go of the open file, stopping what plays and reads it.
     fn close_file(&mut self) {
-        if self.file.is_some() {
-            self.remember_spot();
-            self.save_spots();
-        }
-        self.resumed = None;
         if let Some(file) = &self.file {
             self.preview.pause(file.tracks.played_videos());
         }
@@ -422,8 +431,6 @@ impl Viewer {
             at: self.position(),
             playing: self.is_playing(),
         };
-        self.remember_spot();
-        self.save_spots();
         self.pause();
         self.preview.close(MEDIA);
         self.preview.set_sound(Vec::new(), Ticks(0));
@@ -436,19 +443,20 @@ impl Viewer {
         if let Some(info) = &mut self.info {
             info.stop_reading();
         }
-        self.resumed = None;
         self.was_playing = false;
         Some(released)
     }
 
     /// Opens a file again after it was let go, at the same moment, playing or paused as it was,
-    /// keeping the zoom. It may have a new name.
+    /// keeping the zoom and an open trimmer with its handles. It may have a new name.
     pub(super) fn reopen(&mut self, ctx: &egui::Context, path: &Path, at: Ticks, playing: bool) {
         let zoom = self.zoom;
-        let resume = std::mem::replace(&mut self.settings.resume, false);
+        let trim = self.trim.take();
         self.open(ctx, path);
-        self.settings.resume = resume;
         self.zoom = zoom;
+        if self.file.is_some() {
+            self.trim = trim;
+        }
         self.pause();
         self.seek(at);
         if playing {
@@ -736,7 +744,6 @@ impl Viewer {
 
         self.take_saved_picture(&ctx);
         self.take_folder();
-        self.keep_spot_while_playing();
         self.poll_trimmer(&ctx);
         self.keep_within_trim();
 
@@ -792,22 +799,38 @@ impl Viewer {
         };
 
         // The info card slides in from the right, between the bars, and the picture narrows
-        // beside it as it comes.
-        let info_room = !self.full_screen && whole.width() > info::CARD_WIDTH * 2.0;
+        // beside it as it comes. In full screen it stays clear of where the bars slide in, so
+        // they never cover its heading. In a window too narrow to share, it lies over the
+        // picture instead.
         let info_shown = theme::appear(
             &ctx,
             egui::Id::unique("viewer_info_card"),
-            self.is_info_open() && info_room,
+            self.is_info_open(),
         );
         if info_shown <= 0.0 {
             self.forget_closed_info();
         }
         let card = (info_shown > 0.0 && self.info.is_some()).then(|| {
+            let (top, mut bottom) = if overlay {
+                (title.bottom(), bottom.top())
+            } else {
+                (video.top(), video.bottom())
+            };
             let left = whole.right() - info_shown * (info::CARD_WIDTH + info::CARD_MARGIN);
-            video.max.x = whole.right() - info_shown * (info::CARD_WIDTH + info::CARD_MARGIN * 2.0);
+            if info_narrows_picture(whole.width()) {
+                video.max.x =
+                    whole.right() - info_shown * (info::CARD_WIDTH + info::CARD_MARGIN * 2.0);
+            } else {
+                // Lying over the picture, it stops above the pill, or the trimmer's time.
+                bottom -= if trimming {
+                    trim::FLOATING_ROOM
+                } else {
+                    pill::PILL_GAP + pill::PILL_HEIGHT
+                };
+            }
             Rect::from_min_max(
-                pos2(left, video.top() + info::CARD_MARGIN),
-                pos2(left + info::CARD_WIDTH, video.bottom() - info::CARD_MARGIN),
+                pos2(left, top + info::CARD_MARGIN),
+                pos2(left + info::CARD_WIDTH, bottom - info::CARD_MARGIN),
             )
         });
 
@@ -827,9 +850,9 @@ impl Viewer {
         } else {
             Rect::NOTHING
         };
-        // The arrows to the files either side come and go with the pill, and stay while
-        // trimming, as they always have.
-        let arrows = if trimming { 1.0 } else { pill_appears };
+        // The arrows to the files either side come and go with the pill. Trimming keeps to
+        // the file on screen, so they don't show.
+        let arrows = if trimming { 0.0 } else { pill_appears };
 
         self.video_area(ui, palette, video);
         if let Some(card) = card {
@@ -841,9 +864,16 @@ impl Viewer {
             self.info_panel(ui, palette, card);
         }
         if arrows > 0.0 {
+            // A card lying over the picture keeps the arrows to its left.
+            let arrows_area = match card {
+                Some(card) if card.left() < video.right() => {
+                    video.with_max_x(card.left() - info::CARD_MARGIN)
+                }
+                _ => video,
+            };
             ui.scope(|ui| {
                 ui.multiply_opacity(arrows);
-                self.edge_arrows(ui, palette, video);
+                self.edge_arrows(ui, palette, arrows_area);
             });
         }
         // With the pill away, the pointer goes too while playing, and always in full screen,
@@ -878,7 +908,6 @@ impl Viewer {
         self.show_notice(ui, palette, video, &mut top);
         self.trim_notes(ui, palette, video, &mut top);
         self.saved_picture_note(ui, palette, video, &mut top);
-        self.start_over_note(ui, palette, video, &mut top);
         self.settings_window(&ctx, palette);
         self.delete_dialog(&ctx, palette);
         crate::editor::window_edges(&ctx);
@@ -1244,7 +1273,7 @@ impl Viewer {
 
     /// The picture, or the cover or mark of a sound file, or why the file can't be played.
     fn video_area(&mut self, ui: &mut egui::Ui, palette: &Palette, area: Rect) {
-        ui.painter().rect_filled(area, 0.0, palette.stage);
+        ui.painter().rect_filled(area, 0.0, palette.bg_app);
         let ctx = ui.ctx().clone();
         if let Some(video) = self.video_size()
             && self.view != area
@@ -1263,8 +1292,9 @@ impl Viewer {
             let reason = failed.reason.clone();
             stage_message(
                 ui,
+                palette,
                 area,
-                (&icons::CIRCLE_ALERT, theme::DARK.danger),
+                (&icons::CIRCLE_ALERT, palette.danger),
                 "This file can't be played",
                 &reason,
             );
@@ -1287,8 +1317,9 @@ impl Viewer {
             }
             stage_message(
                 ui,
+                palette,
                 area,
-                (&icons::FILM, theme::DARK.text_muted),
+                (&icons::FILM, palette.text_muted),
                 "Nothing open",
                 "Open a video or sound from File Explorer to play it here.",
             );
@@ -1297,13 +1328,14 @@ impl Viewer {
         if file.is_sound() {
             let cover = file.cover.clone();
             let has_cover = cover.is_some();
-            let picture = cover.or_else(|| self.mark(ui.ctx()));
+            let picture = cover.or_else(|| self.lockup(ui.ctx()));
             if let Some(picture) = picture {
                 let size = picture.size_vec2();
                 let room = if has_cover {
                     area.shrink(24.0).size()
                 } else {
-                    vec2(MARK_SIDE, MARK_SIDE)
+                    let widest = LOCKUP_WIDTH.min(area.width() - 48.0).max(0.0);
+                    vec2(widest, area.height())
                 };
                 let shown = fit_inside(size, room);
                 let rect = Rect::from_center_size(area.center(), shown);
@@ -1377,17 +1409,30 @@ impl Viewer {
         }
     }
 
-    /// The BareClip mark, which stands in for a sound file's missing cover.
-    fn mark(&mut self, ctx: &egui::Context) -> Option<TextureHandle> {
-        if self.mark.is_none() {
-            let icon = eframe::icon_data::from_png_bytes(crate::editor::LOGO_DARK).ok()?;
+    /// The BareClip logo and name, which stand in for a sound file's missing cover, in the
+    /// colours for the theme showing.
+    fn lockup(&mut self, ctx: &egui::Context) -> Option<TextureHandle> {
+        let dark = ctx.theme() == egui::Theme::Dark;
+        if self
+            .lockup
+            .as_ref()
+            .is_none_or(|(made_for, _)| *made_for != dark)
+        {
+            let png = if dark { LOCKUP_DARK } else { LOCKUP_LIGHT };
+            let image = eframe::icon_data::from_png_bytes(png).ok()?;
             let image = egui::ColorImage::from_rgba_unmultiplied(
-                [icon.width as usize, icon.height as usize],
-                &icon.rgba,
+                [image.width as usize, image.height as usize],
+                &image.rgba,
             );
-            self.mark = Some(ctx.load_texture("viewer-mark", image, TextureOptions::LINEAR));
+            let name = if dark {
+                "viewer-lockup-dark"
+            } else {
+                "viewer-lockup-light"
+            };
+            let texture = ctx.load_texture(name, image, TextureOptions::LINEAR);
+            self.lockup = Some((dark, texture));
         }
-        self.mark.clone()
+        self.lockup.as_ref().map(|(_, texture)| texture.clone())
     }
 
     /// Saves the picture on screen beside the video, at the video's full size, in the
@@ -1408,7 +1453,7 @@ impl Viewer {
             let saved = bareclip_media::picture_at(&video, time)
                 .and_then(|picture| bareclip_media::write_png(&target, &picture))
                 .map(|()| target)
-                .map_err(|error| format!("The picture couldn't be saved. {error}"));
+                .map_err(|error| format!("The frame couldn't be saved. {error}"));
             let _ = sender.send(saved);
             repaint.request_repaint();
         });
@@ -1470,11 +1515,21 @@ impl Viewer {
     /// beside them, and the version and Done along the bottom.
     fn settings_window(&mut self, ctx: &egui::Context, palette: &Palette) {
         if !self.settings_open {
+            self.default_player = None;
             return;
         }
+        let back_in_front = ctx.input(|input| {
+            input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::WindowFocused(true)))
+        });
+        if self.default_player.is_none() || back_in_front {
+            self.default_player = Some((self.is_default_player)());
+        }
+        let is_default = self.default_player.unwrap_or(false);
         let mut close = false;
         let mut jumps = [self.jump(false), self.jump(true)];
-        let mut resume = self.settings.resume;
         let mut tab = self.settings_tab;
         egui::Modal::new(egui::Id::unique("viewer_settings"))
             .frame(crate::editor::dialog_frame(ctx))
@@ -1500,7 +1555,7 @@ impl Viewer {
                             SETTINGS_PAGE_HEIGHT,
                             |ui, tab| match tab {
                                 SettingsTab::General => {
-                                    general_settings(ui, palette, &mut jumps, &mut resume);
+                                    general_settings(ui, palette, &mut jumps, is_default);
                                 }
                                 SettingsTab::Keys => key_settings(ui, palette),
                             },
@@ -1518,9 +1573,6 @@ impl Viewer {
             if seconds != self.jump(forward) {
                 self.set_jump(forward, seconds);
             }
-        }
-        if resume != self.settings.resume {
-            self.set_resume(resume);
         }
         let theme = ctx.options(|options| options.theme_preference).into();
         if theme != self.theme {
@@ -1641,31 +1693,23 @@ const SETTINGS_TABS: [(SettingsTab, icons::Icon, &str, &str); 2] = [
     (SettingsTab::Keys, icons::KEYBOARD, "Keys", "Keys settings"),
 ];
 
-/// Settings' General tab: the jumps and picking up where it stopped, the theme, and making
-/// BareClip the default player.
-fn general_settings(ui: &mut egui::Ui, palette: &Palette, jumps: &mut [u32; 2], resume: &mut bool) {
+/// Settings' General tab: the jumps, the theme, and making
+/// BareClip the default player, which shows a tick once it is.
+fn general_settings(ui: &mut egui::Ui, palette: &Palette, jumps: &mut [u32; 2], is_default: bool) {
     components::settings_group(ui, palette, "Playing", |ui| {
-        for (index, (label, detail)) in [
-            ("Jump back", "Jump back and the Left key"),
-            ("Jump forward", "Jump forward and the Right key"),
+        for (index, (label, name)) in [
+            ("Jump back by", "Jump back"),
+            ("Jump forward by", "Jump forward"),
         ]
         .into_iter()
         .enumerate()
         {
-            components::settings_row(
-                ui,
-                palette,
-                (label, Some(detail)),
-                JUMP_DROPDOWN_WIDTH,
-                |ui| {
-                    jump_dropdown(ui, palette, label, &mut jumps[index]);
-                },
-            );
-            components::settings_divider(ui, palette);
-        }
-        let row = components::SwitchRow::new(palette, "Pick up where I stopped", *resume);
-        if ui.add(row).clicked() {
-            *resume = !*resume;
+            if index > 0 {
+                components::settings_divider(ui, palette);
+            }
+            components::settings_row(ui, palette, (label, None), JUMP_DROPDOWN_WIDTH, |ui| {
+                jump_dropdown(ui, palette, name, &mut jumps[index]);
+            });
         }
     });
     ui.add_space(SETTINGS_GAP);
@@ -1685,10 +1729,18 @@ fn general_settings(ui: &mut egui::Ui, palette: &Palette, jumps: &mut [u32; 2], 
             palette,
             (
                 "Open videos and sound in BareClip",
-                Some("Windows asks once, on its Default apps page"),
+                Some(if is_default {
+                    DEFAULT_PLAYER_NOTE
+                } else {
+                    NOT_DEFAULT_PLAYER_NOTE
+                }),
             ),
             MAKE_DEFAULT_WIDTH,
             |ui| {
+                if is_default {
+                    default_mark(ui, palette);
+                    return;
+                }
                 let button = ActionButton::new(palette, Kind::Secondary, "Make default")
                     .small()
                     .width(MAKE_DEFAULT_WIDTH);
@@ -1702,6 +1754,33 @@ fn general_settings(ui: &mut egui::Ui, palette: &Palette, jumps: &mut [u32; 2], 
             },
         );
     });
+}
+
+/// In place of Make default once BareClip is the default: a tick and the word, with no box, so
+/// it reads as a fact rather than something to press, in full colour so it is easy to read.
+fn default_mark(ui: &mut egui::Ui, palette: &Palette) {
+    const ICON: f32 = 14.0;
+    const GAP: f32 = 6.0;
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(MAKE_DEFAULT_WIDTH, DEFAULT_MARK_HEIGHT),
+        Sense::hover(),
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, "Default"));
+    let galley = ui.painter().layout_no_wrap(
+        "Default".to_owned(),
+        FontId::proportional(12.0),
+        palette.text,
+    );
+    let width = ICON + GAP + galley.size().x;
+    let left = rect.center().x - width / 2.0;
+    icons::paint(
+        ui.painter(),
+        icons::square_at(pos2(left + ICON / 2.0, rect.center().y), ICON),
+        &icons::CHECK,
+        palette.accent,
+    );
+    let at = pos2(left + ICON + GAP, rect.center().y - galley.size().y / 2.0);
+    ui.painter().galley(at, galley, palette.text);
 }
 
 /// A jump's choices, from 5 to 30 seconds, in a dropdown.
@@ -1793,10 +1872,11 @@ fn watching_speed(index: usize) -> Speed {
     .with_factor(SPEEDS[index.min(SPEEDS.len() - 1)])
 }
 
-/// A symbol, a heading and a line under it, in the middle of the picture's space. The stage is
-/// dark in both themes, so these take the dark theme's colours.
+/// A symbol, a heading and a line under it, in the middle of the picture's space, which is the
+/// window's own colour.
 fn stage_message(
     ui: &egui::Ui,
+    palette: &Palette,
     area: Rect,
     (icon, tint): (&icons::Icon, Color32),
     heading: &str,
@@ -1815,16 +1895,22 @@ fn stage_message(
         Align2::CENTER_CENTER,
         heading,
         fonts::strong(18.0),
-        theme::DARK.text,
+        palette.text,
     );
     let detail = painter.layout(
         detail.to_owned(),
         FontId::proportional(13.0),
-        theme::DARK.text_muted,
+        palette.text_muted,
         (area.width() - 48.0).clamp(80.0, 460.0),
     );
     let at = pos2(middle.x - detail.size().x / 2.0, middle.y + 16.0);
-    painter.galley(at, detail, theme::DARK.text_muted);
+    painter.galley(at, detail, palette.text_muted);
+}
+
+/// Whether a window this wide has room for the info card beside the picture. Narrower, the card
+/// lies over the picture.
+pub fn info_narrows_picture(width: f32) -> bool {
+    width > info::CARD_WIDTH * 2.0
 }
 
 /// A size shrunk or grown to fit inside a room, keeping its shape.
@@ -1861,7 +1947,6 @@ mod info;
 mod mini;
 mod note;
 mod pill;
-mod resume;
 #[cfg(test)]
 mod tests;
 mod trim;

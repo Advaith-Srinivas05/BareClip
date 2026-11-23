@@ -65,6 +65,10 @@ pub const PLAYER_PIPE_PREFIX: &str = "BareClipPlayer";
 /// does that and leaves, with no window.
 pub const REFRESH_FLAG: &str = "--refresh-file-types";
 
+/// Opens a window of its own rather than handing the files to one already open. A player that
+/// is trimming starts the app with this for a file sent to it, so the file can't come back.
+pub const NEW_WINDOW_FLAG: &str = "--new-window";
+
 /// More than any list of paths Explorer would send, so a stray writer can't fill memory.
 const LARGEST_MESSAGE: u64 = 4 << 20;
 
@@ -86,6 +90,8 @@ pub enum LaunchKind {
 pub struct Launch {
     pub kind: LaunchKind,
     pub paths: Vec<PathBuf>,
+    /// Opens its own window, never handing the files over.
+    pub new_window: bool,
 }
 
 impl Launch {
@@ -100,8 +106,11 @@ impl Launch {
 pub fn read_launch(args: impl IntoIterator<Item = OsString>) -> Launch {
     let mut kind = None;
     let mut paths = Vec::new();
+    let mut new_window = false;
     for arg in args {
-        if arg == EDIT_FLAG {
+        if arg == NEW_WINDOW_FLAG {
+            new_window = true;
+        } else if arg == EDIT_FLAG {
             kind.get_or_insert(LaunchKind::Edit);
         } else if arg == PLAY_FLAG {
             kind.get_or_insert(LaunchKind::Play);
@@ -114,6 +123,7 @@ pub fn read_launch(args: impl IntoIterator<Item = OsString>) -> Launch {
     Launch {
         kind: kind.unwrap_or(LaunchKind::Editor),
         paths,
+        new_window,
     }
 }
 
@@ -558,7 +568,8 @@ mod tests {
             launch,
             Launch {
                 kind: LaunchKind::Edit,
-                paths: vec![PathBuf::from(r"C:\a b.mp4")]
+                paths: vec![PathBuf::from(r"C:\a b.mp4")],
+                new_window: false,
             }
         );
         assert!(launch.edit());
@@ -576,7 +587,8 @@ mod tests {
             launch,
             Launch {
                 kind: LaunchKind::Play,
-                paths: vec![PathBuf::from(r"C:\a.mp4"), PathBuf::from(r"C:\b.mp3")]
+                paths: vec![PathBuf::from(r"C:\a.mp4"), PathBuf::from(r"C:\b.mp3")],
+                new_window: false,
             }
         );
         assert!(!launch.edit());
@@ -597,6 +609,20 @@ mod tests {
         assert!(launch.paths.is_empty());
         assert!(!launch.edit());
     }
+    #[test]
+    fn a_new_window_is_asked_for_beside_play_and_never_taken_for_a_file() {
+        for args in [
+            ["--play", "--new-window", r"C:\a.mp4"],
+            ["--new-window", "--play", r"C:\a.mp4"],
+        ] {
+            let launch = read_launch(args.map(OsString::from));
+            assert_eq!(launch.kind, LaunchKind::Play, "{args:?}");
+            assert!(launch.new_window);
+            assert_eq!(launch.paths, [PathBuf::from(r"C:\a.mp4")]);
+        }
+        assert!(!read_launch(["--play", r"C:\a.mp4"].map(OsString::from)).new_window);
+    }
+
     #[test]
     fn the_first_flag_decides_and_later_flags_are_not_taken_for_files() {
         let launch = read_launch(["--play", r"C:\a.mp4", "--edit"].map(OsString::from));

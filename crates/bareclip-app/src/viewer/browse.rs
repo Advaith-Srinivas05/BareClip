@@ -1,30 +1,20 @@
-//! Moving through the files in the open file's folder, and picking a file up where it was
-//! last stopped.
+//! Moving through the files in the open file's folder.
 
 use std::{
     path::{Path, PathBuf},
     sync::mpsc,
     thread,
-    time::{Duration, Instant},
 };
 
-use bareclip_core::time::Ticks;
 use eframe::egui::{self, Rect, pos2, vec2};
 
-use super::{
-    Viewer,
-    note::{Note, NotePress},
-};
+use super::Viewer;
 use crate::{
     components::{IconButton, Kind},
     folder_files, icons,
     theme::Palette,
 };
 
-/// How long Start over stays after a file picks up where it was stopped.
-pub const START_OVER_FOR: Duration = Duration::from_secs(5);
-/// How often the spot of a file that is playing is kept, so a crash loses little.
-const KEEP_SPOT_EVERY: Duration = Duration::from_secs(5);
 const EDGE_BUTTON: f32 = 44.0;
 
 impl Viewer {
@@ -69,8 +59,12 @@ impl Viewer {
         folder_files::previous_before(&self.folder, self.current_path()?)
     }
 
-    /// Opens the next or previous file in the folder, if there is one.
+    /// Opens the next or previous file in the folder, if there is one. Not while trimming, which
+    /// belongs to the file on screen.
     pub fn go_to_neighbour(&mut self, ctx: &egui::Context, forward: bool) {
+        if self.trim.is_some() {
+            return;
+        }
         let neighbour = if forward {
             self.next_file()
         } else {
@@ -79,62 +73,6 @@ impl Viewer {
         if let Some(path) = neighbour {
             self.open(ctx, &path);
         }
-    }
-
-    /// Keeps where the file on screen was stopped, in memory.
-    pub(super) fn remember_spot(&mut self) {
-        if !self.settings.resume {
-            return;
-        }
-        let Some(file) = &self.file else {
-            return;
-        };
-        let (path, duration) = (file.info.path.clone(), file.info.duration);
-        let at = self.position();
-        self.resume.remember(&path, at, duration);
-    }
-
-    /// Writes the remembered spots to disk.
-    pub(super) fn save_spots(&mut self) {
-        if let Some(folder) = &self.app_folder
-            && let Err(error) = self.resume.save(folder)
-        {
-            self.notice = Some(format!("Where you stopped couldn't be kept. {error}"));
-        }
-        self.spot_kept = Instant::now();
-    }
-
-    /// While playing, keeps the spot every few seconds, so a crash keeps it too.
-    pub(super) fn keep_spot_while_playing(&mut self) {
-        if self.is_playing() && self.spot_kept.elapsed() >= KEEP_SPOT_EVERY {
-            self.remember_spot();
-            self.save_spots();
-        }
-    }
-
-    /// Jumps to where this file was last stopped, if resume is on and it was.
-    pub(super) fn resume_if_stopped_partway(&mut self) {
-        if !self.settings.resume {
-            return;
-        }
-        let Some(path) = self.current_path().map(Path::to_owned) else {
-            return;
-        };
-        if let Some(at) = self.resume.spot_for(&path) {
-            self.seek(at);
-            self.resumed = Some((at, Instant::now()));
-        }
-    }
-
-    /// Goes back to the start after picking up partway.
-    pub fn start_over(&mut self) {
-        self.resumed = None;
-        self.seek(Ticks(0));
-    }
-
-    pub fn set_resume(&mut self, on: bool) {
-        self.settings.resume = on;
-        self.save_settings();
     }
 
     /// The arrows at the picture's edges, while the mouse is over it.
@@ -178,32 +116,6 @@ impl Viewer {
                 .clicked()
         {
             self.go_to_neighbour(&ctx, true);
-        }
-    }
-
-    /// Says where a file picked up, with Start over, for a few seconds.
-    pub(super) fn start_over_note(
-        &mut self,
-        ui: &mut egui::Ui,
-        palette: &Palette,
-        area: Rect,
-        top: &mut f32,
-    ) {
-        let Some((at, since)) = self.resumed else {
-            return;
-        };
-        if since.elapsed() >= START_OVER_FOR {
-            self.resumed = None;
-            return;
-        }
-        ui.ctx()
-            .request_repaint_after(START_OVER_FOR - since.elapsed());
-        let words = format!("Picked up at {}", self.clock(at));
-        if let NotePress::Action(_) = Note::new(&icons::CLOCK, palette.text_muted, &words)
-            .actions(&["Start over"])
-            .show(ui, palette, area, top)
-        {
-            self.start_over();
         }
     }
 }

@@ -362,6 +362,55 @@ pub fn default_apps_link() -> &'static str {
     }
 }
 
+/// The kind Windows opens a file type with, such as `BareClip.Video` for `mp4`, following the
+/// user's own choice in Default apps or Open with.
+pub fn opens_with(extension: &str) -> Option<String> {
+    use windows_sys::Win32::UI::Shell::{ASSOCF_NONE, ASSOCSTR_PROGID, AssocQueryStringW};
+    let extension: Vec<u16> = format!(".{extension}").encode_utf16().chain([0]).collect();
+    let mut buffer = [0_u16; 260];
+    let mut length = buffer.len() as u32;
+    // SAFETY: the extension is nul-terminated, and the length is the buffer's, in characters.
+    let result = unsafe {
+        AssocQueryStringW(
+            ASSOCF_NONE,
+            ASSOCSTR_PROGID,
+            extension.as_ptr(),
+            std::ptr::null(),
+            buffer.as_mut_ptr(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    let end = buffer.iter().position(|&unit| unit == 0)?;
+    Some(String::from_utf16_lossy(&buffer[..end]))
+}
+
+/// Whether every type the player plays opens in BareClip, which is what Windows' Set default
+/// does on BareClip's Default apps page. One type opening elsewhere is enough to say no.
+pub fn is_default_player() -> bool {
+    every_type_opens_in_bareclip(opens_with)
+}
+
+fn every_type_opens_in_bareclip(opens_with: impl Fn(&str) -> Option<String>) -> bool {
+    let mut types = crate::text::PLAYER_VIDEO_EXTENSIONS
+        .iter()
+        .chain(&crate::text::PLAYER_AUDIO_EXTENSIONS);
+    types.all(|extension| {
+        opens_with(extension).is_some_and(|opener| {
+            // Picking bareclip.exe by browsing for it in Open with names the program instead.
+            [
+                "BareClip.Video",
+                "BareClip.Audio",
+                r"Applications\bareclip.exe",
+            ]
+            .iter()
+            .any(|bareclip| opener.eq_ignore_ascii_case(bareclip))
+        })
+    })
+}
+
 /// Opens Windows' Default apps page at BareClip.
 pub fn open_default_apps() {
     let _ = std::process::Command::new("explorer.exe")

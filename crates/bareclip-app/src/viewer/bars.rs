@@ -205,7 +205,7 @@ impl Viewer {
                             has_file,
                             IconButton::new(palette, kind, icons::SCISSORS, "Trim"),
                         )
-                        .on_hover_text("Trim: keep one stretch of this file")
+                        .on_hover_text("Trim")
                         .clicked()
                     {
                         if trimming {
@@ -230,7 +230,7 @@ impl Viewer {
                             has_file,
                             IconButton::new(palette, Kind::Ghost, icons::TRASH_2, "Delete"),
                         )
-                        .on_hover_text("Move to the Recycle Bin (Delete)")
+                        .on_hover_text("Delete")
                         .clicked()
                     {
                         self.ask_to_delete();
@@ -324,14 +324,15 @@ impl Viewer {
                 .layout(Layout::right_to_left(Align::Center)),
             |ui| {
                 ui.spacing_mut().item_spacing.x = CONTROL_SPACING;
-                let (icon, name) = if self.full_screen {
-                    (icons::MINIMIZE, "Leave full screen")
+                // F11 works too, but the hint only names F.
+                let (icon, name, hint) = if self.full_screen {
+                    (icons::MINIMIZE, "Leave full screen", "Exit fullscreen (F)")
                 } else {
-                    (icons::MAXIMIZE, "Full screen")
+                    (icons::MAXIMIZE, "Full screen", "Fullscreen (F)")
                 };
                 if ui
                     .add(IconButton::new(palette, Kind::Ghost, icon, name))
-                    .on_hover_text(format!("{name} (F or F11)"))
+                    .on_hover_text(hint)
                     .clicked()
                 {
                     let full = !self.full_screen;
@@ -347,7 +348,7 @@ impl Viewer {
                             "Mini view",
                         ),
                     )
-                    .on_hover_text("Mini view, a small window above the others")
+                    .on_hover_text("Mini view")
                     .clicked()
                 {
                     self.enter_mini_view(ui.ctx());
@@ -364,13 +365,9 @@ impl Viewer {
     pub(super) fn skip_button(&mut self, ui: &mut egui::Ui, palette: &Palette, forward: bool) {
         let step = self.jump(forward);
         let (icon, name, hint) = if forward {
-            (
-                icons::REDO,
-                "Jump forward",
-                format!("Forward {step} s (Right)"),
-            )
+            (icons::REDO, "Jump forward", format!("Forward {step}s"))
         } else {
-            (icons::UNDO, "Jump back", format!("Back {step} s (Left)"))
+            (icons::UNDO, "Jump back", format!("Back {step}s"))
         };
         let enabled = self.file.is_some();
         let button = IconButton::new(palette, Kind::Ghost, icon, name)

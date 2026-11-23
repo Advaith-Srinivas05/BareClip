@@ -1,6 +1,6 @@
 //! The pill of playing controls that floats over the bottom of the picture, laid out as the
 //! Photos app's: play, jump back, jump forward, the volume, the time, the seek line, the
-//! length, loop and save picture. In a narrow window the jumps, loop and save picture go into a
+//! length, loop and save frame. In a narrow window the jumps, loop and save frame go into a
 //! "…" at its end and the times hide, as Photos does, so the seek line keeps its room.
 //!
 //! Its size was measured from Photos at three window sizes and with Info open: always 56% as
@@ -76,6 +76,25 @@ pub fn raised_card(ui: &egui::Ui, palette: &Palette, rect: Rect, radius: f32) {
         egui::StrokeKind::Inside,
     );
 }
+
+/// A card floating over the picture that lets it show through. It has no shadow, which would
+/// show through it as a smudge.
+pub fn floating_card(ui: &egui::Ui, palette: &Palette, rect: Rect, radius: f32) {
+    ui.painter().rect_filled(
+        rect,
+        radius,
+        palette.raised.gamma_multiply(FLOATING_OPACITY),
+    );
+    ui.painter().rect_stroke(
+        rect,
+        radius,
+        Stroke::new(1.0, palette.border.gamma_multiply(FLOATING_OPACITY)),
+        egui::StrokeKind::Inside,
+    );
+}
+
+/// How solid a card floating over the picture is.
+pub const FLOATING_OPACITY: f32 = 0.7;
 
 /// A time in a box `width` wide, against its left or right side, so the line beside it never
 /// moves as it changes.
@@ -154,7 +173,7 @@ impl Viewer {
                         has_file,
                         IconButton::new(palette, Kind::Ghost, icon, name).solid(),
                     )
-                    .on_hover_text("Play or pause (Space)")
+                    .on_hover_text(name)
                     .clicked()
                 {
                     self.toggle_playback();
@@ -221,16 +240,16 @@ impl Viewer {
         if ui
             .add_enabled(
                 self.saving_picture.is_none(),
-                IconButton::new(palette, Kind::Ghost, icons::CAMERA, "Save picture"),
+                IconButton::new(palette, Kind::Ghost, icons::CAMERA, "Save frame"),
             )
-            .on_hover_text("Save this picture beside the video")
+            .on_hover_text("Save frame")
             .clicked()
         {
             self.save_picture(ui.ctx());
         }
     }
 
-    /// The narrow pill's "…": the jumps, loop and save picture.
+    /// The narrow pill's "…": the jumps, loop and save frame.
     fn pill_more(&mut self, ui: &mut egui::Ui, palette: &Palette, picture: bool) {
         let kind = bars::flyout_kind(self.flyout.open, Flyout::More);
         let response = ui
@@ -240,8 +259,8 @@ impl Viewer {
             )
             .on_hover_text("More options");
         let (back_hint, forward_hint) = (
-            format!("Back {} s", self.jump(false)),
-            format!("Forward {} s", self.jump(true)),
+            format!("Back {}s", self.jump(false)),
+            format!("Forward {}s", self.jump(true)),
         );
         let looping = self.looping;
         let saving = self.saving_picture.is_some();
@@ -261,7 +280,7 @@ impl Viewer {
                 && ui
                     .add_enabled(
                         !saving,
-                        MenuItem::new(palette, icons::CAMERA, "Save picture", "").tick_room(),
+                        MenuItem::new(palette, icons::CAMERA, "Save frame", "").tick_room(),
                     )
                     .clicked();
             PillMore {
