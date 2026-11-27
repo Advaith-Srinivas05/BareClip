@@ -885,8 +885,10 @@ mod tests {
 
         let sound = mixed(vec![span(&path, 0.0, 0.0, 1.0)], 0.0, 1.25);
 
-        near(level_at(&sound, 0.5), 0.25);
-        near(level_at(&sound, 0.95), 0.25);
+        // Every moment, not a few, because a block cut short leaves gaps of silence between.
+        for frame in frames(0.01)..frames(0.99) {
+            near(sound[frame * CHANNELS], 0.25);
+        }
         near(level_at(&sound, 1.1), 0.0);
     }
 

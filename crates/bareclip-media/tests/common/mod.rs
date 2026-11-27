@@ -70,7 +70,11 @@ fn video_source_sized(seconds: u32, height: usize) -> String {
 
 /// Beeps for a tenth of a second at the start of every second.
 fn beep_source(seconds: u32) -> String {
-    format!("aevalsrc='0.8*sin(2*PI*440*t)*lt(mod(t,1),0.1)':d={seconds}:s=48000")
+    beep_source_at(seconds, 48_000)
+}
+
+fn beep_source_at(seconds: u32, rate: u32) -> String {
+    format!("aevalsrc='0.8*sin(2*PI*440*t)*lt(mod(t,1),0.1)':d={seconds}:s={rate}")
 }
 
 fn tone_source(frequency: u32, seconds: u32) -> String {
@@ -110,6 +114,25 @@ pub fn h264_mp4() -> PathBuf {
                 "4M",
                 "-g",
                 "30",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+            ],
+            path,
+        );
+    })
+}
+
+/// Only sound, as AAC at 44.1 kHz, beeping at the start of every second.
+pub fn beeps_44k_m4a() -> PathBuf {
+    cached("beeps-44k.m4a", |path| {
+        run_ffmpeg(
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                &beep_source_at(10, 44_100),
                 "-c:a",
                 "aac",
                 "-b:a",

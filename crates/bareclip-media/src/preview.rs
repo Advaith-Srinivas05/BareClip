@@ -566,10 +566,31 @@ impl AudioPreview {
 
         let pts = decoded.timestamp().unwrap_or_default();
         let seconds = f64::from(track.time_base) * pts as f64;
-        let start_frame = (seconds * f64::from(sample_rate)).round() as i64;
+        let mut start_frame = (seconds * f64::from(sample_rate)).round() as i64;
 
         let mut converted = frame::Audio::empty();
         if let Some(resampler) = track.resampler.as_mut() {
+            // SAFETY: the context is live, and these only ask what it holds back and can give.
+            let (held, room) = unsafe {
+                let context = resampler.as_mut_ptr();
+                (
+                    ffi::swr_get_delay(context, i64::from(sample_rate)),
+                    ffi::swr_get_out_samples(context, decoded.samples() as i32),
+                )
+            };
+            if room < 0 {
+                return Err(ffmpeg::Error::from(room).into());
+            }
+            // What the filter held back from earlier blocks comes out first, so the sound starts
+            // that much before this block's own time.
+            start_frame -= held;
+            // Left empty, the output is given only as many frames as went in, which cuts every
+            // block short when raising the rate, such as 44.1 kHz sound on a 48 kHz sound card.
+            converted = frame::Audio::new(
+                Sample::F32(SampleType::Packed),
+                room as usize,
+                ChannelLayout::STEREO,
+            );
             resampler.run(&decoded, &mut converted)?;
         }
         let frames = converted.samples();

@@ -212,6 +212,45 @@ fn audio_decodes_every_track_to_stereo_at_the_requested_rate() {
 }
 
 #[test]
+fn audio_raised_to_a_higher_rate_joins_up_and_stays_in_time() {
+    const RATE: usize = 48_000;
+    let mut preview = AudioPreview::open(&beeps_44k_m4a(), RATE as u32).expect("the audio opens");
+
+    let chunks = all_chunks(&mut preview);
+
+    // Each block starts where the last ended. The mix fills a gap over 32 frames with silence,
+    // heard as crackle, and lets a smaller one through with the sound out of place.
+    for pair in chunks.windows(2) {
+        let end = pair[0].start_frame + (pair[0].samples.len() / 2) as i64;
+        let gap = pair[1].start_frame - end;
+        assert!(gap.abs() <= 2, "a gap of {gap} frames at frame {end}");
+    }
+    let mut heard = vec![0.0f32; RATE * 11];
+    for chunk in &chunks {
+        for (offset, left) in chunk.samples.iter().step_by(2).enumerate() {
+            heard[chunk.start_frame as usize + offset] = *left;
+        }
+    }
+    let total: usize = chunks.iter().map(|chunk| chunk.samples.len() / 2).sum();
+    let seconds = total as f64 / RATE as f64;
+    assert!((seconds - 10.0).abs() < 0.05, "lasted {seconds}s");
+    // Each beep starts on its second, not later and later through the file.
+    for second in 1..10 {
+        let from = second * RATE - RATE / 4;
+        let onset = from
+            + heard[from..]
+                .iter()
+                .position(|sample| sample.abs() > 0.1)
+                .expect("the beep is heard");
+        let late = onset as f64 / RATE as f64 - second as f64;
+        assert!(
+            late.abs() < 0.005,
+            "the beep at {second}s came {late}s late"
+        );
+    }
+}
+
+#[test]
 fn audio_seeking_lands_at_the_right_time() {
     let mut preview = AudioPreview::open(&h264_mp4(), 48_000).expect("the audio opens");
 

@@ -630,12 +630,11 @@ struct Snapshot {
     library: Vec<Art>,
 }
 
-/// A trim in progress: where the clip's edge and the playhead were when the drag started.
+/// A trim in progress: where the clip's edge and the pointer were when the drag started.
 #[derive(Clone, Copy, Debug)]
 struct TrimOrigin {
     source: Ticks,
     pointer: Ticks,
-    playhead: Ticks,
 }
 
 struct ExportTask {
@@ -5176,11 +5175,7 @@ impl Editor {
                 ClipEdge::Start => clip.source.start,
                 ClipEdge::End => clip.source.end,
             };
-            self.trim_origin = Some(TrimOrigin {
-                source,
-                pointer,
-                playhead: self.position(),
-            });
+            self.trim_origin = Some(TrimOrigin { source, pointer });
         }
         if let (Some((id, edge, pointer)), Some(origin)) = (events.trim_to, self.trim_origin) {
             self.trim_clip(id, edge, origin, pointer, events.trim_snap);
@@ -5270,7 +5265,6 @@ impl Editor {
         } else {
             self.snap_to_frame(clip.media, wanted)
         };
-        let under_playhead = self.project.tracks.played().locate(origin.playhead);
         self.project.tracks.trim(
             id,
             edge,
@@ -5289,9 +5283,38 @@ impl Editor {
                 (edge_at.0 - moment.0).abs() <= SNAPPED_CLOSE_ENOUGH
             })
         });
-        if self.project.tracks.played().locate(origin.playhead) != under_playhead {
-            self.seek(origin.playhead);
+        // The playhead follows the edge, so the picture shows what is being cut to. Only when it
+        // moves, because seeking again would stop the exact frame from ever being reached.
+        if let Some(edge_frame) = self.edge_frame(id, edge)
+            && edge_frame != self.position()
+        {
+            self.seek(edge_frame);
         }
+    }
+
+    /// Where on the timeline a clip's first frame starts, or its last frame does.
+    fn edge_frame(&self, id: ClipId, edge: ClipEdge) -> Option<Ticks> {
+        let clip = self.project.tracks.clip(id)?;
+        if edge == ClipEdge::Start {
+            return Some(clip.start);
+        }
+        let last_moment = Ticks(clip.source.end.0 - 1);
+        let last_frame = self
+            .entry(clip.media)
+            .and_then(|entry| {
+                let time_base = entry.info.video.time_base;
+                let pts = entry
+                    .index
+                    .as_ref()?
+                    .frame_at(last_moment.to_pts(time_base))?;
+                Some(Ticks::from_pts(pts, time_base))
+            })
+            .filter(|frame| *frame >= clip.source.start)
+            .unwrap_or(last_moment);
+        // Rounding must not land it just before the frame, which would show the one before.
+        let nudge = i64::from(!clip.speed.is_normal());
+        let at = Ticks(clip.time_of(last_frame).0 + nudge);
+        Some(at.min(Ticks(clip.end().0 - 1)))
     }
 
     fn stage(&mut self, ui: &mut egui::Ui, palette: &Palette) {
@@ -13206,57 +13229,61 @@ mod tests {
         (editor, y, start_x, end_x)
     }
 
-    #[test]
-    fn trimming_either_end_leaves_the_playhead_where_it_is() {
-        let ctx = context();
-        let playhead = Ticks::from_seconds(2.0);
+    /// How far the playhead is before the clip's end, which is under a frame when it shows the
+    /// last frame kept.
+    fn short_of_the_end(editor: &Editor) -> Ticks {
+        let clip = editor.project.tracks.played().clips()[0];
+        Ticks(clip.end().0 - editor.position().0)
+    }
 
-        let (mut editor, y, start_x, end_x) = trim_setup(&ctx, 2.0);
-        let scale = editor.timeline_state.scale;
-        let to = pos2(scale.x_of(Ticks::from_seconds(3.0)), y);
-        pointer_drag(&ctx, &mut editor, pos2(end_x, y), to);
-        assert_eq!(editor.position(), playhead);
-
-        let to = pos2(scale.x_of(Ticks::from_seconds(1.0)) + 4.0, y);
-        pointer_drag(&ctx, &mut editor, pos2(start_x, y), to);
-        assert_eq!(editor.position(), playhead);
-        assert!(!editor.preview.in_gap(editor.project.tracks.played()));
+    fn one_frame_at(fps: f64) -> Ticks {
+        Ticks::from_seconds(1.0 / fps)
     }
 
     #[test]
-    fn trimming_away_what_is_under_the_playhead_leaves_it_in_the_dead_space() {
+    fn trimming_the_start_shows_the_first_frame_kept_while_dragging_and_after() {
         let ctx = context();
         let (mut editor, y, start_x, _) = trim_setup(&ctx, 1.0);
         let scale = editor.timeline_state.scale;
 
         let to = pos2(scale.x_of(Ticks::from_seconds(2.0)) + 4.0, y);
-        pointer_drag(&ctx, &mut editor, pos2(start_x, y), to);
+        begin_drag(&ctx, &mut editor, pos2(start_x, y), to);
+        let clip = editor.project.tracks.played().clips()[0];
+        assert!(clip.start > Ticks::from_seconds(1.5));
+        assert_eq!(editor.position(), clip.start);
+        assert!(!editor.preview.in_gap(editor.project.tracks.played()));
 
-        assert_eq!(editor.position(), Ticks::from_seconds(1.0));
-        assert!(editor.preview.in_gap(editor.project.tracks.played()));
+        end_drag(&ctx, &mut editor, to);
+        let clip = editor.project.tracks.played().clips()[0];
+        assert_eq!(editor.position(), clip.start);
     }
 
     #[test]
-    fn trimming_the_project_shorter_than_the_playhead_stops_it_at_the_new_end() {
+    fn trimming_the_end_shows_the_last_frame_kept_while_dragging_and_after() {
         let ctx = context();
-        let (mut editor, y, _, end_x) = trim_setup(&ctx, 3.0);
+        let (mut editor, y, _, end_x) = trim_setup(&ctx, 1.0);
         let scale = editor.timeline_state.scale;
 
-        let to = pos2(scale.x_of(Ticks::from_seconds(2.0)), y);
-        pointer_drag(&ctx, &mut editor, pos2(end_x, y), to);
+        let to = pos2(scale.x_of(Ticks::from_seconds(3.0)), y);
+        begin_drag(&ctx, &mut editor, pos2(end_x, y), to);
+        let short = short_of_the_end(&editor);
+        assert!(short > Ticks(0) && short <= one_frame_at(30.0), "{short:?}");
 
-        assert_eq!(editor.position(), editor.project.tracks.duration());
+        end_drag(&ctx, &mut editor, to);
+        let short = short_of_the_end(&editor);
+        assert!(short > Ticks(0) && short <= one_frame_at(30.0), "{short:?}");
+        assert!(!editor.preview.in_gap(editor.project.tracks.played()));
     }
 
     #[test]
-    fn dragging_an_end_back_out_in_one_go_returns_the_playhead_to_its_place() {
+    fn the_playhead_follows_an_end_dragged_in_and_back_out() {
         let ctx = context();
-        let (mut editor, y, _, end_x) = trim_setup(&ctx, 3.0);
+        let (mut editor, y, _, end_x) = trim_setup(&ctx, 1.0);
         let scale = editor.timeline_state.scale;
 
         let short = pos2(scale.x_of(Ticks::from_seconds(2.0)), y);
         begin_drag(&ctx, &mut editor, pos2(end_x, y), short);
-        assert!(editor.position() < Ticks::from_seconds(3.0));
+        assert!(editor.position() < Ticks::from_seconds(2.1));
 
         let back = pos2(end_x, y);
         for _ in 0..3 {
@@ -13264,7 +13291,72 @@ mod tests {
         }
         end_drag(&ctx, &mut editor, back);
 
-        assert_eq!(editor.position(), Ticks::from_seconds(3.0));
+        assert!(editor.position() > Ticks::from_seconds(3.5));
+        let short = short_of_the_end(&editor);
+        assert!(short > Ticks(0) && short <= one_frame_at(30.0), "{short:?}");
+    }
+
+    #[test]
+    fn a_clip_at_twice_the_speed_shows_its_last_frame_kept() {
+        let ctx = context();
+        let mut editor = with_videos(&ctx, &[test_clip()]);
+        let clip = editor.project.tracks.played().clips()[0].id;
+        editor
+            .project
+            .tracks
+            .set_speed(clip, Speed::default().with_factor(2.0));
+        run_frame(&ctx, &mut editor, vec![]);
+        let scale = editor.timeline_state.scale;
+        let y = editor.timeline_state.track.center().y;
+        let end_x = scale.x_of(editor.project.tracks.duration()) - 4.0;
+
+        let to = pos2(scale.x_of(Ticks::from_seconds(1.5)), y);
+        pointer_drag(&ctx, &mut editor, pos2(end_x, y), to);
+
+        let short = short_of_the_end(&editor);
+        assert!(short > Ticks(0) && short <= one_frame_at(60.0), "{short:?}");
+    }
+
+    #[test]
+    fn a_trim_resting_in_place_stops_seeking() {
+        let ctx = context();
+        let (mut editor, y, start_x, _) = trim_setup(&ctx, 1.0);
+        let scale = editor.timeline_state.scale;
+
+        let to = pos2(scale.x_of(Ticks::from_seconds(2.0)) + 4.0, y);
+        begin_drag(&ctx, &mut editor, pos2(start_x, y), to);
+        let after_moving = editor.preview.seeks_sent();
+        for _ in 0..10 {
+            run_frame(&ctx, &mut editor, moved(to));
+        }
+
+        assert_eq!(editor.preview.seeks_sent(), after_moving);
+        end_drag(&ctx, &mut editor, to);
+    }
+
+    #[test]
+    fn a_trimmed_edge_does_not_snap_to_the_playhead_following_it() {
+        let ctx = context();
+        let (mut editor, y, start_x, _) = trim_setup(&ctx, 1.0);
+
+        // Small steps, each well inside snapping distance of where the last one left the edge,
+        // and far from the playhead the trim began at.
+        let mut at = pos2(time_x(&editor, 2.0) + 4.0, y);
+        begin_drag(&ctx, &mut editor, pos2(start_x, y), at);
+        for step in 0..8 {
+            at.x += 3.0;
+            run_frame(&ctx, &mut editor, moved(at));
+            run_frame(&ctx, &mut editor, moved(at));
+            assert_eq!(editor.timeline_state.snap_line, None, "step {step}");
+        }
+
+        let wanted = editor.timeline_state.scale.time_at(at.x - 4.0);
+        let start = editor.project.tracks.played().clips()[0].start;
+        assert!(
+            (start.0 - wanted.0).abs() < Ticks::from_seconds(0.05).0,
+            "the start stuck at {start:?}, short of {wanted:?}"
+        );
+        end_drag(&ctx, &mut editor, at);
     }
 
     fn let_dialog_open(ctx: &egui::Context, editor: &mut Editor) {
@@ -20734,6 +20826,31 @@ mod tests {
     }
 
     #[test]
+    fn a_recording_played_along_with_lands_where_the_video_is_once_it_has_opened() {
+        let ctx = context();
+        let (mut editor, _folder) = ready_to_record(&ctx, "slow-open");
+        open_record_bar_by_hand(&ctx, &mut editor);
+        editor.toggle_playback();
+        run_for(&ctx, &mut editor, 0.4);
+
+        // As if opening the file had taken as long as the video has played since it was asked.
+        editor.start_recording(Ticks(0), true);
+        let now = editor.position();
+
+        let lands = match editor.record_bar.as_ref().map(|bar| &bar.stage) {
+            Some(recording::BarStage::Recording(live)) => live.lands_at(),
+            _ => panic!("it is recording"),
+        };
+        assert!(now >= Ticks::from_seconds(0.3), "{now:?}");
+        assert!(
+            (now.0 - lands.0).abs() < Ticks::from_seconds(0.05).0,
+            "{lands:?} against {now:?}"
+        );
+        click_named(&ctx, &mut editor, "Stop");
+        run_frame(&ctx, &mut editor, vec![]);
+    }
+
+    #[test]
     fn recording_with_the_video_playing_lands_where_the_video_was_when_it_began() {
         let ctx = context();
         let (mut editor, _folder) = ready_to_record(&ctx, "play-along");
@@ -20758,8 +20875,9 @@ mod tests {
             Some(recording::BarStage::Recording(live)) => live.lands_at(),
             _ => panic!("it is recording"),
         };
+        // After where the video began, by however long the file took to open.
         assert!(
-            lands >= Ticks::from_seconds(0.5) && lands < Ticks::from_seconds(1.0),
+            lands >= Ticks::from_seconds(0.5) && lands < editor.position(),
             "{lands:?}"
         );
         // The video under the playhead has moved on as long as the recording has run.

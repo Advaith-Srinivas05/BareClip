@@ -512,7 +512,7 @@ impl Editor {
     }
 
     /// Starts writing the file, after any countdown, as belonging at `lands_at` on the timeline.
-    fn start_recording(&mut self, lands_at: Ticks, playing_along: bool) {
+    pub(super) fn start_recording(&mut self, lands_at: Ticks, playing_along: bool) {
         let default = self.recordings_folder();
         let Some(bar) = &mut self.record_bar else {
             return;
@@ -555,6 +555,19 @@ impl Editor {
             Err(error) => {
                 self.notice = Some(format!("The recording could not start. {error}"));
                 self.record_bar = None;
+            }
+        }
+        // Nothing is recorded until the file is open, which takes a moment, longer on a busy
+        // computer, and a video playing along carries on meanwhile. So the recording belongs where
+        // the video is now, not where it was when asked.
+        if playing_along {
+            let now = self.position();
+            if let Some(RecordBar {
+                stage: BarStage::Recording(live),
+                ..
+            }) = &mut self.record_bar
+            {
+                live.lands_at = now;
             }
         }
     }

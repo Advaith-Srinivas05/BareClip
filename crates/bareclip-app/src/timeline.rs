@@ -848,6 +848,9 @@ pub struct TimelineState {
     menu_flyouts: MenuFlyouts,
     /// How far the pointer was from the clip's edge when a trim began.
     trim_grab: Ticks,
+    /// Where the playhead was when a trim began. It follows the edge during the trim, so the
+    /// edge snaps to where it was instead, or it would always be close enough to stick.
+    trim_playhead: Ticks,
     /// What a trimmed edge really lined up with in the last frame, which a target the
     /// clip's footage can't reach does not count as.
     pub trim_aligned: Option<Ticks>,
@@ -892,6 +895,7 @@ impl Default for TimelineState {
             named_clip: None,
             menu_flyouts: MenuFlyouts::default(),
             trim_grab: Ticks(0),
+            trim_playhead: Ticks(0),
             trim_aligned: None,
             playhead_bubble: false,
         }
@@ -1715,8 +1719,8 @@ fn clip_rect(scale: &TimeScale, track: Rect, start: Ticks, end: Ticks) -> Rect {
 }
 
 /// Everything a dragged clip's edges can line up with.
-fn snap_targets(view: &TimelineView, moving: Option<ClipId>) -> Vec<Ticks> {
-    let mut targets = vec![Ticks(0), view.position];
+fn snap_targets(view: &TimelineView, moving: Option<ClipId>, playhead: Ticks) -> Vec<Ticks> {
+    let mut targets = vec![Ticks(0), playhead];
     for clip in view.clips {
         if Some(clip.id) != moving {
             targets.push(clip.start);
@@ -2406,6 +2410,7 @@ pub fn timeline(
                     ClipEdge::End => clip.end,
                 };
                 state.trim_grab = Ticks(time.0 - edge_time.0);
+                state.trim_playhead = view.position;
                 TimelineDrag::Trim(clip.id, edge)
             }
             Some((clip, ClipPart::Body)) => TimelineDrag::Move {
@@ -2435,7 +2440,7 @@ pub fn timeline(
         let time = scale.time_at(pointer.x);
         match state.drag {
             TimelineDrag::Trim(id, edge) if response.dragged() => {
-                let targets = snap_targets(view, Some(id));
+                let targets = snap_targets(view, Some(id), state.trim_playhead);
                 let wanted = Ticks(time.0 - state.trim_grab.0);
                 let snapped = snap_start(wanted, Ticks(0), &targets, tolerance);
                 events.trim_to = Some((id, edge, Ticks(snapped.0 + state.trim_grab.0)));
@@ -2454,7 +2459,7 @@ pub fn timeline(
                 if let Some(clip) = clips.iter().find(|clip| clip.id == id) {
                     let length = Ticks(clip.end.0 - clip.start.0);
                     let wanted = Ticks((time.0 - grab.0).max(0));
-                    let targets = snap_targets(view, Some(id));
+                    let targets = snap_targets(view, Some(id), view.position);
                     let snapped = snap_start(wanted, length, &targets, tolerance);
                     let target = view.tracks.target_for(
                         layout.move_target_at(pointer.y, clip.track),
@@ -2709,7 +2714,12 @@ pub fn timeline(
 
     // Shows where a video dragged from the panel will land.
     let drop_at = |drag: &MediaDrag, time: Ticks| {
-        snap_start(time, drag.length, &snap_targets(view, None), tolerance)
+        snap_start(
+            time,
+            drag.length,
+            &snap_targets(view, None, view.position),
+            tolerance,
+        )
     };
     let dragged_pointer = ui.input(|input| input.pointer.latest_pos());
     if let (Some(drag), Some(time), Some(pointer)) = (
@@ -2724,7 +2734,7 @@ pub fn timeline(
             .tracks
             .landing(target, None, drop_at(&drag, time), drag.length);
         let end = Ticks(start.0 + drag.length.0);
-        state.snap_line = snap_target(start, drag.length, &snap_targets(view, None));
+        state.snap_line = snap_target(start, drag.length, &snap_targets(view, None, view.position));
         let scrolled = scroll_toward_edge(ui, state.track_scroll, furthest, area, pointer.y);
         state.track_scroll_moved |= scrolled != state.track_scroll;
         state.track_scroll = scrolled;

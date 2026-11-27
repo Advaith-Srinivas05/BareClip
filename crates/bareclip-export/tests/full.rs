@@ -1921,18 +1921,30 @@ fn a_lower_quality_makes_a_smaller_file_from_the_same_picture() {
                 vec![part(&input, 0.0, 1.0, 0.0)],
             )
         };
-        export_layered(&job, &AtomicBool::new(false), &|_| {}).expect("it exports");
+        let report = export_layered(&job, &AtomicBool::new(false), &|_| {}).expect("it exports");
         let size = std::fs::metadata(&job.output)
             .expect("it was written")
             .len();
         let _ = std::fs::remove_file(&job.output);
-        size
+        (size, report.encoder)
     };
 
-    let matching = size_at("quality-match", Quality::MatchSource);
-    let smaller = size_at("quality-smaller", Quality::Smaller);
+    // Sizes only compare from the same encoder. NVIDIA's cards open a limited number of encoders
+    // at once, so with other tests exporting alongside, one of the two can go to the next.
+    let ((smaller, smaller_encoder), (matching, matching_encoder)) = (0..5)
+        .map(|_| {
+            (
+                size_at("quality-smaller", Quality::Smaller),
+                size_at("quality-match", Quality::MatchSource),
+            )
+        })
+        .find(|((_, smaller), (_, matching))| smaller == matching)
+        .expect("both come from the same encoder at least once");
 
-    assert!(smaller < matching, "{smaller} is not under {matching}");
+    assert!(
+        smaller < matching,
+        "{smaller} is not under {matching} on {smaller_encoder} and {matching_encoder}"
+    );
 }
 
 fn song_spans(input: &Path, seconds_long: f64, start: f64) -> SoundPlan {
